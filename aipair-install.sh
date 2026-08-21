@@ -53,7 +53,18 @@ warn() { N_WARN=$((N_WARN+1)); printf '[warn] %s\n' "$*"; }
 fail() { N_FAIL=$((N_FAIL+1)); printf '[fail] %s\n' "$*" >&2; }
 note() { printf '       %s\n' "$*"; }
 usage() {
-  sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//'
+  # print the leading comment block from 'aipair-install.sh —' down to the blank
+  # comment line that closes the Exit-codes section (so 0/1/2/3 all show); strip '# '.
+  awk '
+    /^# aipair-install\.sh —/ { on=1 }
+    on {
+      if ($0 !~ /^#/) exit
+      line=$0; sub(/^# ?/, "", line)
+      if (line=="" && seen_codes) exit
+      if (line ~ /^Exit codes:/) seen_codes=1
+      print line
+    }
+  ' "$0"
 }
 
 # --- args --------------------------------------------------------------------
@@ -69,10 +80,20 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-[ -f "$REPO_DIR/bin/aipair" ] && [ -f "$REPO_DIR/templates/claude-md-block.md" ] || {
-  echo "error: run this script from the aipair repository checkout (bin/aipair and templates/ not found next to it)" >&2
+# Verify every bundled artifact up front — before anything is written. Otherwise a
+# missing templates/codex-agents-block.md would surface only AFTER CLAUDE.md was
+# already rewritten, as a Python traceback (PM review #2).
+_missing=""
+for _f in bin/aipair bin/aipair-relay bin/aipair-relay-here bin/peer bin/peer-log bin/aipair-queue \
+          templates/vscode-tasks.json templates/claude-md-block.md templates/codex-agents-block.md \
+          .claude/skills/aipair-setup/SKILL.md .claude/skills/aipair-relay/SKILL.md; do
+  [ -f "$REPO_DIR/$_f" ] || _missing="$_missing $_f"
+done
+if [ -n "$_missing" ]; then
+  printf '[fail] incomplete aipair checkout — missing:%s\n' "$_missing" >&2
+  printf '       run this script from a complete clone of the aipair repository (nothing was changed)\n' >&2
   exit 1
-}
+fi
 
 # --- detection helpers ---------------------------------------------------------
 detect_os() {
@@ -112,8 +133,11 @@ ver_ge() {
 }
 tmux_version()    { tmux -V 2>/dev/null | sed -E 's/^tmux[[:space:]]+(next-)?//' | head -1; }
 python3_version() { python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null; }
-claude_version()  { claude --version 2>/dev/null | head -1 | sed -E 's/[[:space:]]+\(.*\)$//'; }
-codex_version()   { codex --version 2>/dev/null | head -1 | sed -E 's/^codex(-cli)?[[:space:]]+//'; }
+# `timeout` bounds a CLI that blocks on auth; fall back to no timeout where coreutils
+# timeout is absent (e.g. macOS without it) so behaviour is unchanged there (PM review #4).
+if command -v timeout >/dev/null 2>&1; then _vt() { timeout 10 "$@"; }; else _vt() { "$@"; }; fi
+claude_version()  { _vt claude --version 2>/dev/null | head -1 | sed -E 's/[[:space:]]+\(.*\)$//'; }
+codex_version()   { _vt codex --version 2>/dev/null | head -1 | sed -E 's/^codex(-cli)?[[:space:]]+//'; }
 
 locale_utf8() {
   local l="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
@@ -478,10 +502,26 @@ smoke_test() {
   sleep 1
   if ! tmux has-session -t "$name" 2>/dev/null; then fail "smoke: tmux session '$name' was not created by 'aipair $tmp'"; rmdir "$tmp"; return 1; fi
   panes=$(tmux list-panes -t "$name" 2>/dev/null | wc -l | tr -d ' ')
+  # Tear down. Don't swallow failure silently (global rule #19): if the throw-away
+  # session or dir survives, tell the user how to remove it (PM review #3).
+  local cleaned=1
   env -u TMUX "$BIN_DIR/aipair" stop "$tmp" >/dev/null 2>&1 || tmux kill-session -t "$name" 2>/dev/null || true
+  if tmux has-session -t "$name" 2>/dev/null; then
+    cleaned=0
+    warn "smoke: could not remove throw-away session '$name' — run: tmux kill-session -t $name"
+  fi
   rmdir "$tmp" 2>/dev/null || true
+  if [ -d "$tmp" ]; then
+    cleaned=0
+    warn "smoke: could not remove throw-away dir '$tmp' — run: rm -rf $tmp"
+  fi
   if [ "$panes" != 3 ]; then fail "smoke: expected 3 panes (claude / codex / bridge), got $panes"; return 1; fi
-  ok "smoke: 'aipair <tmpdir>' created tmux session '$name' with 3 panes, then 'aipair stop' removed it"
+  # Don't claim it was removed if a warning above said otherwise.
+  if [ "$cleaned" -eq 1 ]; then
+    ok "smoke: 'aipair <tmpdir>' created tmux session '$name' with 3 panes, then tore it down"
+  else
+    ok "smoke: 'aipair <tmpdir>' created tmux session '$name' with 3 panes (throw-away left behind — see warning above)"
+  fi
 }
 smoke_test || exit 1
 
