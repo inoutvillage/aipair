@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# aipair — launch Claude Code + Codex CLI side by side in tmux, with a live
+# "bridge" pane that merges both transcripts so each agent can reference the
+# other (via `peer` / `peer-log`).
+#
+#   aipair [dir]         start the pair (or re-attach if already running)
+#   aipair loop [dir]    start the pair + autonomous review relay (see aipair-relay)
+#   aipair attach [dir]  attach only (error if not running)
+#   aipair stop  [dir]   kill the session for dir
+#   aipair name  [dir]   print the tmux session name for dir
+#
+# Layout:
+#   ┌───────────────┬───────────────┐
+#   │    claude     │     codex     │   two agents, same working dir
+#   ├───────────────┴───────────────┤
+#   │  bridge: peer-log both --watch │   live merged conversation (for you)
+#   └───────────────────────────────┘
+set -euo pipefail
+
+# Single source of truth for a directory's tmux session name.
+session_name() {
+  local base; base="$(basename "$1")"
+  printf 'aipair-%s' "${base//[^A-Za-z0-9_]/-}"
+}
+
+cmd="start"
+case "${1:-}" in
+  start|loop|attach|stop|name) cmd="$1"; shift ;;
+esac
+
+DIR="${1:-$PWD}"
+if [ ! -d "$DIR" ]; then
+  echo "aipair: no such directory: $DIR" >&2
+  exit 1
+fi
+DIR="$(cd "$DIR" && pwd -P)"
+NAME="$(session_name "$DIR")"
+
+running() { tmux has-session -t "$NAME" 2>/dev/null; }
+attach() {
+  if [ -n "${TMUX:-}" ]; then exec tmux switch-client -t "$NAME"
+  else exec tmux attach -t "$NAME"; fi
+}
+
+case "$cmd" in
+  name)
+    printf '%s\n' "$NAME"; exit 0 ;;
+  stop)
+    if running; then tmux kill-session -t "$NAME"; echo "aipair: stopped $NAME"
+    else echo "aipair: no running session $NAME"; fi
+    exit 0 ;;
+  attach)
+    if running; then attach
+    else echo "aipair: no running session $NAME (run 'aipair' to start)" >&2; exit 1; fi ;;
+esac
+
+# cmd == start: re-attach if already running, otherwise build the session.
+if running; then attach; fi
+
+tmux new-session -d -s "$NAME" -c "$DIR"
+CLAUDE=$(tmux list-panes -t "$NAME" -F '#{pane_id}' | head -1)
+BRIDGE=$(tmux split-window -v -l 30% -t "$CLAUDE" -c "$DIR" -P -F '#{pane_id}')
+CODEX=$(tmux split-window -h -l 50% -t "$CLAUDE" -c "$DIR" -P -F '#{pane_id}')
+
+tmux set -t "$NAME" pane-border-status top >/dev/null 2>&1 || true
+tmux set -t "$NAME" mouse on >/dev/null 2>&1 || true
+
+# Bridge pane: live merged log (collaborate) or the autonomous relay (loop).
+if [ "$cmd" = loop ]; then
+  BRIDGE_CMD="aipair-relay --max-rounds ${AIPAIR_MAX_ROUNDS:-20} --stop '${AIPAIR_STOP:-完了です}' --stop-side ${AIPAIR_STOP_SIDE:-codex}"
+  # 起動直後の暫定タイトル。relay 本体が起動後に実際の設定で名乗り直す
+  BRIDGE_TITLE="relay ● 1タスク / max ${AIPAIR_MAX_ROUNDS:-20} / Ctrl-C で停止"
+  # AIPAIR_ENDLESS=1: 停止ワードで終わらず「次のタスクへ」を促し続ける連続モード。
+  # 終端は Codex の AIPAIR_ALL_DONE 宣言のみ（詳細は aipair-relay --help）。
+  if [ -n "${AIPAIR_ENDLESS:-}" ]; then
+    BRIDGE_CMD="$BRIDGE_CMD --endless --task-list '${AIPAIR_TASK_LIST:-tasks/todo.md}'"
+    BRIDGE_CMD="$BRIDGE_CMD --next-ask '${AIPAIR_NEXT_ASK:-次のタスクをください}'"
+    BRIDGE_CMD="$BRIDGE_CMD --all-done '${AIPAIR_ALL_DONE:-全タスク完了}'"
+    BRIDGE_TITLE="relay ● endless / max ${AIPAIR_MAX_ROUNDS:-20} / 終端「${AIPAIR_ALL_DONE:-全タスク完了}」/ Ctrl-C で停止"
+  fi
+else
+  BRIDGE_CMD='peer-log both --watch --last 15'
+  BRIDGE_TITLE='bridge  (claude × codex — peer-log both --watch)'
+fi
+
+tmux select-pane -t "$CLAUDE" -T 'claude'
+tmux select-pane -t "$CODEX"  -T 'codex'
+tmux select-pane -t "$BRIDGE" -T "$BRIDGE_TITLE"
+
+# Launch flags. Override via env; set to empty (e.g. AIPAIR_CLAUDE_FLAGS=) for none.
+CLAUDE_FLAGS="${AIPAIR_CLAUDE_FLAGS---dangerously-skip-permissions}"
+CODEX_FLAGS="${AIPAIR_CODEX_FLAGS---dangerously-bypass-approvals-and-sandbox}"
+
+# AI_SELF / AI_PEER let each agent's `peer` command target the other.
+tmux send-keys -t "$CLAUDE" "export AI_SELF=claude AI_PEER=codex; clear; claude $CLAUDE_FLAGS" C-m
+tmux send-keys -t "$CODEX"  "export AI_SELF=codex AI_PEER=claude; clear; codex $CODEX_FLAGS" C-m
+tmux send-keys -t "$BRIDGE" "export AI_SELF=bridge; clear; $BRIDGE_CMD" C-m
+
+tmux select-pane -t "$CLAUDE"
+attach

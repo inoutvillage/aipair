@@ -1,0 +1,96 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "🤝【AI Pair】起動 / 再アタッチ（claude ┃ codex ／ 下段 bridge）",
+      "type": "shell",
+      "command": "wsl.exe",
+      "args": [
+        "--cd", "${workspaceFolder}",
+        "bash", "-ic", "aipair"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": true,
+        "clear": true
+      },
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "🔁【AI Pair】相互レビュー・ループ（自走 / Codexが「完了です」で停止）",
+      "type": "shell",
+      "command": "wsl.exe",
+      "args": [
+        "--cd", "${workspaceFolder}",
+        "bash", "-ic", "aipair loop"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": true,
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "📜【AI Pair】統合ログ（bridge）だけ表示",
+      "type": "shell",
+      "command": "wsl.exe",
+      "args": [
+        "--cd", "${workspaceFolder}",
+        "bash", "-ic", "peer-log both --watch"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "🛑【AI Pair】停止（tmux セッション kill）",
+      "type": "shell",
+      "command": "wsl.exe",
+      "args": [
+        "--cd", "${workspaceFolder}",
+        "bash", "-ic", "aipair stop"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "🤖 claude 単体起動（peer 参照可）",
+      "type": "shell",
+      "command": "wsl.exe",
+      "args": [
+        "--cd", "${workspaceFolder}",
+        "bash", "-ic", "export AI_SELF=claude AI_PEER=codex && claude --dangerously-skip-permissions"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "group": "agents"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "🤖 codex 単体起動（peer 参照可）",
+      "type": "shell",
+      "command": "wsl.exe",
+      "args": [
+        "--cd", "${workspaceFolder}",
+        "bash", "-ic", "export AI_SELF=codex AI_PEER=claude && codex --dangerously-bypass-approvals-and-sandbox"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "group": "agents"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

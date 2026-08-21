@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# aipair-relay-here — 走行中の aipair ペアに対し、relay（自律レビューの往復 poke）を
+# オンデマンドで1本だけ起こす。Claude / Codex / bridge どのペインからでも呼べる共通コマンド
+# （bridge ペイン自身から叩いた場合は send-keys ではなくそのまま直接実行する）。
+#
+# relay は「完了です」等で終了する＝そこで自律往復が止まる。新しい仕事ができた時
+# （Claude が必要と判断 / ユーザーが「リレーで処理して」と言った / 前 relay 終了後）に
+# これを1回叩くと、bridge ペインで relay を張り直す（--adopt で既存ペアに乗る）。
+# ※ 自動再起動デーモンではない。1回 = 1 relay。無限ループにしない設計（maintainer decision）。
+#
+# 使い方:
+#   aipair-relay-here [rounds N] [stop "フレーズ"] [stop-side codex|claude|both]
+#                     [--session NAME] [--print]
+#                     [<aipair-relay のフラグ...>]  [-- <以降すべて relay へ素通し>]
+#   ※ --max-rounds / --endless など relay 本体のフラグは `--` 無しでもそのまま書ける
+#      例: aipair-relay-here --max-rounds 100 --endless
+# 既定: --adopt / relay 側の既定（--stop 完了です / --stop-side codex / --max-rounds 20）
+#
+# env でも指定できる（優先順位: 引数 > 環境変数 > 既定）。send-keys 投入では呼び出し側の
+# env が bridge に届かないため、ここでフラグへ展開して渡す。--print で結果を確認できる:
+#   AIPAIR_MAX_ROUNDS  最大往復数        AIPAIR_STOP / AIPAIR_STOP_SIDE  停止ワードと判定側
+#   AIPAIR_ENDLESS     連続モード(1でon)  AIPAIR_TASK_LIST / AIPAIR_NEXT_ASK / AIPAIR_ALL_DONE
+# 例: AIPAIR_MAX_ROUNDS=100 AIPAIR_ENDLESS=1 aipair-relay-here --print
+set -uo pipefail
+
+RELAY="$HOME/.local/bin/aipair-relay"
+SHELLS="bash zsh sh fish"
+
+die() { printf 'aipair-relay-here: %s\n' "$*" >&2; exit 2; }
+
+# 値をシェル安全に単一引用符で包む（UTF-8 は素通り。%q は日本語を $'..' 化し bridge が sh だと壊れるため使わない）
+sq() { local s=$1; s=${s//\'/\'\\\'\'}; printf "'%s'" "$s"; }
+
+SESSION=""; DRYRUN=0; ROUNDS=""; STOP=""; STOP_SIDE=""; EXTRA=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    rounds)     ROUNDS="${2:?rounds に数値が要る}"; shift 2 ;;
+    stop)       STOP="${2:?stop にフレーズが要る}"; shift 2 ;;
+    stop-side)  STOP_SIDE="${2:?stop-side に値が要る}"; shift 2 ;;
+    --session)  SESSION="${2:?--session に名前が要る}"; shift 2 ;;
+    --print|-n) DRYRUN=1; shift ;;
+    --)         shift; EXTRA=("$@"); break ;;
+    -h|--help)  sed -n '2,23p' "$0"; exit 0 ;;
+    # relay 本体のフラグ（--max-rounds / --endless 等）は `--` 無しでもそのまま受ける。
+    # 値を伴うフラグは「次が別フラグでも既知キーワードでもなければ値」とみなして一緒に取り込む。
+    # 例: `--max-rounds 100 --endless` / `--endless rounds 100` / `--endless --print` すべて可。
+    --*)        EXTRA+=("$1"); shift
+                if [ $# -gt 0 ]; then
+                  case "$1" in
+                    -*|rounds|stop|stop-side) : ;;   # 値ではない → 次のループへ回す
+                    *) EXTRA+=("$1"); shift ;;       # 値として取り込む
+                  esac
+                fi ;;
+    *)          die "unknown arg: $1（使い方は -h）" ;;
+  esac
+done
+
+command -v tmux >/dev/null 2>&1 || die "tmux が無い"
+[ -x "$RELAY" ] || die "aipair-relay が無い: $RELAY"
+
+# --- セッション特定 ---------------------------------------------------------
+if [ -z "$SESSION" ]; then
+  [ -n "${TMUX:-}" ] || die "aipair セッションの外です（tmux 外）。ペア内の Claude/Codex ペインから実行してください。"
+  SESSION="$(tmux display-message -p '#{session_name}' 2>/dev/null)" || die "現在の tmux セッション名を取得できない"
+fi
+tmux has-session -t "$SESSION" 2>/dev/null || die "セッションが無い: $SESSION"
+
+# --- bridge ペイン検出（title 優先 → シェル/pythonペインへフォールバック）---
+SELF="${TMUX_PANE:-}"
+BRIDGE=""; BRIDGE_CMD=""
+panes="$(tmux list-panes -t "$SESSION" -F '#{pane_id}	#{pane_current_command}	#{pane_title}')"
+while IFS=$'\t' read -r pid cmd title; do
+  [ "$pid" = "$SELF" ] && continue
+  lt="$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]')"
+  case "$lt" in bridge*|relay*) BRIDGE="$pid"; BRIDGE_CMD="$cmd"; break ;; esac
+done <<< "$panes"
+if [ -z "$BRIDGE" ]; then
+  while IFS=$'\t' read -r pid cmd title; do
+    [ "$pid" = "$SELF" ] && continue
+    case " $SHELLS python3 python " in *" $cmd "*) BRIDGE="$pid"; BRIDGE_CMD="$cmd"; break ;; esac
+  done <<< "$panes"
+fi
+# --- 自ペインが bridge のケース（relay 終了後、bridge の bash プロンプトから叩いた）---
+# 上の2つの検出は自ペインを除外している（Claude/Codex ペインから呼ぶ想定）ため、
+# bridge 自身から呼ぶと候補ゼロで死んでいた（2026-07-14 実バグ）。title が bridge/relay の
+# 自ペインなら send-keys ではなくこのプロセスをそのまま relay に差し替えて実行する。
+RUN_IN_PLACE=0
+if [ -z "$BRIDGE" ] && [ -n "$SELF" ]; then
+  self_title="$(tmux display-message -p -t "$SELF" '#{pane_title}' 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  case "$self_title" in
+    bridge*|relay*) BRIDGE="$SELF"; BRIDGE_CMD="(self)"; RUN_IN_PLACE=1 ;;
+  esac
+fi
+[ -n "$BRIDGE" ] || die "bridge ペインが見つからない（session=$SESSION）。aipair セッションの構成を確認してください。"
+
+# --- 二重起動ガード: bridge が idle シェルの時だけ点火する -------------------
+# （自ペイン実行時は不要: プロンプトからこのスクリプトを叩けている＝relay は走っていない）
+if [ "$RUN_IN_PLACE" != 1 ]; then
+  case " $SHELLS " in
+    *" $BRIDGE_CMD "*) : ;;  # idle → OK
+    *) die "bridge ペイン($BRIDGE)が busy（current_command=$BRIDGE_CMD）。relay 走行中か collaborate(peer-log)モードの可能性。二重起動回避のため中止。停止は bridge で Ctrl-C 後に再実行。" ;;
+  esac
+fi
+
+# --- env 既定の取り込み（明示引数が無い項目だけ）-----------------------------
+# 🔴 bridge ペインへは send-keys で「コマンド文字列」を打ち込むため、呼び出し側シェルの
+# 環境変数は relay に引き継がれない（bridge ペイン側シェルの env が使われる）。
+# 例: Claude ペインで AIPAIR_MAX_ROUNDS=100 を付けても、そのままでは無言で無視される。
+# → ここでフラグへ明示展開しておく（--print で実際の値が見える）。
+# 自ペイン実行（RUN_IN_PLACE）は exec なので env も効くが、同じ値が二重に効くだけで無害。
+has_extra() {
+  local needle=$1 e
+  [ ${#EXTRA[@]} -eq 0 ] && return 1
+  for e in "${EXTRA[@]}"; do [ "$e" = "$needle" ] && return 0; done
+  return 1
+}
+# 明示フラグ（`--` 以降 or 直接指定）で既に渡されている項目には env を重ねない
+if [ -z "$ROUNDS" ]    && ! has_extra --max-rounds; then ROUNDS="${AIPAIR_MAX_ROUNDS:-}"; fi
+if [ -z "$STOP" ]      && ! has_extra --stop;       then STOP="${AIPAIR_STOP:-}"; fi
+if [ -z "$STOP_SIDE" ] && ! has_extra --stop-side;  then STOP_SIDE="${AIPAIR_STOP_SIDE:-}"; fi
+
+ENV_ARGS=()
+if ! has_extra --endless && ! has_extra --no-endless; then
+  case "$(printf '%s' "${AIPAIR_ENDLESS:-}" | tr '[:upper:]' '[:lower:]')" in
+    ""|0|false|no|off) : ;;
+    *)                 ENV_ARGS+=(--endless) ;;
+  esac
+fi
+if [ -n "${AIPAIR_TASK_LIST:-}" ] && ! has_extra --task-list; then
+  ENV_ARGS+=(--task-list "$AIPAIR_TASK_LIST")
+fi
+if [ -n "${AIPAIR_NEXT_ASK:-}" ] && ! has_extra --next-ask; then
+  ENV_ARGS+=(--next-ask "$AIPAIR_NEXT_ASK")
+fi
+if [ -n "${AIPAIR_ALL_DONE:-}" ] && ! has_extra --all-done; then
+  ENV_ARGS+=(--all-done "$AIPAIR_ALL_DONE")
+fi
+
+# --- relay コマンド組み立て --------------------------------------------------
+CMD=("$RELAY" --adopt --session "$SESSION" --dir "$PWD")
+[ -n "$ROUNDS" ]    && CMD+=(--max-rounds "$ROUNDS")
+[ -n "$STOP" ]      && CMD+=(--stop "$STOP")
+[ -n "$STOP_SIDE" ] && CMD+=(--stop-side "$STOP_SIDE")
+[ ${#ENV_ARGS[@]} -gt 0 ] && CMD+=("${ENV_ARGS[@]}")
+[ ${#EXTRA[@]} -gt 0 ] && CMD+=("${EXTRA[@]}")
+LINE=""; for a in "${CMD[@]}"; do LINE+="$(sq "$a") "; done; LINE="${LINE% }"
+
+if [ "$DRYRUN" = 1 ]; then
+  printf 'session : %s\n' "$SESSION"
+  printf 'bridge  : %s (cmd=%s)%s\n' "$BRIDGE" "$BRIDGE_CMD" \
+    "$([ "$RUN_IN_PLACE" = 1 ] && printf ' [このペインで直接実行]')"
+  printf 'dir     : %s\n' "$PWD"
+  printf 'launch  : %s\n' "$LINE"
+  exit 0
+fi
+
+if [ "$RUN_IN_PLACE" = 1 ]; then
+  # 自ペインが bridge → このままフォアグラウンドで実行（send-keys だと自分の入力バッファに落ちる）
+  printf 'relay 点火（このペインで直接実行）: session=%s\n' "$SESSION"
+  printf '  %s\n' "$LINE"
+  exec "${CMD[@]}"
+fi
+
+# --- bridge へ投入（literal → 0.3s → Enter：実績ある作法）-------------------
+tmux send-keys -t "$BRIDGE" -l "$LINE"
+sleep 0.3
+tmux send-keys -t "$BRIDGE" Enter
+printf 'relay 点火: session=%s / bridge=%s\n' "$SESSION" "$BRIDGE"
+printf '  %s\n' "$LINE"
+printf '  → 会話は  peer / peer-log both  で追える。停止は bridge ペインで Ctrl-C。\n'
+exit 0

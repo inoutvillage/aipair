@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""peer-log — read the latest Claude Code / Codex CLI transcript for a directory.
+
+Both agents write JSONL session logs keyed (directly or via metadata) to a cwd:
+  - Claude Code: ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl
+  - Codex CLI:   ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl  (cwd in session_meta)
+
+This tool finds the newest session for a directory, extracts the human-readable
+turns, and prints them.  With `both` it merges Claude + Codex by timestamp, and
+with `--watch` it follows the live conversation — used by the `aipair` bridge pane.
+
+Usage:
+  peer-log <claude|codex|both> [--dir DIR] [--last N] [--full] [--tools]
+                               [--watch] [--no-color]
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
+CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
+
+# ANSI colors (agent tag + dim role); disabled when not a tty or --no-color.
+TAG = {"claude": "\033[1;36m", "codex": "\033[1;32m", "bridge": "\033[1;35m"}
+DIM, RESET = "\033[2m", "\033[0m"
+USE_COLOR = True
+
+
+def c(code, s):
+    return f"{code}{s}{RESET}" if USE_COLOR else s
+
+
+# --------------------------------------------------------------------------- #
+# Locating the newest session file for a directory
+# --------------------------------------------------------------------------- #
+def _norm(p):
+    return os.path.normcase(os.path.realpath(os.path.expanduser(p))).rstrip("/")
+
+
+def claude_file(cwd):
+    """Newest Claude .jsonl for cwd.
+    Claude Code のプロジェクトdir名は非英数字をすべて '-' に置換する
+    （日本語・'_' を含むパスで空振りしてセッションを発見できないバグの修正。
+     aipair-relay.claude_glob() と同一ロジックに統一）。"""
+    enc = re.sub(r"[^A-Za-z0-9]", "-", cwd)
+    d = os.path.join(CLAUDE_PROJECTS, enc)
+    if not os.path.isdir(d):
+        # 後方互換フォールバック（旧エンコード規則で作られた既存dir）。
+        alt = "".join("-" if ch in "/." else ch for ch in cwd)
+        d = os.path.join(CLAUDE_PROJECTS, alt)
+        if not os.path.isdir(d):
+            return None
+    files = glob.glob(os.path.join(d, "*.jsonl"))
+    return max(files, key=os.path.getmtime) if files else None
+
+
+def codex_file(cwd):
+    """Newest Codex rollout whose session_meta.cwd matches cwd."""
+    want = _norm(cwd)
+    files = glob.glob(os.path.join(CODEX_SESSIONS, "*", "*", "*", "rollout-*.jsonl"))
+    files.sort(key=os.path.getmtime, reverse=True)
+    for f in files[:500]:
+        try:
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                first = fh.readline()
+            meta = json.loads(first)
+            cw = (meta.get("payload") or {}).get("cwd") or meta.get("cwd")
+            if cw and _norm(cw) == want:
+                return f
+        except (ValueError, OSError):
+            continue
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Parsing each format into a common {ts, role, text} stream
+# --------------------------------------------------------------------------- #
+def _fmt_time(ts):
+    if not ts:
+        return "--:--:--"
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return dt.astimezone().strftime("%H:%M:%S")
+    except ValueError:
+        return "--:--:--"
+
+
+def _ts_key(ts):
+    try:
+        return datetime.fromisoformat((ts or "").replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+CLAUDE_META_PREFIXES = (
+    "<local-command", "<command-name", "<command-message", "<command-args",
+    "<system-reminder", "<bridge", "<user-prompt-submit", "caveat:",
+)
+CODEX_META_PREFIXES = (
+    "<environment_context", "<user_instructions", "<permissions",
+    "<warnings", "<exit", "## my request for codex",
+    "# agents.md", "<instructions>",
+)
+
+
+def _is_meta(text, prefixes):
+    t = text.lstrip().lower()
+    return any(t.startswith(p) for p in prefixes)
+
+
+def parse_claude(path, show_tools):
+    """Yield (ts, role, text) from a Claude session file."""
+    out = []
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            typ = d.get("type")
+            if typ not in ("user", "assistant"):
+                continue
+            msg = d.get("message") or {}
+            content = msg.get("content")
+            ts = d.get("timestamp")
+            parts = []
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    bt = b.get("type")
+                    if bt == "text":
+                        parts.append(b.get("text", ""))
+                    elif bt == "tool_use" and show_tools:
+                        parts.append(f"· tool:{b.get('name','?')}")
+                    elif bt == "tool_result" and show_tools:
+                        parts.append("· tool_result")
+            text = "\n".join(p for p in parts if p).strip()
+            if not text or _is_meta(text, CLAUDE_META_PREFIXES):
+                continue
+            out.append((ts, typ, text))
+    return out
+
+
+def parse_codex(path, show_tools):
+    """Yield (ts, role, text) from a Codex rollout file."""
+    out = []
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            payload = d.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            ts = d.get("timestamp")
+            ptype = payload.get("type")
+            if d.get("type") == "response_item" and ptype == "message":
+                role = payload.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                content = payload.get("content")
+                parts = []
+                if isinstance(content, str):
+                    parts.append(content)
+                elif isinstance(content, list):
+                    for b in content:
+                        if isinstance(b, dict):
+                            parts.append(b.get("text", ""))
+                text = "\n".join(p for p in parts if p).strip()
+                if not text or _is_meta(text, CODEX_META_PREFIXES):
+                    continue
+                out.append((ts, role, text))
+            elif show_tools and ptype == "function_call":
+                name = payload.get("name", "?")
+                out.append((ts, "assistant", f"· tool:{name}"))
+    return out
+
+
+def load(agent, cwd, show_tools):
+    f = claude_file(cwd) if agent == "claude" else codex_file(cwd)
+    if not f:
+        return None, []
+    msgs = parse_claude(f, show_tools) if agent == "claude" else parse_codex(f, show_tools)
+    return f, [(ts, agent, role, text) for (ts, role, text) in msgs]
+
+
+# --------------------------------------------------------------------------- #
+# Rendering
+# --------------------------------------------------------------------------- #
+def render(entry, compact):
+    ts, agent, role, text = entry
+    tag = c(TAG.get(agent, ""), f"[{agent}]")
+    when = c(DIM, _fmt_time(ts))
+    if compact:
+        flat = " ".join(text.split())
+        if len(flat) > 280:
+            flat = flat[:277] + "…"
+        return f"{when} {tag} {c(DIM, role)} ▸ {flat}"
+    head = f"{c(DIM, '──')} {tag} {c(DIM, role + ' · ' + _fmt_time(ts))} {c(DIM, '──')}"
+    return f"{head}\n{text}\n"
+
+
+def main():
+    global USE_COLOR
+    ap = argparse.ArgumentParser(add_help=True, description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("agent", choices=["claude", "codex", "both"],
+                    help="which agent's transcript to show")
+    ap.add_argument("--dir", default=os.getcwd(), help="working directory (default: cwd)")
+    ap.add_argument("--last", type=int, default=40, help="show last N messages (default 40)")
+    ap.add_argument("--full", action="store_true", help="show the entire transcript")
+    ap.add_argument("--tools", action="store_true", help="include tool-call activity")
+    ap.add_argument("--watch", action="store_true", help="follow live (for the bridge pane)")
+    ap.add_argument("--no-color", action="store_true")
+    a = ap.parse_args()
+
+    USE_COLOR = (not a.no_color) and sys.stdout.isatty()
+    cwd = os.path.realpath(os.path.expanduser(a.dir))
+    agents = ["claude", "codex"] if a.agent == "both" else [a.agent]
+    compact = a.watch or a.agent == "both"
+
+    if not a.watch:
+        merged = []
+        missing = []
+        for ag in agents:
+            f, entries = load(ag, cwd, a.tools)
+            if f is None:
+                missing.append(ag)
+            merged += entries
+        merged.sort(key=lambda e: _ts_key(e[0]))
+        if not a.full and a.last > 0:
+            merged = merged[-a.last:]
+        for e in merged:
+            print(render(e, compact))
+        for ag in missing:
+            print(c(DIM, f"(no {ag} session found for {cwd})"), file=sys.stderr)
+        return
+
+    # --watch: follow live. Track emitted count per file path (logs are append-only).
+    print(c(TAG["bridge"], f"● watching {', '.join(agents)} in {cwd}  (Ctrl-C to stop)"))
+    emitted = {}
+    seeded = False
+    try:
+        while True:
+            batch = []
+            for ag in agents:
+                f, entries = load(ag, cwd, a.tools)
+                if f is None:
+                    continue
+                start = emitted.get(f, 0)
+                if f not in emitted and not seeded and not a.full and a.last > 0:
+                    start = max(0, len(entries) - a.last)  # seed with recent tail
+                batch += entries[start:]
+                emitted[f] = len(entries)
+            batch.sort(key=lambda e: _ts_key(e[0]))
+            for e in batch:
+                print(render(e, True), flush=True)
+            seeded = True
+            time.sleep(1.5)
+    except KeyboardInterrupt:
+        print(c(DIM, "\n● stopped"))
+
+
+if __name__ == "__main__":
+    main()

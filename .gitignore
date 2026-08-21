@@ -1,0 +1,4 @@
+*.bak-*
+*.aipair-bak-*
+__pycache__/
+_reference/
