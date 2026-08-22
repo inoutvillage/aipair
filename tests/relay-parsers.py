@@ -510,5 +510,23 @@ class TranscriptParsers(unittest.TestCase):
         self.assertFalse(peerlog._is_meta("system reminder text", peerlog.CLAUDE_META_PREFIXES))
 
 
+class CorelibStandalone(unittest.TestCase):
+    """aipair-corelib must load with NO aipair-relay dependency (that decoupling is the point
+    of the split): a fresh SourceFileLoader of just corelib exposes the pure helpers."""
+    def test_corelib_loads_and_works_without_relay(self):
+        loader = importlib.machinery.SourceFileLoader("corelib_standalone", os.path.join(BIN, "aipair-corelib"))
+        core = importlib.util.module_from_spec(importlib.util.spec_from_loader("corelib_standalone", loader))
+        loader.exec_module(core)   # would raise if it referenced relay-only globals
+        self.assertEqual(core.parse_version("2.1.238 (Claude Code)"), "2.1.238")
+        self.assertTrue(core.hit_stop(["完了です。"], ["完了です"]))
+        self.assertEqual(core.scrub_output("a\x00b"), "a b")
+        self.assertEqual(core.TESTED_VERSIONS, relay.TESTED_VERSIONS)
+
+    def test_relay_reexports_are_the_corelib_objects(self):
+        # relay.X is bound to the corelib implementation (not a stale copy)
+        self.assertIs(relay.parse_version, relay.corelib.parse_version)
+        self.assertIs(relay.version_gate, relay.corelib.version_gate)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

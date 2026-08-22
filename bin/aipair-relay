@@ -86,6 +86,24 @@ _spec = importlib.util.spec_from_loader("peerlog", _loader)
 peerlog = importlib.util.module_from_spec(_spec)
 _loader.exec_module(peerlog)  # __name__ != __main__, so its main() does not run
 
+# --- pure helpers live in aipair-corelib (D3: split, increment 1) ------------
+# tmux/log-free functions (stop-phrase, version gate, gate output shaping); bound into this
+# module's namespace so relay code and tests keep calling them unqualified / as relay.X.
+_CORELIB = os.path.join(os.path.dirname(os.path.realpath(__file__)), "aipair-corelib")
+_cl_loader = importlib.machinery.SourceFileLoader("aipaircorelib", _CORELIB)
+corelib = importlib.util.module_from_spec(importlib.util.spec_from_loader("aipaircorelib", _cl_loader))
+_cl_loader.exec_module(corelib)
+TESTED_VERSIONS = corelib.TESTED_VERSIONS
+GATE_OUTPUT_CAP = corelib.GATE_OUTPUT_CAP
+parse_version = corelib.parse_version
+detect_version = corelib.detect_version
+version_gate = corelib.version_gate
+hit_stop = corelib.hit_stop
+scrub_output = corelib.scrub_output
+gate_tail = corelib.gate_tail
+gate_message = corelib.gate_message
+_oneline_cap = corelib._oneline_cap
+
 USE_COLOR = True
 C = {"claude": "\033[1;36m", "codex": "\033[1;32m", "relay": "\033[1;35m",
      "warn": "\033[1;31m", "ok": "\033[1;32m", "dim": "\033[2m", "off": "\033[0m"}
@@ -872,96 +890,6 @@ def claude_response_attributed(path, probe):
     return False
 
 
-# --- version gate ----------------------------------------------------------- #
-# The plan-approval / question dialogs are read by scraping the CLIs' TUI, so they are
-# tied to specific claude/codex versions. Keep this in sync with README「検証済みバージョン」.
-TESTED_VERSIONS = {"claude": "2.1.238", "codex": "0.149.0"}
-
-
-def parse_version(text):
-    """The first version token in `text`, captured WHOLE so nothing that differs from a
-    tested version can be truncated onto it: 2.1.238 → '2.1.238', but 2.1.238.1 /
-    2.1.238rc1 / 2.1.238-beta.1 keep their full form and therefore mismatch. Starts at a
-    `d.d` not glued to a preceding number, and runs to the last version char (never ends
-    on a separator). None if there is no such token."""
-    m = re.search(r"(?<![0-9.+-])\d+\.\d+(?:[0-9A-Za-z.+-]*[0-9A-Za-z])?", text or "")
-    return m.group(0) if m else None
-
-
-def detect_version(binary):
-    """`binary --version` → version string, or None if it can't be run, exits non-zero, or
-    prints nothing parseable. errors='replace' keeps the decode from RAISING; if that
-    replacement actually fired (U+FFFD present) the output is not valid UTF-8, so it is
-    treated as unknown (None) rather than parsed — 'unknown' is the safe side of the
-    version gate, and half-decoded bytes must not read as a tested version."""
-    try:
-        p = subprocess.run([binary, "--version"], capture_output=True, text=True,
-                           errors="replace", timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if p.returncode != 0:
-        return None
-    out = (p.stdout or "") + (p.stderr or "")
-    if "\ufffd" in out:
-        return None
-    return parse_version(out)
-
-
-def version_gate(a, detected, tested=TESTED_VERSIONS):
-    """Compare detected claude/codex versions to the tested ones. Returns (rows, bad):
-    rows = [(name, detected, tested, status)] with status in ok/mismatch/unknown; bad =
-    names not known-good. On any bad entry, dialog automation (plan review + question
-    relay) is switched OFF — unless --allow-untested-dialogs — while poke/transcript
-    relaying continues unchanged."""
-    rows, bad = [], []
-    for name in ("claude", "codex"):
-        det, tst = detected.get(name), tested.get(name)
-        if det is None:
-            status = "unknown"; bad.append(name)
-        elif det == tst:
-            status = "ok"
-        else:
-            status = "mismatch"; bad.append(name)
-        rows.append((name, det, tst, status))
-    if bad and not a.allow_untested_dialogs:
-        a.no_plan_review = True
-        a.no_question_relay = True
-    return rows, bad
-
-
-def hit_stop(texts, phrases):
-    """停止ワード判定。poke は「本文の冒頭に停止ワードを明記」と指示しているが、
-    エージェントは1ターンに進捗ナレーション（「〜を確認します」等）を複数メッセージ吐くため、
-    連結全文ではなく最終メッセージ（=本文）の冒頭で判定する。連結全文の冒頭100字判定だと
-    ナレーションに押し出されて停止ワードが窓の外に出、永遠に取り逃がす
-    （実運用で 20 往復キャップまで空回りした実バグ）。
-    文中の偶発的な言及（例:「ツールの修正が完了です。ただし本題は…」）での誤停止を
-    防ぐため、冒頭のみ判定は従来どおり維持する。"""
-    if not texts:
-        return False
-    head = " ".join(texts[-1].split())[:100]
-    return any(p in head for p in phrases)
-
-
-# --- stop gate (--gate): a mechanical check on top of the agents' say-so -------- #
-GATE_OUTPUT_CAP = 256 * 1024   # bytes of gate output kept in memory (tail); the rest is dropped
-
-
-# ANSI CSI/OSC escapes and a lone ESC; scrubbed from gate output before it reaches a
-# pane (ESC would be read as keystrokes) or a log.
-_ANSI_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_][0-9;?]*[ -/]*[@-~]|\x1b")
-
-
-def scrub_output(s):
-    """Make command output safe to type into a tmux pane and to print: drop ANSI escapes,
-    then replace every control char except newline/tab with a space. This covers C0
-    (incl. NUL, which makes `tmux send-keys` raise 'embedded null byte', and ESC, read as
-    keys), DEL (0x7f, a real control input for send-keys) and C1 (0x80-0x9f) — i.e. the
-    whole Unicode "Cc" category, not just ord < 32."""
-    s = _ANSI_RE.sub("", s)
-    return "".join(ch if (ch in "\n\t" or unicodedata.category(ch) != "Cc") else " " for ch in s)
-
-
 def run_gate(cmd, cwd, timeout):
     """Run the --gate shell command in cwd. Returns (ok, scrubbed output text).
 
@@ -1043,29 +971,6 @@ def _kill_group(proc, pgid, signal):
         proc.wait(timeout=3)          # reap the shell (no lingering zombie keeps the pgid "alive")
     except subprocess.TimeoutExpired:
         pass
-
-
-def gate_tail(out, lines=40, limit=1500):
-    """Last `lines` non-empty lines of a command's output, folded into ONE line (pokes are
-    typed into the composer, where a newline would submit), capped at `limit` chars."""
-    tail = [" ".join(l.split()) for l in out.strip().splitlines() if l.strip()][-lines:]
-    text = " ⏎ ".join(tail)
-    return text if len(text) <= limit else "…" + text[-(limit - 1):]
-
-
-def _oneline_cap(s, limit):
-    s = " ".join(s.split())
-    return s if len(s) <= limit else s[:limit - 1] + "…"
-
-
-def gate_message(cmd, out, n, limit):
-    """What Claude gets when the review passed but the gate did not. cmd is folded to one
-    line and capped: a multi-line AIPAIR_GATE must not put a newline in the poke body
-    (the composer submits on newline)."""
-    return (f"【自動レビューループ】レビューは合格しましたが、停止ゲート `{_oneline_cap(cmd, 200)}` が失敗しました"
-            f"（{n}/{limit} 回目）。以下の出力を読んで原因を直し、何を直したか簡潔に述べてターンを終えてください。"
-            "あなたの返答は自動でCodexに共有されます—人間に伝言を頼まないでください。"
-            f" ── gate output (tail): {gate_tail(out) or '(no output)'}")
 
 
 def gate_or_message(a, gate_state, cwd):

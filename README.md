@@ -154,7 +154,7 @@ Windows の VS Code（Remote-WSL でない、Windows フォルダとして開く
 | `<project>/.vscode/tasks.json` | VS Code「Tasks: Run Task」から起動（WSL2 向けテンプレ）。**無修正で全プロジェクト共通** |
 
 🔒 **配置先は `~/.local/bin` 固定**: `aipair-relay-here` が `$HOME/.local/bin/aipair-relay` を参照し、
-`aipair-relay` は**同じディレクトリ**の `peer-log` を読み込む（`SourceFileLoader`）。
+`aipair-relay` は**同じディレクトリ**の `peer-log` と `aipair-corelib`（純粋ヘルパ）を読み込む（`SourceFileLoader`）。
 個別に symlink を張ったり別ディレクトリへ分散させたりしないこと（インストーラはコピーで一括配置する）。
 
 ---
