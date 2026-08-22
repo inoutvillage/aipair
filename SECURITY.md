@@ -79,8 +79,12 @@ relay はエージェントのペインへキー入力（poke）を送ってタ�
 - **境界／緩和:** **マーカー境界のみ置換**（他の行はバイト一致を検証）、タイムスタンプ付きバックアップ、`--no-global-instructions`（`AIPAIR_NO_GLOBAL_INSTRUCTIONS=1`）で完全スキップ。
 
 ### 6. テストハーネスの tmux
-テストは**専用 `-L` ソケット**を使い、実ユーザーの tmux サーバーを触らないことを必須とします
-（`tasks/lessons.md` のガードレール）。全テストが tmux を private socket に shim し、`#{socket_path}` を検証してから実行・後始末します。
+`tests/` のうち **tmux を実際に起動するもの**（`install-global-optout` / `install-upgrade` /
+`env-forward` / `launch-cmds` / `session-name` / `relay-here-libcheck`）は、実 `tmux` を**一意な
+`-L <test-socket>`（専用サーバー）へ転送する wrapper を PATH に置き**、`#{socket_path}` が専用ソケット
+であることを**検証してから**実行し、後始末で `kill-server` ＋ソケットファイル削除まで行います。
+これにより**実ユーザーの既定 tmux サーバー（本番ペア）を作成も kill もしません**。`broadcast-blocks` は
+tmux を起動せず（テンプレの文字列検査のみ）、`run-all` も同様です。
 
 ## スコープ外（aipair が守らないもの）
 

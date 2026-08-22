@@ -5,7 +5,23 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"; REPO="$(dirname "$HERE")"
 command -v tmux >/dev/null 2>&1 || { echo "skip (no tmux)"; exit 0; }
-W="$(mktemp -d "${TMPDIR:-/tmp}/aipair-lc.XXXXXX")"; trap 'rm -rf "$W"' EXIT
+W="$(mktemp -d "${TMPDIR:-/tmp}/aipair-lc.XXXXXX")"
+# aipair-relay-here does a bare `tmux has-session` for session resolution, which would hit the
+# user's DEFAULT server. Force every tmux call onto a PRIVATE -L socket so this test never
+# touches the production server (guardrail; same isolation as the other tmux tests).
+REAL_TMUX="$(command -v tmux)"; SOCKET="aipair-lc-$$-$RANDOM"
+printf '#!/usr/bin/env bash\n%q -L %q start-server 2>/dev/null || true\n%q -L %q set-option -g exit-empty off 2>/dev/null || true\nexec %q -L %q "$@"\n' \
+  "$REAL_TMUX" "$SOCKET" "$REAL_TMUX" "$SOCKET" "$REAL_TMUX" "$SOCKET" > "$W/tmux"; chmod +x "$W/tmux"
+trap '"$REAL_TMUX" -L "$SOCKET" kill-server 2>/dev/null || true; rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SOCKET" 2>/dev/null || true; rm -rf "$W"' EXIT
+# refuse to run unless the shim provably targets the private socket (never the default server)
+"$REAL_TMUX" -L "$SOCKET" new-session -d -s probe 2>/dev/null
+want="$("$REAL_TMUX" -L "$SOCKET" display-message -p -t probe '#{socket_path}')"
+got="$(PATH="$W:$PATH" tmux display-message -p -t probe '#{socket_path}')"
+"$REAL_TMUX" -L "$SOCKET" kill-session -t probe 2>/dev/null || true
+if [ "$got" != "$want" ] || [ "$(basename "$got")" != "$SOCKET" ]; then
+  echo "tmux shim not effective (got '$got', want '$want') — refusing to touch the default server" >&2; exit 2
+fi
+export PATH="$W:$PATH"
 fail=0; n=0
 chk() { n=$((n+1)); if eval "$1"; then echo "ok   $2"; else echo "FAIL $2"; fail=1; fi; }
 

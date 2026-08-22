@@ -12,15 +12,15 @@ chk() { n=$((n+1)); if eval "$1"; then echo "ok   $2"; else echo "FAIL $2"; fail
 # blocks and the setup skill. Each must warn about un-targeted kill-server, name a private
 # server (-L / -S), and explain the $TMUX / TMUX_TMPDIR trap — that combination is the whole
 # lesson; any one of them going missing brings the 2026-08-21 incident back. (The blocks
-# point at the README, not tasks/lessons.md, since a repo path is meaningless once the block
-# is installed into a user's global config; only the in-repo skill cites the lessons log.)
+# point at the README, and the skill at the public SECURITY.md, since tasks/lessons.md is not
+# a tracked/public file — a reference to it is meaningless once installed or cloned.)
 SITES="templates/claude-md-block.md templates/codex-agents-block.md .claude/skills/aipair-setup/SKILL.md"
 for f in $SITES; do
   chk "grep -qF 'kill-server' '$f'"                    "$f warns about kill-server"
   chk "grep -qE 'tmux -L|tmux .*-S|[-]L <|[-]S <' '$f'" "$f names a private server (-L / -S)"
   chk "grep -qF 'TMUX_TMPDIR' '$f'"                    "$f explains the \$TMUX / TMUX_TMPDIR trap"
 done
-chk "grep -qF 'tasks/lessons.md' .claude/skills/aipair-setup/SKILL.md" "setup skill points at the lessons log"
+chk "grep -qF 'SECURITY.md' .claude/skills/aipair-setup/SKILL.md" "setup skill points at the public SECURITY.md (tasks/lessons.md is not tracked)"
 for f in templates/claude-md-block.md templates/codex-agents-block.md; do
   chk "[ \"\$(grep -c 'aipair:start' '$f')\" = 1 ]" "$f has exactly one start marker"
   chk "[ \"\$(grep -c 'aipair:end' '$f')\" = 1 ]"   "$f has exactly one end marker"

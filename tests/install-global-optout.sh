@@ -27,7 +27,7 @@ chmod +x "$SH/bin/claude" "$SH/bin/codex"
 
 # The installer smoke-starts a real pair, which talks to tmux. Force EVERY tmux call (the
 # installer's and the aipair it launches) onto a PRIVATE -L socket so we NEVER create/kill
-# sessions on the user's default/production server (tasks/lessons.md guardrail). exit-empty off
+# sessions on the user's default/production server (SECURITY.md「テストハーネスの tmux」guardrail). exit-empty off
 # keeps the private server alive between calls (tmux 3.4 exits an empty server at once).
 REAL_TMUX="$(command -v tmux)"; SOCKET="aipair-optout-$$-$RANDOM"
 printf '#!/usr/bin/env bash\n%q -L %q start-server 2>/dev/null || true\n%q -L %q set-option -g exit-empty off 2>/dev/null || true\nexec %q -L %q "$@"\n' \
