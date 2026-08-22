@@ -19,6 +19,18 @@ Plan mode (auto plan review):
     approved with extra notes    → feedback + shift+tab (approve w/ feedback)
   Capped at --plan-rounds per plan (default 5); disable with --no-plan-review.
 
+Module layout (D3 split — aipair-relay is the launcher + main loop; helpers live in
+sibling modules it loads by path via SourceFileLoader and binds into its namespace):
+  peer-log            transcript location + parsing (shared with `peer-log` the tool)
+  aipair-corelib      pure helpers: stop-phrase, version gate, gate output shaping
+  aipair-loglib       turn-completion / response-attribution reading
+  aipair-tmuxlib      the tmux(...) runner + pane discovery/inspection
+  aipair-deliverylib  poke delivery + Enter submission (host injects tmux/dim/dialog probe)
+  aipair-dialoglib    plan/question dialog detection + response (+ dialog constants)
+What stays here: env parsing, colour/log, log-locking + LogWatch, the stop-gate runner,
+the poke wording, and main()'s state machine. All six sibling files must sit in the same
+directory as aipair-relay (the installer keeps them together and verifies it).
+
 Question dialogs (auto AskUserQuestion relay):
   If Claude stops at a multiple-choice question dialog (AskUserQuestion — the
   literal-input poke would be eaten by the selector UI), the relay scrapes ALL
@@ -49,8 +61,8 @@ Endless mode (--endless, opt-in; 既定は従来どおり停止ワードで終�
   次タスクの根拠は --task-list（既定 tasks/todo.md）の未チェック項目に限定し、
   リスト外の新規提案を禁じる文面を Codex へ送る（スコープ膨張の防止）。
   終端は Codex の --all-done 宣言のみ。--max-rounds は安全キャップとして残る。
-  ⚠ aipair-queue は「exit 0 = 1タスク完了」を前提に PR/マージへ進むため、
-    キュー実行では --endless を使わないこと。
+  --gate CMD（env AIPAIR_GATE）: 停止ワード検知後に CMD を --dir で実行し、exit 0 の時だけ停止／次タスクへ。
+  失敗は出力の末尾を添えて Claude に差し戻す（--gate-rounds 回（既定 3）で exit 6）。未指定なら従来どおり。
 
 Turn detection (verified against real logs):
   • Claude: latest `assistant` entry whose stop_reason != "tool_use"  → turn done
@@ -76,6 +88,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 
 # --- reuse peer-log's log-location + parsing (no duplication) --------------- #
 # peer-log has no .py extension, so use an explicit SourceFileLoader.
@@ -84,6 +97,94 @@ _loader = importlib.machinery.SourceFileLoader("peerlog", _PEERLOG)
 _spec = importlib.util.spec_from_loader("peerlog", _loader)
 peerlog = importlib.util.module_from_spec(_spec)
 _loader.exec_module(peerlog)  # __name__ != __main__, so its main() does not run
+
+# --- pure helpers live in aipair-corelib (D3: split, increment 1) ------------
+# tmux/log-free functions (stop-phrase, version gate, gate output shaping); bound into this
+# module's namespace so relay code and tests keep calling them unqualified / as relay.X.
+_CORELIB = os.path.join(os.path.dirname(os.path.realpath(__file__)), "aipair-corelib")
+_cl_loader = importlib.machinery.SourceFileLoader("aipaircorelib", _CORELIB)
+corelib = importlib.util.module_from_spec(importlib.util.spec_from_loader("aipaircorelib", _cl_loader))
+_cl_loader.exec_module(corelib)
+TESTED_VERSIONS = corelib.TESTED_VERSIONS
+GATE_OUTPUT_CAP = corelib.GATE_OUTPUT_CAP
+parse_version = corelib.parse_version
+detect_version = corelib.detect_version
+version_gate = corelib.version_gate
+hit_stop = corelib.hit_stop
+scrub_output = corelib.scrub_output
+gate_tail = corelib.gate_tail
+gate_message = corelib.gate_message
+_oneline_cap = corelib._oneline_cap
+
+# --- log/turn helpers live in aipair-loglib (D3: split, increment 2 = A2) ----
+# Transcript reading (turn-done / response attribution); peer-log only, no tmux. Bound into
+# this module so relay code and tests keep calling them unqualified / as relay.X.
+_LOGLIB = os.path.join(os.path.dirname(os.path.realpath(__file__)), "aipair-loglib")
+_ll_loader = importlib.machinery.SourceFileLoader("aipairloglib", _LOGLIB)
+loglib = importlib.util.module_from_spec(importlib.util.spec_from_loader("aipairloglib", _ll_loader))
+_ll_loader.exec_module(loglib)
+claude_done_ts = loglib.claude_done_ts
+codex_done_ts = loglib.codex_done_ts
+turn_texts = loglib.turn_texts
+find_poke_ts = loglib.find_poke_ts
+codex_response_complete = loglib.codex_response_complete
+claude_response_attributed = loglib.claude_response_attributed
+make_fragment = loglib.make_fragment
+
+# --- tmux runner + pane helpers live in aipair-tmuxlib (D3: split, increment 3 = A3) --
+# The subprocess `tmux(...)` wrapper and pane discovery/inspection; stdlib only. Bound in so
+# relay code and tests keep calling them unqualified / as relay.X.
+_TMUXLIB = os.path.join(os.path.dirname(os.path.realpath(__file__)), "aipair-tmuxlib")
+_tl_loader = importlib.machinery.SourceFileLoader("aipairtmuxlib", _TMUXLIB)
+tmuxlib = importlib.util.module_from_spec(importlib.util.spec_from_loader("aipairtmuxlib", _tl_loader))
+_tl_loader.exec_module(tmuxlib)
+tmux = tmuxlib.tmux
+current_session = tmuxlib.current_session
+find_panes = tmuxlib.find_panes
+own_pane = tmuxlib.own_pane
+set_pane_title = tmuxlib.set_pane_title
+cancel_copy_mode = tmuxlib.cancel_copy_mode
+pane_busy = tmuxlib.pane_busy
+capture_pane = tmuxlib.capture_pane
+
+# --- poke delivery + Enter submission live in aipair-deliverylib (D3: increment 4 = A4) --
+# deliverylib does NOT import relay (no cycle); relay injects the tmux helpers, logging, the
+# dialog probe and the BUSY_WAIT budget into it. Names bound back so relay/tests call as X.
+_DELIVERYLIB = os.path.join(os.path.dirname(os.path.realpath(__file__)), "aipair-deliverylib")
+_dl_loader = importlib.machinery.SourceFileLoader("aipairdeliverylib", _DELIVERYLIB)
+deliverylib = importlib.util.module_from_spec(importlib.util.spec_from_loader("aipairdeliverylib", _dl_loader))
+_dl_loader.exec_module(deliverylib)
+deliverylib.tmux = tmux
+deliverylib.cancel_copy_mode = cancel_copy_mode
+deliverylib.pane_busy = pane_busy
+press = deliverylib.press
+paste_text = deliverylib.paste_text
+submit_enter = deliverylib.submit_enter
+poke = deliverylib.poke
+
+# --- dialog detection + response live in aipair-dialoglib (D3: increment 5 = A5) --------
+# Plan-approval / AskUserQuestion detection and the send-back, plus the dialog constants.
+# No relay import (no cycle); relay injects tmux/capture, delivery (press/paste/submit) and
+# make_fragment. Its dialog_on_screen probe also replaces the one injected into deliverylib.
+_DIALOGLIB = os.path.join(os.path.dirname(os.path.realpath(__file__)), "aipair-dialoglib")
+_dg_loader = importlib.machinery.SourceFileLoader("aipairdialoglib", _DIALOGLIB)
+dialoglib = importlib.util.module_from_spec(importlib.util.spec_from_loader("aipairdialoglib", _dg_loader))
+_dg_loader.exec_module(dialoglib)
+dialoglib.capture_pane = capture_pane
+dialoglib.tmux = tmux
+dialoglib.press = press
+dialoglib.paste_text = paste_text
+dialoglib.submit_enter = submit_enter
+dialoglib.make_fragment = make_fragment
+deliverylib.dialog_on_screen = dialoglib.dialog_on_screen   # (re)point the re-press guard (D3 A5)
+newest_plan = dialoglib.newest_plan
+detect_plan_dialog = dialoglib.detect_plan_dialog
+detect_question_dialog = dialoglib.detect_question_dialog
+scrape_questions = dialoglib.scrape_questions
+send_plan_feedback = dialoglib.send_plan_feedback
+send_question_answer = dialoglib.send_question_answer
+PLAN_QUESTION = dialoglib.PLAN_QUESTION      # used by claude_matches_pane (still in relay)
+QUESTION_FOOTER = dialoglib.QUESTION_FOOTER
 
 USE_COLOR = True
 C = {"claude": "\033[1;36m", "codex": "\033[1;32m", "relay": "\033[1;35m",
@@ -144,283 +245,13 @@ def dim(s):
     print(c("dim", "│   " + s), flush=True)
 
 
+deliverylib.dim = dim            # inject the real logger into the delivery module (D3 A4)
+dialoglib.dim = dim              # …and into the dialog module (D3 A5)
+
+
 def oneline(s, n=180):
     s = " ".join(s.split())
     return s if len(s) <= n else s[: n - 1] + "…"
-
-
-# --- tmux helpers ----------------------------------------------------------- #
-def tmux(*args, check=True, capture=False):
-    return subprocess.run(["tmux", *args], check=check,
-                          capture_output=capture, text=True)
-
-
-def current_session():
-    try:
-        return tmux("display-message", "-p", "#{session_name}", capture=True).stdout.strip()
-    except subprocess.CalledProcessError:
-        return None
-
-
-def find_panes(session):
-    """Identify the claude/codex panes. Titles set by aipair ('claude'/'codex')
-    get overwritten by the CLIs at runtime, so fall back to the running command
-    and finally to aipair's layout order (claude, codex, bridge)."""
-    out = tmux("list-panes", "-t", session,
-               "-F", "#{pane_id}\t#{pane_current_command}\t#{pane_title}",
-               capture=True).stdout
-    self_pane = os.environ.get("TMUX_PANE")
-    panes, leftovers = {}, []
-    for line in out.splitlines():
-        pid, cmd, title = (line.split("\t", 2) + ["", ""])[:3]
-        if pid == self_pane:
-            continue
-        t, cl = title.strip().lower(), cmd.strip().lower()
-        if "claude" not in panes and (t.startswith("claude") or cl == "claude"):
-            panes["claude"] = pid
-        elif "codex" not in panes and (t.startswith("codex") or cl == "codex"):
-            panes["codex"] = pid
-        elif cl not in ("bash", "zsh", "sh", "fish", "python3", "python"):
-            leftovers.append(pid)
-    if "claude" not in panes and leftovers:
-        panes["claude"] = leftovers.pop(0)
-    if "codex" not in panes and leftovers:
-        panes["codex"] = leftovers.pop(0)
-    return panes
-
-
-def own_pane(session):
-    """自分（relay）が走っている tmux ペインを返す。
-    タイトルは `aipair` が起動時に一度セットするだけなので、`aipair-relay-here` で
-    張り直すと実態と食い違ったまま残る（2026-08-17 実例: endless で走っているのに
-    タイトルは "auto review loop" のまま）。relay 自身が名乗れば起動経路によらず正しくなる。
-    TMUX_PANE が対象セッションに属さない場合は None（--session を明示して外から
-    回した時に、無関係なペインを改名しないため）。"""
-    pid = os.environ.get("TMUX_PANE")
-    if not pid:
-        return None
-    try:
-        out = tmux("list-panes", "-t", session, "-F", "#{pane_id}", capture=True).stdout
-    except subprocess.CalledProcessError:
-        return None
-    return pid if pid in out.split() else None
-
-
-def set_pane_title(pane, title):
-    if pane:
-        tmux("select-pane", "-t", pane, "-T", title, check=False)
-
-
-def cancel_copy_mode(pane):
-    """A pane left in copy-mode (e.g. the human scrolled it with the mouse)
-    silently eats send-keys input — cancel it before injecting anything."""
-    if tmux("display-message", "-p", "-t", pane, "#{pane_in_mode}",
-            capture=True).stdout.strip() != "0":
-        tmux("send-keys", "-t", pane, "-X", "cancel", check=False)
-        time.sleep(0.2)
-
-
-def pane_busy(pane):
-    """Target TUI is mid-turn (streaming)?
-    速判定: 'esc to interrupt'（Codex は常時表示・Claude Code は間欠表示）。
-    フォールバック: 1秒あけた2回キャプチャの差分が3行以上 — 実行中は転写が流れて
-    複数行が動く。アイドルの TUI にも毎秒その場で動く行（完了バッジのアニメ・
-    ヒント行・ステータスライン等）があるため、全一致比較だとアイドルの Claude
-    ペインを延々 busy と誤判定する（2026-08-14 実バグ: 60分の busy-wait 満了で
-    poke が配達不可となり relay 停止）。"""
-    try:
-        first = tmux("capture-pane", "-p", "-t", pane, capture=True).stdout
-    except subprocess.CalledProcessError:
-        return False
-    if "esc to interrupt" in first.lower():
-        return True
-    time.sleep(1.0)
-    try:
-        second = tmux("capture-pane", "-p", "-t", pane, capture=True).stdout
-    except subprocess.CalledProcessError:
-        return False
-    if first == second:
-        return False
-    a = first.splitlines()
-    b = second.splitlines()
-    if len(a) < len(b):
-        a += [""] * (len(b) - len(a))
-    elif len(b) < len(a):
-        b += [""] * (len(a) - len(b))
-    return sum(1 for x, y in zip(a, b) if x != y) >= 3
-
-
-BUSY_WAIT = 90  # poke 前に相手ペインのアイドルを待つ上限秒（超過後は注入続行。--busy-wait で変更可）
-
-
-def _dialog_on_screen(pane):
-    """Claude の選択ダイアログ（プラン承認/AskUserQuestion）が表示中か。
-    Enter 再打鍵の直前ガード専用 — 1回目の Enter が実は送信に成功していて、
-    高速ターンがもうダイアログを出している場合、盲目の再打鍵は選択肢を
-    誤確定するため（Codex ペインではどちらのマーカーも出ないので常に False）。"""
-    try:
-        cap = capture_pane(pane)
-    except subprocess.CalledProcessError:
-        return False
-    lines = [l for l in cap.splitlines() if l.strip()]
-    return bool(lines) and (PLAN_QUESTION in cap
-                            or lines[-1].lstrip().startswith(QUESTION_FOOTER))
-
-
-def submit_enter(pane, confirm=None, badge=True):
-    """Enter を送り、送信の成立を検証。確認できなければ最大3回再打鍵する。
-
-    長文投入直後の Enter は TUI の取り込みバースト（改行扱い）や copy-mode に
-    食われて未送信のまま残ることが恒常的にある（2026-08-14 実測: クリーンな
-    コンポーザでも1回目は食われた）。検証の source of truth は confirm()（呼び出し元が
-    LogWatch で作る「ログへの追記」判定）。badge=True なら実行中バッジ
-    「esc to interrupt」の画面一致も成功とみなす — これは **Codex ペイン専用**
-    （Codex は実行中ずっと表示）。Claude Code は実行中でもバッジを出さず、逆に
-    transcript 中の同語句で偽陽性になる（2026-08-16 実測）ので Claude 宛は badge=False。
-    pane_busy の画面差分は使わない（食われた Enter が起こすコンポーザ再描画すら
-    「送信成功」に見える）。偽陰性は無害: 再打鍵 Enter は空コンポーザで no-op、
-    ダイアログ表示中は直前ガードで中止する。"""
-    for retry in range(3):
-        if retry and _dialog_on_screen(pane):
-            dim("再打鍵前にダイアログ表示を検知 → 送信済み（高速ターン）とみなし Enter を中止")
-            return True
-        cancel_copy_mode(pane)
-        tmux("send-keys", "-t", pane, "Enter")
-        verify_until = time.time() + 7
-        while time.time() < verify_until:
-            if confirm is not None and confirm():
-                if retry:
-                    dim(f"Enter 再打鍵 {retry + 1} 回目で送信を確認（ログ追記）")
-                return True
-            if badge:
-                try:
-                    cap = tmux("capture-pane", "-p", "-t", pane, capture=True).stdout
-                except subprocess.CalledProcessError:
-                    cap = ""
-                if "esc to interrupt" in cap.lower():
-                    if retry:
-                        dim(f"Enter 再打鍵 {retry + 1} 回目で送信を確認（実行中バッジ）")
-                    return True
-            time.sleep(0.5)
-        dim(f"Enter が効いていない（送信を確認できず）→ 再打鍵 {retry + 1}/3")
-    sys.stdout.write("\a")
-    sys.stdout.flush()
-    dim(f"Enter を3回送っても送信を確認できず（pane {pane}）— コンポーザを確認し手動で送信してください")
-    return False
-
-
-def poke(pane, text, confirm=None, badge=True):
-    """Inject text into a pane the way the agent TUIs expect (literal, then Enter).
-    Verifies the text actually reached the composer before pressing Enter;
-    if delivery can't be confirmed, never presses Enter (a blind Enter submits
-    empty/partial input and strands the loop).
-    確認は呼び出しごとのnonce(文末付与)で行う — 固定文面の先頭をprobeにすると、
-    画面の過去ログに残った同一依頼文でfalse positiveになるため。"""
-    # 相手が実行中(streaming)だと入力エコーが不安定で配達確認に失敗しやすいので、
-    # 短時間だけアイドルを待つ（礼儀としての待機）。ただし待機はハードゲートに
-    # しない: アイドル画面にも常時その場アニメする行があり pane_busy の偽busyは
-    # 完全に潰せず、「上限満了→配達不可→relay死亡」が2度実発生した（2026-08-14/15、
-    # 全一致比較でも差分3行閾値でも再発）。今の配達系は nonce 検証・Enter 送信検証・
-    # 非破壊キーのみで自衛できるため、待ち切れなければ注入を続行する — 実行中の
-    # TUI へ投入されたテキストはコンポーザに保持され、Enter でキュー投入されて
-    # ターン終了後に通常のメッセージとして届く（Claude Code はこのセッションで
-    # キュー配達を実測済み。失敗しても配達検証が3回試行→残置で loud stop する）。
-    waited = 0
-    while pane_busy(pane) and waited < BUSY_WAIT:
-        if waited == 0:
-            dim(f"相手ペイン({pane})が実行中 → 最大{BUSY_WAIT}秒だけアイドルを待つ")
-        time.sleep(5)
-        waited += 5
-    if waited >= BUSY_WAIT and pane_busy(pane):
-        dim(f"相手ペイン({pane})が{waited}秒経過後も実行中 → 配達検証に任せて注入を続行（キュー投入）")
-    elif waited:
-        dim(f"アイドル確認（{waited}s 待機）→ 注入開始")
-    probe = "relay-id:" + os.urandom(4).hex()
-    text = f"{text} {probe}"
-    head = "".join(text[:60].split())[:40]
-    delivered = False
-    shown = ""
-    for attempt in range(3):
-        cancel_copy_mode(pane)
-        if attempt:
-            # 再試行前は、宙ぶらりんの bracketed paste を閉じるだけ（ESC[201~ 単発）。
-            # 未終端ペースト（貼り付け事故等）が開いたままだと C-u もテキストも
-            # Enter も全部ペーストバッファへ吸われ、何も画面に出ないまま失敗し続ける
-            # （2026-08-14 実バグ: [Pasted Content] チップ残留で poke が空振り）。
-            # 終端記号はペーストが開いていなければ TUI に無視され、開いていれば
-            # バッファ内容がコンポーザへ文として現れるだけ＝何も消えない。
-            # C-u による掃除は一切しない: チップは人間の貼り付け下書きでも表示され
-            # relay 自身の残骸と確実に区別できない（Codex レビュー指摘）。既存内容が
-            # 残っていても poke は末尾に追記され一緒に送信されるだけで transcript に
-            # 残り失われない。3回失敗なら入力欄を保持したまま停止して人に委ねる。
-            tmux("send-keys", "-t", pane, "-H",
-                 "1b", "5b", "32", "30", "31", "7e", check=False)
-            time.sleep(0.3)
-        try:
-            before = "".join(tmux("capture-pane", "-p", "-t", pane,
-                                  capture=True).stdout.split())
-        except subprocess.CalledProcessError:
-            before = ""
-        tmux("send-keys", "-t", pane, "-l", text)
-        # 長文は TUI の取り込み・再描画が数秒続き、固定 0.3s の一発チェックでは
-        # nonce がまだ描画されていない（2026-08-14 実測）。出現をポーリングで待つ。
-        seen_deadline = time.time() + 3.5
-        while True:
-            time.sleep(0.4)
-            shown = "".join(tmux("capture-pane", "-p", "-t", pane,
-                                 capture=True).stdout.split())
-            if probe in shown:
-                delivered = True
-                break
-            if time.time() >= seen_deadline:
-                break
-        if delivered:
-            break
-        # nonce が出ない場合の傍証は「本文冒頭が新たに画面に現れた」こと（切詰め表示対策）。
-        # before 側にも同じ冒頭が見える場合は過去ポークの転写と区別できないので不採用。
-        # 旧実装の「画面が変化した」だけの判定は、残骸ペーストのチップカウンタ更新の
-        # ような無関係な再描画でも通ってしまい、未配達のまま Enter に進む誤爆があった
-        # （2026-08-14 実バグ）。
-        if head and head in shown and head not in before:
-            dim("nonce は画面外（コンポーザー切詰め表示）だが本文冒頭の表示を確認 → 配達とみなす")
-            delivered = True
-            break
-        dim(f"poke が画面に届いていない（copy-mode・未終端ペースト等）→ 再試行 {attempt + 1}/3")
-        time.sleep(0.5)
-    if not delivered:
-        # 掃除（C-u）はしない: 入力欄に人間の下書きが混ざっている可能性があり、
-        # 消すと復元できない（Codex レビュー指摘）。残したまま人間に委ねる。
-        sys.stdout.write("\a")
-        sys.stdout.flush()
-        dim(f"poke 配達確認に失敗（pane {pane}）— 入力欄は残したまま中断。内容を確認し手動で送信/削除してください")
-        return False
-    # --- Enter（送信）--------------------------------------------------------
-    # 長文 poke（質問リレー等）は send-keys 完了後も TUI 側の取り込み・再描画が
-    # 続いており、そこへ Enter を撃つと入力バーストの一部（改行）として吸収され、
-    # 本文がコンポーザに残ったまま送信されない（2026-08-14 実バグ: 質問リレーで
-    # Codex 未送信のまま relay が回答待ちで停滞。短文の通常 poke は取り込みが
-    # 一瞬のため露見しなかった）。画面静止＝取り込み完了を待ってから Enter を送り、
-    # ターン開始（busy）で送信を検証。確認できなければ copy-mode 解除して再打鍵
-    # （人間のスクロールで copy-mode に食われた Enter もこれで自己回復する）。
-    stable = shown
-    settle_deadline = time.time() + 15
-    while time.time() < settle_deadline:
-        time.sleep(0.6)
-        try:
-            cap = "".join(tmux("capture-pane", "-p", "-t", pane,
-                               capture=True).stdout.split())
-        except subprocess.CalledProcessError:
-            break
-        if cap == stable:
-            break
-        stable = cap
-    # 成功時は nonce を返す（呼び出し元がログでの配達確認・応答帰属に使う）。
-    # confirm(probe) は呼び出し元が LogWatch で作る「nonce がログに追記されたか」。
-    # badge（画面の実行中バッジ）は Codex 宛のみ有効 — 相手が既に実行中だと Enter 前
-    # から出ていて素通しになるため速報にすぎず、その場合の最終確認は応答帰属
-    # （response_done）と no-show 監視（poke_noshow）が担う。
-    ok = submit_enter(pane, confirm=(lambda: confirm(probe)) if confirm else None, badge=badge)
-    return probe if ok else None
 
 
 # --- log file locking (lock onto the loop's freshly-spawned sessions) ------- #
@@ -432,17 +263,13 @@ def claude_glob(cwd):
 
 
 def codex_all():
-    return glob.glob(os.path.join(peerlog.CODEX_SESSIONS, "*", "*", "*", "rollout-*.jsonl"))
+    return peerlog.codex_all()
 
 
 def codex_cwd_matches(path, cwd):
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            meta = peerlog.json.loads(fh.readline())
-        cw = (meta.get("payload") or {}).get("cwd") or meta.get("cwd")
-        return bool(cw) and peerlog._norm(cw) == peerlog._norm(cwd)
-    except (ValueError, OSError):
-        return False
+    # peerlog caches each rollout's first line, so this no longer opens the file every poll.
+    cw = peerlog.codex_cwd(path)
+    return bool(cw) and cw == peerlog._norm(cwd)
 
 
 _MD_STRIP = str.maketrans("", "", "*`#_~|")
@@ -538,28 +365,21 @@ def lock_claude(cwd, seen, pane, baseline):
 
 
 def lock_codex(cwd, seen):
-    fresh = sorted((f for f in codex_all() if f not in seen),
-                   key=os.path.getmtime, reverse=True)
-    for f in fresh:
-        if codex_cwd_matches(f, cwd):
-            return f
-    return None
+    """Newest rollout for cwd that did not exist when the relay started (`seen`).
+    Polled every second while waiting for the pair's Codex to show up, so it goes
+    through peerlog's incremental index rather than re-walking the archive."""
+    return peerlog.codex_newest(cwd, exclude=seen)
 
 
 def refresh_codex_lock(tracked_path, cwd):
     """Codex CLI の再起動/新セッションで rollout がローテートしたら追従する。
     追跡中ファイルより新しい mtime の cwd 一致 rollout が現れたら乗り換える
-    （旧ファイルを見張り続けて task_complete を永遠に取り逃がす事故の防止）。"""
-    files = codex_all()
-    if not files:
-        return tracked_path
-    newest = max(files, key=os.path.getmtime)
-    if newest == tracked_path:
-        return tracked_path
-    tracked_mtime = 0.0
-    if tracked_path and os.path.exists(tracked_path):
-        tracked_mtime = os.path.getmtime(tracked_path)
-    if os.path.getmtime(newest) > tracked_mtime and codex_cwd_matches(newest, cwd):
+    （旧ファイルを見張り続けて task_complete を永遠に取り逃がす事故の防止）。
+    候補は「追跡中より新しいもの全部」を新しい順に照合する（peerlog.codex_follow）。
+    以前は全体で最新の 1 件しか見ておらず、別 cwd の Codex が動いている間は自分の
+    cwd の新 rollout を永遠に見逃した（2026-08-21: aipair と iovillage-cms の 2 ペア同時稼働）。"""
+    newest = peerlog.codex_follow(cwd, tracked_path)
+    if newest and newest != tracked_path:
         dim(f"codex rollout ローテート検知 → 追従: {os.path.basename(newest)}")
         return newest
     return tracked_path
@@ -603,79 +423,6 @@ def refresh_claude_lock(tracked_path, cwd, pane, force=False):
             dim(f"{label}: {os.path.basename(f)}")
             return f
     return tracked_path
-
-
-# --- turn-completion detection --------------------------------------------- #
-def claude_done_ts(path, since):
-    """Epoch of the latest completed Claude turn after `since`, else None."""
-    last_ts = last_sr = None
-    try:
-        for line in open(path, "r", encoding="utf-8", errors="replace"):
-            try:
-                d = peerlog.json.loads(line)
-            except ValueError:
-                continue
-            if d.get("type") == "assistant":
-                last_ts = d.get("timestamp")
-                last_sr = (d.get("message") or {}).get("stop_reason")
-    except OSError:
-        return None
-    if last_ts and last_sr and last_sr != "tool_use":
-        te = peerlog._ts_key(last_ts)
-        return te if te > since else None
-    return None
-
-
-def codex_done_ts(path, since):
-    """Epoch of the latest completed Codex turn (task_complete) after `since`, else None."""
-    last_kind = last_ts = None
-    try:
-        for line in open(path, "r", encoding="utf-8", errors="replace"):
-            try:
-                d = peerlog.json.loads(line)
-            except ValueError:
-                continue
-            if d.get("type") == "event_msg":
-                t = (d.get("payload") or {}).get("type")
-                if t == "task_started":
-                    last_kind, last_ts = "start", d.get("timestamp")
-                elif t == "task_complete":
-                    last_kind, last_ts = "complete", d.get("timestamp")
-    except OSError:
-        return None
-    if last_kind == "complete" and last_ts:
-        te = peerlog._ts_key(last_ts)
-        return te if te > since else None
-    return None
-
-
-def turn_texts(agent, path, since, until):
-    """Assistant messages (list) produced in (since, until] for the agent's completed turn."""
-    msgs = peerlog.parse_claude(path, False) if agent == "claude" else peerlog.parse_codex(path, False)
-    return [t for (ts, role, t) in msgs
-            if role == "assistant" and since < peerlog._ts_key(ts) <= until + 2]
-
-
-def find_poke_ts(agent, path, probe):
-    """poke の nonce（relay-id:xxxx）を含む user メッセージのタイムスタンプ(epoch)を
-    対象ログから探す。無ければ None。
-
-    配達確認と応答帰属の source of truth。busy 中のキュー注入を許した結果、
-    画面ベースの送信検証は「既に実行中バッジが出ている」ため無効化され、
-    poke 直後の壁時計 since では「注入時に走っていた先行ターンの完了」を
-    応答と誤検知する（Codex レビュー指摘）。nonce はキュー配達されて初めて
-    ログに user メッセージとして現れるため、
-      ・nonce がログに在る = 配達成立（Enter 失敗ならキューにも入らず現れない）
-      ・完了 ts > nonce ts = その完了は poke より後に始まった応答
-    が画面状態と無関係に判定できる。"""
-    try:
-        msgs = peerlog.parse_claude(path, False) if agent == "claude" else peerlog.parse_codex(path, False)
-    except OSError:
-        return None
-    for ts, role, text in msgs:
-        if role == "user" and probe in text:
-            return peerlog._ts_key(ts)
-    return None
 
 
 class LogWatch:
@@ -767,233 +514,110 @@ class LogWatch:
         return False
 
 
-def make_fragment(text, n=48):
-    """送信検証用に本文の最初の非空行（先頭 n 字）を返す。改行は経路によって \\r 化する
-    ため複数行は使わない。極端に短ければ None（= 任意の入力行の追記で確認）。"""
-    for line in (text or "").splitlines():
-        s = line.strip()[:n].strip()
-        if s:
-            return s if len(s) >= 3 else None
-    return None
+def run_gate(cmd, cwd, timeout):
+    """Run the --gate shell command in cwd. Returns (ok, scrubbed output text).
 
-
-def codex_response_complete(path, probe):
-    """rollout から nonce の user メッセージを含むタスク（turn_id）を特定し、
-    (そのタスクの task_started ts, 同 turn_id の task_complete ts or None) を返す。
-    nonce 未発見・所属タスク不明なら (None, None)。
-
-    実ログの並び（2026-08-15 実測）は
-        task_started → response_item{message, role=user, nonce} → … → task_complete
-    で、アイドル注入でも nonce は task_started の「後」に記録される。よって
-    「nonce 後の task_started」を応答開始とみなす前提は idle 注入を全棄却する
-    （実バグ）。正しくは Codex 指摘のとおり turn_id ペアリング:
-      nonce の user アイテム自身が internal_chat_message_metadata_passthrough.turn_id
-      を持つ（実ログ確認済み）ので、それをキーに同 turn_id の task_started /
-      task_complete を対応付ける。キュー投入時に「時刻上の直前 start」が先行タスク
-      を指す誤帰属は、位置推定ではなく ID 対応でそもそも起こらない。
-    メタデータ欠落時のみ「直前の task_started」への位置フォールバック。"""
-    starts, completes = [], []
-    nonce_ts = None
-    nonce_turn = None
+    The command runs in its OWN process group (start_new_session): a timeout, a
+    KeyboardInterrupt, or a shell that exits while leaving background jobs — all end with
+    the WHOLE group killed and the reader thread joined, so nothing is orphaned. Output is
+    drained on a thread into a fixed-size tail buffer (an unbounded producer like `yes`
+    cannot OOM the relay, a full pipe cannot deadlock the wait); the buffer is read only
+    after the reader has joined. Bytes are decoded errors="replace" and scrubbed of
+    control characters so non-UTF-8 / ANSI output can neither crash the relay nor be typed
+    into the pane as keystrokes."""
+    import threading, collections, signal
     try:
-        for line in open(path, "r", encoding="utf-8", errors="replace"):
-            try:
-                d = peerlog.json.loads(line)
-            except ValueError:
-                continue
-            t = d.get("type")
-            p = d.get("payload") or {}
-            if t == "event_msg" and p.get("type") == "task_started":
-                starts.append((peerlog._ts_key(d.get("timestamp")), p.get("turn_id")))
-            elif t == "event_msg" and p.get("type") == "task_complete":
-                completes.append((peerlog._ts_key(d.get("timestamp")), p.get("turn_id")))
-            elif nonce_ts is None and t == "response_item" \
-                    and p.get("type") == "message" and p.get("role") == "user":
-                if any(probe in (b.get("text") or "")
-                       for b in (p.get("content") or []) if isinstance(b, dict)):
-                    nonce_ts = peerlog._ts_key(d.get("timestamp"))
-                    meta = p.get("internal_chat_message_metadata_passthrough") or {}
-                    nonce_turn = meta.get("turn_id")
+        proc = subprocess.Popen(cmd, shell=True, cwd=cwd,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        return False, f"exec error: {e}"
+    try:
+        pgid = os.getpgid(proc.pid)          # captured now: valid while any group member lives
     except OSError:
-        return (None, None)
-    if nonce_ts is None:
-        return (None, None)
-    if nonce_turn:
-        anchor = next((ts for ts, tid in starts if tid == nonce_turn), nonce_ts)
-        comp = next((ts for ts, tid in completes if tid == nonce_turn), None)
-        return (anchor, comp)
-    # フォールバック（メタデータ無し）: 時刻上の直前 start を所属タスクとみなす
-    turn = None
-    for ts, tid in starts:
-        if ts <= nonce_ts:
-            turn = (ts, tid)
-        else:
-            break
-    if turn is None:
-        return (None, None)
-    comp = next((ts for ts, tid in completes
-                 if tid == turn[1] and ts > nonce_ts), None)
-    return (turn[0], comp)
+        pgid = proc.pid
+    buf, kept, dropped = collections.deque(), [0], [False]
 
+    def drain():
+        for chunk in iter(lambda: proc.stdout.read(65536), b""):
+            buf.append(chunk); kept[0] += len(chunk)
+            while kept[0] > GATE_OUTPUT_CAP and len(buf) > 1:
+                kept[0] -= len(buf.popleft()); dropped[0] = True
+        proc.stdout.close()
 
-def claude_response_attributed(path, probe):
-    """最後の assistant エントリの parentUuid チェーンに nonce の user エントリが
-    含まれるか（= その完了ターンは poke を読んで走った応答か）。
-
-    Claude Code は busy 中の投入を「実行中ターンへのターン内注入」または
-    「次ターンの入力」として扱うが、どちらでも応答側のエントリチェーンは
-    nonce エントリを祖先に持つ。タイムスタンプ比較と違いキュー順序に依存しない
-    （Codex レビュー指摘の UUID 対応付け）。"""
-    entries = {}
-    last_assist_uuid = None
-    nonce_uuid = None
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    timed_out = False
+    raised = None
     try:
-        for line in open(path, "r", encoding="utf-8", errors="replace"):
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+    except BaseException as e:                # Ctrl-C etc.: clean up, then re-raise below
+        raised = e
+    finally:
+        # Always tear the whole group down: timeout, interrupt, or a shell that exited
+        # leaving `&` background jobs still writing. Then join the reader so the buffer is
+        # not mutated while we read it.
+        _kill_group(proc, pgid, signal)
+        reader.join(timeout=5)
+    out = scrub_output(b"".join(buf).decode("utf-8", "replace"))
+    if dropped[0]:
+        out = "…(truncated to the last ~256KB)… " + out
+    if raised is not None:
+        raise raised
+    if timed_out:
+        return False, out + f"\n[gate] timeout after {timeout}s (process group killed): {oneline(cmd, 200)}"
+    return proc.returncode == 0, out
+
+
+def _kill_group(proc, pgid, signal):
+    """Terminate the gate's process group `pgid`. TERM, a short grace for a clean exit,
+    then KILL unconditionally (a child ignoring TERM whose parent shell already exited
+    must still die — escalation is not gated on the group looking dead, since a reaped or
+    zombie leader confuses liveness probes), then reap the shell so it leaves no zombie.
+    pgid is captured at launch, not re-derived here, to avoid signalling a recycled pid."""
+    def killpg(sig):
+        try:
+            os.killpg(pgid, sig)
+        except OSError:
             try:
-                d = peerlog.json.loads(line)
-            except ValueError:
-                continue
-            u = d.get("uuid")
-            if u:
-                entries[u] = d.get("parentUuid")
-            t = d.get("type")
-            if t == "assistant":
-                last_assist_uuid = u
-            elif t == "user" and nonce_uuid is None:
-                content = ((d.get("message") or {}).get("content"))
-                if isinstance(content, str):
-                    hit = probe in content
-                else:
-                    hit = any(probe in (b.get("text") or "")
-                              for b in (content or []) if isinstance(b, dict))
-                if hit:
-                    nonce_uuid = u
-    except OSError:
-        return False
-    if not (last_assist_uuid and nonce_uuid):
-        return False
-    seen = set()
-    u = last_assist_uuid
-    while u and u not in seen:
-        if u == nonce_uuid:
-            return True
-        seen.add(u)
-        u = entries.get(u)
-    return False
-
-
-def hit_stop(texts, phrases):
-    """停止ワード判定。poke は「本文の冒頭に停止ワードを明記」と指示しているが、
-    エージェントは1ターンに進捗ナレーション（「〜を確認します」等）を複数メッセージ吐くため、
-    連結全文ではなく最終メッセージ（=本文）の冒頭で判定する。連結全文の冒頭100字判定だと
-    ナレーションに押し出されて停止ワードが窓の外に出、永遠に取り逃がす
-    （実運用で 20 往復キャップまで空回りした実バグ）。
-    文中の偶発的な言及（例:「ツールの修正が完了です。ただし本題は…」）での誤停止を
-    防ぐため、冒頭のみ判定は従来どおり維持する。"""
-    if not texts:
-        return False
-    head = " ".join(texts[-1].split())[:100]
-    return any(p in head for p in phrases)
-
-
-# --- plan-approval dialog handling ------------------------------------------ #
-PLAN_QUESTION = "Would you like to proceed?"
-
-
-def capture_pane(pane):
-    return tmux("capture-pane", "-p", "-t", pane, capture=True).stdout
-
-
-def newest_plan():
-    files = glob.glob(os.path.expanduser("~/.claude/plans/*.md"))
-    return max(files, key=os.path.getmtime) if files else None
-
-
-def detect_plan_dialog(pane):
-    """Parse Claude's plan-approval dialog from the pane, if currently shown.
-
-    Option numbers are read from the screen (they vary across versions), so we
-    match by label text. Returns {"tell", "yes", "yes_label", "plan"} or None.
-    """
+                proc.send_signal(sig)
+            except OSError:
+                pass
+    killpg(signal.SIGTERM)
+    deadline = time.time() + 0.5
+    while time.time() < deadline and proc.poll() is None:
+        time.sleep(0.05)
+    killpg(signal.SIGKILL)            # unconditional: SIGKILL can't be ignored by any group member
     try:
-        out = capture_pane(pane)
-    except subprocess.CalledProcessError:
-        return None
-    lines = out.splitlines()
-    qi = next((i for i, l in enumerate(lines) if PLAN_QUESTION in l), None)
-    if qi is None:
-        return None
-    tell = yes = yes_label = None
-    for line in lines[qi + 1:]:
-        m = re.match(r"\s*(?:❯\s*)?(\d+)\.\s+(.+?)\s*$", line)
-        if not m:
-            continue
-        num, label = m.group(1), m.group(2)
-        low = label.lower()
-        if tell is None and "tell claude what to change" in low:
-            tell = num
-        if low.startswith("yes") and (yes is None or "bypass" in low):
-            yes, yes_label = num, label
-    if not (tell or yes):
-        return None
-    m = re.search(r"[^\s·]*\.claude/plans/[^\s]+\.md", out)
-    plan = os.path.expanduser(m.group(0)) if m else newest_plan()
-    return {"tell": tell, "yes": yes, "yes_label": yes_label, "plan": plan}
+        proc.wait(timeout=3)          # reap the shell (no lingering zombie keeps the pgid "alive")
+    except subprocess.TimeoutExpired:
+        pass
 
 
-def press(pane, key):
-    cancel_copy_mode(pane)
-    tmux("send-keys", "-t", pane, key)
-
-
-def paste_text(pane, text):
-    """Bracketed paste so multi-line review text does not submit early."""
-    cancel_copy_mode(pane)
-    tmux("set-buffer", "-b", "aipair-relay", text)
-    tmux("paste-buffer", "-p", "-d", "-b", "aipair-relay", "-t", pane)
-
-
-def send_plan_feedback(pane, dialog, text, approve, watch=None):
-    """'Tell Claude what to change' → paste review → Enter (revise the plan)
-    or shift+tab (approve with this feedback).
-    watch: Claude ログの LogWatch。**本文送信（Enter/BTab）の直前にチェックポイントを
-    置き直し**、それ以降の追記だけで成立を判定する（Codex レビュー指摘: tell 押下等の
-    先行操作が書く行を証拠に数えない）。実測（過去ログ）では tell 経路の tool_result は
-    `the user said:\\n<本文>` と送信後の本文を含む＝書かれるのは Enter 時点なので、
-    成立条件は「tool_result 追記（解決）」または「本文断片の入力行追記」。
-    None のときは画面バッジにフォールバック（ログ未特定時のみ・信頼度低）。"""
-    press(pane, dialog["tell"])
-    time.sleep(0.8)
-    paste_text(pane, text[:4000])
-    time.sleep(0.5)
-    confirm = None
-    if watch is not None:
-        watch.reset()
-        frag = make_fragment(text)
-        confirm = lambda: watch.claude_resolved() or watch.claude_input(frag)
-    if approve:
-        # feedback付き承認は Shift+Tab。直前の paste バーストに吸収されると未承認の
-        # まま relay が claude 待ちへ進み永久停止するため、ログ上の解決で成立を確認する
-        # （Codex レビュー指摘）。BTab は通常コンポーザでは権限モード切替のため、
-        # Enter と違い盲目の再打鍵は不可 — 失敗時は False を返して呼び出し元に
-        # 停止させ、人に委ねる。
-        press(pane, "BTab")
-        deadline = time.time() + 7
-        while time.time() < deadline:
-            if confirm is not None:
-                if confirm():
-                    return True
-            else:
-                try:
-                    cap = tmux("capture-pane", "-p", "-t", pane, capture=True).stdout
-                except subprocess.CalledProcessError:
-                    cap = ""
-                if "esc to interrupt" in cap.lower():
-                    return True
-            time.sleep(0.5)
-        dim("Shift+Tab 後に承認の成立を確認できず（吸収された可能性）")
-        return False
-    return submit_enter(pane, confirm=confirm, badge=confirm is None)
+def gate_or_message(a, gate_state, cwd):
+    """At a stop point, run the gate (in `cwd`, the normalised working dir) if one is set.
+    (True, None)      no gate, or it passed → stop / move on as usual
+    (False, message)  it failed → send Claude back with `message`
+    (False, None)     it failed --gate-rounds times → give up (caller exits 6)"""
+    if not a.gate:
+        return True, None
+    log("◆ 停止ゲート実行: " + _oneline_cap(a.gate, 200))
+    ok, out = run_gate(a.gate, cwd, a.gate_timeout)
+    if ok:
+        log("◆ " + c("ok", "停止ゲート通過"))
+        gate_state["fails"] = 0
+        return True, None
+    gate_state["fails"] += 1
+    n = gate_state["fails"]
+    print(c("warn", f"│ ■ 停止ゲート失敗（{n}/{a.gate_rounds}）: ") + oneline(out, 300), flush=True)
+    if n >= a.gate_rounds:
+        print(c("warn", f"│ ■ 停止ゲートが {a.gate_rounds} 回失敗。人間の判断が必要です。停止します。"), flush=True)
+        print("\a", end="", flush=True)
+        return False, None
+    return False, gate_message(a.gate, out, n, a.gate_rounds)
 
 
 def approval_took_effect(pane, confirm=None):
@@ -1031,111 +655,6 @@ def plan_poke_codex(plan_path, ok):
             f"人間に伝言を頼まないでください）。修正が不要なら本文の冒頭に「{ok}」と明記してください。")
 
 
-# --- AskUserQuestion dialog handling ----------------------------------------- #
-QUESTION_CHAT_LABEL = "chat about this"
-QUESTION_FOOTER = "Enter to select"   # ダイアログ表示中のみ画面最下行に出るフッター
-_OPT_RE = re.compile(r"\s*(?:❯\s*)?(?:[☐☒✔]\s*)?(\d+)\.\s+(.+?)\s*$")
-_SEP_RE = re.compile(r"^\s*─{4,}\s*$")
-
-
-def detect_question_dialog(pane):
-    """Parse Claude's AskUserQuestion (選択式質問) dialog from the pane, if shown.
-
-    Signature: numbered option lines + a numbered "Chat about this" action
-    (label is version-stable; the number varies with the current question's
-    option count, so it is read from the screen) + the dialog footer
-    ("Enter to select …") as the LAST non-empty line. The footer sits at the
-    pane bottom only while the dialog is live — idle screens end with the
-    composer/status bars — which kills false positives from dialog-looking
-    text in the transcript (e.g. a pasted screen dump).
-    Returns {"chat": "<number>"} or None.
-    """
-    try:
-        out = capture_pane(pane)
-    except subprocess.CalledProcessError:
-        return None
-    if PLAN_QUESTION in out:
-        return None
-    lines = [l for l in out.splitlines() if l.strip()]
-    if not lines or not lines[-1].lstrip().startswith(QUESTION_FOOTER):
-        return None
-    chat = None
-    opts = 0
-    for line in lines:
-        m = _OPT_RE.match(line)
-        if not m:
-            continue
-        if QUESTION_CHAT_LABEL in m.group(2).lower():
-            chat = m.group(1)
-        else:
-            opts += 1
-    return {"chat": chat} if (chat and opts) else None
-
-
-def _question_block(out):
-    """キャプチャ画面から現在表示中の質問ブロック（質問文＋選択肢）を1行テキストで抽出。"""
-    lines = out.splitlines()
-    nonempty = [i for i, l in enumerate(lines) if l.strip()]
-    if not nonempty or not lines[nonempty[-1]].lstrip().startswith(QUESTION_FOOTER):
-        return None
-    footer_i = nonempty[-1]
-    opt_is = [i for i in range(footer_i) if _OPT_RE.match(lines[i])]
-    if not opt_is:
-        return None
-    chat_i = next((i for i in opt_is
-                   if QUESTION_CHAT_LABEL in _OPT_RE.match(lines[i]).group(2).lower()),
-                  footer_i)
-    # タブバー（"← ☐ … ✔ Submit →"）の直後から。単問でバーが無ければ質問文の直前の罫線から
-    bar_i = next((i for i in range(min(opt_is[0], chat_i) - 1, -1, -1)
-                  if "Submit" in lines[i] and any(ch in lines[i] for ch in "☐☒✔")
-                  and not _OPT_RE.match(lines[i])), None)
-    if bar_i is not None:
-        start = bar_i + 1
-    else:
-        seps = [i for i in range(opt_is[0]) if _SEP_RE.match(lines[i])]
-        start = (seps[-1] + 1) if seps else max(0, opt_is[0] - 4)
-    block = [l for l in lines[start:chat_i]
-             if l.strip() and not _SEP_RE.match(l)
-             and "type something" not in l.lower() and l.strip() != "Submit"]
-    text = " ".join(" ".join(l.split()) for l in block).strip()
-    return text or None
-
-
-def scrape_questions(pane):
-    """タブ移動（→）で呼び出し1回分の全質問ブロックを画面から収集する。
-
-    未回答の AskUserQuestion tool_use はセッション jsonl に書かれない（回答後に
-    初めて追記される — 2026-07-23 実測）ため、全質問の完全ソースは画面のみ。
-    画面には現在の1問しか出ないが、タブバーの ☐/☒ 数が総問数を示し、→ は選択を
-    確定しない非破壊キーなので、1問ずつ送って読む。単問（タブバー無し）は移動なし。"""
-    blocks = []
-    stagnant = 0
-    for _ in range(12):  # 最大4問 + 再読リトライ分の安全マージン
-        try:
-            out = capture_pane(pane)
-        except subprocess.CalledProcessError:
-            break
-        block = _question_block(out)
-        if block and block not in blocks:
-            blocks.append(block)
-            stagnant = 0
-            bar = next((l for l in out.splitlines()
-                        if "Submit" in l and any(ch in l for ch in "☐☒")), "")
-            total = (bar.count("☐") + bar.count("☒")) or 1
-            if len(blocks) >= total:
-                break
-            # 新しいタブを読めた時だけ → を押す。stale 画面で重ね押しすると
-            # タブを飛ばして質問を取りこぼすため、切替待ちは押さずに再読する
-            press(pane, "Right")
-            time.sleep(0.6)
-        else:
-            stagnant += 1
-            if stagnant >= 4:
-                break
-            time.sleep(0.5)
-    return blocks
-
-
 def question_poke_codex(blocks, limit=3000):
     qtext = " ".join(f"◆{i}問目: {b}" for i, b in enumerate(blocks, 1))
     if len(qtext) > limit:
@@ -1145,28 +664,6 @@ def question_poke_codex(blocks, limit=3000):
             "送信されます—人間に伝言を頼まないでください。各質問について「N問目: 選択肢M（ラベル）」"
             "の形で選択を明示し、根拠を一言添えてください。どの選択肢も不適切なら、その旨と"
             "代替案を明記してください。 " + qtext)
-
-
-def send_question_answer(pane, qdlg, text, watch=None):
-    """質問ダイアログ →「Chat about this」→ 回答本文をペースト → Enter。
-
-    実測（2026-07-23）: chat 押下でダイアログは即座に「User declined to answer
-    questions」として解決しコンポーザへ戻る。回答は後追いのユーザーメッセージとして
-    ペースト送信する（Claude の decline 反応ターン中でもキューされて確実に届き、
-    Claude は回答を読んで続行する）。操作列は send_plan_feedback と同型。"""
-    press(pane, qdlg["chat"])
-    time.sleep(0.8)
-    # chat 押下で decline の tool_result が先に書かれる（実測）ため、チェックポイントを
-    # ここで置き直し、以降の「本文の入力行」（user 文字列 or queue-operation）だけを
-    # Enter の証拠にする。None のときは画面バッジにフォールバック（信頼度低）。
-    confirm = None
-    if watch is not None:
-        watch.reset()
-        frag = make_fragment(text)
-        confirm = lambda: watch.claude_input(frag)
-    paste_text(pane, text[:4000])
-    time.sleep(0.5)
-    return submit_enter(pane, confirm=confirm, badge=confirm is None)
 
 
 # --------------------------------------------------------------------------- #
@@ -1227,7 +724,7 @@ def main():
                     help="safety cap (default 20 / env AIPAIR_MAX_ROUNDS)")
     ap.add_argument("--endless", action="store_true", default=_env_bool("AIPAIR_ENDLESS"),
                     help="停止ワードで終了せず「次のタスクへ」を促し続ける連続モード。"
-                         "終端は Codex の --all-done 宣言のみ（aipair-queue とは併用不可 / env AIPAIR_ENDLESS）")
+                         "終端は Codex の --all-done 宣言のみ（env AIPAIR_ENDLESS）")
     ap.add_argument("--no-endless", action="store_true",
                     help="AIPAIR_ENDLESS が効いている環境で、この1本だけ連続モードを切る")
     ap.add_argument("--next-ask", default=_env_str("AIPAIR_NEXT_ASK", "次のタスクをください"),
@@ -1236,6 +733,13 @@ def main():
                     help="endless: Codex 側が残タスク無しを宣言する終端ワード（default 全タスク完了 / env AIPAIR_ALL_DONE）")
     ap.add_argument("--task-list", default=_env_str("AIPAIR_TASK_LIST", "tasks/todo.md"),
                     help="endless: 次タスクの唯一の根拠にするタスクリスト（default tasks/todo.md / env AIPAIR_TASK_LIST）")
+    ap.add_argument("--gate", default=_env_str("AIPAIR_GATE", None),
+                    help="停止ゲート: 停止ワード検出後にこのシェルコマンドを --dir で実行し、成功（exit 0）した時だけ"
+                         "停止／次タスクへ進む。失敗なら出力を添えて Claude に差し戻す（env AIPAIR_GATE。既定: 無し）")
+    ap.add_argument("--gate-timeout", type=int, default=_env_int("AIPAIR_GATE_TIMEOUT", 600),
+                    help="ゲートコマンドのタイムアウト秒（既定 600 / env AIPAIR_GATE_TIMEOUT）")
+    ap.add_argument("--gate-rounds", type=int, default=_env_int("AIPAIR_GATE_ROUNDS", 3),
+                    help="ゲート失敗で差し戻す上限回数。到達で exit 6（既定 3 / env AIPAIR_GATE_ROUNDS）")
     ap.add_argument("--start-side", default="claude", choices=["claude", "codex"],
                     help="who acts first (default claude)")
     ap.add_argument("--poll", type=float, default=3.0, help="poll seconds (default 3)")
@@ -1248,6 +752,12 @@ def main():
                     help="max plan-review rounds per plan (default 5)")
     ap.add_argument("--plan-ok", default="プラン承認",
                     help="Codex's plan-approval phrase (default プラン承認)")
+    ap.add_argument("--allow-untested-dialogs", action="store_true",
+                    default=_env_bool("AIPAIR_ALLOW_UNTESTED_DIALOGS"),
+                    help="claude/codex の版が検証済みと違ってもプラン承認・質問リレーの自動操作を続ける"
+                         "（既定: 不一致なら自動 OFF / env AIPAIR_ALLOW_UNTESTED_DIALOGS）")
+    ap.add_argument("--no-version-gate", action="store_true", default=_env_bool("AIPAIR_NO_VERSION_GATE"),
+                    help="起動時の claude/codex 版チェックをしない（env AIPAIR_NO_VERSION_GATE）")
     ap.add_argument("--no-plan-review", action="store_true",
                     help="ignore the plan-approval dialog (pre-existing behavior)")
     ap.add_argument("--question-rounds", type=int, default=5,
@@ -1269,12 +779,19 @@ def main():
         print(f"aipair-relay: --stop-side / AIPAIR_STOP_SIDE は codex|claude|both のいずれか"
               f"（実際の値: {a.stop_side!r}）", file=sys.stderr)
         return 2
+    # argparse type=int accepts 0 / negatives on the command line; _env_int already
+    # guards the env path, so validate the resolved values here for both.
+    for name, val in (("--gate-timeout", a.gate_timeout), ("--gate-rounds", a.gate_rounds),
+                      ("--max-rounds", a.max_rounds), ("--plan-rounds", a.plan_rounds),
+                      ("--question-rounds", a.question_rounds)):
+        if val < 1:
+            print(f"aipair-relay: {name} は 1 以上で指定してください（実際の値: {val!r}）", file=sys.stderr)
+            return 2
     if a.no_endless:
         a.endless = False
 
-    global BUSY_WAIT
     USE_COLOR = (not a.no_color) and sys.stdout.isatty()
-    BUSY_WAIT = max(60, a.busy_wait)
+    deliverylib.BUSY_WAIT = max(60, a.busy_wait)   # delivery module reads this (D3 A4)
     cwd = os.path.realpath(os.path.expanduser(a.dir))
     stop_phrases = [s for s in a.stop.split("||") if s]
 
@@ -1302,6 +819,12 @@ def main():
                         f"(found: {panes}). Start with `aipair loop`."), file=sys.stderr)
         return 2
 
+    # Version gate: an untested claude/codex keeps the safe relay (poke + transcripts) but
+    # loses the TUI-scraping dialog automation, which its version might have changed.
+    vrows, vbad = ([], [])
+    if not a.no_version_gate:
+        vrows, vbad = version_gate(a, {n: detect_version(n) for n in ("claude", "codex")})
+
     # ペインタイトルで「今どのモードで・何往復まで」が一目で分かるようにする
     own = own_pane(session)
     set_pane_title(own, (f"relay ● endless / max {a.max_rounds} / 終端「{a.all_done}」/ Ctrl-C で停止"
@@ -1315,6 +838,20 @@ def main():
         log(c("dim", "env 由来の既定値: " + "  ".join(ENV_USED)
               + ("  ※ CLI フラグが渡された項目はそちらが優先" if len(sys.argv) > 1 else "")))
     log(f"停止={'/'.join(stop_phrases)}（{a.stop_side}側）  最大={a.max_rounds}往復  panes={panes['claude']}/{panes['codex']}")
+    if a.gate:
+        log(f"停止ゲート={a.gate}（timeout {a.gate_timeout}s / 差し戻し上限 {a.gate_rounds} 回）")
+    for name, det, tst, status in vrows:
+        if status == "ok":
+            log(c("dim", f"{name} 版 {det}（検証済み）"))
+        elif status == "mismatch":
+            log(c("warn", f"⚠ {name} 版 {det} は検証済み {tst} と異なる"))
+        else:
+            log(c("warn", f"⚠ {name} 版を取得できず（検証済み {tst}）"))
+    if vbad:
+        log((c("dim", "  → --allow-untested-dialogs によりダイアログ自動操作は継続")
+             if a.allow_untested_dialogs else
+             c("warn", "  → プラン承認・質問リレーの自動操作を OFF にしました"
+                       "（poke/transcript は続行。--allow-untested-dialogs で無効化）")))
     if a.endless:
         log(c("ok", "連続モード=on") + f"（「{stop_phrases[0] if stop_phrases else '完了です'}」＝レビュー合格→次のタスクへ）")
         log(f"  タスクリスト={a.task_list}  次を要求={'/'.join(next_ask_phrases)}  "
@@ -1356,14 +893,14 @@ def main():
             else:
                 log(c("warn", "adopt: このプロジェクトの Claude ログが見つからず → 新規セッションの出現待ちに切替"))
         if not tracked["codex"]:
-            for f in sorted(codex_all(), key=os.path.getmtime, reverse=True)[:100]:
-                if codex_cwd_matches(f, cwd):
-                    tracked["codex"] = f
-                    dim(f"adopt: codex = {os.path.basename(f)}")
-                    break
+            f = peerlog.codex_newest(cwd)
+            if f:
+                tracked["codex"] = f
+                dim(f"adopt: codex = {os.path.basename(f)}")
             if not tracked["codex"]:
                 log(c("warn", "adopt: cwd一致の Codex rollout が見つからず → 新規セッションの出現待ちに切替"))
     state = a.start_side
+    gate_state = {"fails": 0}
     # endless: 直前に Codex へ何を頼んだか。"review"=コードレビュー / "next"=次タスクの指示。
     # 新しい state を足さず、codex ブロック内の配達処理（ダイアログ回避を含む）を共有するため。
     pending_kind = "review"
@@ -1458,7 +995,7 @@ def main():
         w = LogWatch(tracked["claude"])
         return lambda p: w.claude_input(p)
 
-    # 終了理由を exit code で区別する（aipair-queue 等の orchestrator が成否を判別するため）:
+    # 終了理由を exit code で区別する（外部 orchestrator が成否を判別できるように）:
     #   0=停止ワード検知（正常完了） 3=最大往復キャップ 4=poke配達失敗
     #   5=プラン/質問リレー上限・選択肢欠落
     code = 0
@@ -1495,18 +1032,27 @@ def main():
                         + (" → Codex に次タスクを依頼" if ask_next else " → Codex にレビュー依頼"))
                     if text:
                         dim(c("claude", "claude") + ": " + oneline(text))
+                    gate_msg = None
                     if (not a.endless) and a.stop_side in ("claude", "both") and hit_stop(texts, stop_phrases):
-                        done_banner(rounds, "claude"); break
-                    sent = poke(panes["codex"], poke_codex_next if ask_next else poke_codex,
-                                confirm=codex_poke_confirm())
+                        ok_gate, gate_msg = gate_or_message(a, gate_state, cwd)
+                        if ok_gate:
+                            done_banner(rounds, "claude"); break
+                        if gate_msg is None:
+                            code = 6; break
+                    if gate_msg:      # stop phrase seen but the gate failed → back to Claude, not to Codex
+                        sent = poke(panes["claude"], gate_msg, confirm=claude_poke_confirm(),
+                                    badge=tracked["claude"] is None)
+                    else:
+                        sent = poke(panes["codex"], poke_codex_next if ask_next else poke_codex,
+                                    confirm=codex_poke_confirm())
                     if not sent:
-                        print(c("warn", "│ ■ Codex への依頼を配達できず（poke失敗）。状態遷移せず停止します。"), flush=True)
+                        print(c("warn", f"│ ■ {'Claude' if gate_msg else 'Codex'} への依頼を配達できず（poke失敗）。状態遷移せず停止します。"), flush=True)
                         print("\a", end="", flush=True)
                         code = 4
                         break
                     pending_kind = "next" if ask_next else "review"
                     probe, probe_ts_cache, probe_sent_at = sent, None, time.time()
-                    since = time.time(); state = "codex"; last_activity = time.time()
+                    since = time.time(); state = "claude" if gate_msg else "codex"; last_activity = time.time()
                 elif (not a.no_plan_review) and (plan_dialog := detect_plan_dialog(panes["claude"])):
                     if plan_rounds >= a.plan_rounds:
                         print(c("warn", f"│ ■ プランレビュー上限 {a.plan_rounds} 回に到達。"
@@ -1691,12 +1237,17 @@ def main():
                                           else "Codex レビュー完了"))
                     if text:
                         dim(c("codex", "codex") + ": " + oneline(text))
-                    # 既定モード: 停止ワードでループ終了（従来どおり）
+                    msg_claude, back_text = poke_claude, text
+                    # 既定モード: 停止ワードでループ終了（従来どおり）。--gate があればその成功が条件
                     if (not a.endless) and a.stop_side in ("codex", "both") and hit_stop(texts, stop_phrases):
-                        done_banner(rounds, "codex"); break
+                        ok_gate, gate_msg = gate_or_message(a, gate_state, cwd)
+                        if ok_gate:
+                            done_banner(rounds, "codex"); break
+                        if gate_msg is None:
+                            code = 6; break
+                        msg_claude = back_text = gate_msg          # review passed, gate did not → back to Claude
                     # 連続モードの終端は「全タスク完了」宣言のみ。レビュー中の宣言も尊重する
                     # （hit_stop は最終メッセージの冒頭100字判定なので、明示的に書いた時だけ効く）
-                    msg_claude = poke_claude
                     if a.endless:
                         if hit_stop(texts, all_done_phrases):
                             all_done_hit = True
@@ -1704,8 +1255,14 @@ def main():
                         if pending_kind == "next":
                             msg_claude = poke_claude_next
                         elif a.stop_side in ("codex", "both") and hit_stop(texts, stop_phrases):
-                            log("◆ " + c("ok", "Codex がレビュー合格") + " → Claude に次のタスクを促す")
-                            msg_claude = poke_claude_pass
+                            ok_gate, gate_msg = gate_or_message(a, gate_state, cwd)
+                            if ok_gate:
+                                log("◆ " + c("ok", "Codex がレビュー合格") + " → Claude に次のタスクを促す")
+                                msg_claude = poke_claude_pass
+                            elif gate_msg is None:
+                                code = 6; break
+                            else:
+                                msg_claude = back_text = gate_msg
                     if rounds >= a.max_rounds:
                         print(c("warn", f"│ ■ 最大 {a.max_rounds} 往復に到達。安全のため停止します。"), flush=True)
                         print("\a", end="", flush=True)
@@ -1725,12 +1282,12 @@ def main():
                     if dialog and dialog["tell"]:
                         log("◆ " + c("claude", "Claude はプラン承認待ち")
                             + " → レビューを「Tell Claude what to change」経由で配達")
-                        delivered_back = send_plan_feedback(panes["claude"], dialog, text, approve=False,
+                        delivered_back = send_plan_feedback(panes["claude"], dialog, back_text, approve=False,
                                                             watch=claude_watch())
                     elif qdlg:
                         log("◆ " + c("claude", "Claude は質問ダイアログ表示中")
                             + " → レビューを「Chat about this」経由で配達")
-                        delivered_back = send_question_answer(panes["claude"], qdlg, text,
+                        delivered_back = send_question_answer(panes["claude"], qdlg, back_text,
                                                               watch=claude_watch())
                     else:
                         # Claude 宛: 画面バッジは信用しない（badge=False）。ログ未特定の
@@ -1768,7 +1325,7 @@ def main():
     # 終了後もタイトルで結果が分かるようにする（走行中と区別がつかないと、
     # 何時間も前に終わった relay を「まだ回っている」と誤読する）
     reason = {0: "全タスク完了" if all_done_hit else "停止ワード", 3: "キャップ到達",
-              4: "配達失敗", 5: "上限到達"}.get(code, f"exit={code}")
+              4: "配達失敗", 5: "上限到達", 6: "停止ゲート失敗"}.get(code, f"exit={code}")
     set_pane_title(own, f"relay ■ 終了({reason}) / {rounds}往復")
     return code
 

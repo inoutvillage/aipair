@@ -24,7 +24,7 @@
       "command": "wsl.exe",
       "args": [
         "--cd", "${workspaceFolder}",
-        "bash", "-ic", "aipair loop"
+        "bash", "-ic", "aipair loop --unsafe"
       ],
       "presentation": {
         "reveal": "always",
@@ -68,7 +68,7 @@
       "command": "wsl.exe",
       "args": [
         "--cd", "${workspaceFolder}",
-        "bash", "-ic", "export AI_SELF=claude AI_PEER=codex && claude --dangerously-skip-permissions"
+        "bash", "-ic", "export AI_SELF=claude AI_PEER=codex && claude"
       ],
       "presentation": {
         "reveal": "always",
@@ -83,7 +83,7 @@
       "command": "wsl.exe",
       "args": [
         "--cd", "${workspaceFolder}",
-        "bash", "-ic", "export AI_SELF=codex AI_PEER=claude && codex --dangerously-bypass-approvals-and-sandbox"
+        "bash", "-ic", "export AI_SELF=codex AI_PEER=claude && codex"
       ],
       "presentation": {
         "reveal": "always",

@@ -60,22 +60,238 @@ def claude_file(cwd):
     return max(files, key=os.path.getmtime) if files else None
 
 
+# Codex rollouts: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl, one per session, the
+# cwd in the first line (session_meta). That first line is written once and never
+# changes, so it is cached per path for the life of the process. Rollouts are
+# appended to, never removed, which is why "the tracked file disappeared" is not a
+# usable rotation signal (see codex_follow).
+CODEX_SCAN_LIMIT = 500            # first lines read per call (bounds a cold start)
+_CODEX_CWD_CACHE = {}             # path -> normalized cwd, "" when the file has no usable meta
+
+
+def codex_all():
+    """Every rollout path (a full walk — used once, to snapshot what existed at start)."""
+    return glob.glob(os.path.join(CODEX_SESSIONS, "*", "*", "*", "rollout-*.jsonl"))
+
+
+def codex_cwd(path):
+    """Normalized session_meta.cwd of a rollout ("" if none), cached per path."""
+    v = _CODEX_CWD_CACHE.get(path)
+    if v is not None:
+        return v
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            first = fh.readline()
+    except OSError:
+        return ""                                   # transient (vanished / unreadable): retry later
+    if not first.endswith("\n"):
+        return ""                                   # still being written: do not cache
+    try:
+        meta = json.loads(first)
+        cw = (meta.get("payload") or {}).get("cwd") or meta.get("cwd")
+        v = _norm(cw) if cw else ""
+    except (ValueError, AttributeError):
+        v = ""                                      # malformed first line never changes
+    _CODEX_CWD_CACHE[path] = v
+    return v
+
+
+class CodexIndex:
+    """Incremental inventory of the rollout archive.
+
+    The first call walks everything (glob + one stat per rollout); that full walk is
+    repeated only every FULL_RESCAN_SECS, as a safety net. In between, a poll stats
+    only the directories where a NEW rollout can appear — the sessions root, the
+    newest year and month directory and the newest DAY_DIRS_WATCHED day directories
+    (creating a file bumps its directory's mtime; appending to a file does not, and
+    need not: a rollout's cwd never changes) — and lists a directory only when its
+    mtime moved. Which of a cwd's rollouts is newest is decided by stat'ing only the
+    FILES_WATCHED most recent of that cwd's files (older ones keep the mtime from the
+    last full walk, so a resumed old session is noticed at the next full walk). The
+    steady-state cost of a poll is therefore a bounded handful of stats, independent
+    of how many sessions the archive — or the project — holds (--watch and the relay
+    poll every ~1 s)."""
+    FULL_RESCAN_SECS = 60
+    DAY_DIRS_WATCHED = 2
+    FILES_WATCHED = 20
+    RECENT_SECS = 2.0     # re-list a dir modified this recently even if its mtime reads the same (coarse-mtime filesystems)
+
+    def __init__(self):
+        self.root = None
+        self.files = {}          # path -> mtime when indexed
+        self.unresolved = []     # paths whose cwd has not been read yet
+        self.by_cwd = {}         # normalized cwd -> set(paths)
+        self.dirs = {}           # watched directory -> mtime
+        self.day_dirs = []
+        self.last_full = None
+        self.counts = {"full_scans": 0, "dir_lists": 0}
+
+    # -- discovery ------------------------------------------------------------------
+    def _add(self, f):
+        if f in self.files:
+            return
+        try:
+            self.files[f] = os.path.getmtime(f)
+        except OSError:
+            return
+        self.unresolved.append(f)
+
+    def _forget(self, f):
+        """Drop a rollout that no longer exists from every table."""
+        self.files.pop(f, None)
+        cw = _CODEX_CWD_CACHE.get(f)
+        if cw:
+            self.by_cwd.get(cw, set()).discard(f)
+        if f in self.unresolved:
+            self.unresolved.remove(f)
+
+    def full_scan(self):
+        self.root = CODEX_SESSIONS
+        self.files, self.unresolved, self.by_cwd = {}, [], {}      # also forgets vanished files
+        for f in glob.glob(os.path.join(self.root, "*", "*", "*", "rollout-*.jsonl")):
+            self._add(f)
+        self._watch()
+        self.last_full = time.monotonic()
+        self.counts["full_scans"] += 1
+
+    @staticmethod
+    def _subdirs(d):
+        try:
+            return sorted(os.path.join(d, n) for n in os.listdir(d) if os.path.isdir(os.path.join(d, n)))
+        except OSError:
+            return []
+
+    def _watch(self):
+        """(Re)select the directories to keep an eye on, record their mtimes, list the day dirs."""
+        chain = [self.root]
+        for _ in range(2):                                   # newest year, newest month
+            sub = self._subdirs(chain[-1])
+            if not sub:
+                break
+            chain.append(sub[-1])
+        self.day_dirs = self._subdirs(chain[-1])[-self.DAY_DIRS_WATCHED:] if len(chain) == 3 else []
+        self.dirs = {}
+        for d in chain + self.day_dirs:
+            try:
+                self.dirs[d] = os.path.getmtime(d)
+            except OSError:
+                self.dirs[d] = None      # absent (sessions root not created yet / removed): keep watching for it
+        for d in self.day_dirs:
+            self.counts["dir_lists"] += 1
+            try:
+                names = os.listdir(d)
+            except OSError:
+                continue
+            present = set()
+            for n in names:
+                if n.startswith("rollout-") and n.endswith(".jsonl"):
+                    f = os.path.join(d, n)
+                    present.add(f)
+                    self._add(f)
+            for f in [f for f in self.files if os.path.dirname(f) == d and f not in present]:
+                self._forget(f)                              # deleted since the last listing
+
+    def poll(self):
+        now = time.monotonic()
+        if (self.last_full is None or self.root != CODEX_SESSIONS
+                or now - self.last_full > self.FULL_RESCAN_SECS):
+            self.full_scan()
+            return
+        wall = time.time()
+        for d, mt in self.dirs.items():
+            try:
+                cur = os.path.getmtime(d)
+            except OSError:
+                cur = None
+            if cur is None and mt is not None:
+                self.full_scan()                             # a watched dir vanished: all below it is stale → rebuild
+                return
+            # moved, appeared (None -> mtime), or touched just now
+            if cur != mt or (cur is not None and wall - cur < self.RECENT_SECS):
+                self._watch()                                # re-select the watched dirs and re-list
+                return
+
+    # -- queries --------------------------------------------------------------------
+    def _resolve(self, limit):
+        """Classify not-yet-read rollouts by cwd, newest first, reading at most `limit`
+        first lines (cache hits are free and do not count)."""
+        if not self.unresolved:
+            return
+        self.unresolved.sort(key=lambda f: self.files.get(f, 0.0), reverse=True)
+        keep, reads = [], 0
+        for i, f in enumerate(self.unresolved):
+            if f not in _CODEX_CWD_CACHE:
+                if reads >= limit:
+                    keep.extend(self.unresolved[i:])
+                    break
+                reads += 1
+            cw = codex_cwd(f)
+            if f not in _CODEX_CWD_CACHE:                    # half-written meta: try again next time
+                keep.append(f)
+            elif cw:
+                self.by_cwd.setdefault(cw, set()).add(f)
+        self.unresolved = keep
+
+    def newest(self, cwd, newer_than=0.0, limit=CODEX_SCAN_LIMIT, exclude=()):
+        want = _norm(cwd)
+        self.poll()
+        self._resolve(limit)
+        ours = sorted(self.by_cwd.get(want, ()), key=lambda f: self.files.get(f, 0.0), reverse=True)
+        while True:
+            best, best_m, verified = None, newer_than, False
+            for i, f in enumerate(ours):
+                if f in exclude:
+                    continue
+                fresh = i < self.FILES_WATCHED               # fresh mtime for the recent ones only
+                if fresh:
+                    try:
+                        self.files[f] = os.path.getmtime(f)
+                    except OSError:
+                        self._forget(f)                      # vanished since indexing
+                        continue
+                m = self.files.get(f, 0.0)
+                if m > best_m:
+                    best, best_m, verified = f, m, fresh
+            if best is None or verified:
+                return best
+            try:                                             # a tail candidate: never hand out a stale path
+                self.files[best] = os.path.getmtime(best)
+                return best
+            except OSError:
+                self._forget(best)
+                ours.remove(best)
+
+
+CODEX_INDEX = CodexIndex()
+
+
+def codex_newest(cwd, newer_than=0.0, limit=CODEX_SCAN_LIMIT, exclude=()):
+    """Newest rollout for cwd, or None. Only files modified after `newer_than` count, files
+    in `exclude` are skipped, and at most `limit` first lines are read per call (cold
+    start). Backed by CODEX_INDEX, so repeated calls do not re-walk the archive."""
+    return CODEX_INDEX.newest(cwd, newer_than, limit, exclude)
+
+
+def codex_follow(cwd, current):
+    """The rollout to read now, given the one read last time (--watch and the relay).
+    Stays on `current` until a rollout for cwd that is newer than it appears — a
+    restarted Codex writes a new file. ALL newer candidates are checked, not only the
+    globally newest one: while another directory's Codex is busy its file is always the
+    newest, and a newest-only check never saw our own new session (2026-08-21, two
+    pairs running side by side)."""
+    if current:
+        try:
+            since = os.path.getmtime(current)
+        except OSError:                      # current vanished (archive pruned): start afresh
+            current = None
+    if not current:
+        return codex_newest(cwd)
+    return codex_newest(cwd, newer_than=since) or current
+
+
 def codex_file(cwd):
     """Newest Codex rollout whose session_meta.cwd matches cwd."""
-    want = _norm(cwd)
-    files = glob.glob(os.path.join(CODEX_SESSIONS, "*", "*", "*", "rollout-*.jsonl"))
-    files.sort(key=os.path.getmtime, reverse=True)
-    for f in files[:500]:
-        try:
-            with open(f, "r", encoding="utf-8", errors="replace") as fh:
-                first = fh.readline()
-            meta = json.loads(first)
-            cw = (meta.get("payload") or {}).get("cwd") or meta.get("cwd")
-            if cw and _norm(cw) == want:
-                return f
-        except (ValueError, OSError):
-            continue
-    return None
+    return codex_newest(cwd)
 
 
 # --------------------------------------------------------------------------- #
@@ -186,11 +402,15 @@ def parse_codex(path, show_tools):
     return out
 
 
-def load(agent, cwd, show_tools):
-    f = claude_file(cwd) if agent == "claude" else codex_file(cwd)
-    if not f:
+def load(agent, cwd, show_tools, current=None):
+    """Locate the transcript (codex: following on from `current`, see codex_follow) and parse it."""
+    try:
+        f = claude_file(cwd) if agent == "claude" else codex_follow(cwd, current)
+        if not f:
+            return None, []
+        msgs = parse_claude(f, show_tools) if agent == "claude" else parse_codex(f, show_tools)
+    except OSError:          # a file vanished between listing, stat and reading — next poll picks another
         return None, []
-    msgs = parse_claude(f, show_tools) if agent == "claude" else parse_codex(f, show_tools)
     return f, [(ts, agent, role, text) for (ts, role, text) in msgs]
 
 
@@ -249,14 +469,16 @@ def main():
     # --watch: follow live. Track emitted count per file path (logs are append-only).
     print(c(TAG["bridge"], f"● watching {', '.join(agents)} in {cwd}  (Ctrl-C to stop)"))
     emitted = {}
+    pinned = {}    # agent -> file read last round; codex follows on from it (codex_follow)
     seeded = False
     try:
         while True:
             batch = []
             for ag in agents:
-                f, entries = load(ag, cwd, a.tools)
+                f, entries = load(ag, cwd, a.tools, pinned.get(ag))
                 if f is None:
                     continue
+                pinned[ag] = f
                 start = emitted.get(f, 0)
                 if f not in emitted and not seeded and not a.full and a.last > 0:
                     start = max(0, len(entries) - a.last)  # seed with recent tail

@@ -7,7 +7,7 @@ description: aipair（Claude Code × Codex CLI を tmux で並走させるツー
 
 ## このスキルの目的
 
-aipair リポジトリを clone した直後のユーザーが、**1 セッション内の質問応答だけで** aipair 一式（`aipair` / `aipair-relay` / `aipair-relay-here` / `peer` / `peer-log` / `aipair-queue`、Claude 用スキル、`~/.claude/CLAUDE.md` と `~/.codex/AGENTS.md` への周知ブロック）を導入し、**tmux セッションが実際に立つところまで**確認できるようにする。
+aipair リポジトリを clone した直後のユーザーが、**1 セッション内の質問応答だけで** aipair 一式（`aipair` / `aipair-relay` / `aipair-relay-here` / `peer` / `peer-log`、Claude 用スキル、`~/.claude/CLAUDE.md` と `~/.codex/AGENTS.md` への周知ブロック）を導入し、**tmux セッションが実際に立つところまで**確認できるようにする。
 
 実作業はすべて **`aipair-install.sh`（冪等・非対話）に任せる**。このスキルは「診断を読んで説明する」「承認を取る」「オプションを決めて呼ぶ」「結果をそのまま報告する」だけを行う。
 
@@ -168,6 +168,15 @@ echo "exit=$?"
   1. 新しいシェルを開く（PATH 反映）→ cd <project> → aipair
   2. 詳しい使い方: README（自走ループ / 連続モード / VS Code から / トラブルシュート）
 ```
+
+---
+
+## 安全メモ: ペア内で tmux を叩くとき
+
+- aipair の動作確認やテストで tmux を使うときは、**必ず専用サーバー**（`tmux -L <名前>` か `-S <ソケット>`）を指定する。
+- tmux ペインの中では環境変数 `$TMUX` が `TMUX_TMPDIR` より優先されるため、`TMUX_TMPDIR` で隔離したつもりでも本番サーバーに刺さる。
+- **引数無しの `tmux kill-server` は禁止**（動いているペアを巻き込む）。後始末は `tmux -L <名前> kill-server` のように対象を明示し、破壊的コマンドの前に `#{socket_path}` で隔離を確認する。
+- 詳細な事故例は aipair リポジトリの `tasks/lessons.md`（2026-08-21 の障害）を参照。
 
 ---
 

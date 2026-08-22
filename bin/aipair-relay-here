@@ -20,10 +20,12 @@
 # env が bridge に届かないため、ここでフラグへ展開して渡す。--print で結果を確認できる:
 #   AIPAIR_MAX_ROUNDS  最大往復数        AIPAIR_STOP / AIPAIR_STOP_SIDE  停止ワードと判定側
 #   AIPAIR_ENDLESS     連続モード(1でon)  AIPAIR_TASK_LIST / AIPAIR_NEXT_ASK / AIPAIR_ALL_DONE
+#   AIPAIR_GATE / AIPAIR_GATE_TIMEOUT / AIPAIR_GATE_ROUNDS  停止ゲート
+#   AIPAIR_ALLOW_UNTESTED_DIALOGS / AIPAIR_NO_VERSION_GATE  版ゲート
 # 例: AIPAIR_MAX_ROUNDS=100 AIPAIR_ENDLESS=1 aipair-relay-here --print
 set -uo pipefail
 
-RELAY="$HOME/.local/bin/aipair-relay"
+RELAY="${AIPAIR_RELAY_BIN:-$HOME/.local/bin/aipair-relay}"   # override for tests
 SHELLS="bash zsh sh fish"
 
 die() { printf 'aipair-relay-here: %s\n' "$*" >&2; exit 2; }
@@ -57,6 +59,10 @@ done
 
 command -v tmux >/dev/null 2>&1 || die "tmux が無い"
 [ -x "$RELAY" ] || die "aipair-relay が無い: $RELAY"
+# aipair-relay loads its sibling libs (corelib/loglib/tmuxlib/deliverylib/dialoglib + peer-log)
+# by path; --help imports them all. Fail loudly here if the install is incomplete, rather
+# than firing a relay that crashes on import inside the bridge pane.
+"$RELAY" --help >/dev/null 2>&1 || die "aipair-relay がロードできない（同じディレクトリの corelib/loglib/tmuxlib/deliverylib/dialoglib/peer-log が揃っているか確認）: $RELAY"
 
 # --- セッション特定 ---------------------------------------------------------
 if [ -z "$SESSION" ]; then
@@ -135,9 +141,32 @@ fi
 if [ -n "${AIPAIR_ALL_DONE:-}" ] && ! has_extra --all-done; then
   ENV_ARGS+=(--all-done "$AIPAIR_ALL_DONE")
 fi
+# gate / version-gate env (same reason as endless above: send-keys drops the caller's env)
+# Trim only leading/trailing whitespace (like relay's _env_bool and aipair's env_on) — NOT
+# all inner spaces, or "f alse" would read as false while the relay reads it as true.
+truthy() {
+  local v; v="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+  case "$v" in ''|0|false|no|off) return 1 ;; *) return 0 ;; esac
+}
+if truthy "${AIPAIR_ALLOW_UNTESTED_DIALOGS:-}" && ! has_extra --allow-untested-dialogs; then ENV_ARGS+=(--allow-untested-dialogs); fi
+if truthy "${AIPAIR_NO_VERSION_GATE:-}"        && ! has_extra --no-version-gate;        then ENV_ARGS+=(--no-version-gate); fi
+if [ -n "${AIPAIR_GATE:-}" ]         && ! has_extra --gate;         then ENV_ARGS+=(--gate "$AIPAIR_GATE"); fi
+if [ -n "${AIPAIR_GATE_TIMEOUT:-}" ] && ! has_extra --gate-timeout; then ENV_ARGS+=(--gate-timeout "$AIPAIR_GATE_TIMEOUT"); fi
+if [ -n "${AIPAIR_GATE_ROUNDS:-}" ]  && ! has_extra --gate-rounds;  then ENV_ARGS+=(--gate-rounds "$AIPAIR_GATE_ROUNDS"); fi
 
 # --- relay コマンド組み立て --------------------------------------------------
-CMD=("$RELAY" --adopt --session "$SESSION" --dir "$PWD")
+# Pin every relay-read AIPAIR_* to this caller's value (empty where unset) so a stale
+# value left in the bridge pane's environment cannot leak into the relay (same reason as
+# bin/aipair; see there). Then append the flag translations and any explicit EXTRA flags.
+RELAY_ENV=()
+for v in AIPAIR_STOP AIPAIR_STOP_SIDE AIPAIR_MAX_ROUNDS AIPAIR_ENDLESS \
+         AIPAIR_TASK_LIST AIPAIR_NEXT_ASK AIPAIR_ALL_DONE \
+         AIPAIR_GATE AIPAIR_GATE_TIMEOUT AIPAIR_GATE_ROUNDS \
+         AIPAIR_ALLOW_UNTESTED_DIALOGS AIPAIR_NO_VERSION_GATE; do
+  RELAY_ENV+=("$v=${!v-}")
+done
+CMD=(env "${RELAY_ENV[@]}" "$RELAY" --adopt --session "$SESSION" --dir "$PWD")
 [ -n "$ROUNDS" ]    && CMD+=(--max-rounds "$ROUNDS")
 [ -n "$STOP" ]      && CMD+=(--stop "$STOP")
 [ -n "$STOP_SIDE" ] && CMD+=(--stop-side "$STOP_SIDE")

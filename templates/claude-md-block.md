@@ -17,15 +17,16 @@ Session control (each takes an optional `[dir]`, default `$PWD`):
 `aipair loop` runs `aipair-relay --max-rounds 20` and stops when **codex** emits the stop phrase
 `完了です` (defaults; override with `AIPAIR_MAX_ROUNDS` / `AIPAIR_STOP` / `AIPAIR_STOP_SIDE` —
 precedence: CLI flag > env > built-in default; the relay itself and `aipair-relay-here` read the
-same env). Both agents launch with permission-bypass flags by default
-(`claude --dangerously-skip-permissions` / `codex --dangerously-bypass-approvals-and-sandbox`);
+same env). By default each agent keeps its normal permission prompts; permission-bypass
+(`claude --dangerously-skip-permissions` / `codex --dangerously-bypass-approvals-and-sandbox`)
+is opt-in via `--unsafe` / `AIPAIR_UNSAFE=1` and is required for `aipair loop`;
 override or disable them with `AIPAIR_CLAUDE_FLAGS` / `AIPAIR_CODEX_FLAGS` (e.g. `AIPAIR_CODEX_FLAGS= aipair`).
 
 **Endless mode** (`AIPAIR_ENDLESS=1` / `--endless`): the stop phrase means "this task passed review,
 move on" instead of "stop". When Claude runs out of work it writes `次のタスクをください` at the start
 of its reply, and Codex assigns the next unchecked item from `tasks/todo.md` (`AIPAIR_TASK_LIST`).
 The loop ends **only** when Codex declares `全タスク完了` (`--max-rounds` is just a safety cap — set it
-high). 🚫 Do not combine with `aipair-queue` (queue treats relay exit 0 as "one task done").
+high).
 
 After a relay has ended and the back-and-forth has stopped, a new round can be started on demand
 with **`aipair-relay-here`** (from the claude or codex pane; it adopts the running pair with
@@ -40,6 +41,10 @@ Notes:
   ("tell Codex X" is wrong — Codex can read it itself).
 - Check `peer` before starting a non-trivial task in an `aipair` session, so you and Codex
   don't both do the same thing.
+- Running tmux in a **test** while inside a pair: target a private server
+  (`tmux -L <name>` or `-S <sock>`). Inside a pane `$TMUX` overrides `TMUX_TMPDIR`, so a
+  bare `tmux kill-server` (or a spawn-then-kill test on the default server) will kill the
+  **live pair** — never run `kill-server` un-targeted; verify `#{socket_path}` first.
 - Outside an `aipair` session `AI_PEER` is unset and `peer` falls back to showing both logs.
 
 Full docs: the README of the aipair repository (https://github.com/inoutvillage/aipair).
