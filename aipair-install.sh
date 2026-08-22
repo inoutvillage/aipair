@@ -372,9 +372,12 @@ else warn "locale is not UTF-8 (LANG=${LANG:-unset} LC_ALL=${LC_ALL:-unset}) —
 
 # --- files -------------------------------------------------------------------
 mkdir -p "$BIN_DIR" || { fail "cannot create $BIN_DIR"; exit 1; }
-# Retire binaries this project no longer ships (D2: aipair-queue removed). An older install
-# would otherwise leave a runnable, now-unsupported copy in PATH.
-RETIRED=(aipair-queue aipair-corelib aipair-loglib aipair-tmuxlib aipair-deliverylib aipair-dialoglib)
+# Retire binaries this project no longer ships at all (D2: aipair-queue). Safe to do BEFORE
+# install: it is not part of any working install. The flat aipair-*lib files (now inside the
+# aipairlib package, #7) are retired LATER — only after the package installs and its import is
+# verified — so a failed package copy leaves the previous working install (old libs) intact.
+RETIRED=(aipair-queue)
+SUPERSEDED=(aipair-corelib aipair-loglib aipair-tmuxlib aipair-deliverylib aipair-dialoglib)
 for f in "${RETIRED[@]}"; do
   if [ -e "$BIN_DIR/$f" ]; then
     if mv "$BIN_DIR/$f" "$BIN_DIR/$f.removed-$TS"; then
@@ -392,18 +395,18 @@ for f in "${FILES[@]}"; do
   mkdir -p "$(dirname "$dst")" || { fail "cannot create $(dirname "$dst")"; exit 1; }
   case "$f" in */*) X=false ;; *) X=true ;; esac   # only top-level entrypoints are executable
   if [ -f "$dst" ] && same_file "$src" "$dst"; then
-    $X && { [ -x "$dst" ] || chmod +x "$dst"; }
+    if $X && [ ! -x "$dst" ]; then chmod +x "$dst" || { fail "cannot chmod +x $dst"; exit 1; }; fi
     skip "$dst is up to date"
     continue
   fi
   if [ -e "$dst" ]; then
     cp -p "$dst" "$dst.bak-$TS" || { fail "cannot back up $dst"; exit 1; }
     cp "$src" "$dst" || { fail "cannot install $dst"; exit 1; }
-    $X && chmod +x "$dst"
+    if $X; then chmod +x "$dst" || { fail "cannot chmod +x $dst"; exit 1; }; fi
     ok "$dst updated (previous copy: $dst.bak-$TS)"
   else
     cp "$src" "$dst" || { fail "cannot install $dst"; exit 1; }
-    $X && chmod +x "$dst"
+    if $X; then chmod +x "$dst" || { fail "cannot chmod +x $dst"; exit 1; }; fi
     ok "$dst installed"
   fi
 done
@@ -415,6 +418,20 @@ for f in aipair-relay peer-log; do
   fi
 done
 ok "aipair-relay / peer-log start from $BIN_DIR (--help exits 0)"
+
+# Now that the aipairlib package is installed AND the entrypoints import it, retire the old flat
+# aipair-*lib files (superseded by the package). Doing this AFTER the import check means a failed
+# package install above leaves the previous working install (old libs) untouched.
+for f in "${SUPERSEDED[@]}"; do
+  if [ -e "$BIN_DIR/$f" ]; then
+    if mv "$BIN_DIR/$f" "$BIN_DIR/$f.removed-$TS"; then
+      ok "retired $BIN_DIR/$f (now provided by the aipairlib package; moved to $f.removed-$TS)"
+    else
+      fail "could not retire superseded $BIN_DIR/$f — remove it by hand, then re-run"
+      exit 1
+    fi
+  fi
+done
 
 # --- skills ------------------------------------------------------------------
 for s in "${SKILLS[@]}"; do
