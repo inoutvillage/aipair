@@ -51,22 +51,34 @@ echo "$out" | grep -q "retired" && retired=1 || retired=0
 chk "[ $retired -eq 1 ]" "installer reports the retirement"
 chk "env -u TMUX HOME='$TH' '$TH/.local/bin/aipair-relay' --help >/dev/null 2>&1" "installed relay imports the aipairlib package (--help ok)"
 
-# --- rollback safety: a package install that FAILS must NOT retire the old flat libs ----------
-# Break a package module in a repo COPY so the copied package fails its import check; the flat
-# libs must survive (they are retired only AFTER the import verifies). Proves the ordering fix.
+# --- rollback safety: a package install that FAILS must leave the PREVIOUS working install intact
+# (old entrypoints still runnable + flat libs not retired). Break a package module in a repo COPY
+# so the staged package fails its import verify; the two-phase installer must stop BEFORE it
+# switches the thin entrypoints, so the old (legacy) aipair-relay/peer-log keep working.
 TH3="$(mktemp -d "${TMPDIR:-/tmp}/aipair-upg3.XXXXXX")"; mkdir -p "$TH3/.local/bin"
 for lib in "${FLATLIBS[@]}"; do stale_bin "$TH3/.local/bin/$lib"; done
+# a WORKING legacy entrypoint (pre-#7): responds to --help with exit 0
+for ep in aipair-relay peer-log; do
+  printf '#!/bin/sh
+echo "legacy %s usage"
+exit 0
+' "$ep" > "$TH3/.local/bin/$ep"; chmod +x "$TH3/.local/bin/$ep"
+done
 BROKEN="$(mktemp -d "${TMPDIR:-/tmp}/aipair-broken.XXXXXX")"
 cp "$REPO/aipair-install.sh" "$BROKEN/"; cp -r "$REPO/bin" "$REPO/templates" "$BROKEN/"
 mkdir -p "$BROKEN/.claude"; cp -r "$REPO/.claude/skills" "$BROKEN/.claude/"
 printf 'def broken(:\n' > "$BROKEN/bin/aipairlib/tmuxlib.py"   # exists (passes preflight) but won't import
 rc=0; out3="$(env -u TMUX PATH="$SHIMD:$PATH" HOME="$TH3" bash "$BROKEN/aipair-install.sh" 2>&1)" || rc=$?
 chk "[ $rc -ne 0 ]" "broken package → installer exits non-zero (got $rc)"
-echo "$out3" | grep -q -- "--help failed" && importfail=1 || importfail=0
-chk "[ $importfail -eq 1 ]" "installer fails at the entrypoint import check"
+echo "$out3" | grep -q "staged aipairlib package failed to import" && importfail=1 || importfail=0
+chk "[ $importfail -eq 1 ]" "installer stops at the staged-package import verify (before switching entrypoints)"
 for lib in "${FLATLIBS[@]}"; do
   chk "[ -e '$TH3/.local/bin/$lib' ]" "flat $lib SURVIVES a failed package install (not retired early)"
 done
+# the crux: the OLD entrypoints are untouched, so the previous install still works
+chk "env -u TMUX HOME='$TH3' '$TH3/.local/bin/aipair-relay' --help >/dev/null 2>&1" "legacy aipair-relay STILL runs after the failed upgrade"
+chk "env -u TMUX HOME='$TH3' '$TH3/.local/bin/peer-log' --help >/dev/null 2>&1" "legacy peer-log STILL runs after the failed upgrade"
+chk "grep -q legacy '$TH3/.local/bin/aipair-relay'" "aipair-relay was NOT replaced by the thin entrypoint"
 rm -rf "$TH3" "$BROKEN"
 
 # --- retire FAILURE must fail the install (a dangerous stale binary left runnable is not ok) ---
