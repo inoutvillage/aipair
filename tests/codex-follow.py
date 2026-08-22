@@ -35,7 +35,8 @@ class Fixture(unittest.TestCase):
             mod._CODEX_CWD_CACHE.clear()
             mod.CODEX_INDEX = mod.CodexIndex()            # fresh inventory per test
             mod.CODEX_INDEX.FULL_RESCAN_SECS = 10 ** 9     # only explicit full rescans below
-            mod.codex_via_pane = lambda cwd: None          # default: no /proc identity → fallback path
+            mod.codex_via_pane = lambda cwd, pane=None: None   # default: no /proc identity → fallback path
+            mod.codex_identity_capable = lambda pane=None: False
         relay.dim = lambda *a, **k: None          # silence the relay's log line
         self.t0 = 1_700_000_000
         # A-old (t+1) / B-new (t+3, globally newest) / A-mid (t+2)
@@ -349,25 +350,25 @@ class DiscoveryRaces(Fixture):
 class RelayLock(Fixture):
     def test_refresh_codex_lock_is_not_fooled_by_a_busier_neighbour(self):
         # the exact 2026-08-21 bug: B is the globally newest file, yet A has a newer session than tracked
-        self.assertEqual(relay.refresh_codex_lock(self.a_old, self.A), self.a_mid)
-        self.assertEqual(relay.refresh_codex_lock(self.a_mid, self.A), self.a_mid)
+        self.assertEqual(relay.refresh_codex_lock(self.a_old, self.A, "%0"), self.a_mid)
+        self.assertEqual(relay.refresh_codex_lock(self.a_mid, self.A, "%0"), self.a_mid)
         a_new = self.rollout("a-new", self.A, 4)
-        self.assertEqual(relay.refresh_codex_lock(self.a_mid, self.A), a_new)
+        self.assertEqual(relay.refresh_codex_lock(self.a_mid, self.A, "%0"), a_new)
 
     def test_relay_prefers_codex_via_pane_over_the_mtime_heuristic(self):
         # when peer-log's /proc identity resolves the pair's Codex, the relay adopts / locks /
         # follows THAT — one source of truth with `peer`, not the newest-for-cwd guess.
         with mock.patch.object(relay.peerlog, "codex_via_pane", return_value=self.a_old):
-            self.assertEqual(relay.lock_codex(self.A, set()), self.a_old)
+            self.assertEqual(relay.lock_codex(self.A, set(), "%0"), self.a_old)
             # even though a_mid is newer for cwd A, the identity wins
-            self.assertEqual(relay.refresh_codex_lock(self.a_mid, self.A), self.a_old)
+            self.assertEqual(relay.refresh_codex_lock(self.a_mid, self.A, "%0"), self.a_old)
 
     def test_lock_codex_only_takes_rollouts_unseen_at_start(self):
         seen = set(relay.codex_all())
-        self.assertIsNone(relay.lock_codex(self.A, seen))
+        self.assertIsNone(relay.lock_codex(self.A, seen, "%0"))
         a_new = self.rollout("a-new", self.A, 4)
         self.rollout("b-newer", self.B, 5)
-        self.assertEqual(relay.lock_codex(self.A, seen), a_new)
+        self.assertEqual(relay.lock_codex(self.A, seen, "%0"), a_new)
 
     def test_codex_cwd_matches_uses_the_shared_cache(self):
         self.assertTrue(relay.codex_cwd_matches(self.a_old, self.A))

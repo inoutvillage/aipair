@@ -316,7 +316,8 @@ if running; then
   if [ "$cmd" = loop ]; then
     echo "aipair: このディレクトリのペアは既に起動しています（$NAME）。" >&2
     echo "aipair: 既存ペアで自動レビューを始めるには、ペア内のペインで  aipair-relay-here  を実行してください。" >&2
-    echo "aipair: （最初から loop で組み直すなら  aipair stop  してから  aipair loop）" >&2
+    echo "aipair:   ただし起動済みエージェントの権限は変わりません（安全モードで起動していれば許可プロンプトは残ります）。" >&2
+    echo "aipair:   完全な自走（権限バイパス）には  aipair stop  後に  aipair loop  で起動し直してください。" >&2
     exit 3
   fi
   attach_session

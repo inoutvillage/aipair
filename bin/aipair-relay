@@ -364,21 +364,29 @@ def lock_claude(cwd, seen, pane, baseline):
     return fresh[0] if fresh else None
 
 
-def lock_codex(cwd, seen):
+def lock_codex(cwd, seen, pane):
     """Newest rollout for cwd that did not exist when the relay started (`seen`).
     Polled every second while waiting for the pair's Codex to show up, so it goes
-    through peerlog's incremental index rather than re-walking the archive."""
-    return peerlog.codex_via_pane(cwd) or peerlog.codex_newest(cwd, exclude=seen)
+    through peerlog's incremental index rather than re-walking the archive. `pane` is the
+    relay's OWN resolved codex pane, so the /proc identity looks at THIS pair (never the
+    caller's session)."""
+    return peerlog.codex_via_pane(cwd, pane) or peerlog.codex_newest(cwd, exclude=seen)
 
 
-def refresh_codex_lock(tracked_path, cwd):
+def refresh_codex_lock(tracked_path, cwd, pane):
     """Codex CLI の再起動/新セッションで rollout がローテートしたら追従する。
-    追跡中ファイルより新しい mtime の cwd 一致 rollout が現れたら乗り換える
-    （旧ファイルを見張り続けて task_complete を永遠に取り逃がす事故の防止）。
-    候補は「追跡中より新しいもの全部」を新しい順に照合する（peerlog.codex_follow）。
-    以前は全体で最新の 1 件しか見ておらず、別 cwd の Codex が動いている間は自分の
-    cwd の新 rollout を永遠に見逃した（2026-08-21: aipair と iovillage-cms の 2 ペア同時稼働）。"""
-    newest = peerlog.codex_via_pane(cwd) or peerlog.codex_follow(cwd, tracked_path)
+    第一は /proc identity（`pane` の Codex プロセスが今開いている rollout）。identity が
+    「一瞬 None（再起動中）」の時に mtime heuristic へ落ちると、同一 cwd の別 Codex へ誤って
+    乗り換え得るため、identity 対応環境（codex_identity_capable）で既に追跡中なら現 path を維持し、
+    heuristic への fallback は /proc 非対応・旧セッションの時だけに限定する（2026-08-22 レビュー）。
+    非 identity 環境では従来どおり codex_follow（追跡中より新しい cwd 一致 rollout を照合）。"""
+    ident = peerlog.codex_via_pane(cwd, pane)
+    if ident:
+        newest = ident
+    elif peerlog.codex_identity_capable(pane):
+        return tracked_path        # identity は使えるが今この瞬間は未解決 → drift させず現状維持
+    else:
+        newest = peerlog.codex_follow(cwd, tracked_path)
     if newest and newest != tracked_path:
         dim(f"codex rollout ローテート検知 → 追従: {os.path.basename(newest)}")
         return newest
@@ -896,7 +904,7 @@ def main():
             # ONE source of truth with peer-log: the rollout the pair's Codex process actually
             # holds open (codex_via_pane), not merely the newest for the cwd — so `peer` and the
             # relay never diverge onto two different same-cwd Codex sessions (2026-08-22 review).
-            f = peerlog.codex_via_pane(cwd) or peerlog.codex_newest(cwd)
+            f = peerlog.codex_via_pane(cwd, panes["codex"]) or peerlog.codex_newest(cwd)
             if f:
                 tracked["codex"] = f
                 dim(f"adopt: codex = {os.path.basename(f)}")
@@ -1116,7 +1124,7 @@ def main():
                     wait_heartbeat("Claude")
             elif state == "codex_plan":
                 if tracked["codex"] is None:
-                    tracked["codex"] = lock_codex(cwd, codex_seen)
+                    tracked["codex"] = lock_codex(cwd, codex_seen, panes["codex"])
                 done = codex_done_ts(tracked["codex"], since) if tracked["codex"] else None
                 done = response_done("codex", tracked["codex"], done)
                 if done:
@@ -1179,14 +1187,14 @@ def main():
                     since = time.time(); state = "claude"; last_activity = time.time()
                 else:
                     if tracked["codex"]:
-                        tracked["codex"] = refresh_codex_lock(tracked["codex"], cwd)
+                        tracked["codex"] = refresh_codex_lock(tracked["codex"], cwd, panes["codex"])
                     if poke_noshow("codex"):
                         code = 4
                         break
                     wait_heartbeat("Codex（プランレビュー）")
             elif state == "codex_question":
                 if tracked["codex"] is None:
-                    tracked["codex"] = lock_codex(cwd, codex_seen)
+                    tracked["codex"] = lock_codex(cwd, codex_seen, panes["codex"])
                 done = codex_done_ts(tracked["codex"], since) if tracked["codex"] else None
                 done = response_done("codex", tracked["codex"], done)
                 if done:
@@ -1219,14 +1227,14 @@ def main():
                     since = time.time(); state = "claude"; last_activity = time.time()
                 else:
                     if tracked["codex"]:
-                        tracked["codex"] = refresh_codex_lock(tracked["codex"], cwd)
+                        tracked["codex"] = refresh_codex_lock(tracked["codex"], cwd, panes["codex"])
                     if poke_noshow("codex"):
                         code = 4
                         break
                     wait_heartbeat("Codex（質問回答）")
             else:  # codex
                 if tracked["codex"] is None:
-                    tracked["codex"] = lock_codex(cwd, codex_seen)
+                    tracked["codex"] = lock_codex(cwd, codex_seen, panes["codex"])
                 done = codex_done_ts(tracked["codex"], since) if tracked["codex"] else None
                 done = response_done("codex", tracked["codex"], done)
                 if done:
@@ -1315,7 +1323,7 @@ def main():
                     since = time.time(); state = "claude"; last_activity = time.time()
                 else:
                     if tracked["codex"]:
-                        tracked["codex"] = refresh_codex_lock(tracked["codex"], cwd)
+                        tracked["codex"] = refresh_codex_lock(tracked["codex"], cwd, panes["codex"])
                     if poke_noshow("codex"):
                         code = 4
                         break

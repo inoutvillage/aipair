@@ -121,5 +121,30 @@ if wait_file "$W/rh3.out"; then
 else n=$((n+1)); echo "FAIL relay-here (--dir override) no output"; fail=1; fi
 reset_server
 
+echo "# [2d] relay-here --session uses EXACT match (a prefix must not hit a longer session)"
+"$REAL_TMUX" -L "$SOCKET" new-session -d -s prefixtest -c "$W/proj"
+"$REAL_TMUX" -L "$SOCKET" select-pane -t prefixtest -T bridge
+P4="$("$REAL_TMUX" -L "$SOCKET" list-panes -t prefixtest -F '#{pane_id}' | head -1)"
+"$REAL_TMUX" -L "$SOCKET" send-keys -t "$P4" "AIPAIR_RELAY_BIN='$STUB' aipair-relay-here --session prefix --print > '$W/rh4.out' 2>&1; echo rc=\$? >> '$W/rh4.out'" Enter
+if wait_file "$W/rh4.out"; then
+  out4="$(cat "$W/rh4.out")"
+  n=$((n+1)); if printf '%s' "$out4" | grep -q 'rc=0'; then echo "FAIL relay-here matched a prefix session ('prefix' → 'prefixtest')"; fail=1; else echo "ok   prefix '--session prefix' rejected (no exact match)"; fi
+  chk_has "$out4" "完全一致" "relay-here reports the exact-match requirement"
+else n=$((n+1)); echo "FAIL relay-here (prefix) produced no output"; fail=1; fi
+reset_server
+
+echo "# [2e] a relative --dir is resolved to an absolute canonical path (caller/bridge agree)"
+"$REAL_TMUX" -L "$SOCKET" new-session -d -s pair4 -c "$W/proj"
+mkdir -p "$W/proj/sub"
+BR5="$("$REAL_TMUX" -L "$SOCKET" split-window -t pair4 -P -F '#{pane_id}' -c "$W/proj")"
+"$REAL_TMUX" -L "$SOCKET" select-pane -t "$BR5" -T bridge
+Q5="$("$REAL_TMUX" -L "$SOCKET" list-panes -t pair4 -F '#{pane_id}' | head -1)"
+ABS="$(cd "$W/proj/sub" && pwd -P)"
+"$REAL_TMUX" -L "$SOCKET" send-keys -t "$Q5" "cd '$W/proj' && AIPAIR_RELAY_BIN='$STUB' aipair-relay-here --session pair4 --dir sub --print > '$W/rh5.out' 2>&1" Enter
+if wait_file "$W/rh5.out"; then
+  chk_has "$(cat "$W/rh5.out")" "dir     : $ABS" "relative --dir sub → absolute canonical ($ABS)"
+else n=$((n+1)); echo "FAIL relay-here (relative --dir) no output"; fail=1; fi
+reset_server
+
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED)"
 exit $fail

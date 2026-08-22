@@ -239,6 +239,30 @@ class ProcIdentity(Base):
              mock.patch.dict(os.environ, {"TMUX": "/tmp/sock"}):
             self.assertEqual(pl.codex_via_pane(self.CWD), ours)
 
+    def test_explicit_pane_skips_session_resolution(self):
+        # the relay passes its OWN codex pane → codex_via_pane must NOT re-derive the session from
+        # the current pane (that would read a DIFFERENT pair's @aipair-codex-pane, P1 2026-08-22).
+        ours = self.rollout("ours", self.CWD, "2026-08-21T00:00:00Z", 100)
+        calls = []
+        def fake_tmux(*a):
+            calls.append(a)
+            return "2000" if (a[0] == "display-message" and "-t" in a) else None   # pane_pid
+        with mock.patch.object(pl, "_tmux", side_effect=fake_tmux), \
+             mock.patch.object(pl, "_descendants", return_value=[2000]), \
+             mock.patch.object(pl, "_open_rollouts", side_effect=lambda pid: [ours] if pid == 2000 else []):
+            self.assertEqual(pl.codex_via_pane(self.CWD, "%7"), ours)
+        self.assertFalse(any(a and a[-1] == "#{session_name}" for a in calls),
+                         "must not resolve the current session when the pane is explicit")
+        self.assertFalse(any("show-options" in a for a in calls),
+                         "must not read @aipair-codex-pane when the pane is explicit")
+
+    def test_codex_identity_capable_reflects_pane_resolution(self):
+        resolves = lambda *a: "3000" if (a[0] == "display-message" and "-t" in a) else None
+        with mock.patch.object(pl, "_tmux", side_effect=resolves):
+            self.assertEqual(pl.codex_identity_capable("%1"), os.path.isdir("/proc"))
+        with mock.patch.object(pl, "_tmux", return_value=None):
+            self.assertFalse(pl.codex_identity_capable("%1"))   # pane pid unresolvable → not capable
+
     def test_returns_none_without_tmux_or_the_pane_option(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("TMUX", None)

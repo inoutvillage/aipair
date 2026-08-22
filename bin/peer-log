@@ -409,26 +409,43 @@ def _open_rollouts(pid):
     return out
 
 
-def codex_via_pane(cwd):
-    """Exact, race-free identity: the rollout FILE the pair's Codex process has open right now.
-    aipair records the Codex pane (@aipair-codex-pane); we take that pane's process tree and read
-    the open rollout fd of its codex process, matched to cwd. Linux+tmux only — returns None
-    elsewhere (and on any hiccup), so the caller falls back to the launch-time pin."""
-    if not os.environ.get("TMUX"):
-        return None
-    sess = _tmux("display-message", "-p", "#{session_name}")
-    if not sess:
-        return None
-    pane = _tmux("show-options", "-t", sess, "-qv", "@aipair-codex-pane")
-    if not pane:
-        return None
+def _codex_pane_pid(pane=None):
+    """The pane_pid of the pair's Codex pane. When `pane` is given (the relay already resolved
+    its own codex pane), use it directly — never re-derive the session from the CURRENT pane,
+    which would read a DIFFERENT session's @aipair-codex-pane when `--session` targets another
+    pair. When `pane` is None (peer), resolve it from THIS pane's session + @aipair-codex-pane."""
+    if pane is None:
+        if not os.environ.get("TMUX"):
+            return None
+        sess = _tmux("display-message", "-p", "#{session_name}")
+        if not sess:
+            return None
+        pane = _tmux("show-options", "-t", sess, "-qv", "@aipair-codex-pane")
+        if not pane:
+            return None
     ppid = _tmux("display-message", "-p", "-t", pane, "#{pane_pid}")
-    if not (ppid and ppid.isdigit()):
+    return int(ppid) if (ppid and ppid.isdigit()) else None
+
+
+def codex_identity_capable(pane=None):
+    """True when /proc pane-identity can be attempted here (Linux + a resolvable Codex pane).
+    Lets a caller tell 'no rollout matched right now' (a restart in flight — keep the current
+    pin) apart from 'this environment cannot do identity' (only then use the mtime heuristic)."""
+    return os.path.isdir("/proc") and _codex_pane_pid(pane) is not None
+
+
+def codex_via_pane(cwd, pane=None):
+    """Exact, race-free identity: the rollout FILE the pair's Codex process has open right now.
+    `pane` pins WHICH Codex pane to inspect (the relay passes its own resolved codex pane so it
+    never re-derives the session from TMUX_PANE); default resolves it from the current pane's
+    @aipair-codex-pane (what `peer` does). Linux+tmux only — None elsewhere / on any hiccup."""
+    ppid = _codex_pane_pid(pane)
+    if ppid is None:
         return None
     want = _norm(cwd)
     # BFS order → the shallowest process holding a cwd-matching rollout is the pair's OWN codex;
     # a nested codex-in-codex sits deeper, so its (possibly newer) rollout never wins.
-    for pid in _descendants(int(ppid)):
+    for pid in _descendants(ppid):
         for roll in _open_rollouts(pid):
             if codex_cwd(roll) == want:
                 return roll
