@@ -5,8 +5,9 @@ name: nightly-smoke
 # then torn down), so a breaking change in either CLI's startup / version output surfaces here.
 #
 # NOTE: an AUTHENTICATED end-to-end round-trip (a real poke → agent reply → relay) additionally
-# needs ANTHROPIC / OPENAI credentials as repo secrets + API budget; the `e2e` step below is
-# gated on ANTHROPIC_API_KEY and stays skipped until such a secret is configured.
+# needs ANTHROPIC + OPENAI credentials as repo secrets + API budget; the `e2e` step below skips
+# unless BOTH secrets are set, and fails (not silently passes) once both are present but the
+# round-trip is still unimplemented.
 on:
   schedule:
     - cron: '37 18 * * *'   # daily ~03:37 JST
@@ -19,7 +20,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: 'lts/*'   # current Claude Code needs node >= 22 (engines); lts/* satisfies it
       - name: Install the real claude + codex CLIs (no auth needed for --version)
         run: |
           set -eux
@@ -31,6 +32,17 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux
       - name: Versions
         run: tmux -V; node --version; python3 --version; claude --version; codex --version
+      - name: Verify aipair's real launch forms exit cleanly (not just that 3 panes exist)
+        run: |
+          set -eux
+          # The installer smoke only asserts 3 panes; a CLI that error-exits inside a pane would
+          # leave a shell and still "pass". aipair launches claude as `claude --session-id <uuid>
+          # <flags>`, so run that EXACT form and require a clean exit (set -e) + a version string.
+          uuid="$(cat /proc/sys/kernel/random/uuid)"
+          out="$(claude --session-id "$uuid" --version)"; echo "$out"
+          printf '%s\n' "$out" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+' || { echo "claude --session-id --version printed no version" >&2; exit 1; }
+          cout="$(codex --version)"; echo "$cout"
+          printf '%s\n' "$cout" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+' || { echo "codex --version printed no version" >&2; exit 1; }
       - name: aipair install + smoke against the REAL CLIs
         run: |
           set -eux
@@ -38,15 +50,18 @@ jobs:
           # asserts 3 panes on a throw-away session, then tears it down. The CI runner's default
           # tmux server is ephemeral, so no private-socket shim is needed here.
           bash aipair-install.sh
-      - name: Authenticated end-to-end (opt-in; self-skips without credentials)
+      - name: Authenticated end-to-end (opt-in; needs BOTH secrets)
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-            echo "skip: no ANTHROPIC_API_KEY secret configured — real round-trip E2E not run."
-            echo "(To enable: add ANTHROPIC_API_KEY / OPENAI_API_KEY repo secrets, then a minimal"
-            echo " poke → reply → relay round-trip can run here.)"
+          if [ -z "${ANTHROPIC_API_KEY:-}" ] || [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "skip: the round-trip E2E needs BOTH ANTHROPIC_API_KEY and OPENAI_API_KEY repo"
+            echo "secrets (+ API budget) — not run."
             exit 0
           fi
-          echo "TODO: minimal real poke → reply → relay round-trip (credentials present)."
+          # Both credentials are present, so the round-trip is expected to run. It is not built
+          # yet, so FAIL loudly rather than pass silently — a standing reminder to implement it.
+          echo "both ANTHROPIC_API_KEY and OPENAI_API_KEY are set, but the poke -> reply -> relay" >&2
+          echo "round-trip E2E is not implemented yet — failing instead of passing silently." >&2
+          exit 1
