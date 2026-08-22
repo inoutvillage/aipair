@@ -718,6 +718,24 @@ class DialoglibStandalone(unittest.TestCase):
         self.assertIs(relay.deliverylib.dialog_on_screen, relay.dialoglib.dialog_on_screen)
 
 
+class ModuleLayout(unittest.TestCase):
+    """D3 split: aipair-relay loads exactly the six sibling modules and binds a representative
+    symbol from each to that module's implementation (guards against a future re-merge/rebind)."""
+    def test_all_libs_loaded_and_bindings_point_to_them(self):
+        for lib in ("corelib", "loglib", "tmuxlib", "deliverylib", "dialoglib", "peerlog"):
+            self.assertTrue(hasattr(relay, lib), f"relay must load {lib}")
+        self.assertIs(relay.parse_version, relay.corelib.parse_version)
+        self.assertIs(relay.claude_done_ts, relay.loglib.claude_done_ts)
+        self.assertIs(relay.find_panes, relay.tmuxlib.find_panes)
+        self.assertIs(relay.poke, relay.deliverylib.poke)
+        self.assertIs(relay.detect_plan_dialog, relay.dialoglib.detect_plan_dialog)
+        # cross-module injection: the delivery re-press guard is the dialog module's probe
+        self.assertIs(relay.deliverylib.dialog_on_screen, relay.dialoglib.dialog_on_screen)
+        # what stays in relay (the launcher core) is defined here, not in a lib
+        for core in ("main", "LogWatch", "lock_codex", "run_gate", "gate_or_message"):
+            self.assertTrue(hasattr(relay, core))
+
+
 class DoneTimestamps(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="aipair-parsers.")

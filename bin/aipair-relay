@@ -19,6 +19,18 @@ Plan mode (auto plan review):
     approved with extra notes    → feedback + shift+tab (approve w/ feedback)
   Capped at --plan-rounds per plan (default 5); disable with --no-plan-review.
 
+Module layout (D3 split — aipair-relay is the launcher + main loop; helpers live in
+sibling modules it loads by path via SourceFileLoader and binds into its namespace):
+  peer-log            transcript location + parsing (shared with `peer-log` the tool)
+  aipair-corelib      pure helpers: stop-phrase, version gate, gate output shaping
+  aipair-loglib       turn-completion / response-attribution reading
+  aipair-tmuxlib      the tmux(...) runner + pane discovery/inspection
+  aipair-deliverylib  poke delivery + Enter submission (host injects tmux/dim/dialog probe)
+  aipair-dialoglib    plan/question dialog detection + response (+ dialog constants)
+What stays here: env parsing, colour/log, log-locking + LogWatch, the stop-gate runner,
+the poke wording, and main()'s state machine. All six sibling files must sit in the same
+directory as aipair-relay (the installer keeps them together and verifies it).
+
 Question dialogs (auto AskUserQuestion relay):
   If Claude stops at a multiple-choice question dialog (AskUserQuestion — the
   literal-input poke would be eaten by the selector UI), the relay scrapes ALL

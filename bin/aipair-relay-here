@@ -59,6 +59,10 @@ done
 
 command -v tmux >/dev/null 2>&1 || die "tmux が無い"
 [ -x "$RELAY" ] || die "aipair-relay が無い: $RELAY"
+# aipair-relay loads its sibling libs (corelib/loglib/tmuxlib/deliverylib/dialoglib + peer-log)
+# by path; --help imports them all. Fail loudly here if the install is incomplete, rather
+# than firing a relay that crashes on import inside the bridge pane.
+"$RELAY" --help >/dev/null 2>&1 || die "aipair-relay がロードできない（同じディレクトリの corelib/loglib/tmuxlib/deliverylib/dialoglib/peer-log が揃っているか確認）: $RELAY"
 
 # --- セッション特定 ---------------------------------------------------------
 if [ -z "$SESSION" ]; then
