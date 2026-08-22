@@ -70,7 +70,7 @@ mkdir -p "$BROKEN/.claude"; cp -r "$REPO/.claude/skills" "$BROKEN/.claude/"
 printf 'def broken(:\n' > "$BROKEN/bin/aipairlib/tmuxlib.py"   # exists (passes preflight) but won't import
 rc=0; out3="$(env -u TMUX PATH="$SHIMD:$PATH" HOME="$TH3" bash "$BROKEN/aipair-install.sh" 2>&1)" || rc=$?
 chk "[ $rc -ne 0 ]" "broken package → installer exits non-zero (got $rc)"
-echo "$out3" | grep -q "staged aipairlib package failed to import" && importfail=1 || importfail=0
+echo "$out3" | grep -q "new aipairlib package failed to import" && importfail=1 || importfail=0
 chk "[ $importfail -eq 1 ]" "installer stops at the staged-package import verify (before switching entrypoints)"
 for lib in "${FLATLIBS[@]}"; do
   chk "[ -e '$TH3/.local/bin/$lib' ]" "flat $lib SURVIVES a failed package install (not retired early)"
@@ -80,6 +80,27 @@ chk "env -u TMUX HOME='$TH3' '$TH3/.local/bin/aipair-relay' --help >/dev/null 2>
 chk "env -u TMUX HOME='$TH3' '$TH3/.local/bin/peer-log' --help >/dev/null 2>&1" "legacy peer-log STILL runs after the failed upgrade"
 chk "grep -q legacy '$TH3/.local/bin/aipair-relay'" "aipair-relay was NOT replaced by the thin entrypoint"
 rm -rf "$TH3" "$BROKEN"
+
+# --- rollback when a #7 package is ALREADY installed: a broken upgrade must NOT overwrite the
+# live package in place (else the existing thin entrypoints would read the broken package). Install
+# the good version, then upgrade the SAME HOME with the broken one, and confirm the previous
+# install still runs and its package content is preserved.
+TH4="$(mktemp -d "${TMPDIR:-/tmp}/aipair-upg4.XXXXXX")"
+env -u TMUX PATH="$SHIMD:$PATH" HOME="$TH4" bash "$REPO/aipair-install.sh" >/dev/null 2>&1
+chk "[ -f '$TH4/.local/bin/aipairlib/relay.py' ]" "(precondition) good #7 install placed the package"
+chk "env -u TMUX HOME='$TH4' '$TH4/.local/bin/aipair-relay' --help >/dev/null 2>&1" "(precondition) installed #7 relay runs"
+BROKEN2="$(mktemp -d "${TMPDIR:-/tmp}/aipair-broken2.XXXXXX")"
+cp "$REPO/aipair-install.sh" "$BROKEN2/"; cp -r "$REPO/bin" "$REPO/templates" "$BROKEN2/"
+mkdir -p "$BROKEN2/.claude"; cp -r "$REPO/.claude/skills" "$BROKEN2/.claude/"
+printf 'def broken(:\n' > "$BROKEN2/bin/aipairlib/tmuxlib.py"
+rc=0; env -u TMUX PATH="$SHIMD:$PATH" HOME="$TH4" bash "$BROKEN2/aipair-install.sh" >/dev/null 2>&1 || rc=$?
+chk "[ $rc -ne 0 ]" "broken UPGRADE over an existing #7 install exits non-zero (got $rc)"
+chk "env -u TMUX HOME='$TH4' '$TH4/.local/bin/aipair-relay' --help >/dev/null 2>&1" "existing aipair-relay STILL runs after the broken upgrade"
+chk "env -u TMUX HOME='$TH4' '$TH4/.local/bin/peer-log' --help >/dev/null 2>&1" "existing peer-log STILL runs after the broken upgrade"
+h_live="$(sha256sum < "$TH4/.local/bin/aipairlib/relay.py")"; h_repo="$(sha256sum < "$REPO/bin/aipairlib/relay.py")"
+chk "[ '$h_live' = '$h_repo' ]" "live relay.py content preserved (not overwritten)"
+chk "! grep -q 'def broken' '$TH4/.local/bin/aipairlib/tmuxlib.py'" "live tmuxlib.py NOT overwritten by the broken module"
+rm -rf "$TH4" "$BROKEN2"
 
 # --- retire FAILURE must fail the install (a dangerous stale binary left runnable is not ok) ---
 TH2="$(mktemp -d "${TMPDIR:-/tmp}/aipair-upg2.XXXXXX")"

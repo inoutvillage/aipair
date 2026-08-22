@@ -409,15 +409,40 @@ install_one() {  # $1 = repo-relative bin path (e.g. aipair-relay or aipairlib/r
     ok "$dst installed"
   fi
 }
-# Two-phase install so a broken package never leaves the previous working install replaced-but-
-# unusable. Phase 1: stage the aipairlib PACKAGE (new/updated files; the old install still uses
-# its own entrypoints + flat libs, so this doesn't disturb it yet).
-for f in "${FILES[@]}"; do case "$f" in aipairlib/*) install_one "$f" || exit 1 ;; esac; done
-# Verify the STAGED package actually imports BEFORE switching the thin entrypoints in — if it is
-# broken, stop here with the previous entrypoints + flat libs still in place (rollback-safe).
-if ! AIPAIR_BIN="$BIN_DIR" python3 -c "import os, sys; sys.path.insert(0, os.environ['AIPAIR_BIN']); import aipairlib.relay, aipairlib.peerlog" 2>/dev/null; then
-  fail "the staged aipairlib package failed to import — the previous entrypoints are left untouched"
-  exit 1
+# Two-phase install so a broken NEW package never leaves the install unusable — neither the flat
+# libs (pre-#7) NOR an already-installed #7 package. Phase 1: stage the aipairlib package in a
+# TEMP dir on the same filesystem as BIN_DIR, verify it imports THERE, and only then atomically
+# swap it into place. The live $BIN_DIR/aipairlib is never overwritten until the new one verifies.
+pkg_up_to_date() {
+  local g
+  for g in "${FILES[@]}"; do case "$g" in aipairlib/*) same_file "$REPO_DIR/bin/$g" "$BIN_DIR/$g" || return 1 ;; esac; done
+  return 0
+}
+if [ -d "$BIN_DIR/aipairlib" ] && pkg_up_to_date; then
+  skip "$BIN_DIR/aipairlib is up to date"
+else
+  STAGE="$BIN_DIR/.aipairlib-stage-$TS"; rm -rf "$STAGE"
+  mkdir -p "$STAGE/aipairlib" || { fail "cannot create staging dir $STAGE"; exit 1; }
+  for f in "${FILES[@]}"; do case "$f" in aipairlib/*)
+    cp "$REPO_DIR/bin/$f" "$STAGE/$f" || { fail "cannot stage $f"; rm -rf "$STAGE"; exit 1; } ;; esac; done
+  # verify the STAGED package imports (from the temp dir) before touching the live one
+  if ! AIPAIR_STAGE="$STAGE" python3 -c "import os, sys; sys.path.insert(0, os.environ['AIPAIR_STAGE']); import aipairlib.relay, aipairlib.peerlog" 2>/dev/null; then
+    rm -rf "$STAGE"
+    fail "the new aipairlib package failed to import — kept the previous install unchanged"
+    exit 1
+  fi
+  # swap into place (mv is atomic on the same filesystem); back up the old package dir first
+  if [ -e "$BIN_DIR/aipairlib" ]; then
+    rm -rf "$BIN_DIR/aipairlib.bak-$TS"
+    mv "$BIN_DIR/aipairlib" "$BIN_DIR/aipairlib.bak-$TS" || { fail "cannot back up $BIN_DIR/aipairlib"; rm -rf "$STAGE"; exit 1; }
+  fi
+  if ! mv "$STAGE/aipairlib" "$BIN_DIR/aipairlib"; then
+    fail "cannot install $BIN_DIR/aipairlib"
+    [ -e "$BIN_DIR/aipairlib.bak-$TS" ] && mv "$BIN_DIR/aipairlib.bak-$TS" "$BIN_DIR/aipairlib"   # restore the old one
+    rm -rf "$STAGE"; exit 1
+  fi
+  rm -rf "$STAGE"
+  ok "$BIN_DIR/aipairlib package installed (verified its import before swapping in)"
 fi
 # Phase 2: now switch the top-level executables (thin entrypoints + bash launchers).
 for f in "${FILES[@]}"; do case "$f" in aipairlib/*) : ;; *) install_one "$f" || exit 1 ;; esac; done
