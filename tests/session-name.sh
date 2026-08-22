@@ -90,7 +90,7 @@ if [ -n "$CI_DIR" ]; then
   echo "# [5] legacy identity compares by inode (-ef): created under another spelling"
   LN="$(aipair name "$CI_DIR" | sed -E 's/-[0-9a-f]{12}$//')"
   tmux new-session -d -s "$LN" -c "$SW"
-  chk "$(aipair name "$CI_DIR")" "$LN" "legacy created with swapped-case -c is adopted"
+  if [ "$SP" = 1 ]; then chk "$(aipair name "$CI_DIR")" "$LN" "legacy created with swapped-case -c is adopted"; else echo "  skip [5] swapped-case legacy adoption (needs #{session_path}, 3.2+)"; fi
   tmux kill-session -t "=$LN"
 fi
 
@@ -140,7 +140,7 @@ if command -v script >/dev/null; then
   tmux new-session -d -s aipair-api -c "$W/a/api"      # legacy for the SAME dir, coexisting
   chk "$(aipair name "$W/a/api")" "$NA" "new-format wins over legacy of the same dir"
   chk "$(aipair stop "$W/a/api")" "aipair: stopped $NA" "stop kills the new-format session"
-  chk "$(aipair name "$W/a/api")" "aipair-api" "…then the legacy one is adopted"
+  if [ "$SP" = 1 ]; then chk "$(aipair name "$W/a/api")" "aipair-api" "…then the legacy one is adopted"; else echo "  skip [8] legacy adoption after new-format stop (needs #{session_path}, 3.2+)"; fi
   tmux kill-session -t =aipair-api
 
   echo "# [9] owner stamp (@aipair-dir) survives 'attach-session -c', which rewrites session_path"
