@@ -69,7 +69,8 @@ PY
 # The hash keeps /home/u/work/api and /home/u/other/api apart (basename alone
 # made them share one session and `aipair` re-attached to the wrong project).
 # 12 hex = 48 bits: with 6 a collision turned up within ~5k directories. An
-# existing session is in any case verified against its #{session_path} below.
+# existing session is in any case verified below against the directory it belongs
+# to — its @aipair-dir owner stamp, or #{session_path} where no stamp is present.
 # python3 is already a hard dependency (relay), which sidesteps the
 # sha1sum (GNU) / shasum (macOS) split.
 session_name() {
@@ -144,7 +145,7 @@ OWNER="$(session_dir_of "$NAME")"
 if [ -n "$OWNER" ]; then
   if ! same_dir "$OWNER" "$DIR"; then
     echo "aipair: session '$NAME' exists but belongs to $OWNER (hash collision) — not touching it." >&2
-    echo "aipair: inspect: tmux list-sessions -F '#{session_name} #{session_path}'   kill: tmux kill-session -t '=$NAME'" >&2
+    echo "aipair: inspect: tmux list-sessions -F '#{session_name} #{@aipair-dir} #{session_path}'   kill: tmux kill-session -t '=$NAME'" >&2
     exit 1
   fi
 else

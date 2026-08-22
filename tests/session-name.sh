@@ -132,7 +132,7 @@ if command -v script >/dev/null; then
   chk "$(aipair name "$W/a/api")" "$NA" "a/api still owns its session (no false 'hash collision')"
   chk "$(aipair name "$W/b/api")" "$NB" "b/api is not fooled by the rewritten session_path"
   chk "$(aipair stop "$W/a/api")" "aipair: stopped $NA" "stop a/api still works"
-else echo "skip real-start tests (`script` not available)"; fi
+else echo "skip real-start tests (\`script\` not available)"; fi
 
 # [10] tmux 3.1 has neither `list-sessions -f` nor #{session_path} (both are 3.2+).
 # session_dir_of must still hold the owner/collision guard there (via @aipair-dir), and a
