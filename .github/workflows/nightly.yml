@@ -6,9 +6,10 @@ name: nightly-smoke
 #
 # NOTE: the AUTHENTICATED end-to-end round-trip (a real poke → agent reply → relay) additionally
 # needs ANTHROPIC + OPENAI credentials as repo secrets + API budget. The `e2e` step below SKIPS
-# unless BOTH secrets are set; when they are, it starts a real pair in a throw-away dir, drives a
-# one-round-trip with a unique nonce, verifies the nonce reached claude AND the relay delivered a
-# poke to codex, and tears the session down either way (fail-closed on any missing signal).
+# unless BOTH secrets are set; when they are, it starts a real pair in a throw-away dir, injects a
+# unique-nonce prompt, and requires all three of: claude replied with EXACTLY the nonce, codex
+# genuinely responded (non-empty last_agent_message in the poked turn — so an invalid OpenAI key
+# fails), and the relay poked claude back. It tears the session down either way (fail-closed).
 on:
   schedule:
     - cron: '37 18 * * *'   # daily ~03:37 JST
@@ -119,17 +120,19 @@ jobs:
           sleep 1
           tmux send-keys -t "$claude_pane" Enter
 
-          # Full round-trip, fail-closed — BOTH signals below require real auth on BOTH sides:
+          # Full round-trip, fail-closed — success needs ALL THREE, and each requires real auth:
           #  (1) claude REPLIED with EXACTLY the nonce: an assistant turn in <SID>.jsonl whose
           #      joined text.strip() == nonce (the prompt demanded exactly it — a mere mention
           #      like "the token is …" must not pass), not the user prompt we injected.
-          #  (2) the relay POKED CLAUDE BACK: a `relay-id:<hex>` appears in claude's own rollout.
-          #      The relay pokes claude only AFTER codex completes a turn, so this is reached only
-          #      when codex actually authenticated and responded — an invalid OPENAI_API_KEY, whose
-          #      poke would still be *recorded* in codex's rollout before any API call, never gets
-          #      here. claude's first turn is our injected prompt (no relay-id), so any relay-id in
-          #      claude's rollout is unambiguously the return hop. (AIPAIR_STOP_SIDE=claude below
-          #      keeps codex's approving "完了です" from ending the relay before that hop.)
+          #  (2) codex GENUINELY RESPONDED: in codex's rollout, the turn of the FIRST relay-id
+          #      poke (matched by internal_chat_message_metadata_passthrough.turn_id) has a
+          #      task_complete whose last_agent_message is NON-EMPTY. A relay-id user item alone
+          #      is recorded before any OpenAI call, and the relay pokes claude back even on an
+          #      empty task_complete — so an invalid OPENAI_API_KEY could clear (3) but never (2).
+          #  (3) the relay POKED CLAUDE BACK: a `relay-id:<hex>` appears in claude's own rollout.
+          #      claude's first turn is our injected prompt (no relay-id), so any relay-id there is
+          #      unambiguously the return hop. (AIPAIR_STOP_SIDE=claude below keeps codex's
+          #      approving "完了です" from ending the relay before that hop.)
           claude_echoed() {
             python3 - "$SID" "$NONCE" <<'PY' 2>/dev/null
           import sys, os, json, glob
@@ -162,17 +165,58 @@ jobs:
           PY
           }
           claude_log() { ls "$HOME"/.claude/projects/*/"$SID".jsonl 2>/dev/null | head -1; }
-          saw_reply=0; saw_return=0
-          for _ in $(seq 1 120); do       # up to ~240s for the two-hop round-trip
+          codex_replied() {   # codex produced a NON-EMPTY response in the turn the relay poked
+            python3 - "$WORK" <<'PY2' 2>/dev/null
+          import sys, os, glob, json
+          def norm(x): return os.path.normcase(os.path.realpath(os.path.expanduser(x))).rstrip("/")
+          work = norm(sys.argv[1])
+          def rollout_cwd(f):
+              try:
+                  with open(f, encoding="utf-8", errors="replace") as fh:
+                      m = json.loads(fh.readline())
+                  cw = (m.get("payload") or {}).get("cwd") or m.get("cwd")
+                  return norm(cw) if cw else ""
+              except Exception:
+                  return ""
+          root = os.path.expanduser("~/.codex/sessions")
+          cands = [f for f in glob.glob(os.path.join(root, "*", "*", "*", "rollout-*.jsonl"))
+                   if rollout_cwd(f) == work]
+          if not cands:
+              sys.exit(1)
+          path = max(cands, key=lambda f: os.path.getmtime(f))
+          relay_turn = None
+          completes = {}
+          for line in open(path, encoding="utf-8", errors="replace"):
+              try:
+                  d = json.loads(line)
+              except Exception:
+                  continue
+              pl = d.get("payload") or {}
+              typ, pt = d.get("type"), pl.get("type")
+              if typ == "response_item" and pt == "message" and pl.get("role") == "user" \
+                      and relay_turn is None:
+                  txt = "".join(b.get("text", "") for b in (pl.get("content") or [])
+                                if isinstance(b, dict))
+                  if "relay-id:" in txt:
+                      meta = pl.get("internal_chat_message_metadata_passthrough") or {}
+                      relay_turn = meta.get("turn_id")
+              elif typ == "event_msg" and pt == "task_complete":
+                  completes[pl.get("turn_id")] = (pl.get("last_agent_message") or "").strip()
+          sys.exit(0 if (relay_turn and completes.get(relay_turn)) else 1)
+          PY2
+          }
+          saw_reply=0; codex_real=0; saw_return=0
+          for _ in $(seq 1 120); do       # up to ~240s for the full round-trip
             claude_echoed && saw_reply=1
+            codex_replied && codex_real=1
             f="$(claude_log)"; [ -n "$f" ] && grep -qE 'relay-id:[0-9a-f]+' "$f" && saw_return=1
-            [ "$saw_reply" = 1 ] && [ "$saw_return" = 1 ] && break
+            [ "$saw_reply" = 1 ] && [ "$codex_real" = 1 ] && [ "$saw_return" = 1 ] && break
             sleep 2
           done
-          if [ "$saw_reply" = 1 ] && [ "$saw_return" = 1 ]; then
-            echo "E2E PASS: claude replied EXACTLY with $NONCE, codex genuinely responded, and the relay poked claude back — full round-trip confirmed."
+          if [ "$saw_reply" = 1 ] && [ "$codex_real" = 1 ] && [ "$saw_return" = 1 ]; then
+            echo "E2E PASS: claude replied EXACTLY with $NONCE, codex genuinely responded (non-empty last_agent_message in the poked turn), and the relay poked claude back — full round-trip confirmed."
             exit 0
           fi
-          echo "E2E FAIL: round-trip incomplete (claude_replied_exactly=$saw_reply relay_returned_to_claude=$saw_return)." >&2
+          echo "E2E FAIL: round-trip incomplete (claude_replied_exactly=$saw_reply codex_genuine_response=$codex_real relay_returned_to_claude=$saw_return)." >&2
           dump
           exit 1
