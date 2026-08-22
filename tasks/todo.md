@@ -248,6 +248,7 @@ F1 ✅ → F2 ✅ → F3 ✅ → F6 ✅ → F4 ✅ → F5 ✅ → F9 ✅ → F8 
 - [ ] #8/#9 CI を実 CLI の nightly smoke/E2E ＋ Python 3.8/tmux 3.1 の matrix に。
   - [x] **Python バージョン matrix**（PR 進行中）— `.github/workflows/ci.yml` を対応下限 3.8（installer 要件）と現行 3.13 の matrix（`fail-fast: false`・`actions/setup-python`）に。run-all が `python3` として起動する全経路（relay・5 lib・peer-log・.py テスト＝6 sibling module）をその版で検証。3.8 互換は事前スキャン（3.9+ 機能不使用）＋ python3.9 実走で確認。README 反映。
   - [x] **tmux 3.1 lane**（PR 進行中）— `ci.yml` に matrix include `{py3.13, tmux 3.1}` を追加（distro は 3.4 なので **ソースビルド**）。`session-name.sh` は実 tmux 版を検出し **tmux<3.2 で `#{session_path}` 依存の採用/衝突ケース（[3]/[4]の一部/[6]/[9]の precondition）を skip**（3.1 は safe-miss＝[10] の模擬で被覆）。他テストは session_path/-f 不使用で 3.1 安全。実 3.2a では SP=1 で 55 checks 不変、SP=0 強制で skip 分岐が正常。
+  - Codex レビュー派生（PR #29 マージ済み）: tmux 3.1 tarball を SHA-256 pin（実DLで一致確認・展開前に `sha256sum -c`・hash 未登録版は fail-closed）で検証、ソースビルド lane で `tmux -V`==`tmux <version>`（`grep -qx`）を assertion、README を 3-lane 表に更新。
   - [ ] 残: 実 claude・codex の nightly smoke・E2E（CI で両 CLI を用意する手段が要る）。
   - Codex レビュー派生（PR #27 マージ済み）: sibling module 数え間違い是正（`aipair-*lib` は 5 本＋peer-log＝6 sibling modules。「relay + 6 lib + peer-log」の二重計上を統一）。
   - 運用: この間に稼働 relay が poke-to-me 配達失敗（claude 2.1.240 自己更新＋大量出力中の pane 状態）で停止 → 最新 main を再インストール（logicalParentUuid compaction 修正・parentUuid schema 検査を反映）して `aipair-relay-here` で再点火・復旧。
