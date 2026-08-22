@@ -80,7 +80,13 @@ jobs:
           printf '# e2e\n- [ ] echo the token\n' > "$WORK/todo.md"
           SID="$(cat /proc/sys/kernel/random/uuid)"
           NONCE="E2E-$(cat /proc/sys/kernel/random/uuid)"
-          export AIPAIR_UNSAFE=1 AIPAIR_MAX_ROUNDS=3 AIPAIR_CLAUDE_SESSION="$SID"
+          # AIPAIR_STOP_SIDE=claude is DELIBERATE: with the default (codex), codex — following the
+          # review prompt — replies "完了です" on approval, which is the stop phrase, so the relay
+          # would terminate on the codex turn and NEVER poke claude back. That would make the
+          # return-hop signal unreachable even when both sides authenticated (a false failure).
+          # Ending only on CLAUDE's stop phrase (which our nonce reply never contains) lets the
+          # relay perform the return hop regardless of codex's content; max-rounds still bounds it.
+          export AIPAIR_UNSAFE=1 AIPAIR_MAX_ROUNDS=3 AIPAIR_STOP_SIDE=claude AIPAIR_CLAUDE_SESSION="$SID"
           NAME="$(aipair name "$WORK")"
 
           dump() {   # leave a readable trail in the run log on failure
@@ -122,7 +128,8 @@ jobs:
           #      when codex actually authenticated and responded — an invalid OPENAI_API_KEY, whose
           #      poke would still be *recorded* in codex's rollout before any API call, never gets
           #      here. claude's first turn is our injected prompt (no relay-id), so any relay-id in
-          #      claude's rollout is unambiguously the return hop.
+          #      claude's rollout is unambiguously the return hop. (AIPAIR_STOP_SIDE=claude below
+          #      keeps codex's approving "完了です" from ending the relay before that hop.)
           claude_echoed() {
             python3 - "$SID" "$NONCE" <<'PY' 2>/dev/null
           import sys, os, json, glob
