@@ -237,7 +237,7 @@ peer-log codex --full      # セッション全体
 | `AIPAIR_NEXT_ASK` | `次のタスクをください` | 連続モード: Claude の手持ちが尽きた合図 |
 | `AIPAIR_ALL_DONE` | `全タスク完了` | 連続モード: Codex の終端宣言 |
 | `AIPAIR_UNSAFE` | （未設定＝安全） | `1`/`--unsafe` で権限バイパス起動（`aipair loop` は必須）。既定は通常の許可プロンプト |
-| `AIPAIR_CLAUDE_FLAGS` / `AIPAIR_CODEX_FLAGS` | （安全＝無し／`--unsafe`＝`--dangerously-…`） | 起動フラグ。明示指定は最優先。**ペイン内のシェルが解釈するシェル断片**（`"--model opus"` は 2 引数、`'--append-system-prompt "a b"'` の引用符も有効）。空文字でフラグ無し |
+| `AIPAIR_CLAUDE_FLAGS` / `AIPAIR_CODEX_FLAGS` | （安全＝無し／`--unsafe`＝`--dangerously-…`） | 起動フラグ。明示指定は最優先。**ペイン内のシェルが解釈するシェル断片**（`"--model opus"` は 2 引数、`'--append-system-prompt "a b"'` の引用符も有効）。空文字でフラグ無し。**ただし `aipair loop` では危険フラグが必ず付与される**（空/カスタム指定にも追記。relay が許可プロンプトに答えられないため） |
 | `AIPAIR_DRY_RUN` | （未設定＝off） | `1` で各ペインに打ち込む起動行を表示するだけで何も起動しない（設定確認・テスト用）。真偽値の読み方は `AIPAIR_ENDLESS` と同じ |
 | `AIPAIR_GATE` | （未設定＝無し） | **停止ゲート**: 停止ワード検出後に実行するシェルコマンド（例 `npm test`）。成功した時だけ停止／次タスクへ。失敗は出力を添えて Claude に差し戻す（→ 下の「停止ゲート」） |
 | `AIPAIR_GATE_TIMEOUT` / `AIPAIR_GATE_ROUNDS` | `600` / `3` | ゲートのタイムアウト秒／差し戻しの上限回数（到達で relay は exit 6） |

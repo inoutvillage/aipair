@@ -51,6 +51,10 @@ chk "$(env AIPAIR_CLAUDE_FLAGS='--model opus' AIPAIR_DRY_RUN=1 aipair "$W/proj" 
 # `aipair loop` without --unsafe is refused (exit 2), nothing printed to stdout
 n=$((n+1)); rc=0; out="$(AIPAIR_DRY_RUN=1 aipair loop "$W/proj" 2>/dev/null)" || rc=$?
 if [ "$rc" = 2 ] && [ -z "$out" ]; then echo "ok   loop without --unsafe → exit 2, no launch"; else echo "FAIL loop refuse: rc=$rc out=$out"; fail=1; fi
+# loop ALWAYS carries the bypass flag under --unsafe, even if the user blanks/customises flags
+chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CLAUDE_FLAGS= AIPAIR_CODEX_FLAGS= AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex claude --dangerously-skip-permissions" "loop: empty AIPAIR_CLAUDE_FLAGS still gets the bypass"
+chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CODEX_FLAGS= AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^codex:  *//p')" "clear; env AI_SELF=codex AI_PEER=claude codex --dangerously-bypass-approvals-and-sandbox" "loop: empty AIPAIR_CODEX_FLAGS still gets the bypass"
+chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CLAUDE_FLAGS='--model opus' AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex claude --model opus --dangerously-skip-permissions" "loop: custom flags preserved AND bypass appended"
 
 echo "# [2] values with shell metacharacters arrive as ONE argument each"
 chk "$(run loop bridge "AIPAIR_STOP=it's done" | sed -n '5p')" "[it's done]" "apostrophe in AIPAIR_STOP"
@@ -68,9 +72,11 @@ done
 chk "$(line loop title AIPAIR_ENDLESS=1 'AIPAIR_ALL_DONE=fin')" "relay ● endless / max 20 / 終端「fin」/ Ctrl-C で停止" "endless title"
 
 echo "# [4] agent flags are shell fragments (documented, backwards compatible)"
-chk "$(run loop claude 'AIPAIR_CLAUDE_FLAGS=')" "cmd=claude self=claude peer=codex" "empty flags → no arguments"
-chk "$(run loop claude 'AIPAIR_CLAUDE_FLAGS=--model opus' | sed -n '2,3p' | paste -sd' ')" "[--model] [opus]" "two words → two arguments"
-chk "$(run loop codex 'AIPAIR_CODEX_FLAGS=--append-system-prompt "a b" -q' | sed -n '2,4p' | paste -sd' ')" "[--append-system-prompt] [a b] [-q]" "quoted word stays one argument"
+# `start` (interactive) mode: loop always appends the bypass flag, so test the fragment
+# semantics here where AIPAIR_*_FLAGS maps 1:1 to argv.
+chk "$(run start claude 'AIPAIR_CLAUDE_FLAGS=')" "cmd=claude self=claude peer=codex" "empty flags → no arguments"
+chk "$(run start claude 'AIPAIR_CLAUDE_FLAGS=--model opus' | sed -n '2,3p' | paste -sd' ')" "[--model] [opus]" "two words → two arguments"
+chk "$(run start codex 'AIPAIR_CODEX_FLAGS=--append-system-prompt "a b" -q' | sed -n '2,4p' | paste -sd' ')" "[--append-system-prompt] [a b] [-q]" "quoted word stays one argument"
 
 echo "# [5] collaborate mode (plain start)"
 chk "$(run start bridge)" "cmd=peer-log self=bridge peer=${J}[both]${J}[--watch]${J}[--last]${J}[15]" "bridge: peer-log both --watch --last 15"

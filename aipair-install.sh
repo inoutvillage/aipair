@@ -350,6 +350,16 @@ else warn "locale is not UTF-8 (LANG=${LANG:-unset} LC_ALL=${LC_ALL:-unset}) —
 
 # --- files -------------------------------------------------------------------
 mkdir -p "$BIN_DIR" || { fail "cannot create $BIN_DIR"; exit 1; }
+# Retire binaries this project no longer ships (D2: aipair-queue removed). An older install
+# would otherwise leave a runnable, now-unsupported copy in PATH.
+RETIRED=(aipair-queue)
+for f in "${RETIRED[@]}"; do
+  if [ -e "$BIN_DIR/$f" ]; then
+    mv "$BIN_DIR/$f" "$BIN_DIR/$f.removed-$TS" \
+      && ok "retired $BIN_DIR/$f (no longer part of aipair; moved to $f.removed-$TS)" \
+      || warn "could not retire stale $BIN_DIR/$f — remove it by hand"
+  fi
+done
 for f in "${FILES[@]}"; do
   src="$REPO_DIR/bin/$f"; dst="$BIN_DIR/$f"
   if [ -f "$dst" ] && same_file "$src" "$dst"; then

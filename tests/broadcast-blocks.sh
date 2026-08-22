@@ -26,5 +26,11 @@ for f in templates/claude-md-block.md templates/codex-agents-block.md; do
   chk "[ \"\$(grep -c 'aipair:end' '$f')\" = 1 ]"   "$f has exactly one end marker"
 done
 
+# D1: no launch path is unsafe-by-default. The VS Code single-launch tasks must NOT hardcode
+# the permission-bypass flags (the relay-loop task opts in explicitly via `aipair loop --unsafe`).
+chk "! grep -q 'claude --dangerously-skip-permissions' templates/vscode-tasks.json" "vscode: claude single-launch is not bypass-by-default"
+chk "! grep -q 'codex --dangerously-bypass-approvals-and-sandbox' templates/vscode-tasks.json" "vscode: codex single-launch is not bypass-by-default"
+chk "grep -q 'aipair loop --unsafe' templates/vscode-tasks.json" "vscode: the loop task opts into --unsafe explicitly"
+
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED)"
 exit $fail
