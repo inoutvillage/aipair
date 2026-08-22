@@ -18,7 +18,7 @@ def dim(_s):
 
 
 def dialog_on_screen(_pane):
-    return False                                # host injects relay._dialog_on_screen
+    return False                                # host injects aipair-dialoglib.dialog_on_screen (D3 A5)
 
 
 def tmux(*_a, **_k):                            # host injects tmuxlib.tmux
