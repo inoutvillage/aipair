@@ -28,6 +28,35 @@ set -uo pipefail
 RELAY="${AIPAIR_RELAY_BIN:-$HOME/.local/bin/aipair-relay}"   # override for tests
 SHELLS="bash zsh sh fish"
 
+# ディレクトリの正準化。bin/aipair の canon_dir と同一ロジック（realpath + 大小文字/正規化を
+# ディスク上の綴りへ統一）。`pwd -P` は WSL DrvFs の大小文字を統一しないため、明示 --dir が
+# 保存済み @aipair-dir と食い違う（2026-08-22 レビュー）。単一ディレクトリ配布のため複製している。
+canon_dir() {
+  python3 - "$1" <<'PYCANON'
+import os, sys, unicodedata
+def key(name):
+    return unicodedata.normalize("NFC", name).casefold()
+p, cur = os.path.realpath(sys.argv[1]), os.sep
+for c in [x for x in p.split(os.sep) if x]:
+    nxt = os.path.join(cur, c)
+    try:
+        names = os.listdir(cur)
+    except OSError:
+        names = [c]
+    if c not in names:
+        for n in names:
+            if key(n) == key(c):
+                try:
+                    if os.path.samefile(os.path.join(cur, n), nxt):
+                        nxt = os.path.join(cur, n)
+                        break
+                except OSError:
+                    pass
+    cur = nxt
+print(cur)
+PYCANON
+}
+
 die() { printf 'aipair-relay-here: %s\n' "$*" >&2; exit 2; }
 
 # 値をシェル安全に単一引用符で包む（UTF-8 は素通り。%q は日本語を $'..' 化し bridge が sh だと壊れるため使わない）
@@ -89,7 +118,9 @@ fi
 [ -d "$DIR" ] || die "作業ディレクトリが存在しない: $DIR（--dir で明示指定できます）"
 # 相対 --dir は caller と bridge で別解釈になる（検証=caller cwd 基準・実行=bridge cwd 基準）。
 # 選択直後に絶対・canonical へ固定して両者を一致させる（2026-08-22 レビュー）。
-DIR="$(cd "$DIR" && pwd -P)" || die "作業ディレクトリを解決できない: $DIR"
+# canon_dir で絶対・canonical（DrvFs 大小文字も統一）へ固定し、保存済み @aipair-dir と同じ綴りに。
+# @aipair-dir 経路は aipair が既に正準化済みなので idempotent。
+DIR="$(canon_dir "$DIR")"; [ -n "$DIR" ] || die "作業ディレクトリを解決できない"
 
 # --- bridge ペイン検出（title 優先 → シェル/pythonペインへフォールバック）---
 SELF="${TMUX_PANE:-}"

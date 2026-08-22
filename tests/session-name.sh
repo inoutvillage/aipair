@@ -121,6 +121,7 @@ if command -v script >/dev/null; then
   # @aipair-codex-pane must be recorded (peer resolves the pair's Codex by this pane's process)
   CODEX_PANE="$(tmux list-panes -s -t "=$NA" -F '#{pane_id} #{pane_title}' | awk '$2=="codex"{print $1}')"
   chk "$(tmux show -t "$NA" -v @aipair-codex-pane)" "$CODEX_PANE" "@aipair-codex-pane points at the codex pane (real tmux set)"
+  n=$((n+1)); if tmux show -t "$NA" -v @aipair-codex-since 2>/dev/null | grep -qE '^[0-9]+([.][0-9]+)?$'; then echo "ok   @aipair-codex-since recorded (launch epoch, for the relay fallback)"; else echo "FAIL @aipair-codex-since not recorded"; fail=1; fi
   tmux new-session -d -s aipair-api -c "$W/a/api"      # legacy for the SAME dir, coexisting
   chk "$(aipair name "$W/a/api")" "$NA" "new-format wins over legacy of the same dir"
   chk "$(aipair stop "$W/a/api")" "aipair: stopped $NA" "stop kills the new-format session"

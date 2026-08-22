@@ -428,10 +428,17 @@ def _codex_pane_pid(pane=None):
 
 
 def codex_identity_capable(pane=None):
-    """True when /proc pane-identity can be attempted here (Linux + a resolvable Codex pane).
-    Lets a caller tell 'no rollout matched right now' (a restart in flight — keep the current
-    pin) apart from 'this environment cannot do identity' (only then use the mtime heuristic)."""
-    return os.path.isdir("/proc") and _codex_pane_pid(pane) is not None
+    """True when /proc pane-identity is the mechanism here. For an EXPLICIT pane (the relay passes
+    its resolved codex pane) this is a STABLE property — Linux with a pane to inspect — and must
+    NOT be downgraded by a momentary tmux hiccup while resolving the pid, which would flip the
+    relay to the mtime heuristic mid-run (2026-08-22 review). For pane=None (peer) the pane must
+    be discoverable via @aipair-codex-pane. Lets a caller tell 'no rollout matched right now'
+    (a restart in flight — hold) apart from 'this environment can't do identity' (heuristic)."""
+    if not os.path.isdir("/proc"):
+        return False
+    if pane is not None:
+        return True                       # explicit pane → capability is stable, don't re-query tmux
+    return _codex_pane_pid(None) is not None
 
 
 def codex_via_pane(cwd, pane=None):

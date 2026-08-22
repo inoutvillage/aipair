@@ -256,12 +256,18 @@ class ProcIdentity(Base):
         self.assertFalse(any("show-options" in a for a in calls),
                          "must not read @aipair-codex-pane when the pane is explicit")
 
-    def test_codex_identity_capable_reflects_pane_resolution(self):
-        resolves = lambda *a: "3000" if (a[0] == "display-message" and "-t" in a) else None
-        with mock.patch.object(pl, "_tmux", side_effect=resolves):
-            self.assertEqual(pl.codex_identity_capable("%1"), os.path.isdir("/proc"))
+    def test_codex_identity_capable_is_stable_for_an_explicit_pane(self):
+        # the relay passes its resolved pane → capability is Linux-only and must NOT flip to
+        # "not capable" on a momentary tmux hiccup (that would drop the relay to the heuristic).
+        self.assertEqual(pl.codex_identity_capable("%1"), os.path.isdir("/proc"))
         with mock.patch.object(pl, "_tmux", return_value=None):
-            self.assertFalse(pl.codex_identity_capable("%1"))   # pane pid unresolvable → not capable
+            self.assertEqual(pl.codex_identity_capable("%1"), os.path.isdir("/proc"),
+                             "explicit-pane capability must not depend on a live tmux query")
+        with mock.patch("os.path.isdir", return_value=False):
+            self.assertFalse(pl.codex_identity_capable("%1"))   # no /proc → never capable
+        # pane=None (peer): still needs @aipair-codex-pane discoverable via tmux
+        with mock.patch("os.path.isdir", return_value=True), mock.patch.object(pl, "_tmux", return_value=None):
+            self.assertFalse(pl.codex_identity_capable(None))
 
     def test_returns_none_without_tmux_or_the_pane_option(self):
         with mock.patch.dict(os.environ, {}, clear=False):

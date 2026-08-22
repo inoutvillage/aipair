@@ -355,6 +355,35 @@ class RelayLock(Fixture):
         a_new = self.rollout("a-new", self.A, 4)
         self.assertEqual(relay.refresh_codex_lock(self.a_mid, self.A, "%0"), a_new)
 
+    def test_lock_holds_none_when_identity_capable_but_unresolved(self):
+        # identity is the mechanism (capable) but momentarily unresolved → wait, NEVER fall to the
+        # mtime heuristic (which could mis-pin a same-cwd Codex from the very first lock).
+        with mock.patch.object(relay.peerlog, "codex_identity_capable", return_value=True), \
+             mock.patch.object(relay.peerlog, "codex_newest", return_value="MTIME") as cn:
+            self.assertIsNone(relay.lock_codex(self.A, set(), "%0"))
+            self.assertIsNone(relay.refresh_codex_lock(None, self.A, "%0"))
+            cn.assert_not_called()
+
+    def test_fallback_uses_codex_since_when_the_launch_epoch_is_known(self):
+        # non-/proc env (capable False) → relay uses peer's EXACT picker (codex_since on the
+        # launch epoch), not codex_newest — so peer and relay agree on macOS.
+        with mock.patch.object(relay, "_CODEX_SINCE_EPOCH", 1_700_000_000.0), \
+             mock.patch.object(relay.peerlog, "codex_since", return_value="SINCE_PICK") as cs, \
+             mock.patch.object(relay.peerlog, "codex_newest", return_value="NEWEST"), \
+             mock.patch.object(relay.peerlog, "codex_follow", return_value="FOLLOW"):
+            self.assertEqual(relay.lock_codex(self.A, set(), "%0"), "SINCE_PICK")
+            self.assertEqual(relay.refresh_codex_lock(self.a_old, self.A, "%0"), "SINCE_PICK")
+            cs.assert_called()
+
+    def test_read_codex_since_parses_the_session_option(self):
+        with mock.patch.object(relay.tmuxlib, "tmux") as t:
+            t.return_value.stdout = "1700000000.5\n"
+            relay.read_codex_since("aipair-x")
+            self.assertEqual(relay._CODEX_SINCE_EPOCH, 1700000000.5)
+            t.return_value.stdout = "\n"           # unset → None
+            relay.read_codex_since("aipair-x")
+            self.assertIsNone(relay._CODEX_SINCE_EPOCH)
+
     def test_relay_prefers_codex_via_pane_over_the_mtime_heuristic(self):
         # when peer-log's /proc identity resolves the pair's Codex, the relay adopts / locks /
         # follows THAT — one source of truth with `peer`, not the newest-for-cwd guess.
