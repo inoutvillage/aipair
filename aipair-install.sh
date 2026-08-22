@@ -55,6 +55,13 @@ skip() { N_SKIP=$((N_SKIP+1)); printf '[skip] %s\n' "$*"; }
 warn() { N_WARN=$((N_WARN+1)); printf '[warn] %s\n' "$*"; }
 fail() { N_FAIL=$((N_FAIL+1)); printf '[fail] %s\n' "$*" >&2; }
 note() { printf '       %s\n' "$*"; }
+# Boolean env value, normalised exactly like bin/aipair's env_on: trim + lowercase, then
+# empty/0/false/no/off = false. (tr, not ${v,,}: macOS ships bash 3.2 with no case expansion.)
+truthy() {
+  local v; v="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+  case "$v" in ''|0|false|no|off) return 1 ;; *) return 0 ;; esac
+}
 usage() {
   # print the leading comment block from 'aipair-install.sh —' down to the blank
   # comment line that closes the Exit-codes section (so 0/1/2/3 all show); strip '# '.
@@ -74,7 +81,7 @@ usage() {
 MODE=install; INSTALL_TMUX=0; VSCODE_DIR=""
 # Opt out of writing the aipair notice blocks into the GLOBAL AI instructions
 # (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md) — those are read by every session, aipair or not.
-case "${AIPAIR_NO_GLOBAL_INSTRUCTIONS:-}" in ''|0|false|no|off) NO_GLOBAL=0 ;; *) NO_GLOBAL=1 ;; esac
+NO_GLOBAL=0; truthy "${AIPAIR_NO_GLOBAL_INSTRUCTIONS:-}" && NO_GLOBAL=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --check)         MODE=check; shift ;;
