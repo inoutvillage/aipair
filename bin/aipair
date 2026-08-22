@@ -256,11 +256,21 @@ else
   bridge=(peer-log both --watch --last 15)
   BRIDGE_TITLE='bridge  (claude × codex — peer-log both --watch)'
 fi
+# Pin the transcript `peer` reads to THIS pair, so it can never drift to another
+# Claude/Codex that merely shares the cwd (peer-log otherwise takes the newest session
+# for the dir — see its AIPAIR_CLAUDE_SESSION / AIPAIR_CODEX_SINCE handling). Claude gets
+# a fixed session id (its log is <id>.jsonl); Codex has no such flag, so we stamp the
+# launch epoch and pin to the rollout it opens at/after it. Both are honoured from the
+# environment when already set (aipair generates them otherwise), which also makes the
+# launch lines deterministic for tests.
+PAIR_SID="${AIPAIR_CLAUDE_SESSION:-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')}"
+PAIR_SINCE="${AIPAIR_CODEX_SINCE:-$(date +%s)}"
+PAIR_PINS="AIPAIR_CLAUDE_SESSION=$PAIR_SID AIPAIR_CODEX_SINCE=$PAIR_SINCE"
 # AI_SELF / AI_PEER let each agent's `peer` command target the other. They are
 # passed with `env` rather than `export …;` because that is the one spelling
 # sh, bash, zsh and fish all accept (fish has no `export`).
-CLAUDE_LINE="clear; env AI_SELF=claude AI_PEER=codex claude $CLAUDE_FLAGS"
-CODEX_LINE="clear; env AI_SELF=codex AI_PEER=claude codex $CODEX_FLAGS"
+CLAUDE_LINE="clear; env AI_SELF=claude AI_PEER=codex $PAIR_PINS claude --session-id $PAIR_SID $CLAUDE_FLAGS"
+CODEX_LINE="clear; env AI_SELF=codex AI_PEER=claude $PAIR_PINS codex $CODEX_FLAGS"
 # Every AIPAIR_* the relay reads is pinned to THIS process's value (empty where unset) on
 # the relay's own command. A pre-existing tmux server may hold a stale value from an
 # earlier run; without pinning, `AIPAIR_GATE= aipair loop` could still run yesterday's
@@ -274,7 +284,7 @@ if [ "$cmd" = loop ]; then
   for v in "${RELAY_ENV_VARS[@]}"; do bridge_env+=("$v=${!v-}"); done
   BRIDGE_LINE="clear; env $(cmdline "${bridge_env[@]}") $(cmdline "${bridge[@]}")"
 else
-  BRIDGE_LINE="clear; env AI_SELF=bridge $(cmdline "${bridge[@]}")"   # peer-log reads no AIPAIR_*
+  BRIDGE_LINE="clear; env AI_SELF=bridge $PAIR_PINS $(cmdline "${bridge[@]}")"   # pins let peer-log both --watch track THIS pair
 fi
 
 # AIPAIR_DRY_RUN=1: print the lines and stop — nothing is started (tests/launch-cmds.sh).
