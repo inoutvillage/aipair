@@ -92,7 +92,7 @@ git clone https://github.com/inoutvillage/aipair && cd aipair
 2. `tmux` の有無と版（≥ 3.1）。無ければ導入コマンドを表示して **exit 3**（`--install-tmux` 時のみ導入）
 3. `python3`（≥ 3.8）/ `claude` / `codex` の有無。欠けていれば導入手順を案内して **exit 3**
 4. ロケールが UTF-8 でなければ `[warn]`
-5. 6 本を **`~/.local/bin` にコピー**（差分があるときだけ上書き。上書き前に `*.bak-<timestamp>` を残す）＋ `chmod +x`。
+5. `bin/` の CLI 一式（`aipair` / `peer` / `aipair-relay` とヘルパーの `aipair-*lib`）を **`~/.local/bin` にコピー**（差分があるときだけ上書き。上書き前に `*.bak-<timestamp>` を残す）＋ `chmod +x`。
    配置後に `aipair-relay --help` 等が動くことを確認（同一ディレクトリ依存の検証）
 6. スキル 2 つを `~/.claude/skills/aipair-setup/` `~/.claude/skills/aipair-relay/` にコピー（同じ退避ルール）
 7. `~/.local/bin` が PATH に無ければ、追記すべき 1 行を表示して `[warn]`（rc ファイルは**書き換えない**）
@@ -143,8 +143,8 @@ Windows の VS Code（Remote-WSL でない、Windows フォルダとして開く
 | パス | 役割 |
 |---|---|
 | `~/.local/bin/aipair` | tmux 3 ペイン起動ランチャ（サブコマンドあり） |
-| `~/.local/bin/peer-log` | 指定 cwd の最新 Claude/Codex セッションを抽出・整形・ライブ追従 |
-| `~/.local/bin/peer` | `$AI_PEER` を見て *相手* のログを表示する短縮版 |
+| `~/.local/bin/peer-log` | 指定 cwd の Claude/Codex セッションを抽出・整形・ライブ追従（既定は最新。aipair 起動時は環境の pin でそのペアのセッションに固定） |
+| `~/.local/bin/peer` | `$AI_PEER` を見て *相手* のログを表示する短縮版（aipair 起動時は起動したペアの相手セッションに固定＝同じ cwd に別セッションがいても混線しない） |
 | `~/.local/bin/aipair-relay` | 自走ループの Watcher（ターン完了を検知 → 相手ペインへ自動ポーク） |
 | `~/.local/bin/aipair-relay-here` | 走行中のペアに relay を 1 本だけ点火する（どのペインからでも） |
 | `~/.claude/skills/aipair-setup/` | 対話型セットアップ（Claude Code スキル） |
@@ -210,6 +210,11 @@ peer-log codex --full      # セッション全体
 
 `peer-log` の主なオプション: `--dir DIR`（既定 cwd）・`--last N`・`--full`・`--tools`・`--watch`・`--no-color`。
 
+> **ペア相手への固定**: `aipair` は起動時に相手セッションを pin する（Claude は固定の `--session-id`、Codex は起動 epoch）。
+> これにより `peer` は**同じ作業ディレクトリで別の Claude/Codex が動いていても**、起動したペアの相手だけを読む。
+> pin は環境変数 `AIPAIR_CLAUDE_SESSION` / `AIPAIR_CODEX_SINCE` で運ばれる（通常は自動。下の表参照）。
+> aipair 外で素の `peer-log` を使う場合は pin が無いので従来どおり「その cwd の最新セッション」を読む。
+
 ---
 
 ## 自走ループ（相互レビュー）
@@ -242,6 +247,8 @@ peer-log codex --full      # セッション全体
 | `AIPAIR_GATE` | （未設定＝無し） | **停止ゲート**: 停止ワード検出後に実行するシェルコマンド（例 `npm test`）。成功した時だけ停止／次タスクへ。失敗は出力を添えて Claude に差し戻す（→ 下の「停止ゲート」） |
 | `AIPAIR_GATE_TIMEOUT` / `AIPAIR_GATE_ROUNDS` | `600` / `3` | ゲートのタイムアウト秒／差し戻しの上限回数（到達で relay は exit 6） |
 | `AIPAIR_ALLOW_UNTESTED_DIALOGS` | （未設定＝off） | `1` で、claude/codex が検証済み版と違っても**プラン承認・質問リレーの自動操作を続ける**（既定は不一致なら自動 OFF。→「版ゲート」） |
+| `AIPAIR_CLAUDE_SESSION` | （自動＝新規 uuid） | `peer` を起動ペアの Claude に固定する内部 pin。この id で `claude --session-id` を起動し、ログ `<id>.jsonl` を一意に指す。明示指定で上書き可（通常は不要） |
+| `AIPAIR_CODEX_SINCE` | （自動＝起動時の epoch 秒） | `peer` を起動ペアの Codex に固定する内部 pin。Codex には session-id 指定が無いため、この epoch 以降に開かれた最古の rollout を「そのペアの Codex」とみなす。明示指定で上書き可（通常は不要） |
 | `AIPAIR_NO_VERSION_GATE` | （未設定＝off） | `1` で起動時の版チェック自体をしない |
 
 `AIPAIR_*_FLAGS` 以外の値は**そのまま 1 引数**として relay に渡る（`'`・空白・`$`・`;` を含んでも壊れない。launcher がシングルクォートで包む）。

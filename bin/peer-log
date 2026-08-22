@@ -5,9 +5,11 @@ Both agents write JSONL session logs keyed (directly or via metadata) to a cwd:
   - Claude Code: ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl
   - Codex CLI:   ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl  (cwd in session_meta)
 
-This tool finds the newest session for a directory, extracts the human-readable
-turns, and prints them.  With `both` it merges Claude + Codex by timestamp, and
-with `--watch` it follows the live conversation — used by the `aipair` bridge pane.
+This tool finds a directory's session — the newest by default, or the pair's own when
+aipair pins it (AIPAIR_CLAUDE_SESSION = Claude's --session-id, AIPAIR_CODEX_SINCE = the
+launch epoch), so `peer` never drifts to another agent that merely shares the cwd —
+extracts the human-readable turns, and prints them. With `both` it merges Claude + Codex
+by timestamp, and with `--watch` it follows the live conversation (the `aipair` bridge pane).
 
 Usage:
   peer-log <claude|codex|both> [--dir DIR] [--last N] [--full] [--tools]
@@ -44,10 +46,18 @@ def _norm(p):
 
 
 def claude_file(cwd):
-    """Newest Claude .jsonl for cwd.
-    Claude Code のプロジェクトdir名は非英数字をすべて '-' に置換する
-    （日本語・'_' を含むパスで空振りしてセッションを発見できないバグの修正。
-     aipair-relay.claude_glob() と同一ロジックに統一）。"""
+    """The Claude .jsonl to read for cwd.
+    With AIPAIR_CLAUDE_SESSION set (aipair pins the pair's session id, which IS the log's
+    basename), resolve that one file wherever it lives — so `peer` reads THIS pair's Claude
+    even when a newer, unrelated Claude runs in the same directory. The id is globally
+    unique, so a single glob finds it regardless of any `cd` the peer's shell has done.
+    Otherwise: newest .jsonl in cwd's project dir. Claude Code のプロジェクトdir名は
+    非英数字をすべて '-' に置換する（日本語・'_' を含むパスで空振りするバグの修正。
+    aipair-relay.claude_glob() と同一ロジックに統一）。"""
+    pin = os.environ.get("AIPAIR_CLAUDE_SESSION")
+    if pin and re.fullmatch(r"[A-Za-z0-9-]+", pin):
+        hits = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", pin + ".jsonl"))
+        return hits[0] if hits else None   # pinned: never fall back to a different session
     enc = re.sub(r"[^A-Za-z0-9]", "-", cwd)
     d = os.path.join(CLAUDE_PROJECTS, enc)
     if not os.path.isdir(d):
@@ -67,6 +77,7 @@ def claude_file(cwd):
 # usable rotation signal (see codex_follow).
 CODEX_SCAN_LIMIT = 500            # first lines read per call (bounds a cold start)
 _CODEX_CWD_CACHE = {}             # path -> normalized cwd, "" when the file has no usable meta
+_CODEX_START_CACHE = {}           # path -> session start epoch (from the meta timestamp), for --since pinning
 
 
 def codex_all():
@@ -95,6 +106,39 @@ def codex_cwd(path):
     _CODEX_CWD_CACHE[path] = v
     return v
 
+
+
+def _iso_epoch(ts):
+    """An ISO-8601 timestamp (e.g. '2026-08-21T14:39:57.960Z') as a Unix epoch, or None."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts).strip().replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def codex_start(path):
+    """Session start epoch of a rollout (its session_meta timestamp), cached per path.
+    None while the first line is still being written / unparseable — never guessed."""
+    v = _CODEX_START_CACHE.get(path)
+    if v is not None:
+        return v
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            first = fh.readline()
+    except OSError:
+        return None
+    if not first.endswith("\n"):
+        return None
+    try:
+        meta = json.loads(first)
+        v = _iso_epoch(meta.get("timestamp") or (meta.get("payload") or {}).get("timestamp"))
+    except (ValueError, AttributeError):
+        v = None
+    if v is not None:
+        _CODEX_START_CACHE[path] = v
+    return v
 
 class CodexIndex:
     """Incremental inventory of the rollout archive.
@@ -232,6 +276,12 @@ class CodexIndex:
                 self.by_cwd.setdefault(cw, set()).add(f)
         self.unresolved = keep
 
+    def candidates(self, cwd, limit=CODEX_SCAN_LIMIT):
+        """Every known rollout whose session_meta.cwd matches cwd (after a poll+resolve)."""
+        self.poll()
+        self._resolve(limit)
+        return list(self.by_cwd.get(_norm(cwd), ()))
+
     def newest(self, cwd, newer_than=0.0, limit=CODEX_SCAN_LIMIT, exclude=()):
         want = _norm(cwd)
         self.poll()
@@ -263,6 +313,21 @@ class CodexIndex:
 
 
 CODEX_INDEX = CodexIndex()
+
+
+def codex_since(cwd, since, limit=CODEX_SCAN_LIMIT):
+    """The pair's own rollout: the EARLIEST rollout for cwd whose session started at/after
+    `since` (the pair-launch epoch aipair stamps as AIPAIR_CODEX_SINCE). Unlike codex_newest
+    it never drifts to a later, unrelated Codex that happens to share the cwd, and it stays
+    on the same append-only file for the pair's life. None until that rollout exists."""
+    best, best_start = None, None
+    for fpath in CODEX_INDEX.candidates(cwd, limit):
+        st = codex_start(fpath)
+        if st is None or st < since:
+            continue
+        if best_start is None or st < best_start:
+            best, best_start = fpath, st
+    return best
 
 
 def codex_newest(cwd, newer_than=0.0, limit=CODEX_SCAN_LIMIT, exclude=()):
@@ -402,10 +467,23 @@ def parse_codex(path, show_tools):
     return out
 
 
+def _codex_pick(cwd, current):
+    """Codex rollout to read: pinned to the pair's own session when aipair stamped
+    AIPAIR_CODEX_SINCE (never drifts to an unrelated Codex sharing the cwd), else the newest
+    for cwd followed across a restart (codex_follow)."""
+    since = os.environ.get("AIPAIR_CODEX_SINCE")
+    if since:
+        try:
+            return codex_since(cwd, float(since))
+        except ValueError:
+            pass                                  # garbage in the env: fall back to normal following
+    return codex_follow(cwd, current)
+
+
 def load(agent, cwd, show_tools, current=None):
-    """Locate the transcript (codex: following on from `current`, see codex_follow) and parse it."""
+    """Locate the transcript (codex: pinned or following on from `current`) and parse it."""
     try:
-        f = claude_file(cwd) if agent == "claude" else codex_follow(cwd, current)
+        f = claude_file(cwd) if agent == "claude" else _codex_pick(cwd, current)
         if not f:
             return None, []
         msgs = parse_claude(f, show_tools) if agent == "claude" else parse_codex(f, show_tools)
