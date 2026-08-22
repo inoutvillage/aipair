@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """aipair-corelib — pure helpers extracted from aipair-relay (D3 relay 分割・案A 増分1).
 
 tmux / ログ / 画面キャプチャに一切依存しない自己完結関数群（停止ワード判定・版ゲート・

@@ -1,0 +1,720 @@
+"""peer-log — read the latest Claude Code / Codex CLI transcript for a directory.
+
+Both agents write JSONL session logs keyed (directly or via metadata) to a cwd:
+  - Claude Code: ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl
+  - Codex CLI:   ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl  (cwd in session_meta)
+
+This tool finds a directory's session — the newest by default, or the pair's own when
+aipair pins it (AIPAIR_CLAUDE_SESSION = Claude's --session-id, AIPAIR_CODEX_SINCE = the
+launch epoch), so `peer` never drifts to another agent that merely shares the cwd —
+extracts the human-readable turns, and prints them. With `both` it merges Claude + Codex
+by timestamp, and with `--watch` it follows the live conversation (the `aipair` bridge pane).
+
+Usage:
+  peer-log <claude|codex|both> [--dir DIR] [--last N] [--full] [--tools]
+                               [--watch] [--no-color]
+"""
+import argparse
+import glob
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
+CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
+# Pin validation — identical in spirit to the launcher (bin/aipair): a caller-supplied
+# pin is trusted only when it is a canonical UUID / a finite non-negative number.
+# Anything else fails CLOSED (read nothing) rather than reviving cross-session mixing.
+_UUID_RE = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\Z")
+_NUM_RE = re.compile(r"[0-9]+(\.[0-9]+)?\Z")   # no sign, no exponent, no nan/inf
+
+# ANSI colors (agent tag + dim role); disabled when not a tty or --no-color.
+TAG = {"claude": "\033[1;36m", "codex": "\033[1;32m", "bridge": "\033[1;35m"}
+DIM, RESET = "\033[2m", "\033[0m"
+USE_COLOR = True
+
+
+def c(code, s):
+    return f"{code}{s}{RESET}" if USE_COLOR else s
+
+
+# --------------------------------------------------------------------------- #
+# Locating the newest session file for a directory
+# --------------------------------------------------------------------------- #
+def _norm(p):
+    return os.path.normcase(os.path.realpath(os.path.expanduser(p))).rstrip("/")
+
+
+def claude_file(cwd):
+    """The Claude .jsonl to read for cwd.
+    With AIPAIR_CLAUDE_SESSION set (aipair pins the pair's session id, which IS the log's
+    basename), resolve that one file wherever it lives — so `peer` reads THIS pair's Claude
+    even when a newer, unrelated Claude runs in the same directory. The id is globally
+    unique, so a single glob finds it regardless of any `cd` the peer's shell has done.
+    Otherwise: newest .jsonl in cwd's project dir. Claude Code のプロジェクトdir名は
+    非英数字をすべて '-' に置換する（日本語・'_' を含むパスで空振りするバグの修正。
+    aipair-relay.claude_glob() と同一ロジックに統一）。"""
+    pin = os.environ.get("AIPAIR_CLAUDE_SESSION")
+    if pin:                                     # a pin is set (aipair always sets a uuid)
+        if _UUID_RE.match(pin):                 # strict UUID only (also blocks path/glob metachars)
+            hits = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", pin + ".jsonl"))
+            return hits[0] if hits else None   # pinned: never fall back to a different session
+        return None                            # malformed pin → fail CLOSED (no mixing), not the newest
+    enc = re.sub(r"[^A-Za-z0-9]", "-", cwd)
+    d = os.path.join(CLAUDE_PROJECTS, enc)
+    if not os.path.isdir(d):
+        # 後方互換フォールバック（旧エンコード規則で作られた既存dir）。
+        alt = "".join("-" if ch in "/." else ch for ch in cwd)
+        d = os.path.join(CLAUDE_PROJECTS, alt)
+        if not os.path.isdir(d):
+            return None
+    files = glob.glob(os.path.join(d, "*.jsonl"))
+    return max(files, key=os.path.getmtime) if files else None
+
+
+# Codex rollouts: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl, one per session, the
+# cwd in the first line (session_meta). That first line is written once and never
+# changes, so it is cached per path for the life of the process. Rollouts are
+# appended to, never removed, which is why "the tracked file disappeared" is not a
+# usable rotation signal (see codex_follow).
+CODEX_SCAN_LIMIT = 500            # first lines read per call (bounds a cold start)
+_CODEX_CWD_CACHE = {}             # path -> normalized cwd, "" when the file has no usable meta
+_CODEX_START_CACHE = {}           # path -> session start epoch (from the meta timestamp), for --since pinning
+
+
+def codex_all():
+    """Every rollout path (a full walk — used once, to snapshot what existed at start)."""
+    return glob.glob(os.path.join(CODEX_SESSIONS, "*", "*", "*", "rollout-*.jsonl"))
+
+
+def codex_cwd(path):
+    """Normalized session_meta.cwd of a rollout ("" if none), cached per path."""
+    v = _CODEX_CWD_CACHE.get(path)
+    if v is not None:
+        return v
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            first = fh.readline()
+    except OSError:
+        return ""                                   # transient (vanished / unreadable): retry later
+    if not first.endswith("\n"):
+        return ""                                   # still being written: do not cache
+    try:
+        meta = json.loads(first)
+        cw = (meta.get("payload") or {}).get("cwd") or meta.get("cwd")
+        v = _norm(cw) if cw else ""
+    except (ValueError, AttributeError):
+        v = ""                                      # malformed first line never changes
+    _CODEX_CWD_CACHE[path] = v
+    return v
+
+
+
+def _iso_epoch(ts):
+    """An ISO-8601 timestamp (e.g. '2026-08-21T14:39:57.960Z') as a Unix epoch, or None."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts).strip().replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def codex_start(path):
+    """Session start epoch of a rollout (its session_meta timestamp), cached per path.
+    None while the first line is still being written / unparseable — never guessed."""
+    v = _CODEX_START_CACHE.get(path)
+    if v is not None:
+        return v
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            first = fh.readline()
+    except OSError:
+        return None
+    if not first.endswith("\n"):
+        return None
+    try:
+        meta = json.loads(first)
+        v = _iso_epoch(meta.get("timestamp") or (meta.get("payload") or {}).get("timestamp"))
+    except (ValueError, AttributeError):
+        v = None
+    if v is not None:
+        _CODEX_START_CACHE[path] = v
+    return v
+
+class CodexIndex:
+    """Incremental inventory of the rollout archive.
+
+    The first call walks everything (glob + one stat per rollout); that full walk is
+    repeated only every FULL_RESCAN_SECS, as a safety net. In between, a poll stats
+    only the directories where a NEW rollout can appear — the sessions root, the
+    newest year and month directory and the newest DAY_DIRS_WATCHED day directories
+    (creating a file bumps its directory's mtime; appending to a file does not, and
+    need not: a rollout's cwd never changes) — and lists a directory only when its
+    mtime moved. Which of a cwd's rollouts is newest is decided by stat'ing only the
+    FILES_WATCHED most recent of that cwd's files (older ones keep the mtime from the
+    last full walk, so a resumed old session is noticed at the next full walk). The
+    steady-state cost of a poll is therefore a bounded handful of stats, independent
+    of how many sessions the archive — or the project — holds (--watch and the relay
+    poll every ~1 s)."""
+    FULL_RESCAN_SECS = 60
+    DAY_DIRS_WATCHED = 2
+    FILES_WATCHED = 20
+    RECENT_SECS = 2.0     # re-list a dir modified this recently even if its mtime reads the same (coarse-mtime filesystems)
+
+    def __init__(self):
+        self.root = None
+        self.files = {}          # path -> mtime when indexed
+        self.unresolved = []     # paths whose cwd has not been read yet
+        self.by_cwd = {}         # normalized cwd -> set(paths)
+        self.dirs = {}           # watched directory -> mtime
+        self.day_dirs = []
+        self.last_full = None
+        self.counts = {"full_scans": 0, "dir_lists": 0}
+
+    # -- discovery ------------------------------------------------------------------
+    def _add(self, f):
+        if f in self.files:
+            return
+        try:
+            self.files[f] = os.path.getmtime(f)
+        except OSError:
+            return
+        self.unresolved.append(f)
+
+    def _forget(self, f):
+        """Drop a rollout that no longer exists from every table."""
+        self.files.pop(f, None)
+        cw = _CODEX_CWD_CACHE.get(f)
+        if cw:
+            self.by_cwd.get(cw, set()).discard(f)
+        if f in self.unresolved:
+            self.unresolved.remove(f)
+
+    def full_scan(self):
+        self.root = CODEX_SESSIONS
+        self.files, self.unresolved, self.by_cwd = {}, [], {}      # also forgets vanished files
+        for f in glob.glob(os.path.join(self.root, "*", "*", "*", "rollout-*.jsonl")):
+            self._add(f)
+        self._watch()
+        self.last_full = time.monotonic()
+        self.counts["full_scans"] += 1
+
+    @staticmethod
+    def _subdirs(d):
+        try:
+            return sorted(os.path.join(d, n) for n in os.listdir(d) if os.path.isdir(os.path.join(d, n)))
+        except OSError:
+            return []
+
+    def _watch(self):
+        """(Re)select the directories to keep an eye on, record their mtimes, list the day dirs."""
+        chain = [self.root]
+        for _ in range(2):                                   # newest year, newest month
+            sub = self._subdirs(chain[-1])
+            if not sub:
+                break
+            chain.append(sub[-1])
+        self.day_dirs = self._subdirs(chain[-1])[-self.DAY_DIRS_WATCHED:] if len(chain) == 3 else []
+        self.dirs = {}
+        for d in chain + self.day_dirs:
+            try:
+                self.dirs[d] = os.path.getmtime(d)
+            except OSError:
+                self.dirs[d] = None      # absent (sessions root not created yet / removed): keep watching for it
+        for d in self.day_dirs:
+            self.counts["dir_lists"] += 1
+            try:
+                names = os.listdir(d)
+            except OSError:
+                continue
+            present = set()
+            for n in names:
+                if n.startswith("rollout-") and n.endswith(".jsonl"):
+                    f = os.path.join(d, n)
+                    present.add(f)
+                    self._add(f)
+            for f in [f for f in self.files if os.path.dirname(f) == d and f not in present]:
+                self._forget(f)                              # deleted since the last listing
+
+    def poll(self):
+        now = time.monotonic()
+        if (self.last_full is None or self.root != CODEX_SESSIONS
+                or now - self.last_full > self.FULL_RESCAN_SECS):
+            self.full_scan()
+            return
+        wall = time.time()
+        for d, mt in self.dirs.items():
+            try:
+                cur = os.path.getmtime(d)
+            except OSError:
+                cur = None
+            if cur is None and mt is not None:
+                self.full_scan()                             # a watched dir vanished: all below it is stale → rebuild
+                return
+            # moved, appeared (None -> mtime), or touched just now
+            if cur != mt or (cur is not None and wall - cur < self.RECENT_SECS):
+                self._watch()                                # re-select the watched dirs and re-list
+                return
+
+    # -- queries --------------------------------------------------------------------
+    def _resolve(self, limit):
+        """Classify not-yet-read rollouts by cwd, newest first, reading at most `limit`
+        first lines (cache hits are free and do not count)."""
+        if not self.unresolved:
+            return
+        self.unresolved.sort(key=lambda f: self.files.get(f, 0.0), reverse=True)
+        keep, reads = [], 0
+        for i, f in enumerate(self.unresolved):
+            if f not in _CODEX_CWD_CACHE:
+                if reads >= limit:
+                    keep.extend(self.unresolved[i:])
+                    break
+                reads += 1
+            cw = codex_cwd(f)
+            if f not in _CODEX_CWD_CACHE:                    # half-written meta: try again next time
+                keep.append(f)
+            elif cw:
+                self.by_cwd.setdefault(cw, set()).add(f)
+        self.unresolved = keep
+
+    def candidates(self, cwd, limit=CODEX_SCAN_LIMIT):
+        """Every known rollout whose session_meta.cwd matches cwd (after a poll+resolve)."""
+        self.poll()
+        self._resolve(limit)
+        return list(self.by_cwd.get(_norm(cwd), ()))
+
+    def newest(self, cwd, newer_than=0.0, limit=CODEX_SCAN_LIMIT, exclude=()):
+        want = _norm(cwd)
+        self.poll()
+        self._resolve(limit)
+        ours = sorted(self.by_cwd.get(want, ()), key=lambda f: self.files.get(f, 0.0), reverse=True)
+        while True:
+            best, best_m, verified = None, newer_than, False
+            for i, f in enumerate(ours):
+                if f in exclude:
+                    continue
+                fresh = i < self.FILES_WATCHED               # fresh mtime for the recent ones only
+                if fresh:
+                    try:
+                        self.files[f] = os.path.getmtime(f)
+                    except OSError:
+                        self._forget(f)                      # vanished since indexing
+                        continue
+                m = self.files.get(f, 0.0)
+                if m > best_m:
+                    best, best_m, verified = f, m, fresh
+            if best is None or verified:
+                return best
+            try:                                             # a tail candidate: never hand out a stale path
+                self.files[best] = os.path.getmtime(best)
+                return best
+            except OSError:
+                self._forget(best)
+                ours.remove(best)
+
+
+CODEX_INDEX = CodexIndex()
+
+
+def _tmux(*args):
+    """Run a tmux query, returning its trimmed stdout or None (never raises)."""
+    try:
+        r = subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (r.stdout.strip() or None) if r.returncode == 0 else None
+
+
+def _ppid_from_stat(data):
+    """PPID out of the contents of /proc/<pid>/stat (comm may contain spaces and ')')."""
+    rp = data.rfind(")")
+    if rp < 0:
+        return None
+    try:
+        return int(data[rp + 2:].split()[1])   # after ')': state, ppid, ...
+    except (ValueError, IndexError):
+        return None
+
+
+def _descendants(root):
+    """Pids under `root`, breadth-first (shallowest first). Empty where /proc is absent (macOS).
+    Order matters: the pair's OWN codex sits directly under the pane shell, while a nested
+    codex-in-codex is strictly deeper — walking shallowest-first lets the caller take the pair's
+    own rollout and never a nested subprocess's (even when the nested one is newer)."""
+    children = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return []
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/" + name + "/stat", "r", encoding="utf-8", errors="replace") as fh:
+                ppid = _ppid_from_stat(fh.read())
+        except OSError:
+            continue
+        if ppid is not None:
+            children.setdefault(ppid, []).append(int(name))
+    order, seen, queue = [], set(), [root]
+    while queue:
+        nxt = []
+        for p in queue:
+            for c in sorted(children.get(p, ())):
+                if c not in seen:
+                    seen.add(c)
+                    order.append(c)
+                    nxt.append(c)
+        queue = nxt
+    return order
+
+
+def _valid_rollout(path):
+    """A genuine Codex rollout under CODEX_SESSIONS — not merely any open file whose name
+    happens to contain 'rollout-'. Canonicalises before the prefix check so a symlink or
+    '..' cannot smuggle an outside path in."""
+    base = os.path.basename(path)
+    if not (base.startswith("rollout-") and base.endswith(".jsonl")):
+        return False
+    root = os.path.realpath(CODEX_SESSIONS)
+    try:
+        rp = os.path.realpath(path)
+    except OSError:
+        return False
+    return rp.startswith(root + os.sep)
+
+
+def _open_rollouts(pid):
+    """Genuine Codex rollouts (under CODEX_SESSIONS) the process `pid` holds open."""
+    out = []
+    try:
+        entries = os.listdir("/proc/%d/fd" % pid)
+    except OSError:
+        return out
+    for name in entries:
+        try:
+            tgt = os.readlink("/proc/%d/fd/%s" % (pid, name))
+        except OSError:
+            continue
+        if _valid_rollout(tgt):
+            out.append(tgt)
+    return out
+
+
+def _codex_pane_pid(pane=None):
+    """The pane_pid of the pair's Codex pane. When `pane` is given (the relay already resolved
+    its own codex pane), use it directly — never re-derive the session from the CURRENT pane,
+    which would read a DIFFERENT session's @aipair-codex-pane when `--session` targets another
+    pair. When `pane` is None (peer), resolve it from THIS pane's session + @aipair-codex-pane."""
+    if pane is None:
+        if not os.environ.get("TMUX"):
+            return None
+        sess = _tmux("display-message", "-p", "#{session_name}")
+        if not sess:
+            return None
+        pane = _tmux("show-options", "-t", sess, "-qv", "@aipair-codex-pane")
+        if not pane:
+            return None
+    ppid = _tmux("display-message", "-p", "-t", pane, "#{pane_pid}")
+    return int(ppid) if (ppid and ppid.isdigit()) else None
+
+
+def codex_identity_capable(pane=None):
+    """True when /proc pane-identity is the mechanism here. For an EXPLICIT pane (the relay passes
+    its resolved codex pane) this is a STABLE property — Linux with a pane to inspect — and must
+    NOT be downgraded by a momentary tmux hiccup while resolving the pid, which would flip the
+    relay to the mtime heuristic mid-run (2026-08-22 review). For pane=None (peer) the pane must
+    be discoverable via @aipair-codex-pane. Lets a caller tell 'no rollout matched right now'
+    (a restart in flight — hold) apart from 'this environment can't do identity' (heuristic)."""
+    if not os.path.isdir("/proc"):
+        return False
+    if pane is not None:
+        return True                       # explicit pane → capability is stable, don't re-query tmux
+    return _codex_pane_pid(None) is not None
+
+
+def codex_via_pane(cwd, pane=None):
+    """Exact, race-free identity: the rollout FILE the pair's Codex process has open right now.
+    `pane` pins WHICH Codex pane to inspect (the relay passes its own resolved codex pane so it
+    never re-derives the session from TMUX_PANE); default resolves it from the current pane's
+    @aipair-codex-pane (what `peer` does). Linux+tmux only — None elsewhere / on any hiccup."""
+    ppid = _codex_pane_pid(pane)
+    if ppid is None:
+        return None
+    want = _norm(cwd)
+    # BFS order → the shallowest process holding a cwd-matching rollout is the pair's OWN codex;
+    # a nested codex-in-codex sits deeper, so its (possibly newer) rollout never wins.
+    for pid in _descendants(ppid):
+        for roll in _open_rollouts(pid):
+            if codex_cwd(roll) == want:
+                return roll
+    return None
+
+
+def codex_since(cwd, since, limit=CODEX_SCAN_LIMIT):
+    """The pair's own rollout: the EARLIEST rollout for cwd whose session started at/after
+    `since` (the pair-launch epoch aipair stamps as AIPAIR_CODEX_SINCE). Unlike codex_newest
+    it never drifts to a later, unrelated Codex that happens to share the cwd, and it stays
+    on the same append-only file for the pair's life. None until that rollout exists."""
+    best, best_start = None, None
+    for fpath in CODEX_INDEX.candidates(cwd, limit):
+        st = codex_start(fpath)
+        if st is None or st < since:
+            continue
+        if best_start is None or st < best_start:
+            best, best_start = fpath, st
+    return best
+
+
+def codex_newest(cwd, newer_than=0.0, limit=CODEX_SCAN_LIMIT, exclude=()):
+    """Newest rollout for cwd, or None. Only files modified after `newer_than` count, files
+    in `exclude` are skipped, and at most `limit` first lines are read per call (cold
+    start). Backed by CODEX_INDEX, so repeated calls do not re-walk the archive."""
+    return CODEX_INDEX.newest(cwd, newer_than, limit, exclude)
+
+
+def codex_follow(cwd, current):
+    """The rollout to read now, given the one read last time (--watch and the relay).
+    Stays on `current` until a rollout for cwd that is newer than it appears — a
+    restarted Codex writes a new file. ALL newer candidates are checked, not only the
+    globally newest one: while another directory's Codex is busy its file is always the
+    newest, and a newest-only check never saw our own new session (2026-08-21, two
+    pairs running side by side)."""
+    if current:
+        try:
+            since = os.path.getmtime(current)
+        except OSError:                      # current vanished (archive pruned): start afresh
+            current = None
+    if not current:
+        return codex_newest(cwd)
+    return codex_newest(cwd, newer_than=since) or current
+
+
+def codex_file(cwd):
+    """Newest Codex rollout whose session_meta.cwd matches cwd."""
+    return codex_newest(cwd)
+
+
+# --------------------------------------------------------------------------- #
+# Parsing each format into a common {ts, role, text} stream
+# --------------------------------------------------------------------------- #
+def _fmt_time(ts):
+    if not ts:
+        return "--:--:--"
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return dt.astimezone().strftime("%H:%M:%S")
+    except ValueError:
+        return "--:--:--"
+
+
+def _ts_key(ts):
+    try:
+        return datetime.fromisoformat((ts or "").replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+CLAUDE_META_PREFIXES = (
+    "<local-command", "<command-name", "<command-message", "<command-args",
+    "<system-reminder", "<bridge", "<user-prompt-submit", "caveat:",
+)
+CODEX_META_PREFIXES = (
+    "<environment_context", "<user_instructions", "<permissions",
+    "<warnings", "<exit", "## my request for codex",
+    "# agents.md", "<instructions>",
+)
+
+
+def _is_meta(text, prefixes):
+    t = text.lstrip().lower()
+    return any(t.startswith(p) for p in prefixes)
+
+
+def parse_claude(path, show_tools):
+    """Yield (ts, role, text) from a Claude session file."""
+    out = []
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            typ = d.get("type")
+            if typ not in ("user", "assistant"):
+                continue
+            msg = d.get("message") or {}
+            content = msg.get("content")
+            ts = d.get("timestamp")
+            parts = []
+            if isinstance(content, str):
+                parts.append(content)
+            elif isinstance(content, list):
+                for b in content:
+                    if not isinstance(b, dict):
+                        continue
+                    bt = b.get("type")
+                    if bt == "text":
+                        parts.append(b.get("text", ""))
+                    elif bt == "tool_use" and show_tools:
+                        parts.append(f"· tool:{b.get('name','?')}")
+                    elif bt == "tool_result" and show_tools:
+                        parts.append("· tool_result")
+            text = "\n".join(p for p in parts if p).strip()
+            if not text or _is_meta(text, CLAUDE_META_PREFIXES):
+                continue
+            out.append((ts, typ, text))
+    return out
+
+
+def parse_codex(path, show_tools):
+    """Yield (ts, role, text) from a Codex rollout file."""
+    out = []
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            payload = d.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            ts = d.get("timestamp")
+            ptype = payload.get("type")
+            if d.get("type") == "response_item" and ptype == "message":
+                role = payload.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                content = payload.get("content")
+                parts = []
+                if isinstance(content, str):
+                    parts.append(content)
+                elif isinstance(content, list):
+                    for b in content:
+                        if isinstance(b, dict):
+                            parts.append(b.get("text", ""))
+                text = "\n".join(p for p in parts if p).strip()
+                if not text or _is_meta(text, CODEX_META_PREFIXES):
+                    continue
+                out.append((ts, role, text))
+            elif show_tools and ptype == "function_call":
+                name = payload.get("name", "?")
+                out.append((ts, "assistant", f"· tool:{name}"))
+    return out
+
+
+def _codex_pick(cwd, current):
+    """Codex rollout to read: pinned to the pair's own session when aipair stamped
+    AIPAIR_CODEX_SINCE (never drifts to an unrelated Codex sharing the cwd), else the newest
+    for cwd followed across a restart (codex_follow)."""
+    since = os.environ.get("AIPAIR_CODEX_SINCE")
+    if since:                                     # a pin is set (aipair always sets an epoch)
+        if not _NUM_RE.match(since):
+            return None                           # nan / inf / -1 / 1e3 / garbage → fail CLOSED
+        secs = float(since)
+        if not math.isfinite(secs) or secs < 0:   # defensive: the regex already guarantees this
+            return None
+        return codex_via_pane(cwd) or codex_since(cwd, secs)   # exact identity, else the launch-time pin
+    return codex_follow(cwd, current)
+
+
+def load(agent, cwd, show_tools, current=None):
+    """Locate the transcript (codex: pinned or following on from `current`) and parse it."""
+    try:
+        f = claude_file(cwd) if agent == "claude" else _codex_pick(cwd, current)
+        if not f:
+            return None, []
+        msgs = parse_claude(f, show_tools) if agent == "claude" else parse_codex(f, show_tools)
+    except OSError:          # a file vanished between listing, stat and reading — next poll picks another
+        return None, []
+    return f, [(ts, agent, role, text) for (ts, role, text) in msgs]
+
+
+# --------------------------------------------------------------------------- #
+# Rendering
+# --------------------------------------------------------------------------- #
+def render(entry, compact):
+    ts, agent, role, text = entry
+    tag = c(TAG.get(agent, ""), f"[{agent}]")
+    when = c(DIM, _fmt_time(ts))
+    if compact:
+        flat = " ".join(text.split())
+        if len(flat) > 280:
+            flat = flat[:277] + "…"
+        return f"{when} {tag} {c(DIM, role)} ▸ {flat}"
+    head = f"{c(DIM, '──')} {tag} {c(DIM, role + ' · ' + _fmt_time(ts))} {c(DIM, '──')}"
+    return f"{head}\n{text}\n"
+
+
+def main():
+    global USE_COLOR
+    ap = argparse.ArgumentParser(add_help=True, description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("agent", choices=["claude", "codex", "both"],
+                    help="which agent's transcript to show")
+    ap.add_argument("--dir", default=os.getcwd(), help="working directory (default: cwd)")
+    ap.add_argument("--last", type=int, default=40, help="show last N messages (default 40)")
+    ap.add_argument("--full", action="store_true", help="show the entire transcript")
+    ap.add_argument("--tools", action="store_true", help="include tool-call activity")
+    ap.add_argument("--watch", action="store_true", help="follow live (for the bridge pane)")
+    ap.add_argument("--no-color", action="store_true")
+    a = ap.parse_args()
+
+    USE_COLOR = (not a.no_color) and sys.stdout.isatty()
+    cwd = os.path.realpath(os.path.expanduser(a.dir))
+    agents = ["claude", "codex"] if a.agent == "both" else [a.agent]
+    compact = a.watch or a.agent == "both"
+
+    if not a.watch:
+        merged = []
+        missing = []
+        for ag in agents:
+            f, entries = load(ag, cwd, a.tools)
+            if f is None:
+                missing.append(ag)
+            merged += entries
+        merged.sort(key=lambda e: _ts_key(e[0]))
+        if not a.full and a.last > 0:
+            merged = merged[-a.last:]
+        for e in merged:
+            print(render(e, compact))
+        for ag in missing:
+            print(c(DIM, f"(no {ag} session found for {cwd})"), file=sys.stderr)
+        return
+
+    # --watch: follow live. Track emitted count per file path (logs are append-only).
+    print(c(TAG["bridge"], f"● watching {', '.join(agents)} in {cwd}  (Ctrl-C to stop)"))
+    emitted = {}
+    pinned = {}    # agent -> file read last round; codex follows on from it (codex_follow)
+    seeded = False
+    try:
+        while True:
+            batch = []
+            for ag in agents:
+                f, entries = load(ag, cwd, a.tools, pinned.get(ag))
+                if f is None:
+                    continue
+                pinned[ag] = f
+                start = emitted.get(f, 0)
+                if f not in emitted and not seeded and not a.full and a.last > 0:
+                    start = max(0, len(entries) - a.last)  # seed with recent tail
+                batch += entries[start:]
+                emitted[f] = len(entries)
+            batch.sort(key=lambda e: _ts_key(e[0]))
+            for e in batch:
+                print(render(e, True), flush=True)
+            seeded = True
+            time.sleep(1.5)
+    except KeyboardInterrupt:
+        print(c(DIM, "\n● stopped"))
+
+
+if __name__ == "__main__":
+    main()

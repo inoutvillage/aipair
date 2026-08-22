@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Upgrade path: a real install into a throw-away HOME must retire binaries this project no
-# longer ships (D2: aipair-queue) and install the new sibling lib (aipair-corelib). Needs
+# longer ships (D2: aipair-queue) and install the aipairlib package (#7). Needs
 # the real deps (claude/codex/tmux/script) + a pty, so it SKIPS where they are absent (CI).
 #   bash tests/install-upgrade.sh
 set -uo pipefail
@@ -30,10 +30,11 @@ out="$(env -u TMUX PATH="$SHIMD:$PATH" HOME="$TH" bash "$REPO/aipair-install.sh"
 chk "[ $rc -eq 0 ]" "installer exits 0 (got $rc)"
 chk "[ ! -e '$TH/.local/bin/aipair-queue' ]" "stale aipair-queue removed from bin"
 chk "ls '$TH/.local/bin/'aipair-queue.removed-* >/dev/null 2>&1" "stale aipair-queue moved to .removed-*"
-chk "[ -f '$TH/.local/bin/aipair-corelib' ]" "aipair-corelib installed"
+chk "[ -f '$TH/.local/bin/aipairlib/corelib.py' ]" "aipairlib package installed (corelib.py)"
+chk "[ -f '$TH/.local/bin/aipairlib/relay.py' ]" "aipairlib package installed (relay.py)"
 echo "$out" | grep -q "retired" && retired=1 || retired=0
 chk "[ $retired -eq 1 ]" "installer reports the retirement"
-chk "env -u TMUX HOME='$TH' '$TH/.local/bin/aipair-relay' --help >/dev/null 2>&1" "installed relay loads corelib (--help ok)"
+chk "env -u TMUX HOME='$TH' '$TH/.local/bin/aipair-relay' --help >/dev/null 2>&1" "installed relay loads the aipairlib package (--help ok)"
 
 # --- retire FAILURE must fail the install (a dangerous stale binary left runnable is not ok) ---
 TH2="$(mktemp -d "${TMPDIR:-/tmp}/aipair-upg2.XXXXXX")"

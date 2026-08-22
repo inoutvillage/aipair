@@ -1,0 +1,1416 @@
+"""aipair-relay — autonomous review loop between Claude Code and Codex.
+
+Watches both agents' session logs for turn completion, and relays a short
+"poke" into the other agent's tmux pane so it reacts to what the peer just said:
+
+    (you type the first task into Claude)
+    Claude implements ──end_turn──▶ poke Codex: "read with `peer`, review"
+    Codex reviews   ──task_complete──▶ poke Claude: "read with `peer`, fix"
+    … repeat until Codex's review contains the stop phrase (default 完了です),
+      or the max-round safety cap is hit.
+
+Plan mode (auto plan review):
+  If Claude stops at the plan-approval dialog ("Would you like to proceed?"),
+  the relay asks Codex to review the plan file (~/.claude/plans/*.md, path
+  taken from the dialog itself). Codex's verdict is injected back:
+    changes requested            → "Tell Claude what to change" + review + Enter
+    approved (冒頭に「プラン承認」) → "Yes, and bypass permissions"
+    approved with extra notes    → feedback + shift+tab (approve w/ feedback)
+  Capped at --plan-rounds per plan (default 5); disable with --no-plan-review.
+
+Module layout (#7: relay is the launcher + main loop in the `aipairlib` package; helpers are
+sibling package modules imported normally — `from . import corelib, …` — no SourceFileLoader
+and no runtime attribute injection):
+  peerlog     transcript location + parsing (also `peer-log` the CLI's implementation)
+  logs        shared colour/logging (dim/c/log); colour set once via configure()
+  corelib     pure helpers: stop-phrase, version gate, JSONL schema probe, gate output shaping
+  loglib      turn-completion / response-attribution reading + bounded record reader
+  tmuxlib     the tmux(...) runner + pane discovery/inspection
+  deliverylib poke delivery + Enter submission (imports tmuxlib/logs; poke takes busy_wait=)
+  dialoglib   plan/question dialog detection + response (+ dialog constants)
+The delivery<->dialog cycle is a plain module import used at call-time. What stays in relay:
+env parsing, log-locking + LogWatch, the stop-gate runner, the poke wording, and main()'s
+state machine. The thin `bin/aipair-relay` entrypoint runs `aipairlib.relay.main()`.
+
+Question dialogs (auto AskUserQuestion relay):
+  If Claude stops at a multiple-choice question dialog (AskUserQuestion — the
+  literal-input poke would be eaten by the selector UI), the relay scrapes ALL
+  questions of the call by walking the dialog's tabs with Right-arrow (the
+  pending tool_use is NOT in the session jsonl until answered — 2026-07-23
+  実測 — so the screen is the only complete source), asks Codex to answer them
+  in ONE round-trip, and delivers the reply via "Chat about this": pressing it
+  resolves the dialog immediately as "declined" and returns to the composer,
+  where the answers are pasted+submitted as the follow-up user message
+  (実測: Claude reads the answers and proceeds; it may emit one short turn
+  reacting to the decline before the queued answers arrive — harmless).
+  Capped at --question-rounds consecutive relays without a completed Claude
+  turn; disable with --no-question-relay.
+
+Endless mode (--endless, opt-in; 既定は従来どおり停止ワードで終了):
+  停止ワード（既定 完了です）を「このタスクのレビュー合格」の合図として扱い、
+  ループを止めずに Claude へ「次のタスクへ進め」と伝える。Claude 側の手持ちが
+  尽きたら Claude が --next-ask（既定「次のタスクをください」）を冒頭に書き、
+  relay は Codex に「タスクリストから次の1件を指示せよ」と依頼する。Codex が
+  --all-done（既定「全タスク完了」）を冒頭に書いた時点でループ終了（exit 0）。
+
+      Claude 実装 ──▶ Codex レビュー
+        ├ 指摘あり      → Claude が修正（従来どおり）
+        └「完了です」    → Claude「次のタスクへ」
+                            └ 手持ちなし →「次のタスクをください」
+                                 └─▶ Codex「次はこれ」/「全タスク完了」→ 終了
+
+  次タスクの根拠は --task-list（既定 tasks/todo.md）の未チェック項目に限定し、
+  リスト外の新規提案を禁じる文面を Codex へ送る（スコープ膨張の防止）。
+  終端は Codex の --all-done 宣言のみ。--max-rounds は安全キャップとして残る。
+  --gate CMD（env AIPAIR_GATE）: 停止ワード検知後に CMD を --dir で実行し、exit 0 の時だけ停止／次タスクへ。
+  失敗は出力の末尾を添えて Claude に差し戻す（--gate-rounds 回（既定 3）で exit 6）。未指定なら従来どおり。
+
+Turn detection (verified against real logs):
+  • Claude: latest `assistant` entry whose stop_reason != "tool_use"  → turn done
+  • Codex : latest task_* event is `task_complete`                    → turn done
+
+Injection uses a proven tmux incantation:
+  send-keys -l "<text>" → 配達確認 → 画面静止待ち → send-keys Enter → busy確認
+(one-shot "text+Enter" gets interpreted as a newline by the agent TUIs. Long
+texts additionally need the stability wait: an Enter arriving while the TUI is
+still ingesting the input burst is absorbed as a newline instead of submitting
+— 2026-08-14 実バグ、質問リレーの長文 poke で Codex が未送信のまま停滞。
+busy 確認は copy-mode 等に食われた Enter の再打鍵つき自己回復).
+
+Run it inside the aipair tmux session (the bridge pane); it auto-detects the
+session, the two panes (by title), and each agent's freshly-spawned log file.
+"""
+import argparse
+import glob
+import math
+import os
+import re
+import subprocess
+import sys
+import time
+import unicodedata
+
+# --- sibling package modules (#7: normal imports; was SourceFileLoader-by-path + per-module
+# attribute injection). Re-bound below so relay code and tests keep calling them unqualified /
+# as relay.X. The delivery<->dialog cycle, the shared logger, and the idle budget are now real
+# imports / a poke(busy_wait=...) argument, handled inside those modules — no injection here.
+from . import peerlog, corelib, loglib, tmuxlib, deliverylib, dialoglib, logs
+from .logs import c, log, dim, configure
+
+# corelib (pure helpers)
+TESTED_VERSIONS = corelib.TESTED_VERSIONS
+GATE_OUTPUT_CAP = corelib.GATE_OUTPUT_CAP
+parse_version = corelib.parse_version
+detect_version = corelib.detect_version
+version_gate = corelib.version_gate
+schema_probe = corelib.schema_probe
+schema_gate = corelib.schema_gate
+hit_stop = corelib.hit_stop
+scrub_output = corelib.scrub_output
+gate_tail = corelib.gate_tail
+gate_message = corelib.gate_message
+_oneline_cap = corelib._oneline_cap
+# loglib (transcript reading)
+claude_done_ts = loglib.claude_done_ts
+codex_done_ts = loglib.codex_done_ts
+turn_texts = loglib.turn_texts
+find_poke_ts = loglib.find_poke_ts
+codex_response_complete = loglib.codex_response_complete
+claude_response_attributed = loglib.claude_response_attributed
+make_fragment = loglib.make_fragment
+read_records = loglib.read_records
+
+
+def probe_log_schema(agent, path):
+    """(status, reason) for the agent's tracked transcript via corelib.schema_probe, or
+    ('unverified', 'ログ未特定') when no log is pinned yet. Bounded read (loglib.read_records)."""
+    if not path:
+        return ("unverified", "ログ未特定")
+    return schema_probe(agent, read_records(path))
+
+
+# tmuxlib (tmux runner + pane helpers)
+tmux = tmuxlib.tmux
+current_session = tmuxlib.current_session
+find_panes = tmuxlib.find_panes
+own_pane = tmuxlib.own_pane
+set_pane_title = tmuxlib.set_pane_title
+cancel_copy_mode = tmuxlib.cancel_copy_mode
+pane_busy = tmuxlib.pane_busy
+capture_pane = tmuxlib.capture_pane
+# deliverylib (poke delivery + Enter submission)
+press = deliverylib.press
+paste_text = deliverylib.paste_text
+submit_enter = deliverylib.submit_enter
+poke = deliverylib.poke
+# dialoglib (plan/question dialog detection + response)
+newest_plan = dialoglib.newest_plan
+detect_plan_dialog = dialoglib.detect_plan_dialog
+detect_question_dialog = dialoglib.detect_question_dialog
+scrape_questions = dialoglib.scrape_questions
+send_plan_feedback = dialoglib.send_plan_feedback
+send_question_answer = dialoglib.send_question_answer
+PLAN_QUESTION = dialoglib.PLAN_QUESTION      # used by claude_matches_pane (still in relay)
+QUESTION_FOOTER = dialoglib.QUESTION_FOOTER
+
+# --- AIPAIR_* 環境変数を既定値として読む ------------------------------------ #
+# 優先順位: CLI フラグ > 環境変数 > 組み込み既定。relay ペインのプロンプトから
+# 直接起動する時（`aipair-relay --adopt …` / `aipair-relay-here`）でも
+# `aipair loop` と同じ env で設定できるようにするため（2026-08-16）。
+# tmux new-session は起動シェルの env を引き継ぐので、`AIPAIR_MAX_ROUNDS=100 aipair loop`
+# しておけば bridge ペインにも残り、後から張り直す relay にも効く。
+ENV_USED = []          # 起動ログで「env 由来」を可視化する（無言で効かせない）
+
+
+def _env_str(name, default):
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return default
+    ENV_USED.append(f"{name}={v}")
+    return v
+
+
+def _env_int(name, default):
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return default
+    try:
+        n = int(v)
+    except ValueError:
+        n = -1
+    if n < 1:
+        # 設定ミスを黙って既定値に落とすと「指定したのに効かない」が起きる → 即エラー
+        print(f"aipair-relay: {name} は 1 以上の整数で指定してください（実際の値: {v!r}）",
+              file=sys.stderr)
+        sys.exit(2)
+    ENV_USED.append(f"{name}={n}")
+    return n
+
+
+def _env_bool(name, default=False):
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return default
+    on = v.strip().lower() not in ("0", "false", "no", "off")
+    ENV_USED.append(f"{name}={v}" + ("" if on else "（off）"))
+    return on
+
+
+def oneline(s, n=180):
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+# --- log file locking (lock onto the loop's freshly-spawned sessions) ------- #
+def claude_glob(cwd):
+    # Claude Code のプロジェクトdir名は非英数字をすべて '-' に置換する
+    # （日本語・'_' を含むパスで glob が空振りしてセッションを永遠に発見できないバグの修正）
+    enc = re.sub(r"[^A-Za-z0-9]", "-", cwd)
+    return os.path.join(peerlog.CLAUDE_PROJECTS, enc, "*.jsonl")
+
+
+def codex_all():
+    return peerlog.codex_all()
+
+
+def codex_cwd_matches(path, cwd):
+    # peerlog caches each rollout's first line, so this no longer opens the file every poll.
+    cw = peerlog.codex_cwd(path)
+    return bool(cw) and cw == peerlog._norm(cwd)
+
+
+_MD_STRIP = str.maketrans("", "", "*`#_~|")
+
+
+def _norm_text(s):
+    """空白と markdown 記号を落とす（jsonl の生テキストと TUI のレンダリング済み画面を比較可能にする）。"""
+    return "".join(s.split()).translate(_MD_STRIP)
+
+
+def _last_assistant_entry(path):
+    """jsonl の最後の assistant エントリ（dict）を返す。"""
+    last = None
+    try:
+        for line in open(path, "r", encoding="utf-8", errors="replace"):
+            try:
+                d = peerlog.json.loads(line)
+            except ValueError:
+                continue
+            if d.get("type") == "assistant":
+                last = d
+    except OSError:
+        return None
+    return last
+
+
+def claude_matches_pane(path, pane):
+    """候補 jsonl がそのペインのセッションか、画面内容との突き合わせで照合する。
+    同一プロジェクト dir に複数の Claude セッション（ワーカー + 別ペインのアシスタント会話等）が
+    あると、mtime 最新 = ペインのセッションとは限らない（2026-07-20 実バグ: --adopt が
+    アシスタント側を誤ピンし、その返答を「実装完了」と誤認して幽霊ラウンドが進行）。
+
+    1) 通常時: 直近 assistant テキスト断片が画面に見えるか（TUI は代替スクリーンで
+       スクロールバックが無いため、可視画面 = 直近の transcript）
+    2) プランダイアログ表示中: 画面はダイアログに占有され transcript が見えないため、
+       「最後の assistant エントリが ExitPlanMode の tool_use で終わっている」=
+       承認待ち状態のペインと整合するログか、で照合する"""
+    try:
+        cap = tmux("capture-pane", "-p", "-t", pane, "-S", "-300", capture=True).stdout
+    except subprocess.CalledProcessError:
+        return False
+    hay = _norm_text(cap)
+    msgs = [t for (_ts, role, t) in peerlog.parse_claude(path, False) if role == "assistant"]
+    for m in reversed(msgs[-3:]):
+        norm = _norm_text(m)
+        for probe in (norm[:40], norm[-40:]):
+            if len(probe) >= 16 and probe in hay:
+                return True
+    if PLAN_QUESTION in cap:
+        # ダイアログが参照するプランファイルと、ログ末尾の tool_use の対象を突き合わせる。
+        # プランモードは「プランファイルへの Edit/Write → ダイアログ表示」で止まるため、
+        # 承認待ちセッションの最終エントリはそのプランファイルを指す（2026-07-20 実測）。
+        m = re.search(r"[^\s·]*\.claude/plans/[^\s]+\.md", cap)
+        plan_base = os.path.basename(m.group(0)) if m else None
+        last = _last_assistant_entry(path)
+        content = ((last or {}).get("message") or {}).get("content")
+        if isinstance(content, list):
+            for b in content:
+                if not (isinstance(b, dict) and b.get("type") == "tool_use"):
+                    continue
+                if b.get("name") == "ExitPlanMode":
+                    # ExitPlanMode の存在だけでは同一 cwd の別セッション（別ペインで
+                    # 承認待ちの別プラン等）と区別できない（2026-07-21 Codex レビュー）。
+                    # 入力のプラン本文が画面のダイアログに見えている場合のみ一致とする
+                    # （ダイアログはプラン本文を表示するため、正しいペインなら断片が写る）
+                    plan_text = _norm_text((b.get("input") or {}).get("plan") or "")
+                    for probe in (plan_text[:40], plan_text[-40:]):
+                        if len(probe) >= 16 and probe in hay:
+                            return True
+                    continue
+                fp = (b.get("input") or {}).get("file_path") or ""
+                if plan_base and os.path.basename(fp) == plan_base:
+                    return True
+    return False
+
+
+def lock_claude(cwd, seen, pane, baseline):
+    files = sorted(glob.glob(claude_glob(cwd)), key=os.path.getmtime, reverse=True)
+    freshset = {f for f in files if f not in seen}
+    # 照合候補を「新規ファイル」に限定しない: /resume は relay 起動前から存在する旧 jsonl
+    # へ「追記」するため、新規ファイル監視では永遠に発見できない（2026-07-21 実バグ:
+    # tmux 再起動→ペイン内 resume で、resume 前の空セッションを誤ピンし
+    # 「Claude の応答待ち」のまま永久停止）。relay 起動後に書き込みのあった既存ファイルは
+    # resume 追記の可能性があるので照合候補に含める（照合ゲートが誤ピンを防ぐ）。
+    live = [f for f in files if f in freshset or os.path.getmtime(f) > baseline]
+    for f in live[:10]:
+        if claude_matches_pane(f, pane):
+            return f
+    # 照合できる候補が無ければ従来どおり新規ファイルの mtime 最新（新規セッションはまだ
+    # assistant テキストが無く照合不能のため。誤ピンしても refresh_claude_lock が自己回復する）
+    fresh = sorted(freshset, key=os.path.getmtime, reverse=True)
+    return fresh[0] if fresh else None
+
+
+# The pair's launch epoch (peer's AIPAIR_CODEX_SINCE), read once from the session option
+# @aipair-codex-since. Lets the relay share peer's EXACT fallback picker (codex_since) when
+# /proc identity is unavailable (macOS), so the two never diverge onto different Codex sessions.
+_CODEX_SINCE_EPOCH = None   # valid launch epoch, or None when the option is genuinely unset (legacy)
+_CODEX_SINCE_BAD = False    # True when the option is PRESENT but invalid / unreadable → fail-closed
+
+
+def read_codex_since(session):
+    """Read @aipair-codex-since with the SAME validation peer-log applies to AIPAIR_CODEX_SINCE
+    (peerlog._NUM_RE + finite, non-negative). Three outcomes, kept distinct so a corrupt value
+    can never masquerade as 'legacy, use the heuristic': unset → epoch=None (heuristic allowed);
+    valid → the epoch; present-but-invalid or query failure → BAD (codex_fallback fails closed)."""
+    global _CODEX_SINCE_EPOCH, _CODEX_SINCE_BAD
+    _CODEX_SINCE_EPOCH, _CODEX_SINCE_BAD = None, False
+    try:
+        v = tmuxlib.tmux("show-options", "-t", session, "-qv", "@aipair-codex-since",
+                         capture=True).stdout.strip()
+    except subprocess.CalledProcessError:
+        _CODEX_SINCE_BAD = True        # metadata present but unreadable → do not guess
+        return
+    if not v:
+        return                         # genuinely unset → legacy session, heuristic allowed
+    if not peerlog._NUM_RE.match(v):
+        _CODEX_SINCE_BAD = True; return
+    val = float(v)
+    if not math.isfinite(val) or val < 0:
+        _CODEX_SINCE_BAD = True; return
+    _CODEX_SINCE_EPOCH = val
+
+
+def codex_fallback(cwd, tracked_or_none, seen=None):
+    """Non-/proc Codex picker. A present-but-invalid launch epoch fails CLOSED (None) — never the
+    mtime heuristic, which could mis-pin a same-cwd Codex. A valid epoch uses codex_since — the
+    SAME pick peer makes, so peer and relay agree on macOS. Only a genuinely unset epoch (legacy
+    session) keeps the old behaviour (lock: newest-unseen; refresh: follow-newer)."""
+    if _CODEX_SINCE_BAD:
+        return None
+    if _CODEX_SINCE_EPOCH is not None:
+        return peerlog.codex_since(cwd, _CODEX_SINCE_EPOCH)
+    if seen is not None:
+        return peerlog.codex_newest(cwd, exclude=seen)
+    return peerlog.codex_follow(cwd, tracked_or_none)
+
+
+def lock_codex(cwd, seen, pane):
+    """Newest rollout for cwd that did not exist when the relay started (`seen`).
+    Polled every second while waiting for the pair's Codex to show up, so it goes
+    through peerlog's incremental index rather than re-walking the archive. `pane` is the
+    relay's OWN resolved codex pane, so the /proc identity looks at THIS pair (never the
+    caller's session). identity-capable but momentarily unresolved → return None and keep
+    waiting; NEVER fall to the mtime heuristic there (it could mis-pin a same-cwd Codex from
+    the very first lock — 2026-08-22 review)."""
+    ident = peerlog.codex_via_pane(cwd, pane)
+    if ident:
+        return ident
+    if peerlog.codex_identity_capable(pane):
+        return None
+    return codex_fallback(cwd, None, seen=seen)
+
+
+def refresh_codex_lock(tracked_path, cwd, pane):
+    """Codex CLI の再起動/新セッションで rollout がローテートしたら追従する。
+    第一は /proc identity（`pane` の Codex プロセスが今開いている rollout）。identity が
+    「一瞬 None（再起動中）」の時に mtime heuristic へ落ちると、同一 cwd の別 Codex へ誤って
+    乗り換え得るため、identity 対応環境（codex_identity_capable）で既に追跡中なら現 path を維持し、
+    heuristic への fallback は /proc 非対応・旧セッションの時だけに限定する（2026-08-22 レビュー）。
+    非 identity 環境では従来どおり codex_follow（追跡中より新しい cwd 一致 rollout を照合）。"""
+    ident = peerlog.codex_via_pane(cwd, pane)
+    if ident:
+        newest = ident
+    elif peerlog.codex_identity_capable(pane):
+        return tracked_path        # identity は使えるが今この瞬間は未解決 → drift させず現状維持
+    else:
+        newest = codex_fallback(cwd, tracked_path)
+    if newest and newest != tracked_path:
+        dim(f"codex rollout ローテート検知 → 追従: {os.path.basename(newest)}")
+        return newest
+    return tracked_path
+
+
+_RELOCK_EVERY = 15  # 秒。claude 側ローテート走査の下限間隔（照合は jsonl 全 parse を伴うため）
+_relock_at = 0.0
+
+
+def refresh_claude_lock(tracked_path, cwd, pane, force=False):
+    """Claude セッションのローテート（/resume・/clear・CLI 再起動）に追従する。
+    codex 側 refresh_codex_lock と同趣旨。resume は旧 jsonl へ追記するため新規ファイル
+    監視では捕まらず、resume 前の空セッションを誤ピンしたまま応答待ちで永久停止する
+    （2026-07-21 実バグ）。追跡中ファイルより新しい mtime の jsonl がペイン内容と
+    照合一致したら乗り換える。照合ゲートがあるので同プロジェクトで並走する別セッション
+    （ワーカー・アシスタント会話等）には乗らない。
+
+    誤ピン自己回復（2026-07-21 Codex レビュー）: 追跡中ログ自体がペイン照合に失敗する
+    場合は「より新しい mtime」条件を外して直近候補を走査する。mtime 最新の誤ピンから
+    より古い正解ログへは newer 条件では永遠に戻れないため。force=True は rate-limit を
+    無視する（done 判定直前の妥当性確認用）。"""
+    global _relock_at
+    now = time.time()
+    if not force and now - _relock_at < _RELOCK_EVERY:
+        return tracked_path
+    _relock_at = now
+    files = sorted(glob.glob(claude_glob(cwd)), key=os.path.getmtime, reverse=True)
+    tracked_ok = bool(tracked_path) and os.path.exists(tracked_path) \
+        and claude_matches_pane(tracked_path, pane)
+    if tracked_ok:
+        tracked_mtime = os.path.getmtime(tracked_path)
+        candidates = [f for f in files
+                      if f != tracked_path and os.path.getmtime(f) > tracked_mtime][:5]
+        label = "claude セッションローテート検知 → 追従"
+    else:
+        # 誤ピン疑い（追跡中ログがペインと照合不一致）: mtime 条件なしで走査
+        candidates = [f for f in files if f != tracked_path][:10]
+        label = "claude 誤ピン検知 → ペイン一致ログへ乗り換え"
+    for f in candidates:
+        if claude_matches_pane(f, pane):
+            dim(f"{label}: {os.path.basename(f)}")
+            return f
+    return tracked_path
+
+
+class LogWatch:
+    """セッションログの「作成時点以降に追記された行」だけを見る監視。送信検証の source of truth。
+
+    Claude Code の画面には実行中でも「esc to interrupt」が出ない（2026-08-16 実測: ツール
+    実行中の下部はアイドルと同じ ❯ とステータス行だけ）。以前この検証が通っていたのは
+    Claude の返答文に同語句が書かれていた偶然（偽陽性）で、別プロジェクトのペアでは
+    codex→claude の配達確認が全滅した（実障害）。一方 jsonl は Enter 成立の瞬間に必ず
+    書かれる — アイドル時は type=user（content=文字列）、実行中は type=queue-operation/
+    enqueue（content=全文、長文ペーストでも即時・全文を実測）— ので、これを証拠にする。
+    ダイアログの解決（承認/差し戻し/decline）は tool_result を持つ user 行として現れる。"""
+
+    def __init__(self, path):
+        self.path = path
+        try:
+            self.offset = os.path.getsize(path) if path else 0
+        except OSError:
+            self.offset = 0
+
+    def reset(self):
+        """チェックポイントを現在のファイル末尾へ進める（以後の追記だけを見る）。"""
+        try:
+            self.offset = os.path.getsize(self.path) if self.path else 0
+        except OSError:
+            self.offset = 0
+
+    def new_lines(self):
+        if not self.path:
+            return []
+        try:
+            size = os.path.getsize(self.path)
+            if size < self.offset:      # 切り詰め/ローテート → 先頭から
+                self.offset = 0
+            with open(self.path, "rb") as fh:
+                fh.seek(self.offset)
+                return fh.read().decode("utf-8", "replace").splitlines()
+        except OSError:
+            return []
+
+    def has_raw(self, fragment):
+        """追記行に fragment（ASCII nonce 等）が生で含まれるか（Codex rollout 用）。"""
+        return any(fragment in l for l in self.new_lines())
+
+    def claude_input(self, fragment=None):
+        """Claude に「入力として送信された」行が追記されたか: type=user の文字列 content
+        （アイドル時）または type=queue-operation/enqueue（実行中）。fragment 指定時は
+        本文一致も要求。tool_result 等のブロック content はここでは対象外。"""
+        for l in self.new_lines():
+            if '"queue-operation"' not in l and '"user"' not in l:
+                continue
+            try:
+                d = peerlog.json.loads(l)
+            except ValueError:
+                continue
+            t = d.get("type")
+            if t == "queue-operation":
+                if d.get("operation") not in (None, "enqueue"):
+                    continue
+                text = d.get("content") if isinstance(d.get("content"), str) else ""
+            elif t == "user":
+                c = (d.get("message") or {}).get("content")
+                if not isinstance(c, str):
+                    continue
+                text = c
+            else:
+                continue
+            if fragment is None or fragment in text:
+                return True
+        return False
+
+    def claude_resolved(self):
+        """tool_result を持つ user 行が追記されたか（= ダイアログの解決: プラン承認/
+        差し戻し/decline）。ダイアログ待ちの間 Claude は停止しており、これ以外の
+        user 行は書かれないので、承認キー/BTab/Enter の成立証拠になる。"""
+        for l in self.new_lines():
+            if '"tool_result"' not in l:
+                continue
+            try:
+                d = peerlog.json.loads(l)
+            except ValueError:
+                continue
+            if d.get("type") != "user":
+                continue
+            c = (d.get("message") or {}).get("content")
+            if isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "tool_result"
+                                           for b in c):
+                return True
+        return False
+
+
+def run_gate(cmd, cwd, timeout):
+    """Run the --gate shell command in cwd. Returns (ok, scrubbed output text).
+
+    The command runs in its OWN process group (start_new_session): a timeout, a
+    KeyboardInterrupt, or a shell that exits while leaving background jobs — all end with
+    the WHOLE group killed and the reader thread joined, so nothing is orphaned. Output is
+    drained on a thread into a fixed-size tail buffer (an unbounded producer like `yes`
+    cannot OOM the relay, a full pipe cannot deadlock the wait); the buffer is read only
+    after the reader has joined. Bytes are decoded errors="replace" and scrubbed of
+    control characters so non-UTF-8 / ANSI output can neither crash the relay nor be typed
+    into the pane as keystrokes."""
+    import threading, collections, signal
+    try:
+        proc = subprocess.Popen(cmd, shell=True, cwd=cwd,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        return False, f"exec error: {e}"
+    try:
+        pgid = os.getpgid(proc.pid)          # captured now: valid while any group member lives
+    except OSError:
+        pgid = proc.pid
+    buf, kept, dropped = collections.deque(), [0], [False]
+
+    def drain():
+        for chunk in iter(lambda: proc.stdout.read(65536), b""):
+            buf.append(chunk); kept[0] += len(chunk)
+            while kept[0] > GATE_OUTPUT_CAP and len(buf) > 1:
+                kept[0] -= len(buf.popleft()); dropped[0] = True
+        proc.stdout.close()
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    timed_out = False
+    raised = None
+    try:
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+    except BaseException as e:                # Ctrl-C etc.: clean up, then re-raise below
+        raised = e
+    finally:
+        # Always tear the whole group down: timeout, interrupt, or a shell that exited
+        # leaving `&` background jobs still writing. Then join the reader so the buffer is
+        # not mutated while we read it.
+        _kill_group(proc, pgid, signal)
+        reader.join(timeout=5)
+    out = scrub_output(b"".join(buf).decode("utf-8", "replace"))
+    if dropped[0]:
+        out = "…(truncated to the last ~256KB)… " + out
+    if raised is not None:
+        raise raised
+    if timed_out:
+        return False, out + f"\n[gate] timeout after {timeout}s (process group killed): {oneline(cmd, 200)}"
+    return proc.returncode == 0, out
+
+
+def _kill_group(proc, pgid, signal):
+    """Terminate the gate's process group `pgid`. TERM, a short grace for a clean exit,
+    then KILL unconditionally (a child ignoring TERM whose parent shell already exited
+    must still die — escalation is not gated on the group looking dead, since a reaped or
+    zombie leader confuses liveness probes), then reap the shell so it leaves no zombie.
+    pgid is captured at launch, not re-derived here, to avoid signalling a recycled pid."""
+    def killpg(sig):
+        try:
+            os.killpg(pgid, sig)
+        except OSError:
+            try:
+                proc.send_signal(sig)
+            except OSError:
+                pass
+    killpg(signal.SIGTERM)
+    deadline = time.time() + 0.5
+    while time.time() < deadline and proc.poll() is None:
+        time.sleep(0.05)
+    killpg(signal.SIGKILL)            # unconditional: SIGKILL can't be ignored by any group member
+    try:
+        proc.wait(timeout=3)          # reap the shell (no lingering zombie keeps the pgid "alive")
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def gate_or_message(a, gate_state, cwd):
+    """At a stop point, run the gate (in `cwd`, the normalised working dir) if one is set.
+    (True, None)      no gate, or it passed → stop / move on as usual
+    (False, message)  it failed → send Claude back with `message`
+    (False, None)     it failed --gate-rounds times → give up (caller exits 6)"""
+    if not a.gate:
+        return True, None
+    log("◆ 停止ゲート実行: " + _oneline_cap(a.gate, 200))
+    ok, out = run_gate(a.gate, cwd, a.gate_timeout)
+    if ok:
+        log("◆ " + c("ok", "停止ゲート通過"))
+        gate_state["fails"] = 0
+        return True, None
+    gate_state["fails"] += 1
+    n = gate_state["fails"]
+    print(c("warn", f"│ ■ 停止ゲート失敗（{n}/{a.gate_rounds}）: ") + oneline(out, 300), flush=True)
+    if n >= a.gate_rounds:
+        print(c("warn", f"│ ■ 停止ゲートが {a.gate_rounds} 回失敗。人間の判断が必要です。停止します。"), flush=True)
+        print("\a", end="", flush=True)
+        return False, None
+    return False, gate_message(a.gate, out, n, a.gate_rounds)
+
+
+def approval_took_effect(pane, confirm=None):
+    """プラン承認キー（数字）押下後、ダイアログ消失（画面）またはログ上の解決
+    （confirm = LogWatch.claude_resolved）で成立を確認する。
+    キーが吸収されると承認ダイアログが残ったまま relay が Claude 完了待ちで永久停止
+    する（Codex レビュー指摘）。ダイアログ消失を成功条件にできるのは、押下直前まで
+    PLAN_QUESTION が画面に出ていることが確定しているため。実行中バッジは Claude
+    画面では信用できない（2026-08-16）ので使わない。
+    capture 失敗・空キャプチャは「ダイアログ消失」と区別できない確認不能なので
+    成功条件にせず、ポーリング継続 → timeout で False（Codex レビュー指摘）。"""
+    deadline = time.time() + 7
+    while time.time() < deadline:
+        if confirm is not None and confirm():
+            return True
+        try:
+            cap = tmux("capture-pane", "-p", "-t", pane, capture=True).stdout
+        except subprocess.CalledProcessError:
+            time.sleep(0.5)
+            continue
+        if not cap.strip():
+            time.sleep(0.5)
+            continue
+        if PLAN_QUESTION not in cap:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def plan_poke_codex(plan_path, ok):
+    where = f"`{plan_path}`" if plan_path else "`~/.claude/plans/` にある最新の .md"
+    return (f"【自動プランレビュー】Claudeが実装プランを作成し、承認待ちで停止しています。"
+            f"プランファイル {where} を読んでレビューしてください。修正すべき点があれば具体的かつ簡潔に"
+            f"列挙してください（あなたの返答はそのままClaudeのプラン承認ダイアログに送信されます—"
+            f"人間に伝言を頼まないでください）。修正が不要なら本文の冒頭に「{ok}」と明記してください。")
+
+
+def question_poke_codex(blocks, limit=3000):
+    qtext = " ".join(f"◆{i}問目: {b}" for i, b in enumerate(blocks, 1))
+    if len(qtext) > limit:
+        qtext = qtext[: limit - 1] + "…"
+    return ("【自動質問応答】Claudeが選択式の質問ダイアログで停止しています。必要なら `peer` で"
+            "直近の文脈を確認し、以下の各質問に回答してください。あなたの返答はそのままClaudeへ"
+            "送信されます—人間に伝言を頼まないでください。各質問について「N問目: 選択肢M（ラベル）」"
+            "の形で選択を明示し、根拠を一言添えてください。どの選択肢も不適切なら、その旨と"
+            "代替案を明記してください。 " + qtext)
+
+
+# --------------------------------------------------------------------------- #
+DEFAULT_POKE_CLAUDE = ("【自動レビューループ】Codexがレビューしました。`peer` でCodexの最新の指摘を読み、"
+                       "対応（修正）してください。あなたの返答は自動でCodexに共有されます—"
+                       "人間に伝言や共有を頼まないでください。修正したら何を直したか簡潔に述べ、ターンを終えてください。")
+
+
+def default_poke_codex(stop):
+    return (f"【自動レビューループ】Claudeが実装/修正を更新しました。`peer` でClaudeの最新の発言を読み、"
+            f"コードをレビューしてください。あなたの返答は自動でClaudeに共有されます—人間に伝言を頼まないでください。"
+            f"修正が必要なら具体的に指摘し、これ以上直す点が無ければ本文の冒頭に「{stop}」と明記してください。")
+
+
+# --- endless mode の poke 文面 ---------------------------------------------- #
+# 既定モードでは使わない（--endless の時だけ組み立てる）。
+def endless_poke_claude_pass(task_list, next_ask):
+    """Codex が「レビュー合格」を出した直後に Claude へ送る文面。"""
+    return ("【自動レビューループ】Codexのレビューは合格でした。まず"
+            f"`{task_list}` の**完了した項目を `- [x]` にチェック**してください（これをしないとループが"
+            "収束しません）。次に、未チェック項目から**次の1件**に着手してください。着手する項目名を"
+            "明示してから実装し、終わったら何をしたか簡潔に述べてターンを終えてください。"
+            "あなたの返答は自動でCodexに共有されます—人間に伝言を頼まないでください。"
+            f"未チェック項目が無く、あなたの側でやることが尽きている場合のみ、本文の冒頭に「{next_ask}」と"
+            "明記してターンを終えてください（Codexが次の指示を出します）。")
+
+
+def endless_poke_codex_next(task_list, all_done):
+    """Claude が「次をください」と言った時に Codex へ送る文面。"""
+    return ("【自動レビューループ】Claudeは手持ちのタスクを終えました。`peer` で経緯を読み、"
+            f"`{task_list}` の**未チェック項目**から次に着手すべきものを**1件だけ**指示してください。"
+            "指示は「どのファイルで何をするか」が分かる具体性で書いてください。"
+            "あなたの返答は自動でClaudeに共有されます—人間に伝言を頼まないでください。"
+            f"⚠ リストに無い作業を新規に提案しないこと。未チェック項目が残っていない場合は、本文の冒頭に"
+            f"「{all_done}」と明記してください（それでループを終了します）。")
+
+
+def endless_poke_claude_next(task_list):
+    """Codex が次タスクを指示した直後に Claude へ送る文面。"""
+    return ("【自動レビューループ】Codexが次のタスクを指示しました。`peer` で内容を読み、"
+            "その1件に着手してください。あなたの返答は自動でCodexに共有されます—"
+            "人間に伝言を頼まないでください。終わったら何をしたか簡潔に述べ、"
+            f"`{task_list}` の該当項目を `- [x]` にチェックしてからターンを終えてください。")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--session", help="tmux session (default: current)")
+    ap.add_argument("--dir", default=os.getcwd(), help="working directory (default: cwd)")
+    ap.add_argument("--stop", default=_env_str("AIPAIR_STOP", "完了です"),
+                    help="stop phrase(s), '||'-separated (default 完了です / env AIPAIR_STOP)")
+    ap.add_argument("--stop-side", default=_env_str("AIPAIR_STOP_SIDE", "codex"),
+                    choices=["codex", "claude", "both"],
+                    help="whose message ends the loop (default codex / env AIPAIR_STOP_SIDE)")
+    ap.add_argument("--max-rounds", type=int, default=_env_int("AIPAIR_MAX_ROUNDS", 20),
+                    help="safety cap (default 20 / env AIPAIR_MAX_ROUNDS)")
+    ap.add_argument("--endless", action="store_true", default=_env_bool("AIPAIR_ENDLESS"),
+                    help="停止ワードで終了せず「次のタスクへ」を促し続ける連続モード。"
+                         "終端は Codex の --all-done 宣言のみ（env AIPAIR_ENDLESS）")
+    ap.add_argument("--no-endless", action="store_true",
+                    help="AIPAIR_ENDLESS が効いている環境で、この1本だけ連続モードを切る")
+    ap.add_argument("--next-ask", default=_env_str("AIPAIR_NEXT_ASK", "次のタスクをください"),
+                    help="endless: Claude 側の手持ちが尽きた合図（default 次のタスクをください / env AIPAIR_NEXT_ASK）")
+    ap.add_argument("--all-done", default=_env_str("AIPAIR_ALL_DONE", "全タスク完了"),
+                    help="endless: Codex 側が残タスク無しを宣言する終端ワード（default 全タスク完了 / env AIPAIR_ALL_DONE）")
+    ap.add_argument("--task-list", default=_env_str("AIPAIR_TASK_LIST", "tasks/todo.md"),
+                    help="endless: 次タスクの唯一の根拠にするタスクリスト（default tasks/todo.md / env AIPAIR_TASK_LIST）")
+    ap.add_argument("--gate", default=_env_str("AIPAIR_GATE", None),
+                    help="停止ゲート: 停止ワード検出後にこのシェルコマンドを --dir で実行し、成功（exit 0）した時だけ"
+                         "停止／次タスクへ進む。失敗なら出力を添えて Claude に差し戻す（env AIPAIR_GATE。既定: 無し）")
+    ap.add_argument("--gate-timeout", type=int, default=_env_int("AIPAIR_GATE_TIMEOUT", 600),
+                    help="ゲートコマンドのタイムアウト秒（既定 600 / env AIPAIR_GATE_TIMEOUT）")
+    ap.add_argument("--gate-rounds", type=int, default=_env_int("AIPAIR_GATE_ROUNDS", 3),
+                    help="ゲート失敗で差し戻す上限回数。到達で exit 6（既定 3 / env AIPAIR_GATE_ROUNDS）")
+    ap.add_argument("--start-side", default="claude", choices=["claude", "codex"],
+                    help="who acts first (default claude)")
+    ap.add_argument("--poll", type=float, default=3.0, help="poll seconds (default 3)")
+    ap.add_argument("--busy-wait", type=int, default=90,
+                    help="poke 前に相手ペインのアイドルを待つ上限秒。超過後は中止せず注入を続行する（既定90）")
+    ap.add_argument("--settle", type=float, default=1.2, help="settle seconds before relaying")
+    ap.add_argument("--poke-claude", default=DEFAULT_POKE_CLAUDE)
+    ap.add_argument("--poke-codex", default=None, help="default references the stop phrase")
+    ap.add_argument("--plan-rounds", type=int, default=5,
+                    help="max plan-review rounds per plan (default 5)")
+    ap.add_argument("--plan-ok", default="プラン承認",
+                    help="Codex's plan-approval phrase (default プラン承認)")
+    ap.add_argument("--allow-untested-dialogs", action="store_true",
+                    default=_env_bool("AIPAIR_ALLOW_UNTESTED_DIALOGS"),
+                    help="claude/codex の版が検証済みと違ってもプラン承認・質問リレーの自動操作を続ける"
+                         "（既定: 不一致なら自動 OFF / env AIPAIR_ALLOW_UNTESTED_DIALOGS）")
+    ap.add_argument("--no-version-gate", action="store_true", default=_env_bool("AIPAIR_NO_VERSION_GATE"),
+                    help="起動時の claude/codex 版チェックをしない（env AIPAIR_NO_VERSION_GATE）")
+    ap.add_argument("--allow-untested-schema", action="store_true",
+                    default=_env_bool("AIPAIR_ALLOW_UNTESTED_SCHEMA"),
+                    help="ログ JSONL schema がコア relay の依存と不一致でもダイアログ自動操作を続行"
+                         "（既定: 不一致なら自動 OFF / env AIPAIR_ALLOW_UNTESTED_SCHEMA）")
+    ap.add_argument("--no-schema-probe", action="store_true",
+                    default=_env_bool("AIPAIR_NO_SCHEMA_PROBE"),
+                    help="起動時/実行時の JSONL schema feature-probe をしない（env AIPAIR_NO_SCHEMA_PROBE）")
+    ap.add_argument("--no-plan-review", action="store_true",
+                    help="ignore the plan-approval dialog (pre-existing behavior)")
+    ap.add_argument("--question-rounds", type=int, default=5,
+                    help="連続質問リレーの上限（Claudeのターン完了でリセット、default 5）")
+    ap.add_argument("--no-question-relay", action="store_true",
+                    help="AskUserQuestionダイアログの自動リレーを無効化")
+    ap.add_argument("--claude-log", help="pin Claude session jsonl (adopt an existing session)")
+    ap.add_argument("--codex-log", help="pin Codex rollout jsonl (adopt an existing session)")
+    ap.add_argument("--adopt", action="store_true",
+                    help="既存セッションを自動採用: 最新のClaude jsonl と cwd一致の最新Codex rollout を"
+                         "ピン留めする（同プロジェクトでClaudeが複数動いていると最新更新のものが選ばれる。"
+                         "確実に指定したい場合は --claude-log/--codex-log で明示ピン）")
+    ap.add_argument("--no-color", action="store_true")
+    a = ap.parse_args()
+    a.schema_mismatch = False   # set by schema_gate / schema_watch when core JSONL schema drifts
+
+    # argparse の choices は「コマンドラインで渡された値」しか検証しない。
+    # env 由来の既定値は素通りするので、ここで明示的に弾く（無言で codex 扱いにしない）。
+    if a.stop_side not in ("codex", "claude", "both"):
+        print(f"aipair-relay: --stop-side / AIPAIR_STOP_SIDE は codex|claude|both のいずれか"
+              f"（実際の値: {a.stop_side!r}）", file=sys.stderr)
+        return 2
+    # argparse type=int accepts 0 / negatives on the command line; _env_int already
+    # guards the env path, so validate the resolved values here for both.
+    for name, val in (("--gate-timeout", a.gate_timeout), ("--gate-rounds", a.gate_rounds),
+                      ("--max-rounds", a.max_rounds), ("--plan-rounds", a.plan_rounds),
+                      ("--question-rounds", a.question_rounds)):
+        if val < 1:
+            print(f"aipair-relay: {name} は 1 以上で指定してください（実際の値: {val!r}）", file=sys.stderr)
+            return 2
+    if a.no_endless:
+        a.endless = False
+
+    configure((not a.no_color) and sys.stdout.isatty())
+    bw = max(60, a.busy_wait)   # idle budget passed explicitly to poke()
+    cwd = os.path.realpath(os.path.expanduser(a.dir))
+    stop_phrases = [s for s in a.stop.split("||") if s]
+
+    poke_codex = a.poke_codex or default_poke_codex(stop_phrases[0] if stop_phrases else "完了です")
+    poke_claude = a.poke_claude
+    next_ask_phrases = [s for s in a.next_ask.split("||") if s]
+    all_done_phrases = [s for s in a.all_done.split("||") if s]
+    poke_claude_pass = endless_poke_claude_pass(a.task_list, next_ask_phrases[0] if next_ask_phrases
+                                                else "次のタスクをください")
+    poke_codex_next = endless_poke_codex_next(a.task_list, all_done_phrases[0] if all_done_phrases
+                                              else "全タスク完了")
+    poke_claude_next = endless_poke_claude_next(a.task_list)
+    if a.endless and not all_done_phrases:
+        print(c("warn", "aipair-relay: --endless では --all-done が終端の唯一の手段です（空にできません）"),
+              file=sys.stderr)
+        return 2
+
+    session = a.session or current_session()
+    if not session:
+        print(c("warn", "aipair-relay: not inside tmux and --session not given"), file=sys.stderr)
+        return 2
+    panes = find_panes(session)
+    read_codex_since(session)   # for the non-/proc fallback: share peer's codex_since picker
+    if "claude" not in panes or "codex" not in panes:
+        print(c("warn", f"aipair-relay: could not find claude+codex panes in '{session}' "
+                        f"(found: {panes}). Start with `aipair loop`."), file=sys.stderr)
+        return 2
+
+    # Version gate: an untested claude/codex keeps the safe relay (poke + transcripts) but
+    # loses the TUI-scraping dialog automation, which its version might have changed.
+    vrows, vbad = ([], [])
+    if not a.no_version_gate:
+        vrows, vbad = version_gate(a, {n: detect_version(n) for n in ("claude", "codex")})
+
+    # Schema feature-probe: the version gate only knows --version strings, so also probe the
+    # actual JSONL the core relay reads. At startup only EXPLICIT pins exist (an `aipair loop`
+    # has no log yet → "unverified"); schema_watch() re-probes the tracked logs at runtime.
+    srows, sbad = ([], [])
+    if not a.no_schema_probe:
+        spin = {"claude": os.path.realpath(os.path.expanduser(a.claude_log)) if a.claude_log else None,
+                "codex":  os.path.realpath(os.path.expanduser(a.codex_log)) if a.codex_log else None}
+        srows, sbad = schema_gate(a, {n: probe_log_schema(n, spin[n]) for n in ("claude", "codex")})
+
+    # ペインタイトルで「今どのモードで・何往復まで」が一目で分かるようにする
+    own = own_pane(session)
+    set_pane_title(own, (f"relay ● endless / max {a.max_rounds} / 終端「{a.all_done}」/ Ctrl-C で停止"
+                         if a.endless else
+                         f"relay ● 1タスク / max {a.max_rounds} / 停止「{a.stop}」/ Ctrl-C で停止"))
+
+    print(c("relay", "┌─ aipair-relay ───────────────────────────────────────────────"))
+    log(f"session={session}  dir={cwd}")
+    if ENV_USED:
+        # env を読んだ事実を必ず見せる（「指定したのに効いていない/効きすぎている」を防ぐ）
+        log(c("dim", "env 由来の既定値: " + "  ".join(ENV_USED)
+              + ("  ※ CLI フラグが渡された項目はそちらが優先" if len(sys.argv) > 1 else "")))
+    log(f"停止={'/'.join(stop_phrases)}（{a.stop_side}側）  最大={a.max_rounds}往復  panes={panes['claude']}/{panes['codex']}")
+    if a.gate:
+        log(f"停止ゲート={a.gate}（timeout {a.gate_timeout}s / 差し戻し上限 {a.gate_rounds} 回）")
+    for name, det, tst, status in vrows:
+        if status == "ok":
+            log(c("dim", f"{name} 版 {det}（検証済み）"))
+        elif status == "mismatch":
+            log(c("warn", f"⚠ {name} 版 {det} は検証済み {tst} と異なる"))
+        else:
+            log(c("warn", f"⚠ {name} 版を取得できず（検証済み {tst}）"))
+    if vbad:
+        log((c("dim", "  → --allow-untested-dialogs によりダイアログ自動操作は継続")
+             if a.allow_untested_dialogs else
+             c("warn", "  → プラン承認・質問リレーの自動操作を OFF にしました"
+                       "（poke/transcript は続行。--allow-untested-dialogs で無効化）")))
+    for name, status, reason in srows:
+        if status == "ok":
+            log(c("dim", f"{name} ログschema OK（{reason}）"))
+        elif status == "mismatch":
+            log(c("warn", f"⚠ {name} ログschema がコア relay の依存と不一致（{reason}）"))
+        # "unverified" at startup is normal (no pinned log yet) → schema_watch() checks at runtime
+    if not a.no_schema_probe and not any(st != "unverified" for _n, st, _r in srows):
+        log(c("dim", "ログschema=実行時に検査（起動時はピン待ち）"))
+    if sbad:
+        log((c("dim", "  → --allow-untested-schema によりダイアログ自動操作は継続")
+             if a.allow_untested_schema else
+             c("warn", "  → ログschema不一致のためダイアログ自動操作を OFF"
+                       "（ターン検出の信頼性低下に注意。--allow-untested-schema で無効化）")))
+    if a.endless:
+        log(c("ok", "連続モード=on") + f"（「{stop_phrases[0] if stop_phrases else '完了です'}」＝レビュー合格→次のタスクへ）")
+        log(f"  タスクリスト={a.task_list}  次を要求={'/'.join(next_ask_phrases)}  "
+            f"終端={'/'.join(all_done_phrases)}（codex側）")
+        if a.stop_side != "codex":
+            log(c("warn", f"  ⚠ --stop-side {a.stop_side} は連続モードでは終了になりません"
+                          "（終端は Codex の終端ワードのみ）"))
+        if a.max_rounds == 20:
+            log(c("dim", "  ヒント: 連続モードは往復が伸びます。--max-rounds を大きめに（例 100）"))
+    log("プランレビュー=" + ("off" if a.no_plan_review
+        else f"on（上限{a.plan_rounds}回・承認ワード「{a.plan_ok}」）"))
+    log("質問リレー=" + ("off" if a.no_question_relay
+        else f"on（連続上限{a.question_rounds}回・Chat about this 経由で回答）"))
+    log(c("ok", f"▶ {a.start_side} ペインに最初の依頼を入力してください。完了を検知したら自動でリレーします。"))
+    log(c("dim", "  （停止: このペインで Ctrl-C ／ `aipair stop`）"))
+    print(c("relay", "└──────────────────────────────────────────────────────────────"))
+
+    baseline = time.time()
+    claude_seen = set(glob.glob(claude_glob(cwd)))
+    codex_seen = set(codex_all())
+    tracked = {"claude": None, "codex": None}
+    if a.claude_log:
+        tracked["claude"] = os.path.realpath(os.path.expanduser(a.claude_log))
+    if a.codex_log:
+        tracked["codex"] = os.path.realpath(os.path.expanduser(a.codex_log))
+    if a.adopt:
+        # 既存セッションの自動採用（明示ピンがある側はそちらを優先）
+        if not tracked["claude"]:
+            existing = sorted(glob.glob(claude_glob(cwd)), key=os.path.getmtime, reverse=True)
+            match = next((f for f in existing[:10]
+                          if claude_matches_pane(f, panes["claude"])), None)
+            if match:
+                tracked["claude"] = match
+                dim(f"adopt: claude = {os.path.basename(match)}（ペイン内容と照合一致）")
+            elif existing:
+                tracked["claude"] = existing[0]
+                dim(f"adopt: claude = {os.path.basename(existing[0])}"
+                    "（ペイン照合できず mtime 最新にフォールバック — 誤ピンの可能性あり）")
+            else:
+                log(c("warn", "adopt: このプロジェクトの Claude ログが見つからず → 新規セッションの出現待ちに切替"))
+        if not tracked["codex"]:
+            # ONE source of truth with peer-log: the rollout the pair's Codex process actually
+            # holds open (codex_via_pane), not merely the newest for the cwd — so `peer` and the
+            # relay never diverge onto two different same-cwd Codex sessions (2026-08-22 review).
+            ident = peerlog.codex_via_pane(cwd, panes["codex"])
+            if ident:
+                f = ident
+            elif peerlog.codex_identity_capable(panes["codex"]):
+                f = None                       # capable but not resolved yet → wait, don't mis-pin
+            else:
+                f = codex_fallback(cwd, None)
+            if f:
+                tracked["codex"] = f
+                dim(f"adopt: codex = {os.path.basename(f)}")
+            if not tracked["codex"]:
+                log(c("warn", "adopt: cwd一致の Codex rollout が見つからず → 新規セッションの出現待ちに切替"))
+    state = a.start_side
+    gate_state = {"fails": 0}
+    # endless: 直前に Codex へ何を頼んだか。"review"=コードレビュー / "next"=次タスクの指示。
+    # 新しい state を足さず、codex ブロック内の配達処理（ダイアログ回避を含む）を共有するため。
+    pending_kind = "review"
+    since = baseline
+    rounds = 0
+    plan_rounds = 0
+    plan_dialog = None
+    question_rounds = 0        # 連続質問リレー回数（Claude のターン完了でリセット）
+    q_unconfirmed_warned = False  # 「画面は質問ダイアログだがログ照合できず」の警告を1回に抑制
+    last_activity = time.time()
+    probe = None               # 未消化 poke の nonce（ログでの配達確認・応答帰属に使用）
+    probe_ts_cache = None      # 応答判定アンカー ts（nonce 出現 ts → codex は新タスク開始 ts へ前進）
+    probe_sent_at = 0.0        # poke 送出時刻（no-show 監視用）
+    POKE_NOSHOW = 1800         # nonce がログに現れないまま諦めるまでの秒数
+    last_rejected = None       # 帰属棄却した完了 ts（棄却ログを完了値ごと1回に抑制）
+    schema_latched = {"claude": None, "codex": None}   # runtime JSONL schema probe: latch once per agent
+
+    def schema_watch():
+        """Once per agent, probe the tracked transcript for the core schema the relay reads
+        (turn-completion keys). An `aipair loop` has no log at startup, so this — not the
+        startup banner — is where real drift is caught, the first time a pinned log has turns.
+        Latches per agent (probe cost is paid only until each side resolves ok/mismatch); a
+        mismatch warns loudly + rings the bell and, unless --allow-untested-schema, falls to the
+        version gate's safe posture (dialogs off)."""
+        if a.no_schema_probe:
+            return
+        for agent in ("claude", "codex"):
+            if schema_latched[agent] is not None or not tracked[agent]:
+                continue
+            status, reason = probe_log_schema(agent, tracked[agent])
+            if status == "ok":
+                schema_latched[agent] = "ok"
+                dim(f"{agent} ログschema OK（{reason}）")
+            elif status == "mismatch":
+                schema_latched[agent] = "mismatch"
+                print(c("warn", f"│ ■ {agent} のログ JSONL schema がコア relay の依存と不一致（{reason}）。"
+                                "ターン検出が誤動作する可能性があります。claude/codex の版と"
+                                " TESTED schema を確認してください。"), flush=True)
+                print("\a", end="", flush=True)
+                if not a.allow_untested_schema:
+                    a.no_plan_review = True
+                    a.no_question_relay = True
+                    a.schema_mismatch = True
+            # "unverified" → leave unlatched, re-probe next iteration
+
+    def wait_heartbeat(who):
+        # 待機フェーズごとに1回だけ表示（None = 表示済み。状態遷移時の time.time() 再セットで再アーム）
+        nonlocal last_activity
+        if last_activity is not None and time.time() - last_activity > 30:
+            dim(f"… {who} の応答待ち")
+            last_activity = None
+
+    def response_done(agent, path, raw_done):
+        """完了検知を「poke への応答」と確定できるときだけ通すゲート。
+        キュー投入では nonce の user メッセージが先行ターンの完了前にログへ出るため
+        「done > nonce_ts」だけでは先行ターンの完了が通ってしまう（Codex レビュー
+        指摘）。codex は turn_id ペアリング（nonce アイテムの turn_id と同じ
+        task_complete の ts を確定値として返す）、claude は「最終 assistant
+        エントリの parentUuid チェーンが nonce エントリを祖先に持つ」ことまで
+        要求する。棄却は新しい完了値のたびに1回だけ可視化する。"""
+        nonlocal probe_ts_cache, last_rejected
+        if not raw_done or not probe:
+            return raw_done
+
+        def reject(reason):
+            nonlocal last_rejected
+            if raw_done != last_rejected:
+                last_rejected = raw_done
+                dim(f"完了を検知したが poke への応答と紐づかず棄却（{reason}）→ 継続監視")
+            return None
+
+        if probe_ts_cache is None:
+            probe_ts_cache = find_poke_ts(agent, path, probe)
+        if probe_ts_cache is None:
+            return None  # nonce 未着（未配達）— poke_noshow が期限を監視
+        if agent == "codex":
+            anchor, comp = codex_response_complete(path, probe)
+            if anchor is None:
+                return reject("nonce の user アイテム未発見")
+            if comp is None:
+                return reject("応答タスク（同 turn_id）が未完了")
+            # texts 窓のアンカーを応答タスク開始時刻へ進める（先行タスク末尾の混入防止）
+            probe_ts_cache = anchor
+            # 確定した応答タスクの完了 ts を返す — raw_done（最新完了）をそのまま
+            # 使うと、応答より後に完了した別タスクを応答として採用してしまう
+            # （Codex レビュー指摘）
+            return comp
+        # claude: nonce 以後の完了 かつ 応答チェーンが nonce エントリを祖先に持つこと
+        if raw_done <= probe_ts_cache:
+            return reject("nonce 以前の完了")
+        if not claude_response_attributed(path, probe):
+            return reject("応答チェーン不一致")
+        return raw_done
+
+    def poke_noshow(agent):
+        """poke の nonce が一定時間ログに現れない = 配達失敗（キュー投入も不成立）。
+        画面検証をすり抜けた未送信をここで確実に検知して停止させる。"""
+        nonlocal probe_ts_cache
+        if not probe or probe_ts_cache is not None or not probe_sent_at:
+            return False
+        if time.time() - probe_sent_at < POKE_NOSHOW:
+            return False
+        if tracked[agent]:
+            probe_ts_cache = find_poke_ts(agent, tracked[agent], probe)
+            if probe_ts_cache is not None:
+                return False
+        print(c("warn", f"│ ■ poke（{probe}）が{POKE_NOSHOW // 60}分経ってもログに現れません。"
+                        "未配達（Enter不成立等）とみなし停止します。コンポーザを確認してください。"), flush=True)
+        print("\a", end="", flush=True)
+        return True
+
+    def claude_watch():
+        """Claude 宛配達の直前に作る LogWatch（ログ未特定なら None → 画面フォールバック）。"""
+        return LogWatch(tracked["claude"]) if tracked["claude"] else None
+
+    def codex_poke_confirm():
+        w = LogWatch(tracked["codex"])
+        return lambda p: w.has_raw(p)
+
+    def claude_poke_confirm():
+        w = LogWatch(tracked["claude"])
+        return lambda p: w.claude_input(p)
+
+    # 終了理由を exit code で区別する（外部 orchestrator が成否を判別できるように）:
+    #   0=停止ワード検知（正常完了） 3=最大往復キャップ 4=poke配達失敗
+    #   5=プラン/質問リレー上限・選択肢欠落
+    code = 0
+    all_done_hit = False
+    try:
+        while True:
+            schema_watch()
+            if state == "claude":
+                if tracked["claude"] is None:
+                    tracked["claude"] = lock_claude(cwd, claude_seen, panes["claude"], baseline)
+                done = claude_done_ts(tracked["claude"], since) if tracked["claude"] else None
+                if done and not claude_matches_pane(tracked["claude"], panes["claude"]):
+                    # 誤ピン先の end_turn を「Claude 完了」と誤認しない（2026-07-21 Codex レビュー）:
+                    # ペイン照合に失敗した完了は採用せず、mtime 条件なしの強制 re-lock で
+                    # ペイン一致ログへ乗り換えてから判定をやり直す（一致ログが無ければ保留）
+                    dim("完了検知したが追跡ログがペイン照合に不一致（誤ピン疑い）→ 強制 re-lock")
+                    relocked = refresh_claude_lock(tracked["claude"], cwd, panes["claude"], force=True)
+                    done = claude_done_ts(relocked, since) if relocked != tracked["claude"] else None
+                    tracked["claude"] = relocked
+                done = response_done("claude", tracked["claude"], done)
+                if done:
+                    time.sleep(a.settle)
+                    done = response_done("claude", tracked["claude"],
+                                         claude_done_ts(tracked["claude"], since)) or done
+                    rounds += 1
+                    question_rounds = 0
+                    q_unconfirmed_warned = False
+                    tstart = max(since, probe_ts_cache) if probe else since
+                    texts = turn_texts("claude", tracked["claude"], tstart, done)
+                    text = "\n".join(texts)
+                    # endless: Claude の手持ちが尽きた宣言なら、レビューではなく
+                    # 「次のタスクをリストから指示せよ」を Codex に頼む
+                    ask_next = a.endless and hit_stop(texts, next_ask_phrases)
+                    log(f"● round {rounds}: " + c("claude", "Claude 完了")
+                        + (" → Codex に次タスクを依頼" if ask_next else " → Codex にレビュー依頼"))
+                    if text:
+                        dim(c("claude", "claude") + ": " + oneline(text))
+                    gate_msg = None
+                    if (not a.endless) and a.stop_side in ("claude", "both") and hit_stop(texts, stop_phrases):
+                        ok_gate, gate_msg = gate_or_message(a, gate_state, cwd)
+                        if ok_gate:
+                            done_banner(rounds, "claude"); break
+                        if gate_msg is None:
+                            code = 6; break
+                    if gate_msg:      # stop phrase seen but the gate failed → back to Claude, not to Codex
+                        sent = poke(panes["claude"], gate_msg, confirm=claude_poke_confirm(),
+                                    badge=tracked["claude"] is None, busy_wait=bw)
+                    else:
+                        sent = poke(panes["codex"], poke_codex_next if ask_next else poke_codex,
+                                    confirm=codex_poke_confirm(), busy_wait=bw)
+                    if not sent:
+                        print(c("warn", f"│ ■ {'Claude' if gate_msg else 'Codex'} への依頼を配達できず（poke失敗）。状態遷移せず停止します。"), flush=True)
+                        print("\a", end="", flush=True)
+                        code = 4
+                        break
+                    pending_kind = "next" if ask_next else "review"
+                    probe, probe_ts_cache, probe_sent_at = sent, None, time.time()
+                    since = time.time(); state = "claude" if gate_msg else "codex"; last_activity = time.time()
+                elif (not a.no_plan_review) and (plan_dialog := detect_plan_dialog(panes["claude"])):
+                    if plan_rounds >= a.plan_rounds:
+                        print(c("warn", f"│ ■ プランレビュー上限 {a.plan_rounds} 回に到達。"
+                                        f"人間の判断が必要です（ダイアログはそのまま）。停止します。"), flush=True)
+                        print("\a", end="", flush=True)
+                        code = 5
+                        break
+                    plan_rounds += 1
+                    log("◆ " + c("claude", "プラン承認ダイアログ検知")
+                        + f"（{plan_rounds}/{a.plan_rounds}回目）→ Codex にプランレビュー依頼")
+                    dim(f"plan: {plan_dialog['plan'] or '(パス不明)'}")
+                    sent = poke(panes["codex"], plan_poke_codex(plan_dialog["plan"], a.plan_ok),
+                                confirm=codex_poke_confirm(), busy_wait=bw)
+                    if not sent:
+                        print(c("warn", "│ ■ Codex へのプランレビュー依頼を配達できず（poke失敗）。"
+                                        "状態遷移せず停止します（ダイアログはそのまま）。"), flush=True)
+                        print("\a", end="", flush=True)
+                        code = 4
+                        break
+                    probe, probe_ts_cache, probe_sent_at = sent, None, time.time()
+                    since = time.time(); state = "codex_plan"; last_activity = time.time()
+                elif (not a.no_question_relay) and detect_question_dialog(panes["claude"]):
+                    if question_rounds >= a.question_rounds:
+                        print(c("warn", f"│ ■ 質問リレー上限 {a.question_rounds} 回に到達。"
+                                        f"人間の判断が必要です（ダイアログはそのまま）。停止します。"), flush=True)
+                        print("\a", end="", flush=True)
+                        code = 5
+                        break
+                    # 全質問を画面から収集（未回答の tool_use は jsonl に無いため画面が唯一のソース）
+                    qs_blocks = scrape_questions(panes["claude"])
+                    if not qs_blocks:
+                        if not q_unconfirmed_warned:
+                            dim("質問ダイアログを検知したが質問文を抽出できず → 作用せず待機")
+                            q_unconfirmed_warned = True
+                        if tracked["claude"]:
+                            tracked["claude"] = refresh_claude_lock(tracked["claude"], cwd, panes["claude"])
+                        wait_heartbeat("Claude")
+                    else:
+                        question_rounds += 1
+                        log("◆ " + c("claude", "質問ダイアログ検知")
+                            + f"（{question_rounds}/{a.question_rounds}回目・{len(qs_blocks)}問）→ Codex に回答依頼")
+                        sent = poke(panes["codex"], question_poke_codex(qs_blocks),
+                                    confirm=codex_poke_confirm(), busy_wait=bw)
+                        if not sent:
+                            print(c("warn", "│ ■ Codex への回答依頼を配達できず（poke失敗）。"
+                                            "状態遷移せず停止します（ダイアログはそのまま）。"), flush=True)
+                            print("\a", end="", flush=True)
+                            code = 4
+                            break
+                        probe, probe_ts_cache, probe_sent_at = sent, None, time.time()
+                        since = time.time(); state = "codex_question"; last_activity = time.time()
+                else:
+                    if tracked["claude"]:
+                        tracked["claude"] = refresh_claude_lock(tracked["claude"], cwd, panes["claude"])
+                    if poke_noshow("claude"):
+                        code = 4
+                        break
+                    wait_heartbeat("Claude")
+            elif state == "codex_plan":
+                if tracked["codex"] is None:
+                    tracked["codex"] = lock_codex(cwd, codex_seen, panes["codex"])
+                done = codex_done_ts(tracked["codex"], since) if tracked["codex"] else None
+                done = response_done("codex", tracked["codex"], done)
+                if done:
+                    time.sleep(a.settle)
+                    done = response_done("codex", tracked["codex"],
+                                         codex_done_ts(tracked["codex"], since)) or done
+                    tstart = max(since, probe_ts_cache) if probe else since
+                    texts = turn_texts("codex", tracked["codex"], tstart, done)
+                    text = "\n".join(texts).strip()
+                    # 承認判定も停止ワードと同じ理由で最終メッセージ（=本文）の冒頭で行う
+                    final = " ".join(texts[-1].split()) if texts else ""
+                    dialog = detect_plan_dialog(panes["claude"]) or plan_dialog
+                    if text:
+                        dim(c("codex", "codex") + ": " + oneline(text))
+                    if not text:
+                        log(c("warn", "◆ Codex のレビュー本文を取得できず。ダイアログ検知からやり直します。"))
+                    elif dialog is None:
+                        log(c("warn", "◆ プランダイアログが見当たりません（人間が操作した？）。通常の待機に戻ります。"))
+                    elif a.plan_ok in final[:80]:
+                        extra = final.replace(a.plan_ok, "", 1).strip(" 。、！!\n\t「」")
+                        if len(extra) > 80 and dialog["tell"]:
+                            log("◆ " + c("ok", "Codex がプラン承認（付帯コメントあり）")
+                                + " → feedback付きで承認（shift+tab）")
+                            if not send_plan_feedback(panes["claude"], dialog, text, approve=True,
+                                                      watch=claude_watch()):
+                                print(c("warn", "│ ■ feedback付き承認（Shift+Tab）の成立を確認できず。"
+                                                "状態遷移せず停止します。"), flush=True)
+                                print("\a", end="", flush=True)
+                                code = 4
+                                break
+                        else:
+                            log("◆ " + c("ok", "Codex がプラン承認") + f" → 「{dialog['yes_label']}」を選択")
+                            w = claude_watch()
+                            press(panes["claude"], dialog["yes"])
+                            if not approval_took_effect(panes["claude"],
+                                                       confirm=(w.claude_resolved if w else None)):
+                                print(c("warn", "│ ■ プラン承認キーの押下が効いていません（ダイアログ残存）。"
+                                                "状態遷移せず停止します。"), flush=True)
+                                print("\a", end="", flush=True)
+                                code = 4
+                                break
+                        plan_rounds = 0
+                    elif dialog["tell"] is None:
+                        print(c("warn", "│ ■ 『Tell Claude what to change』の選択肢が見つからず"
+                                        "修正依頼を送れません。停止します。"), flush=True)
+                        print("\a", end="", flush=True)
+                        code = 5
+                        break
+                    else:
+                        log("◆ " + c("codex", "Codex が修正を要求")
+                            + " → 「Tell Claude what to change」で送信")
+                        if not send_plan_feedback(panes["claude"], dialog, text, approve=False,
+                                                  watch=claude_watch()):
+                            print(c("warn", "│ ■ プラン修正依頼の送信を確認できず（Enter失敗）。"
+                                            "状態遷移せず停止します。"), flush=True)
+                            print("\a", end="", flush=True)
+                            code = 4
+                            break
+                    probe = None  # ダイアログ経由の配達に nonce は無い（帰属ゲート不使用）
+                    since = time.time(); state = "claude"; last_activity = time.time()
+                else:
+                    if tracked["codex"]:
+                        tracked["codex"] = refresh_codex_lock(tracked["codex"], cwd, panes["codex"])
+                    if poke_noshow("codex"):
+                        code = 4
+                        break
+                    wait_heartbeat("Codex（プランレビュー）")
+            elif state == "codex_question":
+                if tracked["codex"] is None:
+                    tracked["codex"] = lock_codex(cwd, codex_seen, panes["codex"])
+                done = codex_done_ts(tracked["codex"], since) if tracked["codex"] else None
+                done = response_done("codex", tracked["codex"], done)
+                if done:
+                    time.sleep(a.settle)
+                    done = response_done("codex", tracked["codex"],
+                                         codex_done_ts(tracked["codex"], since)) or done
+                    tstart = max(since, probe_ts_cache) if probe else since
+                    texts = turn_texts("codex", tracked["codex"], tstart, done)
+                    text = "\n".join(texts).strip()
+                    # 配達直前に再検知する（Codex の回答中に人間が操作した可能性があるため）
+                    qdlg = detect_question_dialog(panes["claude"])
+                    if text:
+                        dim(c("codex", "codex") + ": " + oneline(text))
+                    if not text:
+                        log(c("warn", "◆ Codex の回答本文を取得できず。ダイアログ検知からやり直します。"))
+                    elif qdlg is None:
+                        log(c("warn", "◆ 質問ダイアログが見当たりません（人間が操作した？）。通常の待機に戻ります。"))
+                    else:
+                        log("◆ " + c("ok", "Codex が回答") + " → 「Chat about this」経由で配達")
+                        if not send_question_answer(panes["claude"], qdlg, text,
+                                                    watch=claude_watch()):
+                            # ダイアログは chat 押下で既に閉じており、未送信のまま state を
+                            # 進めると永久停止する（Codex レビュー指摘）→ 明示停止
+                            print(c("warn", "│ ■ 質問回答の送信を確認できず（Enter失敗）。"
+                                            "状態遷移せず停止します。回答はコンポーザに残っています。"), flush=True)
+                            print("\a", end="", flush=True)
+                            code = 4
+                            break
+                    probe = None  # ダイアログ経由の配達に nonce は無い（帰属ゲート不使用）
+                    since = time.time(); state = "claude"; last_activity = time.time()
+                else:
+                    if tracked["codex"]:
+                        tracked["codex"] = refresh_codex_lock(tracked["codex"], cwd, panes["codex"])
+                    if poke_noshow("codex"):
+                        code = 4
+                        break
+                    wait_heartbeat("Codex（質問回答）")
+            else:  # codex
+                if tracked["codex"] is None:
+                    tracked["codex"] = lock_codex(cwd, codex_seen, panes["codex"])
+                done = codex_done_ts(tracked["codex"], since) if tracked["codex"] else None
+                done = response_done("codex", tracked["codex"], done)
+                if done:
+                    time.sleep(a.settle)
+                    done = response_done("codex", tracked["codex"],
+                                         codex_done_ts(tracked["codex"], since)) or done
+                    tstart = max(since, probe_ts_cache) if probe else since
+                    texts = turn_texts("codex", tracked["codex"], tstart, done)
+                    text = "\n".join(texts)
+                    log("● " + c("codex", "Codex 次タスク指示 完了" if pending_kind == "next"
+                                          else "Codex レビュー完了"))
+                    if text:
+                        dim(c("codex", "codex") + ": " + oneline(text))
+                    msg_claude, back_text = poke_claude, text
+                    # 既定モード: 停止ワードでループ終了（従来どおり）。--gate があればその成功が条件
+                    if (not a.endless) and a.stop_side in ("codex", "both") and hit_stop(texts, stop_phrases):
+                        ok_gate, gate_msg = gate_or_message(a, gate_state, cwd)
+                        if ok_gate:
+                            done_banner(rounds, "codex"); break
+                        if gate_msg is None:
+                            code = 6; break
+                        msg_claude = back_text = gate_msg          # review passed, gate did not → back to Claude
+                    # 連続モードの終端は「全タスク完了」宣言のみ。レビュー中の宣言も尊重する
+                    # （hit_stop は最終メッセージの冒頭100字判定なので、明示的に書いた時だけ効く）
+                    if a.endless:
+                        if hit_stop(texts, all_done_phrases):
+                            all_done_hit = True
+                            done_banner(rounds, "codex", all_done=True); break
+                        if pending_kind == "next":
+                            msg_claude = poke_claude_next
+                        elif a.stop_side in ("codex", "both") and hit_stop(texts, stop_phrases):
+                            ok_gate, gate_msg = gate_or_message(a, gate_state, cwd)
+                            if ok_gate:
+                                log("◆ " + c("ok", "Codex がレビュー合格") + " → Claude に次のタスクを促す")
+                                msg_claude = poke_claude_pass
+                            elif gate_msg is None:
+                                code = 6; break
+                            else:
+                                msg_claude = back_text = gate_msg
+                    if rounds >= a.max_rounds:
+                        print(c("warn", f"│ ■ 最大 {a.max_rounds} 往復に到達。安全のため停止します。"), flush=True)
+                        print("\a", end="", flush=True)
+                        code = 3
+                        break
+                    # Claude がプラン承認ダイアログで停止中だと poke は物理的に届かない
+                    # （ダイアログはリテラル入力をエコーしない）。その場合は Codex のレビューを
+                    # 「Tell Claude what to change」経由で配達する（2026-07-20 実バグ:
+                    # レビュー中に Claude がプランを提示 → poke 3連続失敗で relay 死亡）。
+                    dialog = None if a.no_plan_review else detect_plan_dialog(panes["claude"])
+                    # 質問ダイアログ中も同様に poke は届かず、さらに poke の nonce（16進）の数字が
+                    # 選択として解釈され画面が変わると「画面変化=配達成功」フォールバックが誤爆して
+                    # Enter が飛ぶ（=選択肢を誤送信）リスクがある → 「Chat about this」経由で配達
+                    qdlg = None if a.no_question_relay else detect_question_dialog(panes["claude"])
+                    delivered_back = True
+                    new_probe = None
+                    if dialog and dialog["tell"]:
+                        log("◆ " + c("claude", "Claude はプラン承認待ち")
+                            + " → レビューを「Tell Claude what to change」経由で配達")
+                        delivered_back = send_plan_feedback(panes["claude"], dialog, back_text, approve=False,
+                                                            watch=claude_watch())
+                    elif qdlg:
+                        log("◆ " + c("claude", "Claude は質問ダイアログ表示中")
+                            + " → レビューを「Chat about this」経由で配達")
+                        delivered_back = send_question_answer(panes["claude"], qdlg, back_text,
+                                                              watch=claude_watch())
+                    else:
+                        # Claude 宛: 画面バッジは信用しない（badge=False）。ログ未特定の
+                        # 劣化時のみバッジにフォールバックし、その旨を可視化する
+                        if tracked["claude"] is None:
+                            dim("Claude ログ未特定 → 送信検証を画面バッジにフォールバック（信頼度低）")
+                        new_probe = poke(panes["claude"], msg_claude, confirm=claude_poke_confirm(),
+                                         badge=tracked["claude"] is None, busy_wait=bw)
+                        if not new_probe:
+                            print(c("warn", "│ ■ Claude への依頼を配達できず（poke失敗）。状態遷移せず停止します。"), flush=True)
+                            print("\a", end="", flush=True)
+                            code = 4
+                            break
+                    if not delivered_back:
+                        print(c("warn", "│ ■ レビューの配達（Enter）を確認できず。状態遷移せず停止します。"
+                                        "本文はコンポーザに残っています。"), flush=True)
+                        print("\a", end="", flush=True)
+                        code = 4
+                        break
+                    pending_kind = "review"
+                    probe, probe_ts_cache, probe_sent_at = new_probe, None, time.time()
+                    since = time.time(); state = "claude"; last_activity = time.time()
+                else:
+                    if tracked["codex"]:
+                        tracked["codex"] = refresh_codex_lock(tracked["codex"], cwd, panes["codex"])
+                    if poke_noshow("codex"):
+                        code = 4
+                        break
+                    wait_heartbeat("Codex")
+            time.sleep(a.poll)
+    except KeyboardInterrupt:
+        print("\n" + c("warn", f"│ ■ 中断しました（{rounds} 往復）。"), flush=True)
+        set_pane_title(own, f"relay ■ 中断 / {rounds}往復")
+        return 130
+    # 終了後もタイトルで結果が分かるようにする（走行中と区別がつかないと、
+    # 何時間も前に終わった relay を「まだ回っている」と誤読する）
+    reason = {0: "全タスク完了" if all_done_hit else "停止ワード", 3: "キャップ到達",
+              4: "配達失敗", 5: "上限到達", 6: "停止ゲート失敗"}.get(code, f"exit={code}")
+    set_pane_title(own, f"relay ■ 終了({reason}) / {rounds}往復")
+    return code
+
+
+def done_banner(rounds, who, all_done=False):
+    label = "Codex" if who == "codex" else "Claude"
+    what = "全タスク完了を宣言" if all_done else "停止ワードを宣言"
+    print(c("ok", f"│ ■ 完了：{label} が{what}。{rounds} 往復でループ終了。"), flush=True)
+    print("\a", end="", flush=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

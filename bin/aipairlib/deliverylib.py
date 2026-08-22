@@ -1,36 +1,17 @@
-#!/usr/bin/env python3
 """aipair-deliverylib — poke delivery + Enter submission extracted from aipair-relay
-(D3 relay 分割・案A 増分4 = A4). No import of aipair-relay (no cycle). The host injects its
-tmux helpers, logging, dialog probe and the BUSY_WAIT budget into the module attributes
-below — the functions never reach back into relay's globals. Covered by tests/relay-parsers.py.
+(D3 relay 分割・案A 増分4 = A4). No import of relay (no cycle back to it). Its tmux helpers, logging and the dialog probe
+come from sibling package modules (normal imports; the delivery<->dialog cycle uses a module
+import + call-time reference). The idle budget is an explicit `busy_wait` argument to poke().
+Covered by tests/relay-parsers.py.
 """
 import os
 import subprocess
 import sys
 import time
 
-# ---- injected by the host (aipair-relay) after load; safe defaults otherwise ----
-BUSY_WAIT = 90
-
-
-def dim(_s):
-    pass                                        # host injects relay.dim
-
-
-def dialog_on_screen(_pane):
-    return False                                # host injects aipair-dialoglib.dialog_on_screen (D3 A5)
-
-
-def tmux(*_a, **_k):                            # host injects tmuxlib.tmux
-    raise RuntimeError("aipair-deliverylib.tmux was not injected by the host")
-
-
-def cancel_copy_mode(_pane):
-    pass                                        # host injects tmuxlib.cancel_copy_mode
-
-
-def pane_busy(_pane):
-    return False                                # host injects tmuxlib.pane_busy
+from .logs import dim
+from .tmuxlib import tmux, cancel_copy_mode, pane_busy
+from . import dialoglib   # delivery <-> dialog cycle: import the module, use dialoglib.X at call-time
 
 
 def submit_enter(pane, confirm=None, badge=True):
@@ -47,7 +28,7 @@ def submit_enter(pane, confirm=None, badge=True):
     「送信成功」に見える）。偽陰性は無害: 再打鍵 Enter は空コンポーザで no-op、
     ダイアログ表示中は直前ガードで中止する。"""
     for retry in range(3):
-        if retry and dialog_on_screen(pane):
+        if retry and dialoglib.dialog_on_screen(pane):
             dim("再打鍵前にダイアログ表示を検知 → 送信済み（高速ターン）とみなし Enter を中止")
             return True
         cancel_copy_mode(pane)
@@ -75,7 +56,7 @@ def submit_enter(pane, confirm=None, badge=True):
     return False
 
 
-def poke(pane, text, confirm=None, badge=True):
+def poke(pane, text, confirm=None, badge=True, busy_wait=90):
     """Inject text into a pane the way the agent TUIs expect (literal, then Enter).
     Verifies the text actually reached the composer before pressing Enter;
     if delivery can't be confirmed, never presses Enter (a blind Enter submits
@@ -92,12 +73,12 @@ def poke(pane, text, confirm=None, badge=True):
     # ターン終了後に通常のメッセージとして届く（Claude Code はこのセッションで
     # キュー配達を実測済み。失敗しても配達検証が3回試行→残置で loud stop する）。
     waited = 0
-    while pane_busy(pane) and waited < BUSY_WAIT:
+    while pane_busy(pane) and waited < busy_wait:
         if waited == 0:
-            dim(f"相手ペイン({pane})が実行中 → 最大{BUSY_WAIT}秒だけアイドルを待つ")
+            dim(f"相手ペイン({pane})が実行中 → 最大{busy_wait}秒だけアイドルを待つ")
         time.sleep(5)
         waited += 5
-    if waited >= BUSY_WAIT and pane_busy(pane):
+    if waited >= busy_wait and pane_busy(pane):
         dim(f"相手ペイン({pane})が{waited}秒経過後も実行中 → 配達検証に任せて注入を続行（キュー投入）")
     elif waited:
         dim(f"アイドル確認（{waited}s 待機）→ 注入開始")

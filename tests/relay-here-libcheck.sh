@@ -25,17 +25,20 @@ export PATH="$W:$PATH"
 fail=0; n=0
 chk() { n=$((n+1)); if eval "$1"; then echo "ok   $2"; else echo "FAIL $2"; fail=1; fi; }
 
-ALL=(aipair-relay peer-log aipair-corelib aipair-loglib aipair-tmuxlib aipair-deliverylib aipair-dialoglib)
-
-# complete set → relay loads → the lib check passes (relay-here then dies later on 'no session',
-# which is a DIFFERENT failure, proving it got past the load gate)
-mkdir -p "$W/full"; for f in "${ALL[@]}"; do cp "$REPO/bin/$f" "$W/full/"; done; chmod +x "$W/full/"*
+# The relay/peer-log are thin entrypoints that import the aipairlib package sitting next to
+# them (#7). complete set → import succeeds → the load gate passes (relay-here then dies later
+# on 'no session', a DIFFERENT failure, proving it got past the gate).
+mkdir -p "$W/full/aipairlib"
+cp "$REPO/bin/aipair-relay" "$REPO/bin/peer-log" "$W/full/"; chmod +x "$W/full/aipair-relay" "$W/full/peer-log"
+cp "$REPO/bin/aipairlib/"*.py "$W/full/aipairlib/"
 out="$(env -u TMUX AIPAIR_RELAY_BIN="$W/full/aipair-relay" bash "$REPO/bin/aipair-relay-here" --session none 2>&1)" || true
 echo "$out" | grep -q "ロードできない" && loaderr=1 || loaderr=0
 chk "[ $loaderr -eq 0 ]" "complete install passes the lib-load gate"
 
-# missing one lib (tmuxlib) → relay import fails → relay-here dies at the load gate
-mkdir -p "$W/partial"; for f in "${ALL[@]}"; do [ "$f" = aipair-tmuxlib ] || cp "$REPO/bin/$f" "$W/partial/"; done; chmod +x "$W/partial/"*
+# missing one package module (tmuxlib.py) → the relay import fails → relay-here dies at the gate
+mkdir -p "$W/partial/aipairlib"
+cp "$REPO/bin/aipair-relay" "$REPO/bin/peer-log" "$W/partial/"; chmod +x "$W/partial/aipair-relay" "$W/partial/peer-log"
+for f in "$REPO/bin/aipairlib/"*.py; do [ "$(basename "$f")" = tmuxlib.py ] || cp "$f" "$W/partial/aipairlib/"; done
 rc=0; out="$(env -u TMUX AIPAIR_RELAY_BIN="$W/partial/aipair-relay" bash "$REPO/bin/aipair-relay-here" --session none 2>&1)" || rc=$?
 chk "[ $rc -ne 0 ]" "missing lib → relay-here exits non-zero (got $rc)"
 echo "$out" | grep -q "ロードできない" && loaderr2=1 || loaderr2=0

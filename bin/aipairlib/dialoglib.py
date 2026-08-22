@@ -1,8 +1,8 @@
-#!/usr/bin/env python3
 """aipair-dialoglib — Claude の選択ダイアログ（プラン承認 / AskUserQuestion）の検出と応答
-（D3 relay 分割・案A 増分5 = A5）。ダイアログ定数/正規表現もここに集約。aipair-relay を
-import しない（循環なし）。host が tmux/画面・配達（press/paste_text/submit_enter）・ログ整形
-（make_fragment）・ロガー（dim）を注入する。tests/relay-parsers.py で被覆。
+（D3 relay 分割・案A 増分5 = A5）。ダイアログ定数/正規表現もここに集約。relay を import しない
+（relay への循環なし）。tmux/画面・ログ整形・ロガーは sibling package モジュールから通常 import し、
+配達（press/paste_text/submit_enter）は dialog<->delivery 循環のため module import＋call-time 参照。
+tests/relay-parsers.py で被覆。
 """
 import glob
 import os
@@ -10,33 +10,10 @@ import re
 import subprocess
 import time
 
-# ---- injected by the host (aipair-relay); safe/loud defaults otherwise ----
-def dim(_s):
-    pass
-
-
-def make_fragment(text, _n=48):
-    return text
-
-
-def capture_pane(_pane):
-    raise RuntimeError("aipair-dialoglib.capture_pane was not injected by the host")
-
-
-def tmux(*_a, **_k):
-    raise RuntimeError("aipair-dialoglib.tmux was not injected by the host")
-
-
-def press(_pane, _key):
-    raise RuntimeError("aipair-dialoglib.press was not injected by the host")
-
-
-def paste_text(_pane, _text):
-    raise RuntimeError("aipair-dialoglib.paste_text was not injected by the host")
-
-
-def submit_enter(_pane, confirm=None, badge=True):
-    raise RuntimeError("aipair-dialoglib.submit_enter was not injected by the host")
+from .logs import dim
+from .loglib import make_fragment
+from .tmuxlib import capture_pane, tmux
+from . import deliverylib   # dialog <-> delivery cycle: import the module, use deliverylib.X at call-time
 
 
 def dialog_on_screen(pane):
@@ -103,9 +80,9 @@ def send_plan_feedback(pane, dialog, text, approve, watch=None):
     `the user said:\\n<本文>` と送信後の本文を含む＝書かれるのは Enter 時点なので、
     成立条件は「tool_result 追記（解決）」または「本文断片の入力行追記」。
     None のときは画面バッジにフォールバック（ログ未特定時のみ・信頼度低）。"""
-    press(pane, dialog["tell"])
+    deliverylib.press(pane, dialog["tell"])
     time.sleep(0.8)
-    paste_text(pane, text[:4000])
+    deliverylib.paste_text(pane, text[:4000])
     time.sleep(0.5)
     confirm = None
     if watch is not None:
@@ -118,7 +95,7 @@ def send_plan_feedback(pane, dialog, text, approve, watch=None):
         # （Codex レビュー指摘）。BTab は通常コンポーザでは権限モード切替のため、
         # Enter と違い盲目の再打鍵は不可 — 失敗時は False を返して呼び出し元に
         # 停止させ、人に委ねる。
-        press(pane, "BTab")
+        deliverylib.press(pane, "BTab")
         deadline = time.time() + 7
         while time.time() < deadline:
             if confirm is not None:
@@ -134,7 +111,7 @@ def send_plan_feedback(pane, dialog, text, approve, watch=None):
             time.sleep(0.5)
         dim("Shift+Tab 後に承認の成立を確認できず（吸収された可能性）")
         return False
-    return submit_enter(pane, confirm=confirm, badge=confirm is None)
+    return deliverylib.submit_enter(pane, confirm=confirm, badge=confirm is None)
 
 
 # --- AskUserQuestion dialog handling ----------------------------------------- #
@@ -238,7 +215,7 @@ def scrape_questions(pane):
                 break
             # 新しいタブを読めた時だけ → を押す。stale 画面で重ね押しすると
             # タブを飛ばして質問を取りこぼすため、切替待ちは押さずに再読する
-            press(pane, "Right")
+            deliverylib.press(pane, "Right")
             time.sleep(0.6)
         else:
             stagnant += 1
@@ -255,7 +232,7 @@ def send_question_answer(pane, qdlg, text, watch=None):
     questions」として解決しコンポーザへ戻る。回答は後追いのユーザーメッセージとして
     ペースト送信する（Claude の decline 反応ターン中でもキューされて確実に届き、
     Claude は回答を読んで続行する）。操作列は send_plan_feedback と同型。"""
-    press(pane, qdlg["chat"])
+    deliverylib.press(pane, qdlg["chat"])
     time.sleep(0.8)
     # chat 押下で decline の tool_result が先に書かれる（実測）ため、チェックポイントを
     # ここで置き直し、以降の「本文の入力行」（user 文字列 or queue-operation）だけを
@@ -265,6 +242,6 @@ def send_question_answer(pane, qdlg, text, watch=None):
         watch.reset()
         frag = make_fragment(text)
         confirm = lambda: watch.claude_input(frag)
-    paste_text(pane, text[:4000])
+    deliverylib.paste_text(pane, text[:4000])
     time.sleep(0.5)
-    return submit_enter(pane, confirm=confirm, badge=confirm is None)
+    return deliverylib.submit_enter(pane, confirm=confirm, badge=confirm is None)

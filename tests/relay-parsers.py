@@ -4,7 +4,7 @@ env parsing, pane discovery, Claude's plan / question dialogs, turn-completion d
 and transcript parsing. No tmux, no agents, nothing under ~ is touched.
     python3 tests/relay-parsers.py
 """
-import importlib.machinery, importlib.util, json, os, subprocess, sys, tempfile, time, types, unittest
+import importlib.machinery, importlib.util, inspect, json, os, subprocess, sys, tempfile, time, types, unittest
 from datetime import datetime, timezone
 from unittest import mock
 
@@ -20,8 +20,20 @@ def load_module(name, path):
     return mod
 
 
-relay = load_module("relay_parsers_under_test", os.path.join(BIN, "aipair-relay"))
+sys.path.insert(0, BIN)
+import aipairlib.relay as relay   # the package (#7); was a SourceFileLoader of bin/aipair-relay
 peerlog = relay.peerlog
+
+
+def _imports_without_relay(modname, *check_attrs):
+    """A CLEAN interpreter can `import aipairlib.<modname>` WITHOUT pulling in aipairlib.relay
+    (the package's libs never depend back on relay). Returns True on that + every check_attr
+    being callable. Replaces the old standalone SourceFileLoader tests, which can't load a
+    package module that uses relative imports (from . import …)."""
+    attrs = "".join("; assert callable(getattr(m, %r))" % a for a in check_attrs)
+    code = ("import sys; sys.path.insert(0, %r); import aipairlib.%s as m%s; "
+            "sys.exit(3 if 'aipairlib.relay' in sys.modules else 0)" % (BIN, modname, attrs))
+    return subprocess.run([sys.executable, "-c", code], capture_output=True).returncode == 0
 
 
 def epoch(iso):
@@ -80,7 +92,7 @@ class EnvHelpers(unittest.TestCase):
 
 def panes(*rows):
     """Fake `tmux list-panes -F '#{pane_id}\\t#{pane_current_command}\\t#{pane_title}'` output.
-    find_panes now lives in aipair-tmuxlib and calls that module's `tmux`, so patch there."""
+    find_panes now lives in aipairlib.tmuxlib and calls that module's `tmux`, so patch there."""
     out = "\n".join("\t".join(r) for r in rows) + "\n"
     def side(*a, **k):
         if a and a[0] == "show-options":
@@ -226,8 +238,8 @@ PLAN_SCREEN = """\
 
 
 class TmuxHelpers(unittest.TestCase):
-    """aipair-tmuxlib: the tmux runner's pane helpers. Every real subprocess is faked by
-    patching aipair-tmuxlib's own `tmux` (the helpers call it within that module)."""
+    """aipairlib.tmuxlib: the tmux runner's pane helpers. Every real subprocess is faked by
+    patching aipairlib.tmuxlib's own `tmux` (the helpers call it within that module)."""
     def _tmux(self, side_effect):
         return mock.patch.object(relay.tmuxlib, "tmux", side_effect=side_effect)
 
@@ -297,7 +309,7 @@ class TmuxHelpers(unittest.TestCase):
 
 
 class Delivery(unittest.TestCase):
-    """aipair-deliverylib: poke / submit_enter / press / paste_text. The tmux runner and the
+    """aipairlib.deliverylib: poke / submit_enter / press / paste_text. The tmux runner and the
     dialog/log hooks are injected into the delivery module — patch them there."""
     def setUp(self):
         self.dl = relay.deliverylib
@@ -343,7 +355,7 @@ class Delivery(unittest.TestCase):
         sends = []
         with self._tmux(lambda *a, **k: (sends.append(a) if a[:1] == ("send-keys",) else None) or types.SimpleNamespace(stdout="")), \
              mock.patch.object(self.dl, "cancel_copy_mode"), \
-             mock.patch.object(self.dl, "dialog_on_screen", side_effect=[True]):
+             mock.patch.object(relay.dialoglib, "dialog_on_screen", side_effect=[True]):
             ok = self.dl.submit_enter("%0", confirm=lambda: False, badge=False)
         self.assertTrue(ok)
         self.assertEqual(len([a for a in sends if "Enter" in a]), 1, "only the first Enter is sent; retry aborts")
@@ -352,7 +364,7 @@ class Delivery(unittest.TestCase):
         enters = []
         with self._tmux(lambda *a, **k: (enters.append(a) if a[-1:] == ("Enter",) else None) or types.SimpleNamespace(stdout="")), \
              mock.patch.object(self.dl, "cancel_copy_mode"), \
-             mock.patch.object(self.dl, "dialog_on_screen", return_value=False), \
+             mock.patch.object(relay.dialoglib, "dialog_on_screen", return_value=False), \
              mock.patch.object(self.dl.sys.stdout, "write"), mock.patch.object(self.dl.sys.stdout, "flush"):
             self.assertFalse(self.dl.submit_enter("%0", confirm=lambda: False, badge=False))
         self.assertEqual(len(enters), 3, "Enter re-pressed 3 times before giving up")
@@ -370,7 +382,7 @@ class Delivery(unittest.TestCase):
         got = {}
         with self._tmux(fake), mock.patch.object(self.dl, "cancel_copy_mode"), \
              mock.patch.object(self.dl, "pane_busy", return_value=False), \
-             mock.patch.object(self.dl, "dialog_on_screen", return_value=False):
+             mock.patch.object(relay.dialoglib, "dialog_on_screen", return_value=False):
             res = self.dl.poke("%0", "please review", confirm=lambda probe: got.setdefault("p", probe) or True, badge=False)
         self.assertIsInstance(res, str); self.assertTrue(res.startswith("relay-id:"))
         self.assertEqual(res, got["p"], "poke returns the nonce it delivered and confirmed")
@@ -383,7 +395,7 @@ class Delivery(unittest.TestCase):
             return types.SimpleNamespace(stdout="unrelated screen")   # nonce never appears
         with self._tmux(fake), mock.patch.object(self.dl, "cancel_copy_mode"), \
              mock.patch.object(self.dl, "pane_busy", return_value=False), \
-             mock.patch.object(self.dl, "dialog_on_screen", return_value=False), \
+             mock.patch.object(relay.dialoglib, "dialog_on_screen", return_value=False), \
              mock.patch.object(self.dl.sys.stdout, "write"), mock.patch.object(self.dl.sys.stdout, "flush"):
             self.assertFalse(self.dl.poke("%0", "hi", confirm=lambda p: True, badge=False))
         self.assertEqual(enters, [], "no Enter is pressed when delivery could not be confirmed")
@@ -396,29 +408,25 @@ class Delivery(unittest.TestCase):
             if a[:2] == ("send-keys", "-t") and "-l" in a: state["buf"] = a[-1]
             if a[:1] == ("capture-pane",): return types.SimpleNamespace(stdout=state["buf"])
             return types.SimpleNamespace(stdout="")
-        with mock.patch.object(self.dl, "BUSY_WAIT", 30), self._tmux(fake), \
+        with self._tmux(fake), \
              mock.patch.object(self.dl, "cancel_copy_mode"), \
              mock.patch.object(self.dl, "pane_busy", side_effect=lambda p: next(busy, False)), \
-             mock.patch.object(self.dl, "dialog_on_screen", return_value=False):
-            res = self.dl.poke("%0", "x", confirm=lambda p: True, badge=False)
+             mock.patch.object(relay.dialoglib, "dialog_on_screen", return_value=False):
+            res = self.dl.poke("%0", "x", confirm=lambda p: True, badge=False, busy_wait=30)
         self.assertTrue(res and res.startswith("relay-id:"))
 
 
 class DeliverylibStandalone(unittest.TestCase):
-    def test_loads_without_relay_and_defaults_are_safe(self):
-        loader = importlib.machinery.SourceFileLoader("dl_standalone", os.path.join(BIN, "aipair-deliverylib"))
-        dl = importlib.util.module_from_spec(importlib.util.spec_from_loader("dl_standalone", loader))
-        loader.exec_module(dl)                            # raises if it imported relay / used its globals
-        self.assertEqual(dl.BUSY_WAIT, 90)
-        self.assertFalse(dl.dialog_on_screen("%0"))       # safe default
-        with self.assertRaises(RuntimeError):
-            dl.tmux("x")                                  # not injected → explicit error, not silent
+    def test_loads_without_relay_and_re_exports(self):
+        self.assertTrue(_imports_without_relay("deliverylib", "poke", "submit_enter", "press", "paste_text"))
+        # the idle budget is an explicit poke() argument now (was an injected BUSY_WAIT attribute)
+        self.assertEqual(inspect.signature(relay.deliverylib.poke).parameters["busy_wait"].default, 90)
         self.assertIs(relay.poke, relay.deliverylib.poke)
 
 
 class TmuxlibStandalone(unittest.TestCase):
     def test_loads_without_relay(self):
-        loader = importlib.machinery.SourceFileLoader("tmuxlib_standalone", os.path.join(BIN, "aipair-tmuxlib"))
+        loader = importlib.machinery.SourceFileLoader("tmuxlib_standalone", os.path.join(BIN, "aipairlib", "tmuxlib.py"))
         tl = importlib.util.module_from_spec(importlib.util.spec_from_loader("tmuxlib_standalone", loader))
         loader.exec_module(tl)
         self.assertTrue(callable(tl.tmux) and callable(tl.find_panes))
@@ -861,7 +869,7 @@ class SchemaProbe(unittest.TestCase):
 
 
 class DialogSendScrape(unittest.TestCase):
-    """aipair-dialoglib: multi-tab scrape, capture failure, plan revise/approve, question
+    """aipairlib.dialoglib: multi-tab scrape, capture failure, plan revise/approve, question
     answer, watch present/absent. tmux/capture/delivery hooks are injected → patch there."""
     def setUp(self):
         self.dg = relay.dialoglib
@@ -884,7 +892,7 @@ class DialogSendScrape(unittest.TestCase):
         caps = iter([self.Q1, self.Q1, self.Q2])   # read Q1, press Right, read Q2
         presses = []
         with mock.patch.object(self.dg, "capture_pane", side_effect=lambda p: next(caps)), \
-             mock.patch.object(self.dg, "press", side_effect=lambda p, k: presses.append(k)):
+             mock.patch.object(relay.deliverylib, "press", side_effect=lambda p, k: presses.append(k)):
             blocks = self.dg.scrape_questions("%0")
         self.assertEqual(len(blocks), 2)
         self.assertIn("Pick a database", blocks[0]); self.assertIn("Pick a cache", blocks[1])
@@ -898,9 +906,9 @@ class DialogSendScrape(unittest.TestCase):
     def test_plan_revise_uses_submit_enter_with_watch_confirm(self):
         w = mock.Mock(); w.claude_resolved.return_value = False; w.claude_input.return_value = True
         seen = {}
-        with mock.patch.object(self.dg, "press") as press, \
-             mock.patch.object(self.dg, "paste_text") as paste, \
-             mock.patch.object(self.dg, "submit_enter", side_effect=lambda p, confirm=None, badge=True: seen.update(confirm=confirm, badge=badge) or True) as se:
+        with mock.patch.object(relay.deliverylib, "press") as press, \
+             mock.patch.object(relay.deliverylib, "paste_text") as paste, \
+             mock.patch.object(relay.deliverylib, "submit_enter", side_effect=lambda p, confirm=None, badge=True: seen.update(confirm=confirm, badge=badge) or True) as se:
             ok = self.dg.send_plan_feedback("%0", {"tell": "3"}, "please change X", approve=False, watch=w)
         self.assertTrue(ok)
         press.assert_any_call("%0", "3")                 # 'Tell Claude what to change'
@@ -911,58 +919,55 @@ class DialogSendScrape(unittest.TestCase):
 
     def test_plan_approve_uses_btab_and_confirms_via_watch(self):
         w = mock.Mock(); w.claude_resolved.side_effect = [False, True]; w.claude_input.return_value = False
-        with mock.patch.object(self.dg, "press") as press, mock.patch.object(self.dg, "paste_text"), \
+        with mock.patch.object(relay.deliverylib, "press") as press, mock.patch.object(relay.deliverylib, "paste_text"), \
              mock.patch.object(self.dg, "tmux", return_value=types.SimpleNamespace(stdout="")):
             ok = self.dg.send_plan_feedback("%0", {"tell": "3"}, "ok", approve=True, watch=w)
         self.assertTrue(ok)
         press.assert_any_call("%0", "BTab")              # feedback-approve is Shift+Tab
 
     def test_plan_approve_badge_fallback_without_watch(self):
-        with mock.patch.object(self.dg, "press"), mock.patch.object(self.dg, "paste_text"), \
+        with mock.patch.object(relay.deliverylib, "press"), mock.patch.object(relay.deliverylib, "paste_text"), \
              mock.patch.object(self.dg, "tmux", return_value=types.SimpleNamespace(stdout="running esc to interrupt")):
             self.assertTrue(self.dg.send_plan_feedback("%0", {"tell": "3"}, "ok", approve=True, watch=None))
 
     def test_plan_approve_failure_when_not_confirmed(self):
         w = mock.Mock(); w.claude_resolved.return_value = False; w.claude_input.return_value = False
-        with mock.patch.object(self.dg, "press"), mock.patch.object(self.dg, "paste_text"):
+        with mock.patch.object(relay.deliverylib, "press"), mock.patch.object(relay.deliverylib, "paste_text"):
             self.assertFalse(self.dg.send_plan_feedback("%0", {"tell": "3"}, "x", approve=True, watch=w))
 
     def test_question_answer_with_and_without_watch(self):
         # with watch: chat pressed, answer pasted, submit_enter confirm=watch.claude_input, badge False
         w = mock.Mock(); w.claude_input.return_value = True
         seen = {}
-        with mock.patch.object(self.dg, "press") as press, mock.patch.object(self.dg, "paste_text") as paste, \
-             mock.patch.object(self.dg, "submit_enter", side_effect=lambda p, confirm=None, badge=True: seen.update(c=confirm, b=badge) or True):
+        with mock.patch.object(relay.deliverylib, "press") as press, mock.patch.object(relay.deliverylib, "paste_text") as paste, \
+             mock.patch.object(relay.deliverylib, "submit_enter", side_effect=lambda p, confirm=None, badge=True: seen.update(c=confirm, b=badge) or True):
             self.assertTrue(self.dg.send_question_answer("%0", {"chat": "3"}, "my answer", watch=w))
         press.assert_any_call("%0", "3"); paste.assert_called_once()
         self.assertTrue(seen["c"]()); self.assertFalse(seen["b"])
         # without watch: badge fallback (confirm None → badge True)
         seen.clear()
-        with mock.patch.object(self.dg, "press"), mock.patch.object(self.dg, "paste_text"), \
-             mock.patch.object(self.dg, "submit_enter", side_effect=lambda p, confirm=None, badge=True: seen.update(c=confirm, b=badge) or True):
+        with mock.patch.object(relay.deliverylib, "press"), mock.patch.object(relay.deliverylib, "paste_text"), \
+             mock.patch.object(relay.deliverylib, "submit_enter", side_effect=lambda p, confirm=None, badge=True: seen.update(c=confirm, b=badge) or True):
             self.dg.send_question_answer("%0", {"chat": "3"}, "a", watch=None)
         self.assertIsNone(seen["c"]); self.assertTrue(seen["b"])
 
 
 class DialoglibStandalone(unittest.TestCase):
     def test_loads_without_relay(self):
-        loader = importlib.machinery.SourceFileLoader("dg_standalone", os.path.join(BIN, "aipair-dialoglib"))
-        dg = importlib.util.module_from_spec(importlib.util.spec_from_loader("dg_standalone", loader))
-        loader.exec_module(dg)                            # raises if it imported relay
-        self.assertIn("Would you like to proceed?", dg.PLAN_QUESTION)
-        with self.assertRaises(RuntimeError):
-            dg.capture_pane("%0")                          # not injected → explicit error
+        self.assertTrue(_imports_without_relay("dialoglib", "detect_plan_dialog", "dialog_on_screen"))
+        self.assertIn("Would you like to proceed?", relay.dialoglib.PLAN_QUESTION)
         self.assertIs(relay.detect_plan_dialog, relay.dialoglib.detect_plan_dialog)
-        # the delivery re-press guard now points at dialoglib's probe
-        self.assertIs(relay.deliverylib.dialog_on_screen, relay.dialoglib.dialog_on_screen)
+        # delivery routes its re-press guard through the dialog MODULE (the delivery<->dialog cycle)
+        self.assertIs(relay.deliverylib.dialoglib, relay.dialoglib)
+        self.assertIs(relay.dialoglib.deliverylib, relay.deliverylib)
 
 
 class ModuleLayout(unittest.TestCase):
-    """D3 split: aipair-relay loads exactly the six sibling modules and binds a representative
-    symbol from each to that module's implementation (guards against a future re-merge/rebind)."""
+    """#7: relay imports the aipairlib sibling modules normally and binds a representative symbol
+    from each to that module's implementation (guards against a future re-merge / broken import)."""
     def test_all_libs_loaded_and_bindings_point_to_them(self):
-        for lib in ("corelib", "loglib", "tmuxlib", "deliverylib", "dialoglib", "peerlog"):
-            self.assertTrue(hasattr(relay, lib), f"relay must load {lib}")
+        for lib in ("corelib", "loglib", "tmuxlib", "deliverylib", "dialoglib", "peerlog", "logs"):
+            self.assertTrue(hasattr(relay, lib), f"relay must import {lib}")
         self.assertIs(relay.parse_version, relay.corelib.parse_version)
         self.assertIs(relay.schema_probe, relay.corelib.schema_probe)
         self.assertIs(relay.schema_gate, relay.corelib.schema_gate)
@@ -971,8 +976,10 @@ class ModuleLayout(unittest.TestCase):
         self.assertIs(relay.find_panes, relay.tmuxlib.find_panes)
         self.assertIs(relay.poke, relay.deliverylib.poke)
         self.assertIs(relay.detect_plan_dialog, relay.dialoglib.detect_plan_dialog)
-        # cross-module injection: the delivery re-press guard is the dialog module's probe
-        self.assertIs(relay.deliverylib.dialog_on_screen, relay.dialoglib.dialog_on_screen)
+        # the delivery<->dialog cycle is a plain module import (used at call-time), not injection
+        self.assertIs(relay.deliverylib.dialoglib, relay.dialoglib)
+        self.assertIs(relay.dialoglib.deliverylib, relay.deliverylib)
+        self.assertIs(relay.dim, relay.logs.dim)
         # what stays in relay (the launcher core) is defined here, not in a lib
         for core in ("main", "LogWatch", "lock_codex", "run_gate", "gate_or_message"):
             self.assertTrue(hasattr(relay, core))
@@ -1069,10 +1076,10 @@ class TranscriptParsers(unittest.TestCase):
 
 
 class CorelibStandalone(unittest.TestCase):
-    """aipair-corelib must load with NO aipair-relay dependency (that decoupling is the point
+    """aipairlib.corelib must load with NO aipair-relay dependency (that decoupling is the point
     of the split): a fresh SourceFileLoader of just corelib exposes the pure helpers."""
     def test_corelib_loads_and_works_without_relay(self):
-        loader = importlib.machinery.SourceFileLoader("corelib_standalone", os.path.join(BIN, "aipair-corelib"))
+        loader = importlib.machinery.SourceFileLoader("corelib_standalone", os.path.join(BIN, "aipairlib", "corelib.py"))
         core = importlib.util.module_from_spec(importlib.util.spec_from_loader("corelib_standalone", loader))
         loader.exec_module(core)   # would raise if it referenced relay-only globals
         self.assertEqual(core.parse_version("2.1.238 (Claude Code)"), "2.1.238")
@@ -1090,14 +1097,11 @@ class CorelibStandalone(unittest.TestCase):
 
 
 class LoglibStandalone(unittest.TestCase):
-    """aipair-loglib loads with only peer-log (no aipair-relay), and relay re-exports it."""
+    """aipairlib.loglib loads with only peer-log (no aipair-relay), and relay re-exports it."""
     def test_loglib_loads_and_works_without_relay(self):
-        loader = importlib.machinery.SourceFileLoader("loglib_standalone", os.path.join(BIN, "aipair-loglib"))
-        ll = importlib.util.module_from_spec(importlib.util.spec_from_loader("loglib_standalone", loader))
-        loader.exec_module(ll)                       # raises if it referenced relay-only globals
-        self.assertTrue(callable(ll.claude_done_ts) and callable(ll.turn_texts))
-        self.assertTrue(callable(ll.read_records) and ll.read_records("/no/such/file") == [])
-        self.assertEqual(ll.make_fragment("hello world", 5), relay.make_fragment("hello world", 5))
+        self.assertTrue(_imports_without_relay("loglib", "claude_done_ts", "turn_texts", "read_records"))
+        self.assertEqual(relay.loglib.read_records("/no/such/file"), [])
+        self.assertEqual(relay.loglib.make_fragment("hello world", 5), relay.make_fragment("hello world", 5))
 
     def test_relay_reexports_are_the_loglib_objects(self):
         self.assertIs(relay.claude_done_ts, relay.loglib.claude_done_ts)
