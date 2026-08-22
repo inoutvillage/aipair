@@ -1,19 +1,11 @@
-#!/usr/bin/env python3
 """aipair-loglib — Claude/Codex トランスクリプト（jsonl / rollout）からターン完了・応答帰属を
 読み取る関数群（D3 relay 分割・案A 増分2 = A2）。tmux/画面には一切依存せず、peer-log の
 パーサ（parse_claude / parse_codex / _ts_key）だけを使う。aipair-relay が SourceFileLoader で
 読み込み、名前を自分の名前空間に束ねて使う。tests/relay-parsers.py で被覆されている。
 """
-import importlib.machinery
-import importlib.util
-import os
 from collections import deque
 
-# reuse peer-log's parsers (same SourceFileLoader pattern as aipair-relay)
-_PEERLOG = os.path.join(os.path.dirname(os.path.realpath(__file__)), "peer-log")
-_loader = importlib.machinery.SourceFileLoader("peerlog", _PEERLOG)
-peerlog = importlib.util.module_from_spec(importlib.util.spec_from_loader("peerlog", _loader))
-_loader.exec_module(peerlog)
+from . import peerlog   # normal package import (was a SourceFileLoader-by-path)
 
 
 # --- schema feature-probe input --------------------------------------------- #

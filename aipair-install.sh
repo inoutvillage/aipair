@@ -25,7 +25,7 @@
 #
 # Notes:
 #   - Install dir is fixed to ~/.local/bin: aipair-relay-here resolves $HOME/.local/bin/aipair-relay,
-#     and aipair-relay / peer-log / aipair-corelib / aipair-loglib / aipair-tmuxlib / aipair-deliverylib / aipair-dialoglib must live in the same directory (they import each other
+#     and aipair-relay / peer-log (thin entrypoints) + the aipairlib/ package must live in the same directory (the entrypoints import the package)
 #     by path). Files are copied, never symlinked.
 #   - Notice blocks for ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md are delimited by
 #     <!-- aipair:start --> / <!-- aipair:end -->. Re-running replaces the block in place; it never
@@ -43,7 +43,13 @@ CLAUDE_MD="$AH/.claude/CLAUDE.md"
 CODEX_AGENTS="$AH/.codex/AGENTS.md"
 TMUX_MIN="3.1"; TMUX_MIN_MAJOR=3; TMUX_MIN_MINOR=1
 PY_MIN="3.8";   PY_MIN_MAJOR=3;   PY_MIN_MINOR=8
-FILES=(aipair aipair-relay aipair-relay-here peer peer-log aipair-corelib aipair-loglib aipair-tmuxlib aipair-deliverylib aipair-dialoglib)
+# Executables (top-level) + the aipairlib package modules (#7: relay/peer-log are thin
+# entrypoints; the shared code is a normal importable package). Package files go under
+# aipairlib/ and are NOT chmod +x (they are imported, not run).
+FILES=(aipair aipair-relay aipair-relay-here peer peer-log
+       aipairlib/__init__.py aipairlib/logs.py aipairlib/peerlog.py aipairlib/corelib.py
+       aipairlib/loglib.py aipairlib/tmuxlib.py aipairlib/deliverylib.py aipairlib/dialoglib.py
+       aipairlib/relay.py)
 SKILLS=(aipair-setup aipair-relay)
 MARK_START='<!-- aipair:start -->'
 MARK_END='<!-- aipair:end -->'
@@ -98,7 +104,9 @@ done
 # missing templates/codex-agents-block.md would surface only AFTER CLAUDE.md was
 # already rewritten, as a Python traceback (PM review #2).
 _missing=""
-for _f in bin/aipair bin/aipair-relay bin/aipair-relay-here bin/peer bin/peer-log bin/aipair-corelib bin/aipair-loglib bin/aipair-tmuxlib bin/aipair-deliverylib bin/aipair-dialoglib \
+for _f in bin/aipair bin/aipair-relay bin/aipair-relay-here bin/peer bin/peer-log \
+          bin/aipairlib/__init__.py bin/aipairlib/relay.py bin/aipairlib/peerlog.py bin/aipairlib/logs.py \
+          bin/aipairlib/corelib.py bin/aipairlib/loglib.py bin/aipairlib/tmuxlib.py bin/aipairlib/deliverylib.py bin/aipairlib/dialoglib.py \
           templates/vscode-tasks.json templates/claude-md-block.md templates/codex-agents-block.md \
           .claude/skills/aipair-setup/SKILL.md .claude/skills/aipair-relay/SKILL.md; do
   [ -f "$REPO_DIR/$_f" ] || _missing="$_missing $_f"
@@ -366,7 +374,7 @@ else warn "locale is not UTF-8 (LANG=${LANG:-unset} LC_ALL=${LC_ALL:-unset}) —
 mkdir -p "$BIN_DIR" || { fail "cannot create $BIN_DIR"; exit 1; }
 # Retire binaries this project no longer ships (D2: aipair-queue removed). An older install
 # would otherwise leave a runnable, now-unsupported copy in PATH.
-RETIRED=(aipair-queue)
+RETIRED=(aipair-queue aipair-corelib aipair-loglib aipair-tmuxlib aipair-deliverylib aipair-dialoglib)
 for f in "${RETIRED[@]}"; do
   if [ -e "$BIN_DIR/$f" ]; then
     if mv "$BIN_DIR/$f" "$BIN_DIR/$f.removed-$TS"; then
@@ -381,24 +389,28 @@ for f in "${RETIRED[@]}"; do
 done
 for f in "${FILES[@]}"; do
   src="$REPO_DIR/bin/$f"; dst="$BIN_DIR/$f"
+  mkdir -p "$(dirname "$dst")" || { fail "cannot create $(dirname "$dst")"; exit 1; }
+  case "$f" in */*) X=false ;; *) X=true ;; esac   # only top-level entrypoints are executable
   if [ -f "$dst" ] && same_file "$src" "$dst"; then
-    [ -x "$dst" ] || chmod +x "$dst"
+    $X && { [ -x "$dst" ] || chmod +x "$dst"; }
     skip "$dst is up to date"
     continue
   fi
   if [ -e "$dst" ]; then
     cp -p "$dst" "$dst.bak-$TS" || { fail "cannot back up $dst"; exit 1; }
-    cp "$src" "$dst" && chmod +x "$dst" || { fail "cannot install $dst"; exit 1; }
+    cp "$src" "$dst" || { fail "cannot install $dst"; exit 1; }
+    $X && chmod +x "$dst"
     ok "$dst updated (previous copy: $dst.bak-$TS)"
   else
-    cp "$src" "$dst" && chmod +x "$dst" || { fail "cannot install $dst"; exit 1; }
+    cp "$src" "$dst" || { fail "cannot install $dst"; exit 1; }
+    $X && chmod +x "$dst"
     ok "$dst installed"
   fi
 done
-# same-directory import check (aipair-relay imports peer-log + aipair-corelib + aipair-loglib + aipair-tmuxlib + aipair-deliverylib + aipair-dialoglib by path)
+# import check: the thin entrypoints import the aipairlib package (relay/peerlog + siblings).
 for f in aipair-relay peer-log; do
   if ! "$BIN_DIR/$f" --help >/dev/null 2>&1; then
-    fail "$BIN_DIR/$f --help failed — all ${#FILES[@]} bin files must sit together in $BIN_DIR (they import each other by path)"
+    fail "$BIN_DIR/$f --help failed — the aipairlib package must sit next to the entrypoints in $BIN_DIR"
     exit 1
   fi
 done

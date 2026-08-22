@@ -95,7 +95,7 @@ git clone https://github.com/inoutvillage/aipair && cd aipair
 2. `tmux` の有無と版（≥ 3.1）。無ければ導入コマンドを表示して **exit 3**（`--install-tmux` 時のみ導入）
 3. `python3`（≥ 3.8）/ `claude` / `codex` の有無。欠けていれば導入手順を案内して **exit 3**
 4. ロケールが UTF-8 でなければ `[warn]`
-5. `bin/` の CLI 一式（`aipair` / `peer` / `aipair-relay` とヘルパーの `aipair-*lib`）を **`~/.local/bin` にコピー**（差分があるときだけ上書き。上書き前に `*.bak-<timestamp>` を残す）＋ `chmod +x`。
+5. `bin/` の CLI 一式（`aipair` / `peer` / `aipair-relay` / `peer-log` と、共有コードの `aipairlib/` パッケージ）を **`~/.local/bin` にコピー**（差分があるときだけ上書き。上書き前に `*.bak-<timestamp>` を残す）＋ `chmod +x`。
    配置後に `aipair-relay --help` 等が動くことを確認（同一ディレクトリ依存の検証）
 6. スキル 2 つを `~/.claude/skills/aipair-setup/` `~/.claude/skills/aipair-relay/` にコピー（同じ退避ルール）
 7. `~/.local/bin` が PATH に無ければ、追記すべき 1 行を表示して `[warn]`（rc ファイルは**書き換えない**）
@@ -150,6 +150,7 @@ Windows の VS Code（Remote-WSL でない、Windows フォルダとして開く
 | `~/.local/bin/peer` | `$AI_PEER` を見て *相手* のログを表示する短縮版（aipair 起動時は起動したペアの相手セッションに固定＝同じ cwd に別セッションがいても混線しない） |
 | `~/.local/bin/aipair-relay` | 自走ループの Watcher（ターン完了を検知 → 相手ペインへ自動ポーク） |
 | `~/.local/bin/aipair-relay-here` | 走行中のペアに relay を 1 本だけ点火する（どのペインからでも） |
+| `~/.local/bin/aipairlib/` | 共有コードの Python パッケージ（`relay` / `peerlog` / `corelib` / `loglib` / `tmuxlib` / `deliverylib` / `dialoglib` / `logs`）。`aipair-relay`・`peer-log` はこれを import する薄い entrypoint（#7） |
 | `~/.claude/skills/aipair-setup/` | 対話型セットアップ（Claude Code スキル） |
 | `~/.claude/skills/aipair-relay/` | Claude から relay をオンデマンド点火するスキル |
 | `~/.claude/CLAUDE.md` | 末尾に周知ブロック。Claude に `peer` の使い方を周知（全セッションで読まれる） |
@@ -157,7 +158,7 @@ Windows の VS Code（Remote-WSL でない、Windows フォルダとして開く
 | `<project>/.vscode/tasks.json` | VS Code「Tasks: Run Task」から起動（WSL2 向けテンプレ）。**無修正で全プロジェクト共通** |
 
 🔒 **配置先は `~/.local/bin` 固定**: `aipair-relay-here` が `$HOME/.local/bin/aipair-relay` を参照し、
-`aipair-relay` は**同じディレクトリ**の `peer-log`・`aipair-corelib`（純粋ヘルパ）・`aipair-loglib`（トランスクリプト読取）・`aipair-tmuxlib`（tmux 実行/ペイン操作）・`aipair-deliverylib`（poke 配達/Enter 送信）・`aipair-dialoglib`（プラン/質問ダイアログ検出・応答）を読み込む（`SourceFileLoader`）。
+`aipair-relay`・`peer-log` は薄い entrypoint で、**同じディレクトリの `aipairlib/` パッケージ**（`relay`／`peerlog`／`corelib`／`loglib`／`tmuxlib`／`deliverylib`／`dialoglib`／共有 `logs`）を通常 import する（#7 で `SourceFileLoader`＋属性注入から通常 package へ移行）。
 個別に symlink を張ったり別ディレクトリへ分散させたりしないこと（インストーラはコピーで一括配置する）。
 
 ---
@@ -435,7 +436,7 @@ aipair-relay --allow-untested-schema       # schema が食い違っても自動�
 aipair-relay --no-schema-probe             # schema probe 自体をしない（AIPAIR_NO_SCHEMA_PROBE=1）
 ```
 
-probe の実装は純関数 `schema_probe`（`bin/aipair-corelib`）で、`tests/relay-parsers.py` の `SchemaProbe` が
+probe の実装は純関数 `schema_probe`（`bin/aipairlib/corelib.py`）で、`tests/relay-parsers.py` の `SchemaProbe` が
 claude/codex の ok・unverified・各ドリフトを被覆している。
 
 ### 停止ゲート（任意・`--gate`）

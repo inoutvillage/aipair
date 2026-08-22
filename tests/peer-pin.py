@@ -14,6 +14,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -31,7 +32,8 @@ def load_module(name, path):
     return mod
 
 
-pl = load_module("peerlog_pin_under_test", os.path.join(BIN, "peer-log"))
+sys.path.insert(0, BIN)
+import aipairlib.peerlog as pl
 
 
 def epoch(iso):

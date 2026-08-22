@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """aipair-tmuxlib — the tmux runner and pane helpers extracted from aipair-relay
 (D3 relay 分割・案A 増分3 = A3). Self-contained (stdlib only); aipair-relay loads it via
 SourceFileLoader and binds the names. Covered by tests/relay-parsers.py.

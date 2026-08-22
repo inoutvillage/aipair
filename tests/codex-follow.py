@@ -19,8 +19,9 @@ def load_module(name, path):
     return mod
 
 
-peerlog = load_module("peerlog_under_test", os.path.join(BIN, "peer-log"))
-relay = load_module("relay_under_test", os.path.join(BIN, "aipair-relay"))   # loads its own peerlog copy
+sys.path.insert(0, BIN)
+import aipairlib.peerlog as peerlog
+import aipairlib.relay as relay
 
 
 class Fixture(unittest.TestCase):

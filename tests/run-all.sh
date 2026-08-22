@@ -22,11 +22,20 @@ for f in aipair-install.sh bin/* tests/*; do
     *) note "FAIL unclassified script (unknown shebang '$shebang'): $f"; fail=1 ;;
   esac
 done
+# aipairlib package modules are imported, not executed (no shebang), so the shebang loop skips
+# the bin/aipairlib/ directory; compile-check those modules here as python3.
+for f in bin/aipairlib/*.py; do
+  [ -f "$f" ] || continue
+  PY+=("$f"); echo "python3 $f (package module)"
+done
 for must in bin/peer bin/aipair bin/aipair-relay-here aipair-install.sh tests/run-all.sh; do
   printf '%s\n' "${SH[@]}" | grep -qx "$must" || { note "FAIL $must missing from the bash set"; fail=1; }
 done
 for must in bin/peer-log bin/aipair-relay; do
   printf '%s\n' "${PY[@]}" | grep -qx "$must" || { note "FAIL $must missing from the python set"; fail=1; }
+done
+for must in bin/aipairlib/relay.py bin/aipairlib/peerlog.py bin/aipairlib/__init__.py; do
+  [ -f "$must" ] || { note "FAIL $must missing (aipairlib package incomplete)"; fail=1; }
 done
 
 step "bash -n"
