@@ -246,6 +246,8 @@ F1 ✅ → F2 ✅ → F3 ✅ → F6 ✅ → F4 ✅ → F5 ✅ → F9 ✅ → F8 
   - 注意: `TESTED_VERSIONS` と README「必要環境」表は手動同期のまま。稼働中 relay は旧コード→次回インストールで反映（installer は corelib/loglib を配布済み）。
 - [ ] #7 `aipair-relay`（~81KB）を通常の Python package 化（SourceFileLoader 依存注入からの脱却）。
 - [ ] #8/#9 CI を実 CLI の nightly smoke/E2E ＋ Python 3.8/tmux 3.1 の matrix に。
+  - [x] **Python バージョン matrix**（PR 進行中）— `.github/workflows/ci.yml` を対応下限 3.8（installer 要件）と現行 3.13 の matrix（`fail-fast: false`・`actions/setup-python`）に。run-all が `python3` として起動する全経路（relay・6 lib・peer-log・.py テスト）をその版で検証。3.8 互換は事前スキャン（3.9+ 機能不使用）＋ python3.9 実走で確認。README 反映。
+  - [ ] 残: tmux 3.1 lane（ソースビルド）／実 claude・codex の nightly smoke・E2E（CI で両 CLI を用意する手段が要る）。
 - [x] **#11 installer の global 注入 opt-out**（main 反映予定）— `--no-global-instructions`（＋env
   `AIPAIR_NO_GLOBAL_INSTRUCTIONS=1`）で `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` への注入をスキップ
   （既存ブロックは非破壊）。usage/README/install-upgrade テスト追加。
@@ -254,3 +256,4 @@ F1 ✅ → F2 ✅ → F3 ✅ → F6 ✅ → F4 ✅ → F5 ✅ → F9 ✅ → F8 
 - [x] **#12 `SECURITY.md` / README に threat model** — 新規 `SECURITY.md`（信頼モデル・攻撃対象面6項目・スコープ外・安全な使い方・脆弱性報告＝GitHub private advisory・英語サマリ）＋ README「セキュリティ」節（目次込み・SECURITY.md へのポインタ＋主要警告）。
   - 攻撃対象面（実コードと照合済み・盛らない）: ①権限バイパス実行（`aipair loop` は `--unsafe` 必須・未指定は exit 2）②トランスクリプト読取（peer/relay が全履歴を読む・pin あり）③tmux キー注入（stop=最終メッセージ冒頭100字・版/schema/停止ゲート）④自律 git push ⑤グローバル指示注入（マーカー境界・`--no-global-instructions`）⑥テストの private `-L` socket ガードレール。
   - **`aipair-queue`（本番 migration deploy）は D2 で撤去済み**（shipped FILES/README に無し）のため threat model から除外（存在しない機能を書かない）。
+  - Codex レビュー派生（PR #22-#25・マージ済み）: クロスプロバイダー境界の明記（peer/relay 出力が相手クラウドへ＝Claude→OpenAI/Codex→Anthropic）＋private vulnerability reporting を API 有効化＋テンプレの push/PII 誤帰属修正（#22）／§6 のテスト隔離記述を正確化＋非公開 `tasks/lessons.md` 参照を一掃（#23）／SKILL の権限モードを安全既定に是正＋`launch-cmds`・`env-forward` に socket_path preflight（#24）／`AIPAIR_*_FLAGS` の『空でフラグ無し』を対話起動限定に是正（loop は危険フラグ除去不能・追記）（#25）。
