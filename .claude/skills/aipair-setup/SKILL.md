@@ -160,7 +160,9 @@ echo "exit=$?"
   権限バイパス（claude --dangerously-skip-permissions / codex --dangerously-bypass-approvals-and-sandbox）は
   --unsafe（または AIPAIR_UNSAFE=1）で opt-in。信頼できる作業ディレクトリでだけ使うこと。
   `aipair loop`（自走レビュー）は relay が許可プロンプトに答えられないため --unsafe 必須（付けないと起動拒否）。
-  フラグ上書き: AIPAIR_CLAUDE_FLAGS / AIPAIR_CODEX_FLAGS（明示指定が最優先。空文字でフラグ無し）
+  フラグ指定: AIPAIR_CLAUDE_FLAGS / AIPAIR_CODEX_FLAGS
+    - 対話起動（aipair / --unsafe）: 全体を差し替え（空文字でフラグ無し＝危険フラグも外せる）
+    - aipair loop: 危険フラグは常に付与され**除去不能**。指定分は**追加**フラグとして足されるだけ（空指定でも危険フラグは残る）
 
 ▼ 自走ループの既定値（日本語）
   停止ワード「完了です」（AIPAIR_STOP）／ 判定側 codex（AIPAIR_STOP_SIDE）／ 最大 20 往復（AIPAIR_MAX_ROUNDS）

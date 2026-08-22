@@ -20,7 +20,7 @@ precedence: CLI flag > env > built-in default; the relay itself and `aipair-rela
 same env). By default each agent keeps its normal permission prompts; permission-bypass
 (`claude --dangerously-skip-permissions` / `codex --dangerously-bypass-approvals-and-sandbox`)
 is opt-in via `--unsafe` / `AIPAIR_UNSAFE=1` and is required for `aipair loop`;
-override or disable them with `AIPAIR_CLAUDE_FLAGS` / `AIPAIR_CODEX_FLAGS` (e.g. `AIPAIR_CODEX_FLAGS= aipair`).
+for interactive launch, `AIPAIR_CLAUDE_FLAGS` / `AIPAIR_CODEX_FLAGS` set the flags entirely (empty = none, e.g. `AIPAIR_CODEX_FLAGS= aipair`), but under `aipair loop` the bypass flags are always present and cannot be removed — yours are appended.
 
 **Endless mode** (`AIPAIR_ENDLESS=1` / `--endless`): the stop phrase means "this task passed review,
 move on" instead of "stop". When Claude runs out of work it writes `次のタスクをください` at the start

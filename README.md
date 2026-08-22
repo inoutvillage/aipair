@@ -20,7 +20,8 @@
 > ⚠ **Safe by default.** Plain `aipair` starts each agent with its **normal permission prompts**.
 > Permission-bypass (`claude --dangerously-skip-permissions`, `codex --dangerously-bypass-approvals-and-sandbox`)
 > is opt-in via `--unsafe` (or `AIPAIR_UNSAFE=1`), and **`aipair loop` requires it** (the relay can't answer
-> prompts). Override flags entirely with `AIPAIR_CLAUDE_FLAGS` / `AIPAIR_CODEX_FLAGS`. Tested on Linux
+> prompts). `AIPAIR_CLAUDE_FLAGS` / `AIPAIR_CODEX_FLAGS` set the flags for interactive launch (empty = none),
+> but under `aipair loop` the bypass flags are always present and **cannot be removed** (yours are appended). Tested on Linux
 > (WSL2 / AlmaLinux, Ubuntu and Arch containers); **macOS is untested**. The rest of this README is in Japanese.
 
 ---
@@ -180,7 +181,7 @@ aipair name   [dir]    # tmux セッション名を表示
 **安全側が既定**: 素の `aipair` は各エージェントを**通常の許可プロンプト付き**で起動する。
 権限バイパス（`claude --dangerously-skip-permissions` ／ `codex --dangerously-bypass-approvals-and-sandbox`）は
 `--unsafe`（または `AIPAIR_UNSAFE=1`）で opt-in。**`aipair loop` は必須**（relay が許可プロンプトに答えられないため）。
-起動フラグ全体を差し替えるなら `AIPAIR_CLAUDE_FLAGS` / `AIPAIR_CODEX_FLAGS`（下の「カスタマイズ」）。
+起動フラグは `AIPAIR_CLAUDE_FLAGS` / `AIPAIR_CODEX_FLAGS` で指定（対話起動は全体差し替え・空でフラグ無し／**`aipair loop` は危険フラグ除去不能で指定分は追記**。下の「カスタマイズ」）。
 
 > ⚠️ **`--unsafe` 使用時の注意**: `--unsafe`（および必須の `aipair loop`）では、両エージェントが
 > **許可確認なしでコマンド実行・ファイル編集**を行う。信頼できる作業ディレクトリでだけ使うこと。
@@ -501,7 +502,7 @@ aipair-relay --gate 'pytest -q' --gate-rounds 2              # フラグ
 - **bridge の初期表示件数**: `aipair` 内の `peer-log both --watch --last 15` の数値。
 - **起動フラグ / 安全モード**: 既定（安全）は**フラグ無し＝通常の許可プロンプト**。`--unsafe` か `AIPAIR_UNSAFE=1` を付けると
   `claude --dangerously-skip-permissions` / `codex --dangerously-bypass-approvals-and-sandbox` で起動する（`aipair loop` は必須）。
-  env で完全上書き: `AIPAIR_CLAUDE_FLAGS` / `AIPAIR_CODEX_FLAGS`（明示指定は安全/危険モードに関わらず優先。空文字でフラグ無し）。
+  env で指定: `AIPAIR_CLAUDE_FLAGS` / `AIPAIR_CODEX_FLAGS`。**対話起動（`aipair` / `--unsafe`）は全体を差し替え**（空文字でフラグ無し＝危険フラグも外せる）。**`aipair loop` では危険フラグが必ず付与され除去不能**で、指定分は追加フラグとして足されるだけ（空指定でも危険フラグは残る）。
   例: `AIPAIR_CLAUDE_FLAGS="--model opus" aipair` ／ 危険フラグ付きの対話起動は `aipair --unsafe`。
   （VS Code の「🤖 単体起動」タスクは `tasks.json` に直書きしているのでそちらを編集。）
 - **停止ワード・合図**: 上の「日本語の既定値と変更方法」。
