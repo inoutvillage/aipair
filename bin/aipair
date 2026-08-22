@@ -309,9 +309,25 @@ if env_on "${AIPAIR_DRY_RUN:-}"; then
 fi
 
 # ---- Build the session (or re-attach) -----------------------------------------
-if running; then attach_session; fi
+if running; then
+  # `aipair loop` on an ALREADY-running pair used to silently attach WITHOUT starting the
+  # relay — the worst outcome, since the command name promises a review loop. Refuse with
+  # guidance instead; `aipair-relay-here` fires the relay on the live pair from any pane.
+  if [ "$cmd" = loop ]; then
+    echo "aipair: このディレクトリのペアは既に起動しています（$NAME）。" >&2
+    echo "aipair: 既存ペアで自動レビューを始めるには、ペア内のペインで  aipair-relay-here  を実行してください。" >&2
+    echo "aipair: （最初から loop で組み直すなら  aipair stop  してから  aipair loop）" >&2
+    exit 3
+  fi
+  attach_session
+fi
 
+# #4 transactional build: the session is assembled step by step under `set -e`. If any step
+# fails partway, the half-built session must NOT survive — otherwise the next `aipair` would
+# re-attach to a broken pair (2026-08-22 review). Kill it on any early exit; disarm the trap
+# only once the pair is fully assembled.
 tmux new-session -d -s "$NAME" -c "$DIR"
+trap 'tmux kill-session -t "=$NAME" 2>/dev/null || true' EXIT   # EXIT keeps the triggering exit code
 CLAUDE=$(tmux list-panes -t "=$NAME" -F '#{pane_id}' | head -1)
 BRIDGE=$(tmux split-window -v -l 30% -t "$CLAUDE" -c "$DIR" -P -F '#{pane_id}')
 CODEX=$(tmux split-window -h -l 50% -t "$CLAUDE" -c "$DIR" -P -F '#{pane_id}')
@@ -335,5 +351,6 @@ tmux send-keys -t "$CLAUDE" "$CLAUDE_LINE" C-m
 tmux send-keys -t "$CODEX"  "$CODEX_LINE" C-m
 tmux send-keys -t "$BRIDGE" "$BRIDGE_LINE" C-m
 
+trap - EXIT          # fully assembled → keep the session and attach into it
 tmux select-pane -t "$CLAUDE"
 attach_session

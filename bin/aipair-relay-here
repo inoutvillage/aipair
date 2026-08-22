@@ -33,13 +33,14 @@ die() { printf 'aipair-relay-here: %s\n' "$*" >&2; exit 2; }
 # 値をシェル安全に単一引用符で包む（UTF-8 は素通り。%q は日本語を $'..' 化し bridge が sh だと壊れるため使わない）
 sq() { local s=$1; s=${s//\'/\'\\\'\'}; printf "'%s'" "$s"; }
 
-SESSION=""; DRYRUN=0; ROUNDS=""; STOP=""; STOP_SIDE=""; EXTRA=()
+SESSION=""; DRYRUN=0; ROUNDS=""; STOP=""; STOP_SIDE=""; DIR_OVERRIDE=""; EXTRA=()
 while [ $# -gt 0 ]; do
   case "$1" in
     rounds)     ROUNDS="${2:?rounds に数値が要る}"; shift 2 ;;
     stop)       STOP="${2:?stop にフレーズが要る}"; shift 2 ;;
     stop-side)  STOP_SIDE="${2:?stop-side に値が要る}"; shift 2 ;;
     --session)  SESSION="${2:?--session に名前が要る}"; shift 2 ;;
+    --dir)      DIR_OVERRIDE="${2:?--dir にパスが要る}"; shift 2 ;;
     --print|-n) DRYRUN=1; shift ;;
     --)         shift; EXTRA=("$@"); break ;;
     -h|--help)  sed -n '2,23p' "$0"; exit 0 ;;
@@ -70,6 +71,19 @@ if [ -z "$SESSION" ]; then
   SESSION="$(tmux display-message -p '#{session_name}' 2>/dev/null)" || die "現在の tmux セッション名を取得できない"
 fi
 tmux has-session -t "$SESSION" 2>/dev/null || die "セッションが無い: $SESSION"
+
+# relay が監視するログの cwd は「対象セッションが所有するディレクトリ」でなければならない。
+# 別ディレクトリから `aipair-relay-here --session X` を叩くと $PWD は X の作業ディレクトリと
+# 食い違い、X のペインへ poke しながら別 dir のログを見張る事故になる（2026-08-22 レビュー）。
+# 正は tmux に保存された @aipair-dir。明示 --dir があればそれを最優先、無ければ @aipair-dir、
+# それも無い旧セッションだけ $PWD へフォールバックする。
+if [ -n "$DIR_OVERRIDE" ]; then
+  DIR="$DIR_OVERRIDE"
+else
+  DIR="$(tmux show-options -t "$SESSION" -qv @aipair-dir 2>/dev/null)"
+  [ -n "$DIR" ] || DIR="$PWD"
+fi
+[ -d "$DIR" ] || die "作業ディレクトリが存在しない: $DIR（--dir で明示指定できます）"
 
 # --- bridge ペイン検出（title 優先 → シェル/pythonペインへフォールバック）---
 SELF="${TMUX_PANE:-}"
@@ -166,7 +180,7 @@ for v in AIPAIR_STOP AIPAIR_STOP_SIDE AIPAIR_MAX_ROUNDS AIPAIR_ENDLESS \
          AIPAIR_ALLOW_UNTESTED_DIALOGS AIPAIR_NO_VERSION_GATE; do
   RELAY_ENV+=("$v=${!v-}")
 done
-CMD=(env "${RELAY_ENV[@]}" "$RELAY" --adopt --session "$SESSION" --dir "$PWD")
+CMD=(env "${RELAY_ENV[@]}" "$RELAY" --adopt --session "$SESSION" --dir "$DIR")
 [ -n "$ROUNDS" ]    && CMD+=(--max-rounds "$ROUNDS")
 [ -n "$STOP" ]      && CMD+=(--stop "$STOP")
 [ -n "$STOP_SIDE" ] && CMD+=(--stop-side "$STOP_SIDE")
@@ -178,7 +192,7 @@ if [ "$DRYRUN" = 1 ]; then
   printf 'session : %s\n' "$SESSION"
   printf 'bridge  : %s (cmd=%s)%s\n' "$BRIDGE" "$BRIDGE_CMD" \
     "$([ "$RUN_IN_PLACE" = 1 ] && printf ' [このペインで直接実行]')"
-  printf 'dir     : %s\n' "$PWD"
+  printf 'dir     : %s\n' "$DIR"
   printf 'launch  : %s\n' "$LINE"
   exit 0
 fi

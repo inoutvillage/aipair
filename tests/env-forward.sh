@@ -91,5 +91,35 @@ if wait_file "$W/rh.out"; then
 else n=$((n+1)); echo "FAIL relay-here produced no output"; sed 's/^/     /' "$W/rh.out" 2>/dev/null || true; fail=1; fi
 reset_server
 
+echo "# [2b] relay-here derives --dir from the session's @aipair-dir, not the caller's PWD"
+"$REAL_TMUX" -L "$SOCKET" new-session -d -s pair2 -c "$W/proj"
+OWNERDIR="$W/owner"; mkdir -p "$OWNERDIR"
+"$REAL_TMUX" -L "$SOCKET" set -t pair2 @aipair-dir "$OWNERDIR"
+BR2="$("$REAL_TMUX" -L "$SOCKET" split-window -t pair2 -P -F '#{pane_id}' -c "$W/proj")"
+"$REAL_TMUX" -L "$SOCKET" select-pane -t "$BR2" -T bridge
+Q0="$("$REAL_TMUX" -L "$SOCKET" list-panes -t pair2 -F '#{pane_id}' | head -1)"
+# run from a DIFFERENT cwd (/) so PWD can never coincide with @aipair-dir
+"$REAL_TMUX" -L "$SOCKET" send-keys -t "$Q0" "cd / && AIPAIR_RELAY_BIN='$STUB' aipair-relay-here --session pair2 --print > '$W/rh2.out' 2>&1" Enter
+if wait_file "$W/rh2.out"; then
+  out2="$(cat "$W/rh2.out")"
+  chk_has "$out2" "dir     : $OWNERDIR" "relay-here --dir = @aipair-dir (not the caller's cwd)"
+  chk_has "$out2" "'--dir' '$OWNERDIR'" "relay launch carries --dir <@aipair-dir>"
+  n=$((n+1)); if printf '%s' "$out2" | grep -E '^(dir|launch)' | grep -qE "(: |')/($| |')"; then echo "FAIL relay-here used the caller's / cwd for --dir"; fail=1; else echo "ok   caller cwd (/) ignored for --dir"; fi
+else n=$((n+1)); echo "FAIL relay-here (dir) produced no output"; sed 's/^/     /' "$W/rh2.out" 2>/dev/null || true; fail=1; fi
+reset_server
+
+echo "# [2c] an explicit --dir overrides @aipair-dir"
+"$REAL_TMUX" -L "$SOCKET" new-session -d -s pair3 -c "$W/proj"
+"$REAL_TMUX" -L "$SOCKET" set -t pair3 @aipair-dir "$W/owner"
+CUSTOM="$W/custom"; mkdir -p "$CUSTOM"
+BR3="$("$REAL_TMUX" -L "$SOCKET" split-window -t pair3 -P -F '#{pane_id}' -c "$W/proj")"
+"$REAL_TMUX" -L "$SOCKET" select-pane -t "$BR3" -T bridge
+Q1="$("$REAL_TMUX" -L "$SOCKET" list-panes -t pair3 -F '#{pane_id}' | head -1)"
+"$REAL_TMUX" -L "$SOCKET" send-keys -t "$Q1" "AIPAIR_RELAY_BIN='$STUB' aipair-relay-here --session pair3 --dir '$CUSTOM' --print > '$W/rh3.out' 2>&1" Enter
+if wait_file "$W/rh3.out"; then
+  chk_has "$(cat "$W/rh3.out")" "dir     : $CUSTOM" "explicit --dir wins over @aipair-dir"
+else n=$((n+1)); echo "FAIL relay-here (--dir override) no output"; fail=1; fi
+reset_server
+
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED)"
 exit $fail

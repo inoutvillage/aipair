@@ -35,6 +35,7 @@ class Fixture(unittest.TestCase):
             mod._CODEX_CWD_CACHE.clear()
             mod.CODEX_INDEX = mod.CodexIndex()            # fresh inventory per test
             mod.CODEX_INDEX.FULL_RESCAN_SECS = 10 ** 9     # only explicit full rescans below
+            mod.codex_via_pane = lambda cwd: None          # default: no /proc identity → fallback path
         relay.dim = lambda *a, **k: None          # silence the relay's log line
         self.t0 = 1_700_000_000
         # A-old (t+1) / B-new (t+3, globally newest) / A-mid (t+2)
@@ -352,6 +353,14 @@ class RelayLock(Fixture):
         self.assertEqual(relay.refresh_codex_lock(self.a_mid, self.A), self.a_mid)
         a_new = self.rollout("a-new", self.A, 4)
         self.assertEqual(relay.refresh_codex_lock(self.a_mid, self.A), a_new)
+
+    def test_relay_prefers_codex_via_pane_over_the_mtime_heuristic(self):
+        # when peer-log's /proc identity resolves the pair's Codex, the relay adopts / locks /
+        # follows THAT — one source of truth with `peer`, not the newest-for-cwd guess.
+        with mock.patch.object(relay.peerlog, "codex_via_pane", return_value=self.a_old):
+            self.assertEqual(relay.lock_codex(self.A, set()), self.a_old)
+            # even though a_mid is newer for cwd A, the identity wins
+            self.assertEqual(relay.refresh_codex_lock(self.a_mid, self.A), self.a_old)
 
     def test_lock_codex_only_takes_rollouts_unseen_at_start(self):
         seen = set(relay.codex_all())

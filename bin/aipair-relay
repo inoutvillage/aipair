@@ -368,7 +368,7 @@ def lock_codex(cwd, seen):
     """Newest rollout for cwd that did not exist when the relay started (`seen`).
     Polled every second while waiting for the pair's Codex to show up, so it goes
     through peerlog's incremental index rather than re-walking the archive."""
-    return peerlog.codex_newest(cwd, exclude=seen)
+    return peerlog.codex_via_pane(cwd) or peerlog.codex_newest(cwd, exclude=seen)
 
 
 def refresh_codex_lock(tracked_path, cwd):
@@ -378,7 +378,7 @@ def refresh_codex_lock(tracked_path, cwd):
     候補は「追跡中より新しいもの全部」を新しい順に照合する（peerlog.codex_follow）。
     以前は全体で最新の 1 件しか見ておらず、別 cwd の Codex が動いている間は自分の
     cwd の新 rollout を永遠に見逃した（2026-08-21: aipair と iovillage-cms の 2 ペア同時稼働）。"""
-    newest = peerlog.codex_follow(cwd, tracked_path)
+    newest = peerlog.codex_via_pane(cwd) or peerlog.codex_follow(cwd, tracked_path)
     if newest and newest != tracked_path:
         dim(f"codex rollout ローテート検知 → 追従: {os.path.basename(newest)}")
         return newest
@@ -893,7 +893,10 @@ def main():
             else:
                 log(c("warn", "adopt: このプロジェクトの Claude ログが見つからず → 新規セッションの出現待ちに切替"))
         if not tracked["codex"]:
-            f = peerlog.codex_newest(cwd)
+            # ONE source of truth with peer-log: the rollout the pair's Codex process actually
+            # holds open (codex_via_pane), not merely the newest for the cwd — so `peer` and the
+            # relay never diverge onto two different same-cwd Codex sessions (2026-08-22 review).
+            f = peerlog.codex_via_pane(cwd) or peerlog.codex_newest(cwd)
             if f:
                 tracked["codex"] = f
                 dim(f"adopt: codex = {os.path.basename(f)}")
