@@ -148,6 +148,27 @@ F1 ✅ → F2 ✅ → F3 ✅ → F6 ✅ → F4 ✅ → F5 ✅ → F9 ✅ → F8 
 - F1（2026-08-22、Codex 指摘 計 5 件 + 補足 1 件反映後）: `bin/aipair`・README 1 段落・`tests/session-name.sh` 新規。38 ケース全通過（逐次 + 並列 2 本）。
   未検証（仮説）: tmux 内からの `switch-client -t =NAME`（ヘッドレスで実行不能。attach と同じ target-session 解決なので同挙動の見込み）／macOS APFS の NFC/NFD（コードは `unicodedata.normalize("NFC")` で対応、README では「未検証」と明記）。
 
+## 追記: compaction 帰属バグ + dogfood 自己ホスト（2026-08-23）— main マージ済み・CI 緑
+
+> レビューループ中に relay の診断（「応答チェーン不一致で棄却」）から実バグを発見・根治し、
+> 新コードを稼働ペアへ自己ホスト（dogfood）した記録。todo の新規タスクではなくループ派生。
+
+- [x] **compaction が応答帰属の parentUuid 鎖を切断（実機ループ停止バグ）**（PR #19 `5b003fa` → 精緻化 PR #20 `8d74933`）—
+  Claude Code は文脈圧縮時に `{type:"system", subtype:"compact_boundary", parentUuid:None}` の新ルートを書き
+  parentUuid 鎖を切断。「poke→圧縮→応答」で `claude_response_attributed` が pre-compaction の nonce に届かず
+  正当な応答を永久に棄却→ループ停止。境界の `logicalParentUuid`（正確な圧縮前祖先）を親として祖先探索を
+  続ける方式で根治（PR #19 は行位置ベース→ Codex 指摘で PR #20 が logicalParentUuid に一本化・欠落は
+  fail-closed）。schema probe にも parentUuid 検査を追加。実停止トランスクリプトで False→True を確認。
+- [x] **dogfood: 新コードを稼働ペアへ自己ホスト（relay だけホットスワップ）**（社長判断・案1）—
+  private `-L` socket に tmux を shim して `aipair-install.sh` を実行（既定 server の smoke 汚染を回避、
+  4 セッション不変）→ 旧 relay を Ctrl-C → `aipair-relay-here --adopt` で新 relay 点火。起動バナーで
+  版ゲート（claude 2.1.240≠2.1.238→ダイアログ自動操作 OFF）・schema probe（実ログ OK）・adopt
+  （claude=%9/codex=%11）がライブ検証された。launcher 側（transactional/`@aipair-*` スタンプ）は次の
+  フレッシュ起動で検証（このセッションを殺さないため持ち越し）。
+- 申し送り: 稼働 relay は PR #19 の位置ベース版のまま（線形ループでは実害なし）。次回インストールで
+  logicalParentUuid 版へ同期。live claude が 2.1.240（TESTED=2.1.238）→ 版ゲートがダイアログ自動操作を
+  OFF 中（安全側）。2.1.240 の実 TUI 確認後に `TESTED_VERSIONS` 更新を検討（盲目的 bump はしない）。
+
 ## 追記: マージ後のレビュー対応（CI 互換・診断）— すべて main マージ済み・CI 緑
 
 > F1〜F9 / D1〜D4 完了後、PR #1 を main へ入れた後の Codex レビューで判明した互換・診断の追対応。
@@ -230,4 +251,6 @@ F1 ✅ → F2 ✅ → F3 ✅ → F6 ✅ → F4 ✅ → F5 ✅ → F9 ✅ → F8 
   （既存ブロックは非破壊）。usage/README/install-upgrade テスト追加。
 
   - Codex レビュー派生（マージ済み）: PR #16 `ab03cd3` opt-out を CI で検証する `tests/install-global-optout.sh`（claude/codex を `--version` 応答する shim にして global-instructions 分岐を実走）＋ installer の env bool を `bin/aipair` の `env_on` と同じ正規化（trim + lowercase）に統一。PR #17 `4069ff8` 両 install テスト（`install-global-optout.sh` / `install-upgrade.sh`）の installer smoke を **専用 private tmux socket（`-L`）** に隔離（実 tmux を一意 socket へ転送する wrapper を shim ディレクトリに追加し `#{socket_path}` を検証してから実行・後始末で kill-server + socket 削除）→ 既定/本番 server を一切触らない（`tasks/lessons.md` ガードレール）。両 CI 緑。
-- [ ] #12 `SECURITY.md` / README に threat model（`--unsafe`・ログ読取・tmux 入力注入・自律編集の境界）。
+- [x] **#12 `SECURITY.md` / README に threat model** — 新規 `SECURITY.md`（信頼モデル・攻撃対象面6項目・スコープ外・安全な使い方・脆弱性報告＝GitHub private advisory・英語サマリ）＋ README「セキュリティ」節（目次込み・SECURITY.md へのポインタ＋主要警告）。
+  - 攻撃対象面（実コードと照合済み・盛らない）: ①権限バイパス実行（`aipair loop` は `--unsafe` 必須・未指定は exit 2）②トランスクリプト読取（peer/relay が全履歴を読む・pin あり）③tmux キー注入（stop=最終メッセージ冒頭100字・版/schema/停止ゲート）④自律 git push ⑤グローバル指示注入（マーカー境界・`--no-global-instructions`）⑥テストの private `-L` socket ガードレール。
+  - **`aipair-queue`（本番 migration deploy）は D2 で撤去済み**（shipped FILES/README に無し）のため threat model から除外（存在しない機能を書かない）。
