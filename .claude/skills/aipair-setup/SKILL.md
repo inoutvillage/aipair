@@ -171,6 +171,15 @@ echo "exit=$?"
 
 ---
 
+## 安全メモ: ペア内で tmux を叩くとき
+
+- aipair の動作確認やテストで tmux を使うときは、**必ず専用サーバー**（`tmux -L <名前>` か `-S <ソケット>`）を指定する。
+- tmux ペインの中では環境変数 `$TMUX` が `TMUX_TMPDIR` より優先されるため、`TMUX_TMPDIR` で隔離したつもりでも本番サーバーに刺さる。
+- **引数無しの `tmux kill-server` は禁止**（動いているペアを巻き込む）。後始末は `tmux -L <名前> kill-server` のように対象を明示し、破壊的コマンドの前に `#{socket_path}` で隔離を確認する。
+- 詳細な事故例は aipair リポジトリの `tasks/lessons.md`（2026-08-21 の障害）を参照。
+
+---
+
 ## OS 差異の扱い
 
 - `os=wsl2`: VS Code の Tasks は `wsl.exe --cd … bash -ic …` 形式（`templates/vscode-tasks.json`）。`--vscode-tasks` を提案する

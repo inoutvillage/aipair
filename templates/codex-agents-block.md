@@ -21,6 +21,10 @@ Notes:
   ("tell Claude X" is wrong — Claude can read it itself).
 - Check `peer` before starting a non-trivial task in an `aipair` session, so you and
   Claude don't both do the same thing.
+- Running tmux in a **test** while inside a pair: target a private server
+  (`tmux -L <name>` or `-S <sock>`). Inside a pane `$TMUX` overrides `TMUX_TMPDIR`, so a
+  bare `tmux kill-server` (or a spawn-then-kill test on the default server) will kill the
+  **live pair** — never run `kill-server` un-targeted; verify `#{socket_path}` first.
 - Outside an `aipair` session `AI_PEER` is unset and `peer` falls back to showing both logs.
 
 Full docs: the README of the aipair repository (https://github.com/inoutvillage/aipair).

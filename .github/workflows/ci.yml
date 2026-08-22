@@ -1,0 +1,17 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tmux and shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux shellcheck
+      - name: Versions
+        run: |
+          tmux -V; python3 --version; bash --version | head -1; shellcheck --version | head -2
+      - name: Run all checks
+        run: bash tests/run-all.sh

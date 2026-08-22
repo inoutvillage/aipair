@@ -394,6 +394,7 @@ done
 # --- PATH --------------------------------------------------------------------
 if path_has_bin; then ok "$BIN_DIR is on PATH"
 else
+  # shellcheck disable=SC2088  # rc is shown to the user, the literal "~" is intended
   case "$SHELL_NAME" in
     zsh)  line='export PATH="$HOME/.local/bin:$PATH"'; rc="~/.zshrc" ;;
     fish) line='fish_add_path -U ~/.local/bin';        rc="(run once)" ;;

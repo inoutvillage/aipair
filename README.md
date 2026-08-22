@@ -51,8 +51,9 @@
 7. [仕組み](#仕組み)
 8. [トラブルシュート](#トラブルシュート)
 9. [カスタマイズ](#カスタマイズ)
-10. [制約・既知の限界](#制約既知の限界)
-11. [ライセンス](#ライセンス)
+10. [テスト・CI](#テストci)
+11. [制約・既知の限界](#制約既知の限界)
+12. [ライセンス](#ライセンス)
 
 ---
 
@@ -171,7 +172,7 @@ aipair stop   [dir]    # セッション停止
 aipair name   [dir]    # tmux セッション名を表示
 ```
 
-セッション名は作業ディレクトリ名から自動算出（例: `…/my-project` → `aipair-my-project`）。
+セッション名は `aipair-<ディレクトリ名>-<正規化パスの sha1 先頭 12 桁>`（例: `…/my-project` → `aipair-my-project-1a2b3c4d5e6f`。正規化 = symlink 解決 + 大小文字を区別しない FS（WSL の `/mnt/*`。macOS の APFS も同じ扱いだが未検証）ではディスク上の綴りに統一。`/mnt/d/Work` と `/mnt/d/work` は同じ名前になる）。同名のセッションが**別ディレクトリ**のものだった場合（hash collision）は attach / stop せずエラー終了する。同名ディレクトリが別の場所にあっても衝突しない。旧形式 `aipair-my-project`（ハッシュ無し）で動いている既存セッションは、**同じディレクトリのもの**に限り `attach` / `stop` / `name` が自動で引き継ぐ。
 
 既定の起動フラグは `claude --dangerously-skip-permissions` ／ `codex --dangerously-bypass-approvals-and-sandbox`
 （どちらも確認プロンプト無しの YOLO 起動）。env で上書き可 → 下の「カスタマイズ」参照。
@@ -233,10 +234,16 @@ peer-log codex --full      # セッション全体
 | `AIPAIR_TASK_LIST` | `tasks/todo.md` | 連続モードの次タスクの根拠ファイル |
 | `AIPAIR_NEXT_ASK` | `次のタスクをください` | 連続モード: Claude の手持ちが尽きた合図 |
 | `AIPAIR_ALL_DONE` | `全タスク完了` | 連続モード: Codex の終端宣言 |
-| `AIPAIR_CLAUDE_FLAGS` / `AIPAIR_CODEX_FLAGS` | 上記の `--dangerously-…` | 起動フラグ（空文字でフラグ無し） |
+| `AIPAIR_CLAUDE_FLAGS` / `AIPAIR_CODEX_FLAGS` | 上記の `--dangerously-…` | 起動フラグ。**ペイン内のシェルが解釈するシェル断片**（`"--model opus"` は 2 引数、`'--append-system-prompt "a b"'` の引用符も有効）。空文字でフラグ無し |
+| `AIPAIR_DRY_RUN` | （未設定＝off） | `1` で各ペインに打ち込む起動行を表示するだけで何も起動しない（設定確認・テスト用）。真偽値の読み方は `AIPAIR_ENDLESS` と同じ |
+| `AIPAIR_GATE` | （未設定＝無し） | **停止ゲート**: 停止ワード検出後に実行するシェルコマンド（例 `npm test`）。成功した時だけ停止／次タスクへ。失敗は出力を添えて Claude に差し戻す（→ 下の「停止ゲート」） |
+| `AIPAIR_GATE_TIMEOUT` / `AIPAIR_GATE_ROUNDS` | `600` / `3` | ゲートのタイムアウト秒／差し戻しの上限回数（到達で relay は exit 6） |
+| `AIPAIR_ALLOW_UNTESTED_DIALOGS` | （未設定＝off） | `1` で、claude/codex が検証済み版と違っても**プラン承認・質問リレーの自動操作を続ける**（既定は不一致なら自動 OFF。→「版ゲート」） |
+| `AIPAIR_NO_VERSION_GATE` | （未設定＝off） | `1` で起動時の版チェック自体をしない |
 
+`AIPAIR_*_FLAGS` 以外の値は**そのまま 1 引数**として relay に渡る（`'`・空白・`$`・`;` を含んでも壊れない。launcher がシングルクォートで包む）。
 不正値（`AIPAIR_MAX_ROUNDS=abc` / `0` / 負数、`AIPAIR_STOP_SIDE=typo`）は**既定へ落とさず exit 2** で即エラー。
-`AIPAIR_ENDLESS` は `0` / `false` / `no` / `off` で明示的に off。環境に残っている時、その 1 本だけ通常モードに戻すには `--no-endless`。
+`AIPAIR_ENDLESS` / `AIPAIR_DRY_RUN` は `0` / `false` / `no` / `off`（大小文字・前後空白は無視）で明示的に off。環境に残っている時、その 1 本だけ通常モードに戻すには `--no-endless`。
 
 **3 つの起動経路すべてで効きます**:
 
@@ -258,7 +265,7 @@ peer-log codex --full      # セッション全体
   |---|---|
   | 通常モード | `relay ● 1タスク / max 20 / 停止「完了です」/ Ctrl-C で停止` |
   | 連続モード | `relay ● endless / max 100 / 終端「全タスク完了」/ Ctrl-C で停止` |
-  | 終了後 | `relay ■ 終了(全タスク完了) / 3往復` ／ `■ 終了(キャップ到達)` ／ `■ 終了(配達失敗)` ／ `■ 中断` |
+  | 終了後 | `relay ■ 終了(全タスク完了) / 3往復` ／ `■ 終了(キャップ到達)` ／ `■ 終了(配達失敗)` ／ `■ 終了(停止ゲート失敗)` ／ `■ 中断` |
 
 ### 連続モード（endless）— 全タスクが尽きるまで止めない
 
@@ -359,9 +366,43 @@ Codex のレビュー配達時（通常ループ）も、Claude が質問ダイ�
 | 3 | 最大往復キャップ到達 |
 | 4 | poke 配達失敗 |
 | 5 | プランレビュー/質問リレーの上限到達・選択肢欠落 |
+| 6 | 停止ゲート（`--gate`）が `--gate-rounds` 回失敗（`aipair-queue` は `[!] 要人間`） |
 | 130 | Ctrl-C 中断 |
 
 ---
+
+### 版ゲート（自動・claude/codex のバージョン）
+
+プラン承認ダイアログや選択式質問の**自動操作は、CLI の画面（TUI）を文字列で読んで数字キーを送る**方式なので、
+Claude Code / Codex CLI の版が変わると壊れうる。そこで relay は起動時に `claude --version` / `codex --version` を取得し、
+**検証済み版（上の「必要環境」表）と一致しない、または取得できない**場合は、
+
+- **プラン承認・質問リレーの自動操作だけを OFF**（起動ログに理由を表示）
+- **poke による往復・transcript の読み取りは通常どおり継続**（＝ペアの相互レビューは動く）
+
+とする。ダイアログで止まった時は人間が対応する。判断が変わったら:
+
+```bash
+aipair-relay --allow-untested-dialogs      # 版が違っても自動操作を続ける（AIPAIR_ALLOW_UNTESTED_DIALOGS=1）
+aipair-relay --no-version-gate             # 版チェック自体をしない（AIPAIR_NO_VERSION_GATE=1）
+```
+
+検証済み版を上げたら `bin/aipair-relay` の `TESTED_VERSIONS` と README の表を**両方**更新すること（テスト `VersionGate` が両者の一致を前提にしている）。
+
+### 停止ゲート（任意・`--gate`）
+
+既定の停止条件は「Codex が本文冒頭に停止ワードを書く」= **エージェントの自己申告**で、品質を機械的に保証するものではない。
+`--gate` を指定すると、停止ワードを検知した時点で **指定コマンドを作業ディレクトリで実行し、exit 0 の時だけ**停止（連続モードでは次タスクへ）する。
+
+```bash
+AIPAIR_GATE='npm test && npx tsc --noEmit' aipair loop      # env（tmux が引き継ぐので relay が読む）
+aipair-relay --gate 'pytest -q' --gate-rounds 2              # フラグ
+```
+
+- 失敗時: 出力の末尾（40 行・1500 字まで、1 行に畳む）を添えて **Claude に差し戻し**、Codex には送らない。Claude が直して再びレビュー → 合格 → ゲート、の順で回る
+- `--gate-rounds`（既定 3）回失敗したら人間の判断が必要として relay は **exit 6** で停止（`aipair-queue` はこれを `[!] 要人間` として保留する）
+- `--gate-timeout`（既定 600 秒）超過は失敗扱い
+- ゲートは `--stop-side` が claude / codex / both のどれでも、停止ワードを検知した側で走る。未指定なら従来どおり（挙動変更なし）
 
 ## キュー自動処理（aipair-queue・実験的）
 
@@ -378,7 +419,7 @@ bridge ペインで:
 ```
 
 - 1 タスク = 1 relay = 1 PR = 1 マージ。`- [ ] タスク文` がそのまま Claude への指示になる
-- `prisma/migrations/` を含む PR は**マージ前に本番 DB へ `prisma migrate deploy`**（`.env.production` の URL、localhost ガード付き）
+- `prisma/migrations/` を含む PR は、まず **allowlist 検査**（追加系 SQL のみ許可 — `CREATE TABLE`／`ADD COLUMN`(NOT NULL は DEFAULT 必須)／`CREATE [UNIQUE] INDEX`／`CREATE TYPE`／`ALTER TYPE … ADD VALUE`／`CREATE EXTENSION`／`COMMENT ON`。DROP・RENAME・`SET NOT NULL`・型変更・TRUNCATE・DML・DEFAULT 無し必須列・構文不完全・解析不能は拒否 → `[!] 要人間`。検査・適用・マージは PR head SHA に固定）を通してから、**マージ前に本番 DB へ `prisma migrate deploy`**（`.env.production` の URL、localhost ガード付き）。手動レビュー済みなら `--allow-unsafe-migrations` で検査を省略
 - 異常（relay キャップ/poke 失敗・PR 未作成・CI red・migrate 失敗・タイムアウト）は `- [!] 要人間:` で保留して次へ。
   **連続 3 回異常でキュー全体を停止**（同一原因の空回り防止）
 - 停止はキューを実行しているペインで `Ctrl-C`（処理中の relay も連鎖停止）
@@ -439,6 +480,23 @@ bridge ペインで:
 - **停止ワード・合図**: 上の「日本語の既定値と変更方法」。
 
 ---
+
+## テスト・CI
+
+```bash
+bash tests/run-all.sh        # shebang で判別した全 bash/python3 スクリプトの bash -n / compile / shellcheck（入っていれば）+ tests/ 以下すべて
+```
+
+| テスト | 対象 | 方式 |
+|---|---|---|
+| `tests/session-name.sh` | `aipair name` / `stop` / 実起動のセッション名解決（衝突・旧名引き継ぎ・大小文字・collision） | 専用ソケット `tmux -L` の隔離サーバー。本番ペアには触れない |
+| `tests/launch-cmds.sh` | 各ペインに打ち込む起動行（クォート・`AIPAIR_*` の真偽値・シェル断片のフラグ） | `AIPAIR_DRY_RUN=1` の出力を実際にシェルで評価し、シムが受け取った argv を比較 |
+| `tests/codex-follow.py` | Codex rollout の探索・追従・増分インデックス | 一時ディレクトリの fixture。`~/.codex` は読まない |
+| `tests/relay-parsers.py` | 停止ワード判定・env 解析・ペイン特定・プラン/質問ダイアログ検出・ターン完了検出・transcript パーサ | `tmux` / 画面キャプチャをモック |
+| `tests/queue-state.py` | `aipair-queue` のチェックリスト状態遷移（`[ ]`→`[>]`→`[x]`/`[!]`） | 一時ファイル。git / gh は呼ばない |
+
+GitHub Actions（`.github/workflows/ci.yml`）が push / PR ごとに ubuntu-latest で同じ `tests/run-all.sh` を回す（tmux と shellcheck を apt で導入）。
+TUI 本体（Claude Code / Codex CLI の実画面）は CI では動かせないため、ダイアログ検出などは**画面キャプチャの fixture** で固定している。実 UI が変わった時は fixture ごと更新すること。
 
 ## 制約・既知の限界
 
