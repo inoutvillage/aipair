@@ -113,17 +113,54 @@ jobs:
           sleep 1
           tmux send-keys -t "$claude_pane" Enter
 
+          # The nonce must appear in an ASSISTANT turn — i.e. claude actually REPLIED with it —
+          # not merely in the user prompt we injected (which would be there regardless of what
+          # claude did, or even if it diverted to a dialog). Parse claude's <SID>.jsonl directly
+          # (type=="assistant" text blocks). Combined with a relay-id delivered to codex — which
+          # only happens after claude completes a turn — this proves a genuine nonce-tied
+          # poke → reply → relay round-trip.
+          claude_echoed() {
+            python3 - "$SID" "$NONCE" <<'PY' 2>/dev/null
+          import sys, os, json, glob
+          sid, nonce = sys.argv[1], sys.argv[2]
+          for f in glob.glob(os.path.expanduser("~/.claude/projects/*/%s.jsonl" % sid)):
+              try:
+                  for line in open(f, encoding="utf-8"):
+                      line = line.strip()
+                      if not line:
+                          continue
+                      try:
+                          d = json.loads(line)
+                      except Exception:
+                          continue
+                      if d.get("type") != "assistant":
+                          continue
+                      c = (d.get("message") or {}).get("content")
+                      if isinstance(c, str):
+                          text = c
+                      elif isinstance(c, list):
+                          text = "".join(b.get("text", "") for b in c
+                                         if isinstance(b, dict) and b.get("type") == "text")
+                      else:
+                          text = ""
+                      if nonce in text:
+                          sys.exit(0)
+              except Exception:
+                  pass
+          sys.exit(1)
+          PY
+          }
           saw_nonce=0; saw_relay=0
           for _ in $(seq 1 90); do        # up to ~180s for the round-trip
-            peer-log claude --dir "$WORK" --full 2>/dev/null | grep -qF "$NONCE" && saw_nonce=1
-            peer-log codex  --dir "$WORK" --full 2>/dev/null | grep -qE 'relay-id:[0-9a-f]+' && saw_relay=1
+            claude_echoed && saw_nonce=1
+            peer-log codex --dir "$WORK" --full 2>/dev/null | grep -qE 'relay-id:[0-9a-f]+' && saw_relay=1
             [ "$saw_nonce" = 1 ] && [ "$saw_relay" = 1 ] && break
             sleep 2
           done
           if [ "$saw_nonce" = 1 ] && [ "$saw_relay" = 1 ]; then
-            echo "E2E PASS: nonce $NONCE reached claude, claude completed a turn, and the relay delivered a poke to codex (relay-id seen)."
+            echo "E2E PASS: claude REPLIED with nonce $NONCE (assistant turn), and the relay delivered a poke to codex (relay-id seen) — round-trip confirmed."
             exit 0
           fi
-          echo "E2E FAIL: round-trip incomplete (nonce_in_claude=$saw_nonce relay_to_codex=$saw_relay)." >&2
+          echo "E2E FAIL: round-trip incomplete (claude_replied_with_nonce=$saw_nonce relay_to_codex=$saw_relay)." >&2
           dump
           exit 1
