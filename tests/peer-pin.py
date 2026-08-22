@@ -234,7 +234,7 @@ class ProcIdentity(Base):
             if a[0] == "display-message": return "1000"                          # pane_pid
             return None
         with mock.patch.object(pl, "_tmux", side_effect=fake_tmux), \
-             mock.patch.object(pl, "_descendants", return_value={1000, 1001}), \
+             mock.patch.object(pl, "_descendants", return_value=[1000, 1001]), \
              mock.patch.object(pl, "_open_rollouts", side_effect=lambda pid: [ours] if pid == 1001 else []), \
              mock.patch.dict(os.environ, {"TMUX": "/tmp/sock"}):
             self.assertEqual(pl.codex_via_pane(self.CWD), ours)
@@ -262,6 +262,38 @@ class ProcIdentity(Base):
         with mock.patch.object(pl, "codex_via_pane", return_value=None), \
              mock.patch.dict(os.environ, {"AIPAIR_CODEX_SINCE": str(epoch("2026-08-21T00:10:00Z"))}):
             self.assertEqual(pl._codex_pick(self.CWD, None), pair)
+
+    def test_shallowest_codex_wins_over_a_nested_one(self):
+        # the pair's own codex (shallow) holds `main`; a nested codex-in-codex (deeper) holds a
+        # NEWER `nested`. _descendants yields breadth-first, so the shallow one must win — mtime
+        # must not drag the pin down to the subprocess.
+        main = self.rollout("main", self.CWD, "2026-08-21T00:00:00Z", 100)
+        nested = self.rollout("nested", self.CWD, "2026-08-21T00:59:00Z", 9999)   # newer
+        def fake_tmux(*a):
+            if a[0] == "display-message" and a[-1] == "#{session_name}": return "aipair-x"
+            if a[0] == "show-options": return "%5"
+            if a[0] == "display-message": return "1000"
+            return None
+        # BFS: 1001 (pane's codex, shallow) before 1002 (nested, deep)
+        opens = {1001: [main], 1002: [nested]}
+        with mock.patch.object(pl, "_tmux", side_effect=fake_tmux), \
+             mock.patch.object(pl, "_descendants", return_value=[1001, 1002]), \
+             mock.patch.object(pl, "_open_rollouts", side_effect=lambda pid: opens.get(pid, [])), \
+             mock.patch.dict(os.environ, {"TMUX": "/tmp/sock"}):
+            self.assertEqual(pl.codex_via_pane(self.CWD), main,
+                             "the shallow (pair) codex wins over a deeper, newer nested one")
+
+    def test_valid_rollout_only_accepts_files_under_codex_sessions(self):
+        good = self.rollout("good", self.CWD, "2026-08-21T00:00:00Z", 100)
+        self.assertTrue(pl._valid_rollout(good))
+        # right name, wrong place (a process holding a look-alike open elsewhere)
+        elsewhere = os.path.join(self.tmp.name, "rollout-decoy.jsonl")
+        open(elsewhere, "w").close()
+        self.assertFalse(pl._valid_rollout(elsewhere), "a rollout-named file outside CODEX_SESSIONS is refused")
+        # under CODEX_SESSIONS but not a rollout basename
+        notroll = os.path.join(pl.CODEX_SESSIONS, "2026", "08", "21", "notes.jsonl")
+        open(notroll, "w").close()
+        self.assertFalse(pl._valid_rollout(notroll), "a non-rollout basename is refused")
 
 
 if __name__ == "__main__":
