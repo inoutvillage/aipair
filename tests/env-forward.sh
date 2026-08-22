@@ -9,7 +9,7 @@ HERE="$(cd "$(dirname "$0")" && pwd -P)"; REPO="$(dirname "$HERE")"
 REAL_TMUX="$(command -v tmux)" || { echo "tmux not found" >&2; exit 2; }
 command -v script >/dev/null || { echo "skip (no \`script\`): env-forward needs a pty"; exit 0; }
 W="$(mktemp -d "${TMPDIR:-/tmp}/aipair-envfwd.XXXXXX")"; SOCKET="aipair-envfwd-$$-$RANDOM"
-cleanup() { "$REAL_TMUX" -L "$SOCKET" kill-server 2>/dev/null || true; rm -rf "$W"; }; trap cleanup EXIT
+cleanup() { "$REAL_TMUX" -L "$SOCKET" kill-server 2>/dev/null || true; rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SOCKET" 2>/dev/null || true; rm -rf "$W"; }; trap cleanup EXIT
 mkdir -p "$W/bin" "$W/proj"
 # tmux shim forces the private socket even inside a pane ($TMUX beats TMUX_TMPDIR).
 # shim pins `exit-empty off` each call so the private server survives empty moments (tmux 3.4)
@@ -20,9 +20,10 @@ printf '#!/usr/bin/env bash\nexit 0\n' > "$W/bin/claude"; cp "$W/bin/claude" "$W
 cat > "$W/bin/aipair-relay" <<SHIM
 #!/usr/bin/env bash
 { printf 'ARGV: %s\\n' "\$*"
-  printf 'GATE=[%s] NVG=[%s] AUD=[%s] TIMEOUT=[%s] ROUNDS=[%s]\\n' \\
+  printf 'GATE=[%s] NVG=[%s] AUD=[%s] TIMEOUT=[%s] ROUNDS=[%s] AUS=[%s] NSP=[%s]\\n' \\
     "\${AIPAIR_GATE:-}" "\${AIPAIR_NO_VERSION_GATE:-}" "\${AIPAIR_ALLOW_UNTESTED_DIALOGS:-}" \\
-    "\${AIPAIR_GATE_TIMEOUT:-}" "\${AIPAIR_GATE_ROUNDS:-}"
+    "\${AIPAIR_GATE_TIMEOUT:-}" "\${AIPAIR_GATE_ROUNDS:-}" \\
+    "\${AIPAIR_ALLOW_UNTESTED_SCHEMA:-}" "\${AIPAIR_NO_SCHEMA_PROBE:-}"
 } > $W/relay-argv
 SHIM
 chmod +x "$W"/bin/*
@@ -44,7 +45,8 @@ echo "# [1] aipair loop into an EXISTING server forwards gate + version env as f
 "$REAL_TMUX" -L "$SOCKET" new-session -d -s pre -c /tmp        # server now exists → new session won't inherit our env
 rm -f "$W/relay-argv"
 AIPAIR_NO_VERSION_GATE=1 AIPAIR_ALLOW_UNTESTED_DIALOGS=1 AIPAIR_GATE='npm test' \
-  AIPAIR_GATE_TIMEOUT=120 AIPAIR_GATE_ROUNDS=2 AIPAIR_CLAUDE_FLAGS='' AIPAIR_CODEX_FLAGS='' \
+  AIPAIR_GATE_TIMEOUT=120 AIPAIR_GATE_ROUNDS=2 AIPAIR_ALLOW_UNTESTED_SCHEMA=1 AIPAIR_NO_SCHEMA_PROBE=1 \
+  AIPAIR_CLAUDE_FLAGS='' AIPAIR_CODEX_FLAGS='' \
   AIPAIR_UNSAFE=1 timeout 8 script -qec "aipair loop '$W/proj'" /dev/null >/dev/null 2>&1 || true
 if wait_file "$W/relay-argv"; then
   argv="$(cat "$W/relay-argv")"
@@ -53,24 +55,33 @@ if wait_file "$W/relay-argv"; then
   chk_has "$argv" "--gate npm test" "aipair loop → --gate 'npm test'"
   chk_has "$argv" "--gate-timeout 120" "aipair loop → --gate-timeout"
   chk_has "$argv" "--gate-rounds 2" "aipair loop → --gate-rounds"
+  chk_has "$argv" "--allow-untested-schema" "aipair loop → --allow-untested-schema"
+  chk_has "$argv" "--no-schema-probe" "aipair loop → --no-schema-probe"
   chk_has "$argv" "GATE=[npm test]" "relay env sees AIPAIR_GATE"
+  chk_has "$argv" "AUS=[1]" "relay env sees AIPAIR_ALLOW_UNTESTED_SCHEMA"
+  chk_has "$argv" "NSP=[1]" "relay env sees AIPAIR_NO_SCHEMA_PROBE"
 else n=$((n+1)); echo "FAIL aipair loop: relay was never launched"; fail=1; fi
 reset_server
 
 echo "# [1b] a STALE AIPAIR_* in an existing server is overridden by the current (empty) value"
 # Start the server carrying stale values; then launch with the vars empty.
 AIPAIR_GATE='stale gate' AIPAIR_NO_VERSION_GATE=1 AIPAIR_ALLOW_UNTESTED_DIALOGS=1 \
+  AIPAIR_ALLOW_UNTESTED_SCHEMA=1 AIPAIR_NO_SCHEMA_PROBE=1 \
   "$REAL_TMUX" -L "$SOCKET" new-session -d -s pre -c /tmp
 rm -f "$W/relay-argv"
 AIPAIR_GATE='' AIPAIR_NO_VERSION_GATE='' AIPAIR_ALLOW_UNTESTED_DIALOGS='' \
+  AIPAIR_ALLOW_UNTESTED_SCHEMA='' AIPAIR_NO_SCHEMA_PROBE='' \
   AIPAIR_CLAUDE_FLAGS='' AIPAIR_CODEX_FLAGS='' \
   AIPAIR_UNSAFE=1 timeout 8 script -qec "aipair loop '$W/proj'" /dev/null >/dev/null 2>&1 || true
 if wait_file "$W/relay-argv"; then
   argv="$(grep '^ARGV' "$W/relay-argv")"; envl="$(grep '^GATE=' "$W/relay-argv")"
   n=$((n+1)); if printf '%s' "$argv" | grep -qF -- "--gate"; then echo "FAIL stale gate leaked into argv: $argv"; fail=1; else echo "ok   no stale --gate flag"; fi
+  n=$((n+1)); if printf '%s' "$argv" | grep -qF -- "--no-schema-probe"; then echo "FAIL stale --no-schema-probe leaked into argv: $argv"; fail=1; else echo "ok   no stale --no-schema-probe flag"; fi
   chk_has "$envl" "GATE=[]" "relay env AIPAIR_GATE neutralized (was 'stale gate')"
   chk_has "$envl" "NVG=[]" "relay env AIPAIR_NO_VERSION_GATE neutralized (was 1)"
   chk_has "$envl" "AUD=[]" "relay env AIPAIR_ALLOW_UNTESTED_DIALOGS neutralized (was 1)"
+  chk_has "$envl" "AUS=[]" "relay env AIPAIR_ALLOW_UNTESTED_SCHEMA neutralized (was 1)"
+  chk_has "$envl" "NSP=[]" "relay env AIPAIR_NO_SCHEMA_PROBE neutralized (was 1)"
 else n=$((n+1)); echo "FAIL aipair loop (stale): relay never launched"; fail=1; fi
 reset_server
 

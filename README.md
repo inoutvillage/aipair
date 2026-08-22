@@ -260,6 +260,8 @@ peer-log codex --full      # セッション全体
 | `AIPAIR_CLAUDE_SESSION` | （自動＝新規 uuid） | `peer` を起動ペアの Claude に固定する内部 pin。この id で `claude --session-id` を起動し、ログ `<id>.jsonl` を一意に指す（厳密固定）。明示指定は**UUID でなければ起動拒否**、peer-log 側も不正値なら fail-closed。通常は不要 |
 | `AIPAIR_CODEX_SINCE` | （自動＝起動時の高精度 epoch） | Codex pin の**フォールバック**（主経路は `/proc` によるプロセス実体固定。上記「ペア相手への固定」参照）。`/proc`・tmux が無い環境やプロセス特定前に、この epoch 以降に開かれた最古の cwd 一致 rollout を読む。明示指定は**数値（非 nan/inf/負）でなければ起動拒否**、peer-log 側も不正値なら fail-closed。通常は不要 |
 | `AIPAIR_NO_VERSION_GATE` | （未設定＝off） | `1` で起動時の版チェック自体をしない |
+| `AIPAIR_ALLOW_UNTESTED_SCHEMA` | （未設定＝off） | `1` で、**ログ JSONL の schema がコア relay の依存キーと食い違って**も自動操作を続ける（既定は不一致なら自動 OFF・警告。→「版ゲート／schema ゲート」） |
+| `AIPAIR_NO_SCHEMA_PROBE` | （未設定＝off） | `1` で起動時・実行時の **JSONL schema feature-probe** をしない |
 
 `AIPAIR_*_FLAGS` 以外の値は**そのまま 1 引数**として relay に渡る（`'`・空白・`$`・`;` を含んでも壊れない。launcher がシングルクォートで包む）。
 不正値（`AIPAIR_MAX_ROUNDS=abc` / `0` / 負数、`AIPAIR_STOP_SIDE=typo`）は**既定へ落とさず exit 2** で即エラー。
@@ -389,7 +391,7 @@ Codex のレビュー配達時（通常ループ）も、Claude が質問ダイ�
 
 ---
 
-### 版ゲート（自動・claude/codex のバージョン）
+### 版ゲート／schema ゲート（自動・claude/codex のバージョンとログ形状）
 
 プラン承認ダイアログや選択式質問の**自動操作は、CLI の画面（TUI）を文字列で読んで数字キーを送る**方式なので、
 Claude Code / Codex CLI の版が変わると壊れうる。そこで relay は起動時に `claude --version` / `codex --version` を取得し、
@@ -406,6 +408,33 @@ aipair-relay --no-version-gate             # 版チェック自体をしない�
 ```
 
 検証済み版を上げたら `bin/aipair-relay` の `TESTED_VERSIONS` と README の表を**両方**更新すること（テスト `VersionGate` が両者の一致を前提にしている）。
+
+#### schema ゲート（自動・ログの JSONL 形状）
+
+版文字列の一致だけでは足りない。relay の**コア（ターン完了検知・応答帰属）は CLI のログ（Claude の
+`<uuid>.jsonl` ／ Codex の `rollout-*.jsonl`）を「キー」で読む**：Claude は `type=="assistant"` +
+`message.stop_reason` + `timestamp` + `uuid`/`parentUuid`、Codex は `type=="event_msg"` +
+`payload.type`（`task_started`/`task_complete`）+ `timestamp`。CLI 更新で版文字列が「検証済み」のままでも
+これらのキーが移動すると、ターン検出が**黙って**壊れる（完了を一生検知しない等）。
+
+そこで relay は版ゲートに加え、**実ログの feature-probe** を行う（`--no-schema-probe` で無効化）:
+
+- **ok** … 期待するキー形状が実際に在る（起動ログに `ログschema OK`）
+- **unverified** … まだ判定材料が無い（起動直後・空/生まれたてのログ）＝**ブロックしない**
+- **mismatch** … その種のレコードは在るのに relay が読むサブフィールドが**欠けている**＝ドリフト確定 →
+  **安全側**（ダイアログ自動操作を OFF・実行ログで大きく警告＋ベル）
+
+`aipair loop` は起動時点でログがまだ無いため、判定は**実行時**（ピンしたログに最初のターンが出た時）に行い、
+エージェントごとに一度だけ latch する（誤検知を避けるため、キー欠落という**積極的な証拠がある時だけ** mismatch）。
+判断が変わったら:
+
+```bash
+aipair-relay --allow-untested-schema       # schema が食い違っても自動操作を続ける（AIPAIR_ALLOW_UNTESTED_SCHEMA=1）
+aipair-relay --no-schema-probe             # schema probe 自体をしない（AIPAIR_NO_SCHEMA_PROBE=1）
+```
+
+probe の実装は純関数 `schema_probe`（`bin/aipair-corelib`）で、`tests/relay-parsers.py` の `SchemaProbe` が
+claude/codex の ok・unverified・各ドリフトを被覆している。
 
 ### 停止ゲート（任意・`--gate`）
 

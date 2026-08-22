@@ -67,6 +67,94 @@ def version_gate(a, detected, tested=TESTED_VERSIONS):
     return rows, bad
 
 
+# --- JSONL schema feature-probe --------------------------------------------- #
+# version_gate above only compares --version strings, but the CORE relay reads the agents'
+# JSONL/rollout transcripts BY KEY: claude → type=="assistant" carrying message.stop_reason +
+# timestamp, and a uuid/parentUuid chain; codex → type=="event_msg" carrying
+# payload.type in {task_started, task_complete} + timestamp. A CLI update can keep a "tested"
+# version string yet move those keys, and then turn-detection silently breaks (the relay just
+# never sees a completed turn). schema_probe looks at REAL decoded records and reports whether
+# the keyed shape the relay depends on is actually present, so the gate can extend past the TUI.
+
+def schema_probe(agent, records):
+    """Feature-probe decoded JSONL records for the schema markers the core relay reads.
+    Returns (status, reason):
+      "ok"         — positive evidence the expected keyed shape is present.
+      "unverified" — no record of the relevant kind yet (empty/nascent log, or only unrelated
+                     types): can't tell, and must NOT block a just-started pair.
+      "mismatch"   — a record of the RIGHT KIND exists but LACKS the sub-field the relay keys
+                     on: positive evidence of drift → safe side.
+    Only positive drift trips "mismatch"; the mere ABSENCE of a kind stays "unverified", so a
+    fresh session never false-alarms. `records` is a list of decoded dicts (see loglib.read_records)."""
+    records = [d for d in (records or []) if isinstance(d, dict)]
+    if agent == "claude":
+        return _schema_probe_claude(records)
+    if agent == "codex":
+        return _schema_probe_codex(records)
+    return ("unverified", "")
+
+
+def _schema_probe_claude(records):
+    # An "assistant-ish" record = top-level type=="assistant" OR inner message.role=="assistant"
+    # (the latter catches a renamed top-level type). One FULLY shaped assistant turn — the exact
+    # shape claude_done_ts + claude_response_attributed read — proves the schema in a single line.
+    drift = None
+    for d in records:
+        msg = d.get("message") if isinstance(d.get("message"), dict) else None
+        inner_role = msg.get("role") if msg else None
+        if d.get("type") != "assistant" and inner_role != "assistant":
+            continue
+        if (d.get("type") == "assistant" and msg is not None and "stop_reason" in msg
+                and d.get("timestamp") is not None and d.get("uuid") is not None):
+            return ("ok", "assistant+stop_reason+timestamp+uuid 確認")
+        # assistant-ish but not the shape the relay reads → remember the first concrete drift.
+        if d.get("type") != "assistant":
+            drift = drift or "assistant メッセージだが type!='assistant'（型名ドリフト）"
+        elif msg is None or "stop_reason" not in msg:
+            drift = drift or "assistant に message.stop_reason が無い（完了検知不能）"
+        elif d.get("timestamp") is None:
+            drift = drift or "assistant に timestamp が無い"
+        else:
+            drift = drift or "assistant に uuid が無い（応答帰属チェーン不能）"
+    return ("mismatch", drift) if drift else ("unverified", "完了 assistant ターン未確認")
+
+
+def _schema_probe_codex(records):
+    # codex_done_ts keys on type=="event_msg" + payload.type in {task_started, task_complete} +
+    # timestamp. A well-formed task event (started OR complete — same envelope) proves it; a
+    # task event NOT under event_msg, or without a timestamp, is positive drift.
+    drift = None
+    for d in records:
+        p = d.get("payload") if isinstance(d.get("payload"), dict) else None
+        ptype = p.get("type") if p else None
+        if ptype not in ("task_started", "task_complete"):
+            continue
+        if d.get("type") == "event_msg" and d.get("timestamp") is not None:
+            return ("ok", "event_msg/%s+timestamp 確認" % ptype)
+        drift = drift or ("%s だが type!='event_msg'（型名ドリフト）" % ptype
+                          if d.get("type") != "event_msg" else "%s に timestamp が無い" % ptype)
+    return ("mismatch", drift) if drift else ("unverified", "task_started/task_complete 未出現")
+
+
+def schema_gate(a, probes):
+    """probes = {agent: (status, reason)}. Returns (rows, bad): rows = [(name, status, reason)],
+    bad = agents whose status is "mismatch". On any mismatch and not a.allow_untested_schema, the
+    SAME safe posture as the version gate is applied (dialog automation OFF) AND a.schema_mismatch
+    is set so the relay can warn loudly that the core turn-detection schema drifted. "unverified"
+    never trips the gate (a fresh log is normal)."""
+    rows, bad = [], []
+    for name in ("claude", "codex"):
+        status, reason = probes.get(name, ("unverified", ""))
+        rows.append((name, status, reason))
+        if status == "mismatch":
+            bad.append(name)
+    if bad and not getattr(a, "allow_untested_schema", False):
+        a.no_plan_review = True
+        a.no_question_relay = True
+        a.schema_mismatch = True
+    return rows, bad
+
+
 def hit_stop(texts, phrases):
     """停止ワード判定。poke は「本文の冒頭に停止ワードを明記」と指示しているが、
     エージェントは1ターンに進捗ナレーション（「〜を確認します」等）を複数メッセージ吐くため、

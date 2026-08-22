@@ -12,7 +12,7 @@ HERE="$(cd "$(dirname "$0")" && pwd -P)"; REPO="$(dirname "$HERE")"
 REAL_TMUX="$(command -v tmux)" || { echo "tmux not found" >&2; exit 2; }
 W="$(mktemp -d "${TMPDIR:-/tmp}/aipair-test.XXXXXX")"
 SOCKET="aipair-test-$$-$RANDOM"
-cleanup() { "$REAL_TMUX" -L "$SOCKET" kill-server 2>/dev/null || true; rm -rf "$W"; }
+cleanup() { "$REAL_TMUX" -L "$SOCKET" kill-server 2>/dev/null || true; rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SOCKET" 2>/dev/null || true; rm -rf "$W"; }
 trap cleanup EXIT
 
 mkdir -p "$W/bin" "$W/a/api" "$W/b/api" "$W/Case" "$W/case"

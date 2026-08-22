@@ -22,8 +22,8 @@ Plan mode (auto plan review):
 Module layout (D3 split — aipair-relay is the launcher + main loop; helpers live in
 sibling modules it loads by path via SourceFileLoader and binds into its namespace):
   peer-log            transcript location + parsing (shared with `peer-log` the tool)
-  aipair-corelib      pure helpers: stop-phrase, version gate, gate output shaping
-  aipair-loglib       turn-completion / response-attribution reading
+  aipair-corelib      pure helpers: stop-phrase, version gate, JSONL schema probe, gate output shaping
+  aipair-loglib       turn-completion / response-attribution reading + bounded record reader
   aipair-tmuxlib      the tmux(...) runner + pane discovery/inspection
   aipair-deliverylib  poke delivery + Enter submission (host injects tmux/dim/dialog probe)
   aipair-dialoglib    plan/question dialog detection + response (+ dialog constants)
@@ -111,6 +111,8 @@ GATE_OUTPUT_CAP = corelib.GATE_OUTPUT_CAP
 parse_version = corelib.parse_version
 detect_version = corelib.detect_version
 version_gate = corelib.version_gate
+schema_probe = corelib.schema_probe
+schema_gate = corelib.schema_gate
 hit_stop = corelib.hit_stop
 scrub_output = corelib.scrub_output
 gate_tail = corelib.gate_tail
@@ -131,6 +133,15 @@ find_poke_ts = loglib.find_poke_ts
 codex_response_complete = loglib.codex_response_complete
 claude_response_attributed = loglib.claude_response_attributed
 make_fragment = loglib.make_fragment
+read_records = loglib.read_records
+
+
+def probe_log_schema(agent, path):
+    """(status, reason) for the agent's tracked transcript via corelib.schema_probe, or
+    ('unverified', 'ログ未特定') when no log is pinned yet. Bounded read (loglib.read_records)."""
+    if not path:
+        return ("unverified", "ログ未特定")
+    return schema_probe(agent, read_records(path))
 
 # --- tmux runner + pane helpers live in aipair-tmuxlib (D3: split, increment 3 = A3) --
 # The subprocess `tmux(...)` wrapper and pane discovery/inspection; stdlib only. Bound in so
@@ -818,6 +829,13 @@ def main():
                          "（既定: 不一致なら自動 OFF / env AIPAIR_ALLOW_UNTESTED_DIALOGS）")
     ap.add_argument("--no-version-gate", action="store_true", default=_env_bool("AIPAIR_NO_VERSION_GATE"),
                     help="起動時の claude/codex 版チェックをしない（env AIPAIR_NO_VERSION_GATE）")
+    ap.add_argument("--allow-untested-schema", action="store_true",
+                    default=_env_bool("AIPAIR_ALLOW_UNTESTED_SCHEMA"),
+                    help="ログ JSONL schema がコア relay の依存と不一致でもダイアログ自動操作を続行"
+                         "（既定: 不一致なら自動 OFF / env AIPAIR_ALLOW_UNTESTED_SCHEMA）")
+    ap.add_argument("--no-schema-probe", action="store_true",
+                    default=_env_bool("AIPAIR_NO_SCHEMA_PROBE"),
+                    help="起動時/実行時の JSONL schema feature-probe をしない（env AIPAIR_NO_SCHEMA_PROBE）")
     ap.add_argument("--no-plan-review", action="store_true",
                     help="ignore the plan-approval dialog (pre-existing behavior)")
     ap.add_argument("--question-rounds", type=int, default=5,
@@ -832,6 +850,7 @@ def main():
                          "確実に指定したい場合は --claude-log/--codex-log で明示ピン）")
     ap.add_argument("--no-color", action="store_true")
     a = ap.parse_args()
+    a.schema_mismatch = False   # set by schema_gate / schema_watch when core JSONL schema drifts
 
     # argparse の choices は「コマンドラインで渡された値」しか検証しない。
     # env 由来の既定値は素通りするので、ここで明示的に弾く（無言で codex 扱いにしない）。
@@ -886,6 +905,15 @@ def main():
     if not a.no_version_gate:
         vrows, vbad = version_gate(a, {n: detect_version(n) for n in ("claude", "codex")})
 
+    # Schema feature-probe: the version gate only knows --version strings, so also probe the
+    # actual JSONL the core relay reads. At startup only EXPLICIT pins exist (an `aipair loop`
+    # has no log yet → "unverified"); schema_watch() re-probes the tracked logs at runtime.
+    srows, sbad = ([], [])
+    if not a.no_schema_probe:
+        spin = {"claude": os.path.realpath(os.path.expanduser(a.claude_log)) if a.claude_log else None,
+                "codex":  os.path.realpath(os.path.expanduser(a.codex_log)) if a.codex_log else None}
+        srows, sbad = schema_gate(a, {n: probe_log_schema(n, spin[n]) for n in ("claude", "codex")})
+
     # ペインタイトルで「今どのモードで・何往復まで」が一目で分かるようにする
     own = own_pane(session)
     set_pane_title(own, (f"relay ● endless / max {a.max_rounds} / 終端「{a.all_done}」/ Ctrl-C で停止"
@@ -913,6 +941,19 @@ def main():
              if a.allow_untested_dialogs else
              c("warn", "  → プラン承認・質問リレーの自動操作を OFF にしました"
                        "（poke/transcript は続行。--allow-untested-dialogs で無効化）")))
+    for name, status, reason in srows:
+        if status == "ok":
+            log(c("dim", f"{name} ログschema OK（{reason}）"))
+        elif status == "mismatch":
+            log(c("warn", f"⚠ {name} ログschema がコア relay の依存と不一致（{reason}）"))
+        # "unverified" at startup is normal (no pinned log yet) → schema_watch() checks at runtime
+    if not a.no_schema_probe and not any(st != "unverified" for _n, st, _r in srows):
+        log(c("dim", "ログschema=実行時に検査（起動時はピン待ち）"))
+    if sbad:
+        log((c("dim", "  → --allow-untested-schema によりダイアログ自動操作は継続")
+             if a.allow_untested_schema else
+             c("warn", "  → ログschema不一致のためダイアログ自動操作を OFF"
+                       "（ターン検出の信頼性低下に注意。--allow-untested-schema で無効化）")))
     if a.endless:
         log(c("ok", "連続モード=on") + f"（「{stop_phrases[0] if stop_phrases else '完了です'}」＝レビュー合格→次のタスクへ）")
         log(f"  タスクリスト={a.task_list}  次を要求={'/'.join(next_ask_phrases)}  "
@@ -986,6 +1027,35 @@ def main():
     probe_sent_at = 0.0        # poke 送出時刻（no-show 監視用）
     POKE_NOSHOW = 1800         # nonce がログに現れないまま諦めるまでの秒数
     last_rejected = None       # 帰属棄却した完了 ts（棄却ログを完了値ごと1回に抑制）
+    schema_latched = {"claude": None, "codex": None}   # runtime JSONL schema probe: latch once per agent
+
+    def schema_watch():
+        """Once per agent, probe the tracked transcript for the core schema the relay reads
+        (turn-completion keys). An `aipair loop` has no log at startup, so this — not the
+        startup banner — is where real drift is caught, the first time a pinned log has turns.
+        Latches per agent (probe cost is paid only until each side resolves ok/mismatch); a
+        mismatch warns loudly + rings the bell and, unless --allow-untested-schema, falls to the
+        version gate's safe posture (dialogs off)."""
+        if a.no_schema_probe:
+            return
+        for agent in ("claude", "codex"):
+            if schema_latched[agent] is not None or not tracked[agent]:
+                continue
+            status, reason = probe_log_schema(agent, tracked[agent])
+            if status == "ok":
+                schema_latched[agent] = "ok"
+                dim(f"{agent} ログschema OK（{reason}）")
+            elif status == "mismatch":
+                schema_latched[agent] = "mismatch"
+                print(c("warn", f"│ ■ {agent} のログ JSONL schema がコア relay の依存と不一致（{reason}）。"
+                                "ターン検出が誤動作する可能性があります。claude/codex の版と"
+                                " TESTED schema を確認してください。"), flush=True)
+                print("\a", end="", flush=True)
+                if not a.allow_untested_schema:
+                    a.no_plan_review = True
+                    a.no_question_relay = True
+                    a.schema_mismatch = True
+            # "unverified" → leave unlatched, re-probe next iteration
 
     def wait_heartbeat(who):
         # 待機フェーズごとに1回だけ表示（None = 表示済み。状態遷移時の time.time() 再セットで再アーム）
@@ -1072,6 +1142,7 @@ def main():
     all_done_hit = False
     try:
         while True:
+            schema_watch()
             if state == "claude":
                 if tracked["claude"] is None:
                     tracked["claude"] = lock_claude(cwd, claude_seen, panes["claude"], baseline)
