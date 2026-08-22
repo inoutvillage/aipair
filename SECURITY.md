@@ -48,10 +48,13 @@ aipair は次を前提に設計されています。**この前提が崩れる�
 これらには**会話の全履歴**（貼り付けた秘密・PII を含む）が入っています。
 
 - **脅威:** ペアの相手（および同一 uid でログを読めるプロセス）は、もう一方の全履歴を参照できます。Claude に貼った秘密を Codex 側の relay/peer が読めます。
+- **⚠ クロスプロバイダー境界（重要）:** aipair の**プロセス自体**はログを外部へ送信しません（ネットワーク接続を開きません）。しかし `peer`/relay の出力は**相手エージェントのツール結果**になり、そのエージェントの CLI が**自社クラウドへアップロード**します。つまり——
+  - Codex が `peer`（＝Claude のトランスクリプト）を読むと、その内容は **OpenAI** へ送られ得る。
+  - Claude が `peer`（＝Codex のトランスクリプト）を読むと、その内容は **Anthropic** へ送られ得る。
+  - 結果として、**一方のプロバイダーに紐づく会話履歴・秘密が、もう一方のプロバイダーへ渡り得ます**。これは aipair が「両者を突き合わせる」設計上、不可避の情報フローです。
 - **境界／緩和:**
-  - ログはローカルファイルで、aipair は**外部へ送信しません**。
   - peer/relay は起動ペアのセッションに **pin**（Claude=`--session-id`、Codex=`/proc` のプロセス実体、フォールバックは起動 epoch）し、無関係な別セッションを誤読しないようにしています。ただし**同一 uid のログは読める**前提です。
-  - **対策:** ペア稼働中に秘密を貼らない。`~/.claude` / `~/.codex` を第三者と共有しない。
+  - **対策:** ペア稼働中に秘密を貼らない（どちらのプロバイダーにも渡り得る）。規制・契約でプロバイダーを跨げないデータは aipair のペアに載せない。`~/.claude` / `~/.codex` を第三者と共有しない。
 
 ### 3. tmux キーストローク注入（relay の poke）
 relay はエージェントのペインへキー入力（poke）を送ってターンを駆動します。
@@ -67,7 +70,7 @@ relay はエージェントのペインへキー入力（poke）を送ってタ�
 バイパスモードでは、エージェントが**自律的に commit / push** し得ます。
 
 - **脅威:** 秘密・PII を含む push（履歴は不可逆）、サプライチェーン操作、外部への送信。
-- **境界／緩和:** aipair 自体は push しません（**エージェントの判断**です）。導入する周知ブロック（`~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md`）は「push 前に PII/秘密を確認」を求めますが、バイパスモードでは強制力がありません。**対策:** リモートを絞る、push をブロックする `pre-push` フック、レビュー後のみ push を許す運用。
+- **境界／緩和:** aipair 自体は push しません（**エージェントの判断**です）。**aipair が導入する周知ブロック（`templates/claude-md-block.md` / `templates/codex-agents-block.md`）は push や PII の確認を強制しません**——ペア連携の説明だけです。push を止めたいなら**利用者側**で用意してください: リモートを絞る、`pre-push` フックで push をブロック、レビュー後のみ push を許す運用など。
 
 ### 5. グローバル指示の注入（インストーラ）
 `aipair-install.sh` は `~/.claude/CLAUDE.md` と `~/.codex/AGENTS.md` にマーカー境界ブロックを書き込みます。
@@ -104,9 +107,13 @@ Its trust model assumes a single-user local machine, user-private tmux sockets, 
 repository/task content** when `--unsafe`/`aipair loop` is used. aipair **adds no sandboxing**:
 agents run with your full privileges. Principal risks: (1) arbitrary code execution via
 permission-bypass on untrusted content / prompt injection; (2) full conversation transcripts are
-readable by the paired agent and same-uid processes; (3) the relay reads transcript **content**
-for turn/stop detection, so crafted text can mislead it (mitigated by leading-100-char stop
-matching, version/schema gates, and the optional `--gate`); (4) autonomous git push;
+readable by the paired agent and same-uid processes — and **crucially, `peer`/relay output
+becomes the OTHER agent's tool result, which its CLI uploads to that provider's cloud**, so
+Claude-side history can reach OpenAI and Codex-side history can reach Anthropic (a cross-provider
+data flow inherent to pairing; aipair's own process opens no network connection); (3) the relay
+reads transcript **content** for turn/stop detection, so crafted text can mislead it (mitigated
+by leading-100-char stop matching, version/schema gates, and the optional `--gate`);
+(4) autonomous git push (aipair's notice blocks do NOT gate it — use a `pre-push` hook);
 (5) marker-bounded edits to global `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` (opt-out via
 `--no-global-instructions`). Out of scope: sandboxing the agents, a malicious same-uid local
 user, and upstream CLI vulnerabilities. Run untrusted work in a disposable container/VM, keep
