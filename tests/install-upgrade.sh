@@ -24,6 +24,8 @@ chk "[ -f '$TH/.local/bin/aipair-corelib' ]" "aipair-corelib installed"
 echo "$out" | grep -q "retired" && retired=1 || retired=0
 chk "[ $retired -eq 1 ]" "installer reports the retirement"
 chk "env -u TMUX HOME='$TH' '$TH/.local/bin/aipair-relay' --help >/dev/null 2>&1" "installed relay loads corelib (--help ok)"
+chk "grep -q 'aipair:start' '$TH/.claude/CLAUDE.md'" "default install writes the global CLAUDE.md block"
+chk "grep -q 'aipair:start' '$TH/.codex/AGENTS.md'" "default install writes the global AGENTS.md block"
 
 # --- retire FAILURE must fail the install (a dangerous stale binary left runnable is not ok) ---
 TH2="$(mktemp -d "${TMPDIR:-/tmp}/aipair-upg2.XXXXXX")"
@@ -42,6 +44,22 @@ else
   chk "[ $reported -eq 1 ]" "installer reports the retire failure"
   chmod u+w "$TH2/.local/bin" 2>/dev/null || true; rm -rf "$TH2"
 fi
+
+# --- --no-global-instructions must skip the global-instruction injection ---
+TH3="$(mktemp -d "${TMPDIR:-/tmp}/aipair-upg3.XXXXXX")"; mkdir -p "$TH3/.local/bin"
+rc=0; out3="$(env -u TMUX HOME="$TH3" bash "$REPO/aipair-install.sh" --no-global-instructions 2>&1)" || rc=$?
+chk "[ $rc -eq 0 ]" "install --no-global-instructions exits 0 (got $rc)"
+chk "! grep -q 'aipair:start' '$TH3/.claude/CLAUDE.md' 2>/dev/null" "no aipair block written to ~/.claude/CLAUDE.md"
+chk "! grep -q 'aipair:start' '$TH3/.codex/AGENTS.md' 2>/dev/null" "no aipair block written to ~/.codex/AGENTS.md"
+echo "$out3" | grep -q 'スキップ' && sk=1 || sk=0
+chk "[ $sk -eq 1 ]" "installer reports the skip"
+chk "[ -f '$TH3/.local/bin/aipair' ]" "bins still installed with --no-global-instructions"
+rm -rf "$TH3"
+# and the env var form does the same
+TH4="$(mktemp -d "${TMPDIR:-/tmp}/aipair-upg4.XXXXXX")"; mkdir -p "$TH4/.local/bin"
+env -u TMUX HOME="$TH4" AIPAIR_NO_GLOBAL_INSTRUCTIONS=1 bash "$REPO/aipair-install.sh" >/dev/null 2>&1 || true
+chk "! grep -q 'aipair:start' '$TH4/.claude/CLAUDE.md' 2>/dev/null" "AIPAIR_NO_GLOBAL_INSTRUCTIONS=1 also skips the injection"
+rm -rf "$TH4"
 
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED)"
 exit $fail
