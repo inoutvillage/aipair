@@ -21,6 +21,15 @@ def current_session():
         return None
 
 
+def session_option(session, opt):
+    """A session-scoped user option value ("" if unset). Bare -t: show-options does not accept
+    the "=name" exact form, but `session` here is already exact, and tmux prefers an exact name."""
+    try:
+        return tmux("show-options", "-t", session, "-qv", opt, capture=True).stdout.strip()
+    except subprocess.CalledProcessError:
+        return ""
+
+
 def find_panes(session):
     """Identify the claude/codex panes. Titles set by aipair ('claude'/'codex')
     get overwritten by the CLIs at runtime, so fall back to the running command
@@ -28,6 +37,17 @@ def find_panes(session):
     out = tmux("list-panes", "-t", "=" + session,   # "=" = exact match: a prefix (aipair-ai)
                "-F", "#{pane_id}\t#{pane_current_command}\t#{pane_title}",   # must not hit aipair-aipair
                capture=True).stdout
+    live = {ln.split("\t", 1)[0] for ln in out.splitlines() if ln}
+    # Prefer the pane ids aipair stamped (@aipair-claude-pane / @aipair-codex-pane): deterministic,
+    # no title/command guessing (Codex runs as `node`, titles get overwritten). The heuristic below
+    # stays as a fallback for sessions started before the stamps existed.
+    stamped = {}
+    for role in ("claude", "codex"):
+        pid = session_option(session, "@aipair-" + role + "-pane")
+        if pid in live:
+            stamped[role] = pid
+    if len(stamped) == 2:
+        return stamped
     self_pane = os.environ.get("TMUX_PANE")
     panes, leftovers = {}, []
     for line in out.splitlines():

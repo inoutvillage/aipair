@@ -127,7 +127,7 @@ legacy_is_ours() {  # $1 = legacy session name, $2 = canonical dir
 
 cmd="start"
 case "${1:-}" in
-  start|loop|attach|stop|name) cmd="$1"; shift ;;
+  start|loop|attach|stop|name|status) cmd="$1"; shift ;;
 esac
 
 DIR="${1:-$PWD}"
@@ -182,6 +182,26 @@ case "$cmd" in
   attach)
     if running; then attach_session
     else echo "aipair: no running session $NAME (run 'aipair' to start)" >&2; exit 1; fi ;;
+  status)
+    if ! running; then echo "aipair: $NAME — 停止中（未起動）"; exit 1; fi
+    printf 'session: %s\n    dir: %s\n' "$NAME" "$DIR"
+    live_panes="$(tmux list-panes -t "=$NAME" -F '#{pane_id}')"
+    for role in claude codex bridge; do
+      pane="$(tmux show-options -t "$NAME" -qv "@aipair-${role}-pane" 2>/dev/null)"
+      if [ -n "$pane" ] && printf '%s\n' "$live_panes" | grep -qxF "$pane"; then
+        cmd_now="$(tmux display-message -p -t "$pane" '#{pane_current_command}' 2>/dev/null)"
+        case "$cmd_now" in
+          bash|zsh|sh|fish|dash|-bash|-zsh) state="idle（シェルに戻っている）" ;;
+          *)                                state="running（$cmd_now）" ;;
+        esac
+        printf '  %-8s %-5s %s\n' "$role" "$pane" "$state"
+      elif [ -n "$pane" ]; then
+        printf '  %-8s %-5s %s\n' "$role" "$pane" "ペイン消失"
+      else
+        printf '  %-8s %-5s %s\n' "$role" "-" "（このセッションには pane id が記録されていません＝旧セッション）"
+      fi
+    done
+    exit 0 ;;
 esac
 
 # cmd == start|loop.
@@ -341,6 +361,10 @@ tmux set -t "$CLAUDE" @aipair-dir "$DIR"          # owner stamp, read by session
 # (@aipair-codex-since). BOTH are REQUIRED metadata — a silent miss would let peer and the relay
 # diverge onto different same-cwd Codex sessions (2026-08-22 review). So propagate a save failure
 # rather than swallowing it: the transactional EXIT trap above rolls the half-built session back.
+tmux set -t "$CLAUDE" @aipair-claude-pane "$CLAUDE" \
+  || { echo "aipair: 必須メタデータ @aipair-claude-pane を記録できません（起動を中止）" >&2; exit 1; }
+tmux set -t "$CLAUDE" @aipair-bridge-pane "$BRIDGE" \
+  || { echo "aipair: 必須メタデータ @aipair-bridge-pane を記録できません（起動を中止）" >&2; exit 1; }
 tmux set -t "$CLAUDE" @aipair-codex-pane "$CODEX" \
   || { echo "aipair: 必須メタデータ @aipair-codex-pane を記録できません（起動を中止）" >&2; exit 1; }
 tmux set -t "$CLAUDE" @aipair-codex-since "$PAIR_SINCE" \

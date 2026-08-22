@@ -102,6 +102,36 @@ class FindPanes(unittest.TestCase):
              mock.patch.dict(os.environ, {"TMUX_PANE": "%2"}):
             self.assertEqual(relay.find_panes("s"), {"claude": "%0"})
 
+    def test_stamped_pane_options_win_over_the_heuristic(self):
+        # both agent panes look identical to the heuristic (node/blank title) and the stamps are
+        # REVERSED from layout order — only honouring @aipair-*-pane gets it right.
+        rows = [("%0", "node", "x"), ("%1", "python3", "relay"), ("%2", "node", "y")]
+        listing = "\n".join("\t".join(r) for r in rows) + "\n"
+        stamps = {"@aipair-claude-pane": "%2", "@aipair-codex-pane": "%0"}
+        def fake(*a, **k):
+            if a[0] == "list-panes":
+                return types.SimpleNamespace(stdout=listing)
+            if a[0] == "show-options":
+                return types.SimpleNamespace(stdout=stamps.get(a[-1], "") + "\n")
+            return types.SimpleNamespace(stdout="")
+        with mock.patch.object(relay.tmuxlib, "tmux", side_effect=fake), \
+             mock.patch.dict(os.environ, {"TMUX_PANE": "%1"}):
+            self.assertEqual(relay.find_panes("s"), {"claude": "%2", "codex": "%0"})
+
+    def test_stamp_pointing_at_a_dead_pane_falls_back_to_the_heuristic(self):
+        rows = [("%0", "claude", "claude"), ("%1", "python3", "relay"), ("%2", "node", "codex")]
+        listing = "\n".join("\t".join(r) for r in rows) + "\n"
+        stamps = {"@aipair-claude-pane": "%9", "@aipair-codex-pane": "%2"}   # %9 no longer present
+        def fake(*a, **k):
+            if a[0] == "list-panes":
+                return types.SimpleNamespace(stdout=listing)
+            if a[0] == "show-options":
+                return types.SimpleNamespace(stdout=stamps.get(a[-1], "") + "\n")
+            return types.SimpleNamespace(stdout="")
+        with mock.patch.object(relay.tmuxlib, "tmux", side_effect=fake), \
+             mock.patch.dict(os.environ, {"TMUX_PANE": "%1"}):
+            self.assertEqual(relay.find_panes("s"), {"claude": "%0", "codex": "%2"})   # heuristic
+
     def test_layout_order_when_nothing_identifies_them(self):
         with panes(("%0", "foo", "x"), ("%1", "bash", "shell"), ("%2", "bar", "y")), \
              mock.patch.dict(os.environ, {"TMUX_PANE": "%9"}):
