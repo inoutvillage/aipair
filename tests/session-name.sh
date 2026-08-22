@@ -206,5 +206,21 @@ rc=0
   AIPAIR_CLAUDE_FLAGS=--version AIPAIR_CODEX_FLAGS=--version timeout 5 aipair start "$W/fsdir" </dev/null >/dev/null 2>&1 ) || rc=$?
 n=$((n+1)); if [ "$rc" != 0 ] && ! alive "$FSNAME"; then echo "ok   split-window failure → no leftover session (rc=$rc)"; else echo "FAIL leftover session after a failed build (rc=$rc, alive=$(alive "$FSNAME" && echo yes || echo no))"; fail=1; fi
 
+echo "# [13] a failed REQUIRED-metadata set (@aipair-codex-since) rolls the session back too"
+mkdir -p "$W/mdfail" "$W/bin-md"
+cat > "$W/bin-md/tmux" <<MD
+#!/usr/bin/env bash
+"$REAL_TMUX" -L "$SOCKET" start-server 2>/dev/null || true
+"$REAL_TMUX" -L "$SOCKET" set-option -g exit-empty off 2>/dev/null || true
+if [ "\$1" = set ]; then for a in "\$@"; do [ "\$a" = @aipair-codex-since ] && { echo "set @aipair-codex-since: forced failure (test)" >&2; exit 1; }; done; fi
+exec "$REAL_TMUX" -L "$SOCKET" "\$@"
+MD
+chmod +x "$W/bin-md/tmux"
+MDNAME="$(aipair name "$W/mdfail")"
+rc=0
+( export PATH="$W/bin-md:$REPO/bin:$PATH"
+  AIPAIR_CLAUDE_FLAGS=--version AIPAIR_CODEX_FLAGS=--version timeout 5 aipair start "$W/mdfail" </dev/null >/dev/null 2>&1 ) || rc=$?
+n=$((n+1)); if [ "$rc" != 0 ] && ! alive "$MDNAME"; then echo "ok   @aipair-codex-since set failure → session rolled back (rc=$rc)"; else echo "FAIL leftover session after required-metadata failure (rc=$rc, alive=$(alive "$MDNAME" && echo yes || echo no))"; fail=1; fi
+
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED) (socket $SOCKET)"
 exit $fail
