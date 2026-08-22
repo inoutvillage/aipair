@@ -522,7 +522,15 @@ bash tests/run-all.sh        # shebang で判別した全 bash/python3 スクリ
 | `tests/codex-follow.py` | Codex rollout の探索・追従・増分インデックス | 一時ディレクトリの fixture。`~/.codex` は読まない |
 | `tests/relay-parsers.py` | 停止ワード判定・env 解析・ペイン特定・プラン/質問ダイアログ検出・ターン完了検出・transcript パーサ | `tmux` / 画面キャプチャをモック |
 
-GitHub Actions（`.github/workflows/ci.yml`）が push / PR ごとに ubuntu-latest で同じ `tests/run-all.sh` を回す（tmux と shellcheck を apt で導入）。**Python は対応下限の 3.8（`aipair-install.sh` の要件）と現行 3.13 の matrix**で実行し、relay・5 lib・peer-log・`.py` テスト（＝6 sibling module）、および shell テストが `python3` として起動する全経路をその版で検証する（`fail-fast: false` で下限と最新の失敗を取り違えない）。
+GitHub Actions（`.github/workflows/ci.yml`）が push / PR ごとに ubuntu-latest で同じ `tests/run-all.sh` を **3 lane の matrix**（`fail-fast: false`）で回す:
+
+| lane | Python | tmux |
+|---|---|---|
+| 対応下限 Python | **3.8**（`aipair-install.sh` の要件） | distro（apt, 3.4 系） |
+| 現行 Python | 3.13 | distro |
+| 対応下限 tmux | 3.13 | **3.1**（`split-window -l 30%` の下限）を **release tarball からソースビルド**（SHA-256 pin・展開前に検証、`tmux -V` が厳密に `tmux 3.1` かも assertion） |
+
+`run-all.sh` は shebang で判別するので、relay・5 lib・peer-log・`.py` テスト（＝6 sibling module）、および shell テストが `python3` として起動する全経路がその lane の Python で走る。`session-name.sh` は実 tmux が < 3.2 なら `#{session_path}` 依存の採用/衝突ケースを skip（3.1 では安全な非採用に縮退。`[10]` の 3.1 シミュレーションが被覆）。shellcheck は全 lane で apt 導入。実 claude/codex を要する E2E は CI では動かせない（→ 「制約・既知の限界」）。
 TUI 本体（Claude Code / Codex CLI の実画面）は CI では動かせないため、ダイアログ検出などは**画面キャプチャの fixture** で固定している。実 UI が変わった時は fixture ごと更新すること。
 
 ## 制約・既知の限界

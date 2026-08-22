@@ -38,7 +38,14 @@ jobs:
           else
             sudo apt-get install -y -qq libevent-dev libncurses-dev build-essential bison pkg-config
             v='${{ matrix.tmux }}'
+            # Pin the release tarball's SHA-256 (fail-closed for any version without one) and
+            # verify it BEFORE extracting / building / `make install` as root.
+            case "$v" in
+              3.1) sha='979bf38db2c36193de49149aaea5c540d18e01ccc27cf76e2aff5606bd186722' ;;
+              *)   echo "no pinned sha256 for tmux $v — add it before building" >&2; exit 1 ;;
+            esac
             curl -fsSL "https://github.com/tmux/tmux/releases/download/$v/tmux-$v.tar.gz" -o tmux.tgz
+            echo "$sha  tmux.tgz" | sha256sum -c -
             tar xzf tmux.tgz
             ( cd "tmux-$v" && ./configure && make -j"$(nproc)" && sudo make install )
             hash -r
@@ -46,5 +53,9 @@ jobs:
       - name: Versions
         run: |
           tmux -V; python3 --version; bash --version | head -1; shellcheck --version | head -2
+          # On a source-built lane, prove we run EXACTLY that tmux (not some other binary on PATH).
+          if [ "${{ matrix.tmux }}" != distro ]; then
+            tmux -V | grep -qx "tmux ${{ matrix.tmux }}" || { echo "expected 'tmux ${{ matrix.tmux }}', got '$(tmux -V)'" >&2; exit 1; }
+          fi
       - name: Run all checks
         run: bash tests/run-all.sh
