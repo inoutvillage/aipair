@@ -10,7 +10,7 @@ for dep in claude codex tmux script; do
 done
 TH="$(mktemp -d "${TMPDIR:-/tmp}/aipair-upg.XXXXXX")"
 # The installer smoke-starts a real pair → force EVERY tmux call onto a PRIVATE -L socket so we
-# never create/kill sessions on the user's default/production server (tasks/lessons.md guardrail).
+# never create/kill sessions on the user's default/production server (SECURITY.md「テストハーネスの tmux」guardrail).
 REAL_TMUX="$(command -v tmux)"; SOCKET="aipair-upg-$$-$RANDOM"; SHIMD="$(mktemp -d)"
 trap '"$REAL_TMUX" -L "$SOCKET" kill-server 2>/dev/null || true; rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SOCKET" 2>/dev/null || true; rm -rf "$TH" "$SHIMD"' EXIT
 printf '#!/usr/bin/env bash\n%q -L %q start-server 2>/dev/null || true\n%q -L %q set-option -g exit-empty off 2>/dev/null || true\nexec %q -L %q "$@"\n' \
