@@ -192,6 +192,126 @@ class TmuxHelpers(unittest.TestCase):
         self.assertEqual(len([a for a in seen if a[:1] == ("select-pane",)]), 1, "empty pane → no call")
 
 
+class Delivery(unittest.TestCase):
+    """aipair-deliverylib: poke / submit_enter / press / paste_text. The tmux runner and the
+    dialog/log hooks are injected into the delivery module — patch them there."""
+    def setUp(self):
+        self.dl = relay.deliverylib
+        self._clock = [1000.0]                          # a fake clock: sleep() advances it, so the
+        def _sleep(sec): self._clock[0] += (sec or 0.01)  # busy-wait deadlines are reached at once
+        def _time(): self._clock[0] += 0.001; return self._clock[0]
+        self.p = [
+            mock.patch.object(self.dl.time, "sleep", side_effect=_sleep),
+            mock.patch.object(self.dl.time, "time", side_effect=_time),
+            mock.patch.object(self.dl, "dim"),
+        ]
+        for x in self.p: x.start()
+    def tearDown(self):
+        for x in self.p: x.stop()
+
+    def _tmux(self, side_effect):
+        return mock.patch.object(self.dl, "tmux", side_effect=side_effect)
+
+    def test_press_and_paste_cancel_copy_mode_first(self):
+        seen = []
+        with mock.patch.object(self.dl, "cancel_copy_mode", side_effect=lambda p: seen.append(("cancel", p))), \
+             self._tmux(lambda *a, **k: seen.append(a) or types.SimpleNamespace(stdout="")):
+            self.dl.press("%0", "Enter")
+            self.assertEqual(seen[0], ("cancel", "%0"), "press cancels copy-mode before send-keys")
+            seen.clear()
+            self.dl.paste_text("%0", "hi")
+            self.assertEqual(seen[0], ("cancel", "%0"), "paste cancels copy-mode first")
+            self.assertTrue(any(a[:1] == ("paste-buffer",) for a in seen))
+
+    def test_submit_enter_confirm_success(self):
+        with self._tmux(lambda *a, **k: types.SimpleNamespace(stdout="")), \
+             mock.patch.object(self.dl, "cancel_copy_mode"):
+            self.assertTrue(self.dl.submit_enter("%0", confirm=lambda: True, badge=False))
+
+    def test_submit_enter_badge_success(self):
+        with self._tmux(lambda *a, **k: types.SimpleNamespace(stdout="running esc to interrupt")), \
+             mock.patch.object(self.dl, "cancel_copy_mode"):
+            self.assertTrue(self.dl.submit_enter("%0", confirm=None, badge=True))
+
+    def test_submit_enter_aborts_on_dialog_before_re_pressing(self):
+        # first Enter isn't confirmed → on the retry, a dialog is on screen → abort (return True,
+        # do NOT press Enter again, which would mis-select an option)
+        sends = []
+        with self._tmux(lambda *a, **k: (sends.append(a) if a[:1] == ("send-keys",) else None) or types.SimpleNamespace(stdout="")), \
+             mock.patch.object(self.dl, "cancel_copy_mode"), \
+             mock.patch.object(self.dl, "dialog_on_screen", side_effect=[True]):
+            ok = self.dl.submit_enter("%0", confirm=lambda: False, badge=False)
+        self.assertTrue(ok)
+        self.assertEqual(len([a for a in sends if "Enter" in a]), 1, "only the first Enter is sent; retry aborts")
+
+    def test_submit_enter_three_retries_then_fail(self):
+        enters = []
+        with self._tmux(lambda *a, **k: (enters.append(a) if a[-1:] == ("Enter",) else None) or types.SimpleNamespace(stdout="")), \
+             mock.patch.object(self.dl, "cancel_copy_mode"), \
+             mock.patch.object(self.dl, "dialog_on_screen", return_value=False), \
+             mock.patch.object(self.dl.sys.stdout, "write"), mock.patch.object(self.dl.sys.stdout, "flush"):
+            self.assertFalse(self.dl.submit_enter("%0", confirm=lambda: False, badge=False))
+        self.assertEqual(len(enters), 3, "Enter re-pressed 3 times before giving up")
+
+    def test_poke_confirms_via_nonce_and_returns_it(self):
+        # composer shows whatever was sent (echo of the last -l text) → nonce appears → delivered;
+        # confirm(probe) True → submit_enter succeeds → poke returns the nonce string.
+        state = {"buf": ""}
+        def fake(*a, **k):
+            if a[:2] == ("send-keys", "-t") and "-l" in a:
+                state["buf"] = a[-1]                      # the literal text incl. the nonce
+            if a[:1] == ("capture-pane",):
+                return types.SimpleNamespace(stdout=state["buf"])
+            return types.SimpleNamespace(stdout="")
+        got = {}
+        with self._tmux(fake), mock.patch.object(self.dl, "cancel_copy_mode"), \
+             mock.patch.object(self.dl, "pane_busy", return_value=False), \
+             mock.patch.object(self.dl, "dialog_on_screen", return_value=False):
+            res = self.dl.poke("%0", "please review", confirm=lambda probe: got.setdefault("p", probe) or True, badge=False)
+        self.assertIsInstance(res, str); self.assertTrue(res.startswith("relay-id:"))
+        self.assertEqual(res, got["p"], "poke returns the nonce it delivered and confirmed")
+
+    def test_poke_delivery_failure_returns_None_and_never_enters(self):
+        # composer never shows the nonce → 3 delivery attempts fail → return None, no Enter sent
+        enters = []
+        def fake(*a, **k):
+            if a[-1:] == ("Enter",): enters.append(a)
+            return types.SimpleNamespace(stdout="unrelated screen")   # nonce never appears
+        with self._tmux(fake), mock.patch.object(self.dl, "cancel_copy_mode"), \
+             mock.patch.object(self.dl, "pane_busy", return_value=False), \
+             mock.patch.object(self.dl, "dialog_on_screen", return_value=False), \
+             mock.patch.object(self.dl.sys.stdout, "write"), mock.patch.object(self.dl.sys.stdout, "flush"):
+            self.assertFalse(self.dl.poke("%0", "hi", confirm=lambda p: True, badge=False))
+        self.assertEqual(enters, [], "no Enter is pressed when delivery could not be confirmed")
+
+    def test_poke_waits_for_busy_then_proceeds(self):
+        # busy for the first checks, then idle; poke still proceeds and delivers
+        busy = iter([True, True, False, False, False, False, False, False])
+        state = {"buf": ""}
+        def fake(*a, **k):
+            if a[:2] == ("send-keys", "-t") and "-l" in a: state["buf"] = a[-1]
+            if a[:1] == ("capture-pane",): return types.SimpleNamespace(stdout=state["buf"])
+            return types.SimpleNamespace(stdout="")
+        with mock.patch.object(self.dl, "BUSY_WAIT", 30), self._tmux(fake), \
+             mock.patch.object(self.dl, "cancel_copy_mode"), \
+             mock.patch.object(self.dl, "pane_busy", side_effect=lambda p: next(busy, False)), \
+             mock.patch.object(self.dl, "dialog_on_screen", return_value=False):
+            res = self.dl.poke("%0", "x", confirm=lambda p: True, badge=False)
+        self.assertTrue(res and res.startswith("relay-id:"))
+
+
+class DeliverylibStandalone(unittest.TestCase):
+    def test_loads_without_relay_and_defaults_are_safe(self):
+        loader = importlib.machinery.SourceFileLoader("dl_standalone", os.path.join(BIN, "aipair-deliverylib"))
+        dl = importlib.util.module_from_spec(importlib.util.spec_from_loader("dl_standalone", loader))
+        loader.exec_module(dl)                            # raises if it imported relay / used its globals
+        self.assertEqual(dl.BUSY_WAIT, 90)
+        self.assertFalse(dl.dialog_on_screen("%0"))       # safe default
+        with self.assertRaises(RuntimeError):
+            dl.tmux("x")                                  # not injected → explicit error, not silent
+        self.assertIs(relay.poke, relay.deliverylib.poke)
+
+
 class TmuxlibStandalone(unittest.TestCase):
     def test_loads_without_relay(self):
         loader = importlib.machinery.SourceFileLoader("tmuxlib_standalone", os.path.join(BIN, "aipair-tmuxlib"))
