@@ -1193,6 +1193,51 @@ class ResponseAttribution(unittest.TestCase):
         p = self.w("cl.jsonl", [self._cl_asst("a1", None)])
         self.assertFalse(relay.claude_response_attributed(p, "relay-id:zzz"))
 
+    def _compact(self, uuid):
+        # Claude Code's context-compaction root: a system entry with parentUuid None that
+        # SEVERS the chain (everything before it was folded into the continued thread).
+        return {"type": "system", "subtype": "compact_boundary", "uuid": uuid, "parentUuid": None,
+                "timestamp": "2026-08-21T00:10:00Z"}
+
+    def test_claude_attribution_bridges_a_compaction_boundary(self):
+        # poke → compaction → response: the answer's chain roots at the boundary and can NEVER
+        # reach the pre-compaction nonce. The bridge attributes it because the nonce sits before
+        # the boundary (= part of the compacted context). Real 2026-08-23 loop-stall bug.
+        p = self.w("cl.jsonl", [
+            self._cl_user("u1", "be015162", "next task relay-id:abcd"),   # nonce, pre-compaction
+            self._compact("BND"),                                          # compaction boundary
+            self._cl_user("u2", "BND", "<compaction summary continuation>"),
+            self._cl_asst("a1", "u2"), self._cl_asst("a2", "a1")])         # a2→a1→u2→BND (stops at BND)
+        self.assertTrue(relay.claude_response_attributed(p, "relay-id:abcd"),
+                        "a response after a compaction must still attribute to a pre-boundary poke")
+
+    def test_claude_bridge_only_for_a_nonce_before_the_boundary_it_hits(self):
+        # A poke delivered AFTER the boundary that is NOT the most-recent turn must not be
+        # falsely attributed: here the last assistant answers a later, different turn (wxyz),
+        # and abcd's own answer was an earlier assistant. abcd is after the boundary, so the
+        # position guard (nonce_pos < boundary_pos) is False → no bridge, and abcd is not in
+        # the last assistant's chain → correctly unattributed.
+        p = self.w("cl.jsonl", [
+            self._compact("BND"),                                          # line 0
+            self._cl_user("u1", "BND", "poke relay-id:abcd"),              # line 1 (after boundary)
+            self._cl_asst("a1", "u1"),
+            self._cl_user("u2", "BND", "a later different turn relay-id:wxyz"),
+            self._cl_asst("a2", "u2")])                                    # last asst a2→u2 (not u1)
+        self.assertFalse(relay.claude_response_attributed(p, "relay-id:abcd"),
+                         "abcd is post-boundary and not in the last chain → not bridged")
+        self.assertTrue(relay.claude_response_attributed(p, "relay-id:wxyz"),
+                        "the turn actually being answered still matches via the normal chain")
+
+    def test_claude_no_boundary_means_no_bridge(self):
+        # Without a compaction boundary, a severed chain (root parentUuid None, non-boundary)
+        # does NOT bridge — the old strict behaviour is preserved.
+        p = self.w("cl.jsonl", [
+            self._cl_user("u1", None, "poke relay-id:abcd"),
+            {"type": "system", "uuid": "S", "parentUuid": None, "timestamp": "2026-08-21T00:10:00Z"},  # NOT a compact_boundary
+            self._cl_user("u2", "S", "later"),
+            self._cl_asst("a1", "u2")])                                    # a1→u2→S (S is not a boundary) 
+        self.assertFalse(relay.claude_response_attributed(p, "relay-id:abcd"))
+
     # ---- find_poke_ts / turn_texts ---------------------------------------------
     def test_find_poke_ts_per_agent_and_missing(self):
         cl = self.w("cl.jsonl", [self._cl_user("u1", None, "hi relay-id:abcd", ts="2026-08-21T00:00:05Z")])
