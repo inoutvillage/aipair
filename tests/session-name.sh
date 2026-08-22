@@ -181,5 +181,29 @@ if alive aipair-api; then pass "legacy session survives the non-adopt"; else flu
 tmux kill-session -t "=aipair-api" 2>/dev/null || true
 export PATH="$OLD_PATH"
 
+echo "# [11] aipair loop on an ALREADY-running pair refuses (guides to relay-here), never attaches"
+mkdir -p "$W/c/api"; NC="$(aipair name "$W/c/api")"
+tmux new-session -d -s "$NC" -c "$W/c/api"          # a live pair already exists for c/api
+n=$((n+1)); rc=0; out="$(AIPAIR_UNSAFE=1 aipair loop "$W/c/api" </dev/null 2>&1)" || rc=$?
+if [ "$rc" = 3 ] && printf '%s' "$out" | grep -q 'aipair-relay-here'; then pass "loop on existing → exit 3 + relay-here guidance"; else flunk "loop-on-existing: rc=$rc out=$out"; fi
+if alive "$NC"; then pass "existing pair left intact (not killed, not rebuilt)"; else flunk "existing pair disturbed"; fi
+tmux kill-session -t "=$NC" 2>/dev/null || true
+
+echo "# [12] a build that fails partway leaves NO half-built session (transactional trap)"
+mkdir -p "$W/fsdir" "$W/bin-fs"
+cat > "$W/bin-fs/tmux" <<FS
+#!/usr/bin/env bash
+"$REAL_TMUX" -L "$SOCKET" start-server 2>/dev/null || true
+"$REAL_TMUX" -L "$SOCKET" set-option -g exit-empty off 2>/dev/null || true
+[ "\$1" = split-window ] && { echo "split-window: forced failure (test)" >&2; exit 1; }
+exec "$REAL_TMUX" -L "$SOCKET" "\$@"
+FS
+chmod +x "$W/bin-fs/tmux"
+FSNAME="$(aipair name "$W/fsdir")"
+rc=0
+( export PATH="$W/bin-fs:$REPO/bin:$PATH"
+  AIPAIR_CLAUDE_FLAGS=--version AIPAIR_CODEX_FLAGS=--version timeout 5 aipair start "$W/fsdir" </dev/null >/dev/null 2>&1 ) || rc=$?
+n=$((n+1)); if [ "$rc" != 0 ] && ! alive "$FSNAME"; then echo "ok   split-window failure → no leftover session (rc=$rc)"; else echo "FAIL leftover session after a failed build (rc=$rc, alive=$(alive "$FSNAME" && echo yes || echo no))"; fail=1; fi
+
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED) (socket $SOCKET)"
 exit $fail

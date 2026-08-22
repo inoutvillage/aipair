@@ -179,9 +179,9 @@ aipair name   [dir]    # tmux セッション名を表示
 `--unsafe`（または `AIPAIR_UNSAFE=1`）で opt-in。**`aipair loop` は必須**（relay が許可プロンプトに答えられないため）。
 起動フラグ全体を差し替えるなら `AIPAIR_CLAUDE_FLAGS` / `AIPAIR_CODEX_FLAGS`（下の「カスタマイズ」）。
 
-> ⚠️ **既定フラグについて**: 両エージェントは許可確認なしでコマンド実行・ファイル編集を行う。
-> 信頼できる作業ディレクトリでだけ使い、不安なら `AIPAIR_CLAUDE_FLAGS= AIPAIR_CODEX_FLAGS= aipair` でフラグ無しで起動すること
-> （その場合、自走ループは許可プロンプトで止まりうる）。
+> ⚠️ **`--unsafe` 使用時の注意**: `--unsafe`（および必須の `aipair loop`）では、両エージェントが
+> **許可確認なしでコマンド実行・ファイル編集**を行う。信頼できる作業ディレクトリでだけ使うこと。
+> 素の `aipair`（既定）は通常の許可プロンプト付きなので、この注意は当てはまらない。
 
 ### 2. VS Code / Cursor / Antigravity から（WSL2）
 
