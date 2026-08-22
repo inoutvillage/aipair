@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""aipair-loglib — Claude/Codex トランスクリプト（jsonl / rollout）からターン完了・応答帰属を
+読み取る関数群（D3 relay 分割・案A 増分2 = A2）。tmux/画面には一切依存せず、peer-log の
+パーサ（parse_claude / parse_codex / _ts_key）だけを使う。aipair-relay が SourceFileLoader で
+読み込み、名前を自分の名前空間に束ねて使う。tests/relay-parsers.py で被覆されている。
+"""
+import importlib.machinery
+import importlib.util
+import os
+
+# reuse peer-log's parsers (same SourceFileLoader pattern as aipair-relay)
+_PEERLOG = os.path.join(os.path.dirname(os.path.realpath(__file__)), "peer-log")
+_loader = importlib.machinery.SourceFileLoader("peerlog", _PEERLOG)
+peerlog = importlib.util.module_from_spec(importlib.util.spec_from_loader("peerlog", _loader))
+_loader.exec_module(peerlog)
+
+
+# --- turn-completion detection --------------------------------------------- #
+def claude_done_ts(path, since):
+    """Epoch of the latest completed Claude turn after `since`, else None."""
+    last_ts = last_sr = None
+    try:
+        for line in open(path, "r", encoding="utf-8", errors="replace"):
+            try:
+                d = peerlog.json.loads(line)
+            except ValueError:
+                continue
+            if d.get("type") == "assistant":
+                last_ts = d.get("timestamp")
+                last_sr = (d.get("message") or {}).get("stop_reason")
+    except OSError:
+        return None
+    if last_ts and last_sr and last_sr != "tool_use":
+        te = peerlog._ts_key(last_ts)
+        return te if te > since else None
+    return None
+
+
+def codex_done_ts(path, since):
+    """Epoch of the latest completed Codex turn (task_complete) after `since`, else None."""
+    last_kind = last_ts = None
+    try:
+        for line in open(path, "r", encoding="utf-8", errors="replace"):
+            try:
+                d = peerlog.json.loads(line)
+            except ValueError:
+                continue
+            if d.get("type") == "event_msg":
+                t = (d.get("payload") or {}).get("type")
+                if t == "task_started":
+                    last_kind, last_ts = "start", d.get("timestamp")
+                elif t == "task_complete":
+                    last_kind, last_ts = "complete", d.get("timestamp")
+    except OSError:
+        return None
+    if last_kind == "complete" and last_ts:
+        te = peerlog._ts_key(last_ts)
+        return te if te > since else None
+    return None
+
+
+def turn_texts(agent, path, since, until):
+    """Assistant messages (list) produced in (since, until] for the agent's completed turn."""
+    msgs = peerlog.parse_claude(path, False) if agent == "claude" else peerlog.parse_codex(path, False)
+    return [t for (ts, role, t) in msgs
+            if role == "assistant" and since < peerlog._ts_key(ts) <= until + 2]
+
+
+def find_poke_ts(agent, path, probe):
+    """poke の nonce（relay-id:xxxx）を含む user メッセージのタイムスタンプ(epoch)を
+    対象ログから探す。無ければ None。
+
+    配達確認と応答帰属の source of truth。busy 中のキュー注入を許した結果、
+    画面ベースの送信検証は「既に実行中バッジが出ている」ため無効化され、
+    poke 直後の壁時計 since では「注入時に走っていた先行ターンの完了」を
+    応答と誤検知する（Codex レビュー指摘）。nonce はキュー配達されて初めて
+    ログに user メッセージとして現れるため、
+      ・nonce がログに在る = 配達成立（Enter 失敗ならキューにも入らず現れない）
+      ・完了 ts > nonce ts = その完了は poke より後に始まった応答
+    が画面状態と無関係に判定できる。"""
+    try:
+        msgs = peerlog.parse_claude(path, False) if agent == "claude" else peerlog.parse_codex(path, False)
+    except OSError:
+        return None
+    for ts, role, text in msgs:
+        if role == "user" and probe in text:
+            return peerlog._ts_key(ts)
+    return None
+
+
+def make_fragment(text, n=48):
+    """送信検証用に本文の最初の非空行（先頭 n 字）を返す。改行は経路によって \\r 化する
+    ため複数行は使わない。極端に短ければ None（= 任意の入力行の追記で確認）。"""
+    for line in (text or "").splitlines():
+        s = line.strip()[:n].strip()
+        if s:
+            return s if len(s) >= 3 else None
+    return None
+
+
+def codex_response_complete(path, probe):
+    """rollout から nonce の user メッセージを含むタスク（turn_id）を特定し、
+    (そのタスクの task_started ts, 同 turn_id の task_complete ts or None) を返す。
+    nonce 未発見・所属タスク不明なら (None, None)。
+
+    実ログの並び（2026-08-15 実測）は
+        task_started → response_item{message, role=user, nonce} → … → task_complete
+    で、アイドル注入でも nonce は task_started の「後」に記録される。よって
+    「nonce 後の task_started」を応答開始とみなす前提は idle 注入を全棄却する
+    （実バグ）。正しくは Codex 指摘のとおり turn_id ペアリング:
+      nonce の user アイテム自身が internal_chat_message_metadata_passthrough.turn_id
+      を持つ（実ログ確認済み）ので、それをキーに同 turn_id の task_started /
+      task_complete を対応付ける。キュー投入時に「時刻上の直前 start」が先行タスク
+      を指す誤帰属は、位置推定ではなく ID 対応でそもそも起こらない。
+    メタデータ欠落時のみ「直前の task_started」への位置フォールバック。"""
+    starts, completes = [], []
+    nonce_ts = None
+    nonce_turn = None
+    try:
+        for line in open(path, "r", encoding="utf-8", errors="replace"):
+            try:
+                d = peerlog.json.loads(line)
+            except ValueError:
+                continue
+            t = d.get("type")
+            p = d.get("payload") or {}
+            if t == "event_msg" and p.get("type") == "task_started":
+                starts.append((peerlog._ts_key(d.get("timestamp")), p.get("turn_id")))
+            elif t == "event_msg" and p.get("type") == "task_complete":
+                completes.append((peerlog._ts_key(d.get("timestamp")), p.get("turn_id")))
+            elif nonce_ts is None and t == "response_item" \
+                    and p.get("type") == "message" and p.get("role") == "user":
+                if any(probe in (b.get("text") or "")
+                       for b in (p.get("content") or []) if isinstance(b, dict)):
+                    nonce_ts = peerlog._ts_key(d.get("timestamp"))
+                    meta = p.get("internal_chat_message_metadata_passthrough") or {}
+                    nonce_turn = meta.get("turn_id")
+    except OSError:
+        return (None, None)
+    if nonce_ts is None:
+        return (None, None)
+    if nonce_turn:
+        anchor = next((ts for ts, tid in starts if tid == nonce_turn), nonce_ts)
+        comp = next((ts for ts, tid in completes if tid == nonce_turn), None)
+        return (anchor, comp)
+    # フォールバック（メタデータ無し）: 時刻上の直前 start を所属タスクとみなす
+    turn = None
+    for ts, tid in starts:
+        if ts <= nonce_ts:
+            turn = (ts, tid)
+        else:
+            break
+    if turn is None:
+        return (None, None)
+    comp = next((ts for ts, tid in completes
+                 if tid == turn[1] and ts > nonce_ts), None)
+    return (turn[0], comp)
+
+
+def claude_response_attributed(path, probe):
+    """最後の assistant エントリの parentUuid チェーンに nonce の user エントリが
+    含まれるか（= その完了ターンは poke を読んで走った応答か）。
+
+    Claude Code は busy 中の投入を「実行中ターンへのターン内注入」または
+    「次ターンの入力」として扱うが、どちらでも応答側のエントリチェーンは
+    nonce エントリを祖先に持つ。タイムスタンプ比較と違いキュー順序に依存しない
+    （Codex レビュー指摘の UUID 対応付け）。"""
+    entries = {}
+    last_assist_uuid = None
+    nonce_uuid = None
+    try:
+        for line in open(path, "r", encoding="utf-8", errors="replace"):
+            try:
+                d = peerlog.json.loads(line)
+            except ValueError:
+                continue
+            u = d.get("uuid")
+            if u:
+                entries[u] = d.get("parentUuid")
+            t = d.get("type")
+            if t == "assistant":
+                last_assist_uuid = u
+            elif t == "user" and nonce_uuid is None:
+                content = ((d.get("message") or {}).get("content"))
+                if isinstance(content, str):
+                    hit = probe in content
+                else:
+                    hit = any(probe in (b.get("text") or "")
+                              for b in (content or []) if isinstance(b, dict))
+                if hit:
+                    nonce_uuid = u
+    except OSError:
+        return False
+    if not (last_assist_uuid and nonce_uuid):
+        return False
+    seen = set()
+    u = last_assist_uuid
+    while u and u not in seen:
+        if u == nonce_uuid:
+            return True
+        seen.add(u)
+        u = entries.get(u)
+    return False

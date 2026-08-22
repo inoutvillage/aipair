@@ -40,7 +40,7 @@ CLAUDE_MD="$AH/.claude/CLAUDE.md"
 CODEX_AGENTS="$AH/.codex/AGENTS.md"
 TMUX_MIN="3.1"; TMUX_MIN_MAJOR=3; TMUX_MIN_MINOR=1
 PY_MIN="3.8";   PY_MIN_MAJOR=3;   PY_MIN_MINOR=8
-FILES=(aipair aipair-relay aipair-relay-here peer peer-log aipair-corelib)
+FILES=(aipair aipair-relay aipair-relay-here peer peer-log aipair-corelib aipair-loglib)
 SKILLS=(aipair-setup aipair-relay)
 MARK_START='<!-- aipair:start -->'
 MARK_END='<!-- aipair:end -->'
@@ -84,7 +84,7 @@ done
 # missing templates/codex-agents-block.md would surface only AFTER CLAUDE.md was
 # already rewritten, as a Python traceback (PM review #2).
 _missing=""
-for _f in bin/aipair bin/aipair-relay bin/aipair-relay-here bin/peer bin/peer-log bin/aipair-corelib \
+for _f in bin/aipair bin/aipair-relay bin/aipair-relay-here bin/peer bin/peer-log bin/aipair-corelib bin/aipair-loglib \
           templates/vscode-tasks.json templates/claude-md-block.md templates/codex-agents-block.md \
           .claude/skills/aipair-setup/SKILL.md .claude/skills/aipair-relay/SKILL.md; do
   [ -f "$REPO_DIR/$_f" ] || _missing="$_missing $_f"
@@ -381,7 +381,7 @@ for f in "${FILES[@]}"; do
     ok "$dst installed"
   fi
 done
-# same-directory import check (aipair-relay imports peer-log + aipair-corelib by path)
+# same-directory import check (aipair-relay imports peer-log + aipair-corelib + aipair-loglib by path)
 for f in aipair-relay peer-log; do
   if ! "$BIN_DIR/$f" --help >/dev/null 2>&1; then
     fail "$BIN_DIR/$f --help failed — the six files must sit together in $BIN_DIR (they import each other by path)"

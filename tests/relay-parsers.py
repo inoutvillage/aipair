@@ -528,5 +528,19 @@ class CorelibStandalone(unittest.TestCase):
         self.assertIs(relay.version_gate, relay.corelib.version_gate)
 
 
+class LoglibStandalone(unittest.TestCase):
+    """aipair-loglib loads with only peer-log (no aipair-relay), and relay re-exports it."""
+    def test_loglib_loads_and_works_without_relay(self):
+        loader = importlib.machinery.SourceFileLoader("loglib_standalone", os.path.join(BIN, "aipair-loglib"))
+        ll = importlib.util.module_from_spec(importlib.util.spec_from_loader("loglib_standalone", loader))
+        loader.exec_module(ll)                       # raises if it referenced relay-only globals
+        self.assertTrue(callable(ll.claude_done_ts) and callable(ll.turn_texts))
+        self.assertEqual(ll.make_fragment("hello world", 5), relay.make_fragment("hello world", 5))
+
+    def test_relay_reexports_are_the_loglib_objects(self):
+        self.assertIs(relay.claude_done_ts, relay.loglib.claude_done_ts)
+        self.assertIs(relay.turn_texts, relay.loglib.turn_texts)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
