@@ -38,6 +38,7 @@ class Fixture(unittest.TestCase):
             mod.codex_via_pane = lambda cwd, pane=None: None   # default: no /proc identity → fallback path
             mod.codex_identity_capable = lambda pane=None: False
         relay.dim = lambda *a, **k: None          # silence the relay's log line
+        relay._CODEX_SINCE_EPOCH = None; relay._CODEX_SINCE_BAD = False   # reset module globals per test
         self.t0 = 1_700_000_000
         # A-old (t+1) / B-new (t+3, globally newest) / A-mid (t+2)
         self.a_old = self.rollout("a-old", self.A, 1)
@@ -375,14 +376,32 @@ class RelayLock(Fixture):
             self.assertEqual(relay.refresh_codex_lock(self.a_old, self.A, "%0"), "SINCE_PICK")
             cs.assert_called()
 
-    def test_read_codex_since_parses_the_session_option(self):
+    def test_read_codex_since_validates_like_peer_log(self):
         with mock.patch.object(relay.tmuxlib, "tmux") as t:
-            t.return_value.stdout = "1700000000.5\n"
-            relay.read_codex_since("aipair-x")
+            def setopt(v):
+                t.return_value.stdout = v + "\n"
+                relay.read_codex_since("aipair-x")
+            setopt("1700000000.5")           # valid
             self.assertEqual(relay._CODEX_SINCE_EPOCH, 1700000000.5)
-            t.return_value.stdout = "\n"           # unset → None
-            relay.read_codex_since("aipair-x")
+            self.assertFalse(relay._CODEX_SINCE_BAD)
+            setopt("")                       # genuinely unset (legacy) → not BAD
             self.assertIsNone(relay._CODEX_SINCE_EPOCH)
+            self.assertFalse(relay._CODEX_SINCE_BAD)
+            for bad in ("nan", "inf", "-1", "1e3", "junk", "0x10"):   # same set peer-log rejects
+                setopt(bad)
+                self.assertTrue(relay._CODEX_SINCE_BAD, f"{bad!r} must be flagged present-but-invalid")
+                self.assertIsNone(relay._CODEX_SINCE_EPOCH)
+
+    def test_fallback_fails_closed_on_a_present_but_invalid_since(self):
+        # a corrupt @aipair-codex-since must NOT masquerade as legacy → never the mtime heuristic.
+        with mock.patch.object(relay, "_CODEX_SINCE_BAD", True), \
+             mock.patch.object(relay, "_CODEX_SINCE_EPOCH", None), \
+             mock.patch.object(relay.peerlog, "codex_newest", return_value="NEWEST") as cn, \
+             mock.patch.object(relay.peerlog, "codex_follow", return_value="FOLLOW") as cf:
+            self.assertIsNone(relay.lock_codex(self.A, set(), "%0"))
+            self.assertEqual(relay.refresh_codex_lock(self.a_old, self.A, "%0"), self.a_old)  # hold
+            cn.assert_not_called()
+            cf.assert_not_called()
 
     def test_relay_prefers_codex_via_pane_over_the_mtime_heuristic(self):
         # when peer-log's /proc identity resolves the pair's Codex, the relay adopts / locks /

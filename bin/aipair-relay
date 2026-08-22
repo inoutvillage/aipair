@@ -83,6 +83,7 @@ import argparse
 import glob
 import importlib.machinery
 import importlib.util
+import math
 import os
 import re
 import subprocess
@@ -367,23 +368,40 @@ def lock_claude(cwd, seen, pane, baseline):
 # The pair's launch epoch (peer's AIPAIR_CODEX_SINCE), read once from the session option
 # @aipair-codex-since. Lets the relay share peer's EXACT fallback picker (codex_since) when
 # /proc identity is unavailable (macOS), so the two never diverge onto different Codex sessions.
-_CODEX_SINCE_EPOCH = None
+_CODEX_SINCE_EPOCH = None   # valid launch epoch, or None when the option is genuinely unset (legacy)
+_CODEX_SINCE_BAD = False    # True when the option is PRESENT but invalid / unreadable → fail-closed
 
 
 def read_codex_since(session):
-    global _CODEX_SINCE_EPOCH
+    """Read @aipair-codex-since with the SAME validation peer-log applies to AIPAIR_CODEX_SINCE
+    (peerlog._NUM_RE + finite, non-negative). Three outcomes, kept distinct so a corrupt value
+    can never masquerade as 'legacy, use the heuristic': unset → epoch=None (heuristic allowed);
+    valid → the epoch; present-but-invalid or query failure → BAD (codex_fallback fails closed)."""
+    global _CODEX_SINCE_EPOCH, _CODEX_SINCE_BAD
+    _CODEX_SINCE_EPOCH, _CODEX_SINCE_BAD = None, False
     try:
         v = tmuxlib.tmux("show-options", "-t", session, "-qv", "@aipair-codex-since",
                          capture=True).stdout.strip()
-        _CODEX_SINCE_EPOCH = float(v) if v else None
-    except (subprocess.CalledProcessError, ValueError):
-        _CODEX_SINCE_EPOCH = None
+    except subprocess.CalledProcessError:
+        _CODEX_SINCE_BAD = True        # metadata present but unreadable → do not guess
+        return
+    if not v:
+        return                         # genuinely unset → legacy session, heuristic allowed
+    if not peerlog._NUM_RE.match(v):
+        _CODEX_SINCE_BAD = True; return
+    val = float(v)
+    if not math.isfinite(val) or val < 0:
+        _CODEX_SINCE_BAD = True; return
+    _CODEX_SINCE_EPOCH = val
 
 
 def codex_fallback(cwd, tracked_or_none, seen=None):
-    """Non-/proc Codex picker. When the launch epoch is known, use codex_since — the SAME pick
-    peer makes — so peer and relay agree on macOS. Legacy sessions without the epoch keep the old
-    behaviour (lock: newest-unseen; refresh: follow-newer)."""
+    """Non-/proc Codex picker. A present-but-invalid launch epoch fails CLOSED (None) — never the
+    mtime heuristic, which could mis-pin a same-cwd Codex. A valid epoch uses codex_since — the
+    SAME pick peer makes, so peer and relay agree on macOS. Only a genuinely unset epoch (legacy
+    session) keeps the old behaviour (lock: newest-unseen; refresh: follow-newer)."""
+    if _CODEX_SINCE_BAD:
+        return None
     if _CODEX_SINCE_EPOCH is not None:
         return peerlog.codex_since(cwd, _CODEX_SINCE_EPOCH)
     if seen is not None:

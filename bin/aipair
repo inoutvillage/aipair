@@ -336,14 +336,15 @@ CODEX=$(tmux split-window -h -l 50% -t "$CLAUDE" -c "$DIR" -P -F '#{pane_id}')
 # Session options via the pane id: set-option (tmux 3.2a) rejects the "=" exact
 # form, and a bare name could prefix-match another session (see running()).
 tmux set -t "$CLAUDE" @aipair-dir "$DIR"          # owner stamp, read by session_dir_of
-# peer-log resolves the pair's Codex by the process THIS pane runs (its open rollout fd =
-# exact identity), so the pane id must be recorded. Warn loudly on failure rather than
-# swallowing it (a silent miss would drop peer back to the weaker launch-time pin).
-tmux set -t "$CLAUDE" @aipair-codex-pane "$CODEX" 2>/dev/null \
-  || echo "aipair: warning: could not record @aipair-codex-pane; peer falls back to the launch-time Codex pin" >&2
-# The same launch epoch peer reads from AIPAIR_CODEX_SINCE, saved on the session so the relay
-# uses the IDENTICAL Codex picker (codex_since) in the non-/proc fallback — peer and relay agree.
-tmux set -t "$CLAUDE" @aipair-codex-since "$PAIR_SINCE" 2>/dev/null || true
+# peer resolves the pair's Codex by the process THIS pane runs (open rollout fd = exact
+# identity, @aipair-codex-pane); on non-/proc it falls back to the launch epoch
+# (@aipair-codex-since). BOTH are REQUIRED metadata — a silent miss would let peer and the relay
+# diverge onto different same-cwd Codex sessions (2026-08-22 review). So propagate a save failure
+# rather than swallowing it: the transactional EXIT trap above rolls the half-built session back.
+tmux set -t "$CLAUDE" @aipair-codex-pane "$CODEX" \
+  || { echo "aipair: 必須メタデータ @aipair-codex-pane を記録できません（起動を中止）" >&2; exit 1; }
+tmux set -t "$CLAUDE" @aipair-codex-since "$PAIR_SINCE" \
+  || { echo "aipair: 必須メタデータ @aipair-codex-since を記録できません（起動を中止）" >&2; exit 1; }
 tmux set -t "$CLAUDE" pane-border-status top >/dev/null 2>&1 || true
 tmux set -t "$CLAUDE" mouse on >/dev/null 2>&1 || true
 
