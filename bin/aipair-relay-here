@@ -70,7 +70,7 @@ if [ -z "$SESSION" ]; then
   [ -n "${TMUX:-}" ] || die "aipair セッションの外です（tmux 外）。ペア内の Claude/Codex ペインから実行してください。"
   SESSION="$(tmux display-message -p '#{session_name}' 2>/dev/null)" || die "現在の tmux セッション名を取得できない"
 fi
-tmux has-session -t "$SESSION" 2>/dev/null || die "セッションが無い: $SESSION"
+tmux has-session -t "=$SESSION" 2>/dev/null || die "セッションが無い（完全一致）: $SESSION"
 
 # relay が監視するログの cwd は「対象セッションが所有するディレクトリ」でなければならない。
 # 別ディレクトリから `aipair-relay-here --session X` を叩くと $PWD は X の作業ディレクトリと
@@ -80,15 +80,21 @@ tmux has-session -t "$SESSION" 2>/dev/null || die "セッションが無い: $SE
 if [ -n "$DIR_OVERRIDE" ]; then
   DIR="$DIR_OVERRIDE"
 else
-  DIR="$(tmux show-options -t "$SESSION" -qv @aipair-dir 2>/dev/null)"
+  # @aipair-dir を読む。display-message は "=name" 完全一致 target を受けない（session option を
+  # 返せない）が、上の has-session -t "=$SESSION" で完全一致の存在を確認済みなので、bare 名は
+  # tmux の exact 優先により必ずその完全一致セッションを指す（prefix はゲートで弾かれている）。
+  DIR="$(tmux display-message -p -t "$SESSION" '#{@aipair-dir}' 2>/dev/null)"
   [ -n "$DIR" ] || DIR="$PWD"
 fi
 [ -d "$DIR" ] || die "作業ディレクトリが存在しない: $DIR（--dir で明示指定できます）"
+# 相対 --dir は caller と bridge で別解釈になる（検証=caller cwd 基準・実行=bridge cwd 基準）。
+# 選択直後に絶対・canonical へ固定して両者を一致させる（2026-08-22 レビュー）。
+DIR="$(cd "$DIR" && pwd -P)" || die "作業ディレクトリを解決できない: $DIR"
 
 # --- bridge ペイン検出（title 優先 → シェル/pythonペインへフォールバック）---
 SELF="${TMUX_PANE:-}"
 BRIDGE=""; BRIDGE_CMD=""
-panes="$(tmux list-panes -t "$SESSION" -F '#{pane_id}	#{pane_current_command}	#{pane_title}')"
+panes="$(tmux list-panes -t "=$SESSION" -F '#{pane_id}	#{pane_current_command}	#{pane_title}')"
 while IFS=$'\t' read -r pid cmd title; do
   [ "$pid" = "$SELF" ] && continue
   lt="$(printf '%s' "$title" | tr '[:upper:]' '[:lower:]')"

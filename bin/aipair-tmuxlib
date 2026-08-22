@@ -25,8 +25,8 @@ def find_panes(session):
     """Identify the claude/codex panes. Titles set by aipair ('claude'/'codex')
     get overwritten by the CLIs at runtime, so fall back to the running command
     and finally to aipair's layout order (claude, codex, bridge)."""
-    out = tmux("list-panes", "-t", session,
-               "-F", "#{pane_id}\t#{pane_current_command}\t#{pane_title}",
+    out = tmux("list-panes", "-t", "=" + session,   # "=" = exact match: a prefix (aipair-ai)
+               "-F", "#{pane_id}\t#{pane_current_command}\t#{pane_title}",   # must not hit aipair-aipair
                capture=True).stdout
     self_pane = os.environ.get("TMUX_PANE")
     panes, leftovers = {}, []
@@ -59,7 +59,7 @@ def own_pane(session):
     if not pid:
         return None
     try:
-        out = tmux("list-panes", "-t", session, "-F", "#{pane_id}", capture=True).stdout
+        out = tmux("list-panes", "-t", "=" + session, "-F", "#{pane_id}", capture=True).stdout
     except subprocess.CalledProcessError:
         return None
     return pid if pid in out.split() else None
