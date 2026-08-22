@@ -155,10 +155,12 @@ echo "exit=$?"
 【要対応 (warn)】  [warn] 行から（例: ~/.local/bin を PATH に追加: export PATH="$HOME/.local/bin:$PATH"）
 【失敗】           あれば [fail] 行を原文で（無ければ「なし」）
 
-⚠ 既定の起動フラグ:
-  claude --dangerously-skip-permissions / codex --dangerously-bypass-approvals-and-sandbox
-  （確認プロンプト無しで動くモード。信頼できる作業ディレクトリでだけ使うこと）
-  変更・無効化: AIPAIR_CLAUDE_FLAGS / AIPAIR_CODEX_FLAGS（例: AIPAIR_CODEX_FLAGS= aipair でフラグ無し）
+⚠ 権限モード（安全既定）:
+  既定の `aipair` は通常の許可プロンプトを維持（危険フラグ無し）。
+  権限バイパス（claude --dangerously-skip-permissions / codex --dangerously-bypass-approvals-and-sandbox）は
+  --unsafe（または AIPAIR_UNSAFE=1）で opt-in。信頼できる作業ディレクトリでだけ使うこと。
+  `aipair loop`（自走レビュー）は relay が許可プロンプトに答えられないため --unsafe 必須（付けないと起動拒否）。
+  フラグ上書き: AIPAIR_CLAUDE_FLAGS / AIPAIR_CODEX_FLAGS（明示指定が最優先。空文字でフラグ無し）
 
 ▼ 自走ループの既定値（日本語）
   停止ワード「完了です」（AIPAIR_STOP）／ 判定側 codex（AIPAIR_STOP_SIDE）／ 最大 20 往復（AIPAIR_MAX_ROUNDS）
