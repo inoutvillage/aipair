@@ -84,6 +84,7 @@ git clone https://github.com/inoutvillage/aipair && cd aipair
 ./aipair-install.sh                         # 導入（sudo は一切使わない。tmux が無ければ案内して exit 3）
 ./aipair-install.sh --install-tmux          # tmux の導入を明示的に許可（root なら sudo 無し、非 root は sudo <pkg> install tmux）
 ./aipair-install.sh --vscode-tasks <dir>    # 併せて <dir>/.vscode/tasks.json を配置（既存があれば上書きしない）
+./aipair-install.sh --no-global-instructions # グローバル AI 指示への注入をスキップ（AIPAIR_NO_GLOBAL_INSTRUCTIONS=1 でも可）
 ```
 
 やること（各ステップを `[ok]` / `[skip]` / `[warn]` / `[fail]` の 1 行で必ず出力。無言で飛ばす経路はない）:
@@ -96,7 +97,7 @@ git clone https://github.com/inoutvillage/aipair && cd aipair
    配置後に `aipair-relay --help` 等が動くことを確認（同一ディレクトリ依存の検証）
 6. スキル 2 つを `~/.claude/skills/aipair-setup/` `~/.claude/skills/aipair-relay/` にコピー（同じ退避ルール）
 7. `~/.local/bin` が PATH に無ければ、追記すべき 1 行を表示して `[warn]`（rc ファイルは**書き換えない**）
-8. **周知ブロック**を `~/.claude/CLAUDE.md` と `~/.codex/AGENTS.md` に入れる（下記）
+8. **周知ブロック**を `~/.claude/CLAUDE.md` と `~/.codex/AGENTS.md` に入れる（下記）。**`--no-global-instructions`（または `AIPAIR_NO_GLOBAL_INSTRUCTIONS=1`）で注入をスキップ**できる（既存ブロックは非破壊で残す）
 9. （任意）`--vscode-tasks <dir>`
 10. **疎通確認**: 一時ディレクトリで `aipair` を起動（`--version` フラグで TUI は立てない）→ tmux セッションと 3 ペインができることを確認 → 停止
 

@@ -7,6 +7,9 @@
 #   ./aipair-install.sh --install-tmux       opt-in: install tmux with the system package manager
 #                                            (as-is when root / brew, otherwise via sudo)
 #   ./aipair-install.sh --check              diagnose only, print KEY=VALUE lines, change nothing
+#   ./aipair-install.sh --no-global-instructions   skip writing the aipair notice blocks into the
+#                                            GLOBAL AI instructions (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md);
+#                                            also via AIPAIR_NO_GLOBAL_INSTRUCTIONS=1
 #   ./aipair-install.sh --vscode-tasks DIR   also copy templates/vscode-tasks.json to DIR/.vscode/tasks.json
 #                                            (never overwrites an existing tasks.json)
 #   ./aipair-install.sh --help
@@ -69,9 +72,13 @@ usage() {
 
 # --- args --------------------------------------------------------------------
 MODE=install; INSTALL_TMUX=0; VSCODE_DIR=""
+# Opt out of writing the aipair notice blocks into the GLOBAL AI instructions
+# (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md) — those are read by every session, aipair or not.
+case "${AIPAIR_NO_GLOBAL_INSTRUCTIONS:-}" in ''|0|false|no|off) NO_GLOBAL=0 ;; *) NO_GLOBAL=1 ;; esac
 while [ $# -gt 0 ]; do
   case "$1" in
     --check)         MODE=check; shift ;;
+    --no-global-instructions) NO_GLOBAL=1; shift ;;
     --install-tmux)  INSTALL_TMUX=1; shift ;;
     --vscode-tasks)  [ $# -ge 2 ] || { echo "error: --vscode-tasks needs a directory" >&2; usage >&2; exit 2; }
                      VSCODE_DIR="$2"; shift 2 ;;
@@ -488,8 +495,14 @@ PY
     *)                   fail "$file: block install failed (python exit $rc: $res)"; return 1 ;;
   esac
 }
-install_block "$CLAUDE_MD"   "$REPO_DIR/templates/claude-md-block.md"   || exit 1
-install_block "$CODEX_AGENTS" "$REPO_DIR/templates/codex-agents-block.md" || exit 1
+if [ "$NO_GLOBAL" -eq 1 ]; then
+  skip "global AI instructions への注入をスキップ（--no-global-instructions / AIPAIR_NO_GLOBAL_INSTRUCTIONS）"
+  note "対象: $CLAUDE_MD / $CODEX_AGENTS（既存の aipair ブロックがあれば手動で消してください）"
+  note "aipair は動作します。相手ペインの説明は各セッションの env（AI_SELF/AI_PEER）と \`peer --help\` で確認できます"
+else
+  install_block "$CLAUDE_MD"   "$REPO_DIR/templates/claude-md-block.md"   || exit 1
+  install_block "$CODEX_AGENTS" "$REPO_DIR/templates/codex-agents-block.md" || exit 1
+fi
 
 # --- optional: VS Code tasks ---------------------------------------------------
 if [ -n "$VSCODE_DIR" ]; then
