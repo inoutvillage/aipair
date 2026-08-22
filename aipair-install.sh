@@ -355,9 +355,14 @@ mkdir -p "$BIN_DIR" || { fail "cannot create $BIN_DIR"; exit 1; }
 RETIRED=(aipair-queue)
 for f in "${RETIRED[@]}"; do
   if [ -e "$BIN_DIR/$f" ]; then
-    mv "$BIN_DIR/$f" "$BIN_DIR/$f.removed-$TS" \
-      && ok "retired $BIN_DIR/$f (no longer part of aipair; moved to $f.removed-$TS)" \
-      || warn "could not retire stale $BIN_DIR/$f — remove it by hand"
+    if mv "$BIN_DIR/$f" "$BIN_DIR/$f.removed-$TS"; then
+      ok "retired $BIN_DIR/$f (no longer part of aipair; moved to $f.removed-$TS)"
+    else
+      # A stale, unsupported (and, for aipair-queue, dangerous) binary left runnable in PATH
+      # is not a safe success — stop.
+      fail "could not retire stale $BIN_DIR/$f — remove it by hand, then re-run"
+      exit 1
+    fi
   fi
 done
 for f in "${FILES[@]}"; do

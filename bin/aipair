@@ -201,22 +201,20 @@ env_on() {
 # The permission-bypass defaults apply ONLY in --unsafe mode; the plain safe
 # default is no flags, so each agent shows its normal permission prompts. An
 # explicit AIPAIR_*_FLAGS always wins (set it empty to force no flags).
-if [ "$UNSAFE" = 1 ]; then
+# `aipair loop` runs unattended (UNSAFE is already enforced above), so the permission-bypass
+# flag is MANDATORY. Put it FIRST, as a fixed token, then the user's fragment — a '#' in the
+# fragment can comment out what FOLLOWS but never the leading flag, so the bypass stays an
+# active argv no matter what the fragment contains. Built from the raw env (not the branch
+# below) so the flag is never doubled.
+if [ "$cmd" = loop ]; then
+  CLAUDE_FLAGS="--dangerously-skip-permissions${AIPAIR_CLAUDE_FLAGS:+ $AIPAIR_CLAUDE_FLAGS}"
+  CODEX_FLAGS="--dangerously-bypass-approvals-and-sandbox${AIPAIR_CODEX_FLAGS:+ $AIPAIR_CODEX_FLAGS}"
+elif [ "$UNSAFE" = 1 ]; then
   CLAUDE_FLAGS="${AIPAIR_CLAUDE_FLAGS---dangerously-skip-permissions}"
   CODEX_FLAGS="${AIPAIR_CODEX_FLAGS---dangerously-bypass-approvals-and-sandbox}"
 else
   CLAUDE_FLAGS="${AIPAIR_CLAUDE_FLAGS-}"
   CODEX_FLAGS="${AIPAIR_CODEX_FLAGS-}"
-fi
-# `aipair loop` runs unattended, so the relay MUST be able to drive both agents: the
-# permission-bypass flag is mandatory here, appended to whatever the user set (so custom
-# flags survive) — a bare AIPAIR_CLAUDE_FLAGS= must not leave the loop stuck on prompts.
-if [ "$cmd" = loop ]; then
-  ensure_flag() {  # $1 flags, $2 required token → flags with the token guaranteed present
-    case " $1 " in *" $2 "*) printf '%s' "$1" ;; *) printf '%s' "${1:+$1 }$2" ;; esac
-  }
-  CLAUDE_FLAGS="$(ensure_flag "$CLAUDE_FLAGS" --dangerously-skip-permissions)"
-  CODEX_FLAGS="$(ensure_flag "$CODEX_FLAGS" --dangerously-bypass-approvals-and-sandbox)"
 fi
 
 # Everything else from the environment travels as ONE argument each, whatever it

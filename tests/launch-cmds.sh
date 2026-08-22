@@ -54,7 +54,9 @@ if [ "$rc" = 2 ] && [ -z "$out" ]; then echo "ok   loop without --unsafe → exi
 # loop ALWAYS carries the bypass flag under --unsafe, even if the user blanks/customises flags
 chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CLAUDE_FLAGS= AIPAIR_CODEX_FLAGS= AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex claude --dangerously-skip-permissions" "loop: empty AIPAIR_CLAUDE_FLAGS still gets the bypass"
 chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CODEX_FLAGS= AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^codex:  *//p')" "clear; env AI_SELF=codex AI_PEER=claude codex --dangerously-bypass-approvals-and-sandbox" "loop: empty AIPAIR_CODEX_FLAGS still gets the bypass"
-chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CLAUDE_FLAGS='--model opus' AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex claude --model opus --dangerously-skip-permissions" "loop: custom flags preserved AND bypass appended"
+chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CLAUDE_FLAGS='--model opus' AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex claude --dangerously-skip-permissions --model opus" "loop: bypass is prepended, custom flags follow"
+# the bypass is a FIXED token BEFORE the fragment, so a '#' in the fragment can't comment it out
+chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CLAUDE_FLAGS='--model opus # --dangerously-skip-permissions' AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex claude --dangerously-skip-permissions --model opus # --dangerously-skip-permissions" "loop: a '#' in the fragment cannot comment out the bypass (it is prepended)"
 
 echo "# [2] values with shell metacharacters arrive as ONE argument each"
 chk "$(run loop bridge "AIPAIR_STOP=it's done" | sed -n '5p')" "[it's done]" "apostrophe in AIPAIR_STOP"
