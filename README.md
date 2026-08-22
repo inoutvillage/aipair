@@ -168,11 +168,12 @@ aipair                 # カレントディレクトリで起動（既存セッ�
 aipair <dir>           # 指定ディレクトリで起動
 aipair loop   [dir]    # 相互レビューの自走ループ（→「自走ループ」節）
 aipair attach [dir]    # アタッチのみ（未起動ならエラー）
+aipair status [dir]    # claude/codex/bridge の各ペインと稼働/idle を表示
 aipair stop   [dir]    # セッション停止
 aipair name   [dir]    # tmux セッション名を表示
 ```
 
-セッション名は `aipair-<ディレクトリ名>-<正規化パスの sha1 先頭 12 桁>`（例: `…/my-project` → `aipair-my-project-1a2b3c4d5e6f`。正規化 = symlink 解決 + 大小文字を区別しない FS（WSL の `/mnt/*`。macOS の APFS も同じ扱いだが未検証）ではディスク上の綴りに統一。`/mnt/d/Work` と `/mnt/d/work` は同じ名前になる）。同名のセッションが**別ディレクトリ**のものだった場合（hash collision）は attach / stop せずエラー終了する。同名ディレクトリが別の場所にあっても衝突しない。旧形式 `aipair-my-project`（ハッシュ無し）で動いている既存セッションは、**同じディレクトリのもの**に限り `attach` / `stop` / `name` が自動で引き継ぐ。
+セッション名は `aipair-<ディレクトリ名>-<正規化パスの sha1 先頭 12 桁>`（例: `…/my-project` → `aipair-my-project-1a2b3c4d5e6f`。正規化 = symlink 解決 + 大小文字を区別しない FS（WSL の `/mnt/*`。macOS の APFS も同じ扱いだが未検証）ではディスク上の綴りに統一。`/mnt/d/Work` と `/mnt/d/work` は同じ名前になる）。同名のセッションが**別ディレクトリ**のものだった場合（hash collision）は attach / stop せずエラー終了する。同名ディレクトリが別の場所にあっても衝突しない。 起動時に claude/codex/bridge の**ペイン id をセッションオプション**（`@aipair-claude-pane` / `@aipair-codex-pane` / `@aipair-bridge-pane`）へ保存し、relay と `aipair status` はタイトルやコマンド名の推測ではなくこの記録でペインを特定する（Codex は `node` として動きタイトルも上書きされるため）。旧形式 `aipair-my-project`（ハッシュ無し）で動いている既存セッションは、**同じディレクトリのもの**に限り `attach` / `stop` / `name` が自動で引き継ぐ。
 
 **安全側が既定**: 素の `aipair` は各エージェントを**通常の許可プロンプト付き**で起動する。
 権限バイパス（`claude --dangerously-skip-permissions` ／ `codex --dangerously-bypass-approvals-and-sandbox`）は
