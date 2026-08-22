@@ -522,7 +522,7 @@ bash tests/run-all.sh        # shebang で判別した全 bash/python3 スクリ
 | `tests/codex-follow.py` | Codex rollout の探索・追従・増分インデックス | 一時ディレクトリの fixture。`~/.codex` は読まない |
 | `tests/relay-parsers.py` | 停止ワード判定・env 解析・ペイン特定・プラン/質問ダイアログ検出・ターン完了検出・transcript パーサ | `tmux` / 画面キャプチャをモック |
 
-GitHub Actions（`.github/workflows/ci.yml`）が push / PR ごとに ubuntu-latest で同じ `tests/run-all.sh` を回す（tmux と shellcheck を apt で導入）。**Python は対応下限の 3.8（`aipair-install.sh` の要件）と現行 3.13 の matrix**で実行し、relay・6 lib・peer-log・`.py` テスト、および shell テストが `python3` として起動する全経路をその版で検証する（`fail-fast: false` で下限と最新の失敗を取り違えない）。
+GitHub Actions（`.github/workflows/ci.yml`）が push / PR ごとに ubuntu-latest で同じ `tests/run-all.sh` を回す（tmux と shellcheck を apt で導入）。**Python は対応下限の 3.8（`aipair-install.sh` の要件）と現行 3.13 の matrix**で実行し、relay・5 lib・peer-log・`.py` テスト（＝6 sibling module）、および shell テストが `python3` として起動する全経路をその版で検証する（`fail-fast: false` で下限と最新の失敗を取り違えない）。
 TUI 本体（Claude Code / Codex CLI の実画面）は CI では動かせないため、ダイアログ検出などは**画面キャプチャの fixture** で固定している。実 UI が変わった時は fixture ごと更新すること。
 
 ## 制約・既知の限界
