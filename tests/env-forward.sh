@@ -12,7 +12,9 @@ W="$(mktemp -d "${TMPDIR:-/tmp}/aipair-envfwd.XXXXXX")"; SOCKET="aipair-envfwd-$
 cleanup() { "$REAL_TMUX" -L "$SOCKET" kill-server 2>/dev/null || true; rm -rf "$W"; }; trap cleanup EXIT
 mkdir -p "$W/bin" "$W/proj"
 # tmux shim forces the private socket even inside a pane ($TMUX beats TMUX_TMPDIR).
-printf '#!/usr/bin/env bash\nexec %q -L %q "$@"\n' "$REAL_TMUX" "$SOCKET" > "$W/bin/tmux"
+# shim pins `exit-empty off` each call so the private server survives empty moments (tmux 3.4)
+printf '#!/usr/bin/env bash\n%q -L %q start-server 2>/dev/null || true\n%q -L %q set-option -g exit-empty off 2>/dev/null || true\nexec %q -L %q "$@"\n' \
+  "$REAL_TMUX" "$SOCKET" "$REAL_TMUX" "$SOCKET" "$REAL_TMUX" "$SOCKET" > "$W/bin/tmux"
 # claude/codex exit at once so their panes don't hang; the relay shim records its argv.
 printf '#!/usr/bin/env bash\nexit 0\n' > "$W/bin/claude"; cp "$W/bin/claude" "$W/bin/codex"; cp "$W/bin/claude" "$W/bin/peer-log"
 cat > "$W/bin/aipair-relay" <<SHIM

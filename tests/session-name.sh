@@ -16,7 +16,10 @@ cleanup() { "$REAL_TMUX" -L "$SOCKET" kill-server 2>/dev/null || true; rm -rf "$
 trap cleanup EXIT
 
 mkdir -p "$W/bin" "$W/a/api" "$W/b/api" "$W/Case" "$W/case"
-printf '#!/usr/bin/env bash\nexec %q -L %q "$@"\n' "$REAL_TMUX" "$SOCKET" > "$W/bin/tmux"; chmod +x "$W/bin/tmux"
+# The shim also pins `exit-empty off` on every call so the private server survives an
+# empty moment (tmux 3.4 exits an empty server at once; 3.2a lingered, hiding this).
+printf '#!/usr/bin/env bash\n%q -L %q start-server 2>/dev/null || true\n%q -L %q set-option -g exit-empty off 2>/dev/null || true\nexec %q -L %q "$@"\n' \
+  "$REAL_TMUX" "$SOCKET" "$REAL_TMUX" "$SOCKET" "$REAL_TMUX" "$SOCKET" > "$W/bin/tmux"; chmod +x "$W/bin/tmux"
 export PATH="$W/bin:$REPO/bin:$PATH"; unset TMUX
 "$REAL_TMUX" -L "$SOCKET" new-session -d -s shim-probe            # a server with no session exits at once
 want="$("$REAL_TMUX" -L "$SOCKET" display-message -p -t shim-probe '#{socket_path}')"
