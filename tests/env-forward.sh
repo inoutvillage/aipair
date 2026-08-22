@@ -99,7 +99,7 @@ BR2="$("$REAL_TMUX" -L "$SOCKET" split-window -t pair2 -P -F '#{pane_id}' -c "$W
 "$REAL_TMUX" -L "$SOCKET" select-pane -t "$BR2" -T bridge
 Q0="$("$REAL_TMUX" -L "$SOCKET" list-panes -t pair2 -F '#{pane_id}' | head -1)"
 # run from a DIFFERENT cwd (/) so PWD can never coincide with @aipair-dir
-"$REAL_TMUX" -L "$SOCKET" send-keys -t "$Q0" "cd / && aipair-relay-here --session pair2 --print > '$W/rh2.out' 2>&1" Enter
+"$REAL_TMUX" -L "$SOCKET" send-keys -t "$Q0" "cd / && AIPAIR_RELAY_BIN='$STUB' aipair-relay-here --session pair2 --print > '$W/rh2.out' 2>&1" Enter
 if wait_file "$W/rh2.out"; then
   out2="$(cat "$W/rh2.out")"
   chk_has "$out2" "dir     : $OWNERDIR" "relay-here --dir = @aipair-dir (not the caller's cwd)"
@@ -115,7 +115,7 @@ CUSTOM="$W/custom"; mkdir -p "$CUSTOM"
 BR3="$("$REAL_TMUX" -L "$SOCKET" split-window -t pair3 -P -F '#{pane_id}' -c "$W/proj")"
 "$REAL_TMUX" -L "$SOCKET" select-pane -t "$BR3" -T bridge
 Q1="$("$REAL_TMUX" -L "$SOCKET" list-panes -t pair3 -F '#{pane_id}' | head -1)"
-"$REAL_TMUX" -L "$SOCKET" send-keys -t "$Q1" "aipair-relay-here --session pair3 --dir '$CUSTOM' --print > '$W/rh3.out' 2>&1" Enter
+"$REAL_TMUX" -L "$SOCKET" send-keys -t "$Q1" "AIPAIR_RELAY_BIN='$STUB' aipair-relay-here --session pair3 --dir '$CUSTOM' --print > '$W/rh3.out' 2>&1" Enter
 if wait_file "$W/rh3.out"; then
   chk_has "$(cat "$W/rh3.out")" "dir     : $CUSTOM" "explicit --dir wins over @aipair-dir"
 else n=$((n+1)); echo "FAIL relay-here (--dir override) no output"; fail=1; fi
