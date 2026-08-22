@@ -246,7 +246,7 @@ F1 ✅ → F2 ✅ → F3 ✅ → F6 ✅ → F4 ✅ → F5 ✅ → F9 ✅ → F8 
   - 注意: `TESTED_VERSIONS` と README「必要環境」表は手動同期のまま。稼働中 relay は旧コード→次回インストールで反映（installer は corelib/loglib を配布済み）。
 - [ ] #7 `aipair-relay`（~81KB）を通常の Python package 化（SourceFileLoader 依存注入からの脱却）。
 - [ ] #8/#9 CI を実 CLI の nightly smoke/E2E ＋ Python 3.8/tmux 3.1 の matrix に。
-  - [x] **Python バージョン matrix**（PR 進行中）— `.github/workflows/ci.yml` を対応下限 3.8（installer 要件）と現行 3.13 の matrix（`fail-fast: false`・`actions/setup-python`）に。run-all が `python3` として起動する全経路（relay・6 lib・peer-log・.py テスト）をその版で検証。3.8 互換は事前スキャン（3.9+ 機能不使用）＋ python3.9 実走で確認。README 反映。
+  - [x] **Python バージョン matrix**（PR 進行中）— `.github/workflows/ci.yml` を対応下限 3.8（installer 要件）と現行 3.13 の matrix（`fail-fast: false`・`actions/setup-python`）に。run-all が `python3` として起動する全経路（relay・5 lib・peer-log・.py テスト＝6 sibling module）をその版で検証。3.8 互換は事前スキャン（3.9+ 機能不使用）＋ python3.9 実走で確認。README 反映。
   - [ ] 残: tmux 3.1 lane（ソースビルド）／実 claude・codex の nightly smoke・E2E（CI で両 CLI を用意する手段が要る）。
 - [x] **#11 installer の global 注入 opt-out**（main 反映予定）— `--no-global-instructions`（＋env
   `AIPAIR_NO_GLOBAL_INSTRUCTIONS=1`）で `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` への注入をスキップ
