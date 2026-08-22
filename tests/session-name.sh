@@ -128,11 +128,55 @@ if command -v script >/dev/null; then
   start_pair "$W/a/api"
   chk "$(tmux show -t "$NA" -v @aipair-dir)" "$(cd "$W/a/api" && pwd -P)" "@aipair-dir stamped at creation"
   timeout 2 script -qec "tmux attach -t '=$NA' -c '$W/b/api'" /dev/null >/dev/null 2>&1 || true
-  chk "$(tmux list-sessions -f "#{==:#{session_name},$NA}" -F '#{session_path}')" "$W/b/api" "(precondition) session_path now points at b/api"
+  chk "$(tmux display-message -p -t "$NA" '#{session_path}')" "$W/b/api" "(precondition) session_path now points at b/api"
   chk "$(aipair name "$W/a/api")" "$NA" "a/api still owns its session (no false 'hash collision')"
   chk "$(aipair name "$W/b/api")" "$NB" "b/api is not fooled by the rewritten session_path"
   chk "$(aipair stop "$W/a/api")" "aipair: stopped $NA" "stop a/api still works"
-else echo "skip real-start tests (\`script\` not available)"; fi
+else echo "skip real-start tests (`script` not available)"; fi
+
+# [10] tmux 3.1 has neither `list-sessions -f` nor #{session_path} (both are 3.2+).
+# session_dir_of must still hold the owner/collision guard there (via @aipair-dir), and a
+# legacy session — whose only dir clue on 3.1 would be session_path — must degrade to a
+# safe non-adopt, never a false one. A shim reproduces 3.1 on top of whatever tmux runs
+# the suite: it reports "tmux 3.1", rejects `list-sessions -f`, and blanks #{session_path}
+# out of any display-message format. (@aipair-dir is untouched, as on real 3.1.)
+echo "# [10] tmux 3.1 (no -f / no session_path): owner+collision guard hold, legacy safe-misses"
+mkdir -p "$W/bin31"
+cat > "$W/bin31/tmux" <<SH31
+#!/usr/bin/env bash
+[ "\$1" = -V ] && { echo "tmux 3.1"; exit 0; }
+"$REAL_TMUX" -L "$SOCKET" start-server 2>/dev/null || true
+"$REAL_TMUX" -L "$SOCKET" set-option -g exit-empty off 2>/dev/null || true
+if [ "\$1" = list-sessions ] || [ "\$1" = ls ]; then
+  for a in "\$@"; do [ "\$a" = -f ] && { echo "usage: list-sessions [-F format]" >&2; exit 1; }; done
+fi
+if [ "\$1" = display-message ]; then
+  args=(); for a in "\$@"; do [ "\$a" = '#{session_path}' ] && a=''; args+=("\$a"); done   # 3.1 lacks #{session_path}
+  exec "$REAL_TMUX" -L "$SOCKET" "\${args[@]}"
+fi
+exec "$REAL_TMUX" -L "$SOCKET" "\$@"
+SH31
+chmod +x "$W/bin31/tmux"
+OLD_PATH="$PATH"; export PATH="$W/bin31:$PATH"
+chk "$(tmux -V)" "tmux 3.1" "(precondition) shim reports tmux 3.1"
+n=$((n+1)); if tmux list-sessions -f x >/dev/null 2>&1; then echo "FAIL shim still accepts -f"; fail=1; else echo "ok   (precondition) shim rejects list-sessions -f"; fi
+n=$((n+1)); if [ -z "$(tmux display-message -p '#{session_path}' 2>/dev/null)" ]; then echo "ok   (precondition) shim blanks #{session_path}"; else echo "FAIL shim still yields session_path"; fail=1; fi
+A_DIR="$(cd "$W/a/api" && pwd -P)"; B_DIR="$(cd "$W/b/api" && pwd -P)"
+# owner match: a new-format session (stamped @aipair-dir) for a/api is recognized as ours
+tmux new-session -d -s "$NA" -c "$W/a/api"; tmux set -t "$NA" @aipair-dir "$A_DIR"
+chk "$(aipair name "$W/a/api")" "$NA" "owner match via @aipair-dir (no -f)"
+# hash collision: same session name, but it belongs to b/api → refuse, do not touch it
+tmux set -t "$NA" @aipair-dir "$B_DIR"
+n=$((n+1)); if out="$(aipair name "$W/a/api" 2>/dev/null)"; then echo "FAIL collision not refused (got '$out')"; fail=1; else echo "ok   hash collision refused (exit!=0)"; fi
+n=$((n+1)); aipair stop "$W/a/api" >/dev/null 2>&1 || true; if alive "$NA"; then echo "ok   foreign session left untouched by stop"; else echo "FAIL stop killed a foreign session"; fail=1; fi
+tmux kill-session -t "=$NA" 2>/dev/null || true
+# legacy: hash-less session, no @aipair-dir; with session_path absent (3.1) its dir is
+# unknowable → safe miss (returns the hashed name), and the session is left alive.
+tmux new-session -d -s aipair-api -c "$W/a/api"
+chk "$(aipair name "$W/a/api")" "$NA" "legacy safely NOT adopted without session_path (3.1)"
+if alive aipair-api; then pass "legacy session survives the non-adopt"; else flunk "legacy session vanished"; fi
+tmux kill-session -t "=aipair-api" 2>/dev/null || true
+export PATH="$OLD_PATH"
 
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED) (socket $SOCKET)"
 exit $fail

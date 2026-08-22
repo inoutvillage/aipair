@@ -86,26 +86,34 @@ legacy_session_name() {
   local base; base="$(basename "$1")"
   printf 'aipair-%s' "${base//[^A-Za-z0-9_]/-}"
 }
-# Directory a session belongs to ("" if no session has exactly this name).
-# New-format sessions carry it in the user option @aipair-dir, stamped at
-# creation (see below) and untouched by anything tmux does afterwards. Sessions
-# from older aipair versions lack it; for them fall back to #{session_path}, the
-# `new-session -c` directory — good enough for a legacy pair, but not immutable
-# (`attach-session -c` rewrites it), which is why new sessions get the option.
-# Neither follows pane_current_path, which moves with any `cd` typed in a pane
-# (a session for /b/api whose pane cd'ed into /a/api must not be mistaken for
-# /a/api's pair and killed by `aipair stop /a/api`).
-#
-# A `-f` client-side filter selects the one session named exactly $1, so we read
-# a single value per call and never split a multi-field line: tmux 3.4 escapes
-# control bytes in -F output (a \x1f separator comes back as the literal "\037"),
-# which silently broke an earlier one-line, \x1f-delimited parse. $1 is always an
-# aipair-generated name ([A-Za-z0-9_-]), safe to embed in the filter expression.
+# Directory a session belongs to ("" if no session has exactly this name), read with
+# NO multi-field -F line and NO `-f` filter, so it works unchanged across the supported
+# range (tmux 3.1+) and dodges tmux 3.4's habit of escaping control bytes in -F output
+# (a \x1f field separator comes back as the literal "\037"). Two facts shape it:
+#   - `-f` (list-sessions filter) and #{session_path} are BOTH tmux 3.2+.
+#   - #{session_name} and the user option @aipair-dir exist on 3.1, and display-message
+#     reads a single value with no separator to escape.
+# So: confirm a session named EXACTLY $1 exists (single-field name list, exact shell
+# match — bare `-t $1` would prefix-match aipair-api → aipair-api-7f39ac), then read that
+# session's stamp. New-format sessions carry @aipair-dir, stamped at creation (see below)
+# and immutable afterwards; older sessions lack it, so fall back to #{session_path}, the
+# `new-session -c` dir — good enough for a legacy pair, absent on 3.1 (there legacy simply
+# is not adopted: a safe miss, never a false adopt), and not immutable either
+# (`attach-session -c` rewrites it), which is why new sessions get the option. Neither
+# reads pane_current_path, which moves with any `cd` typed in a pane (a session for /b/api
+# whose pane cd'ed into /a/api must not be taken for /a/api's pair and killed by
+# `aipair stop /a/api`). Exact existence is confirmed first, so `-t $1` resolves to the
+# exact session (tmux prefers an exact name over a prefix).
 session_dir_of() {
-  local opt
-  opt="$(tmux list-sessions -f "#{==:#{session_name},$1}" -F '#{@aipair-dir}' 2>/dev/null | head -1)"
+  local names opt
+  names="$(tmux list-sessions -F '#{session_name}' 2>/dev/null)" || return 0
+  case $'\n'"$names"$'\n' in
+    *$'\n'"$1"$'\n'*) ;;   # a session named exactly $1 exists
+    *) return 0 ;;
+  esac
+  opt="$(tmux display-message -p -t "$1" '#{@aipair-dir}' 2>/dev/null || true)"
   if [ -n "$opt" ]; then printf '%s' "$opt"; return 0; fi
-  printf '%s' "$(tmux list-sessions -f "#{==:#{session_name},$1}" -F '#{session_path}' 2>/dev/null | head -1)"
+  printf '%s' "$(tmux display-message -p -t "$1" '#{session_path}' 2>/dev/null || true)"
 }
 # Same directory? -ef compares device+inode, so spelling/case differences on
 # case-insensitive filesystems don't matter; the string fallback keeps a pair
