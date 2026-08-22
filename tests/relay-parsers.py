@@ -82,7 +82,11 @@ def panes(*rows):
     """Fake `tmux list-panes -F '#{pane_id}\\t#{pane_current_command}\\t#{pane_title}'` output.
     find_panes now lives in aipair-tmuxlib and calls that module's `tmux`, so patch there."""
     out = "\n".join("\t".join(r) for r in rows) + "\n"
-    return mock.patch.object(relay.tmuxlib, "tmux", return_value=types.SimpleNamespace(stdout=out))
+    def side(*a, **k):
+        if a and a[0] == "show-options":
+            return types.SimpleNamespace(stdout="")     # stamps unset here → heuristic path
+        return types.SimpleNamespace(stdout=out)
+    return mock.patch.object(relay.tmuxlib, "tmux", side_effect=side)
 
 
 class FindPanes(unittest.TestCase):
@@ -118,10 +122,14 @@ class FindPanes(unittest.TestCase):
              mock.patch.dict(os.environ, {"TMUX_PANE": "%1"}):
             self.assertEqual(relay.find_panes("s"), {"claude": "%2", "codex": "%0"})
 
-    def test_stamp_pointing_at_a_dead_pane_falls_back_to_the_heuristic(self):
-        rows = [("%0", "claude", "claude"), ("%1", "python3", "relay"), ("%2", "node", "codex")]
+    def test_one_dead_stamp_does_NOT_fall_back_and_reverse_roles(self):
+        # Codex's scenario: claude stamp=%2 (live), codex stamp=%9 (gone). Live %0=node,%2=node are
+        # ambiguous, so the heuristic would return {claude:%0,codex:%2} — REVERSED. Once ANY stamp
+        # exists the heuristic is forbidden: keep the live stamp, leave the dead side UNRESOLVED so
+        # the relay refuses to start (it checks both roles) rather than guess.
+        rows = [("%0", "node", "x"), ("%1", "python3", "relay"), ("%2", "node", "y")]
         listing = "\n".join("\t".join(r) for r in rows) + "\n"
-        stamps = {"@aipair-claude-pane": "%9", "@aipair-codex-pane": "%2"}   # %9 no longer present
+        stamps = {"@aipair-claude-pane": "%2", "@aipair-codex-pane": "%9"}   # %9 gone
         def fake(*a, **k):
             if a[0] == "list-panes":
                 return types.SimpleNamespace(stdout=listing)
@@ -130,7 +138,38 @@ class FindPanes(unittest.TestCase):
             return types.SimpleNamespace(stdout="")
         with mock.patch.object(relay.tmuxlib, "tmux", side_effect=fake), \
              mock.patch.dict(os.environ, {"TMUX_PANE": "%1"}):
-            self.assertEqual(relay.find_panes("s"), {"claude": "%0", "codex": "%2"})   # heuristic
+            self.assertEqual(relay.find_panes("s"), {"claude": "%2"})
+
+    def test_a_stamp_query_failure_is_not_read_as_unset(self):
+        # a tmux hiccup reading one stamp must NOT drop to the heuristic (fail-open) — the role is
+        # left unresolved, like a dead stamp.
+        rows = [("%0", "node", "x"), ("%1", "python3", "relay"), ("%2", "node", "y")]
+        listing = "\n".join("\t".join(r) for r in rows) + "\n"
+        def fake(*a, **k):
+            if a[0] == "list-panes":
+                return types.SimpleNamespace(stdout=listing)
+            if a[0] == "show-options":
+                if a[-1] == "@aipair-claude-pane":
+                    return types.SimpleNamespace(stdout="%2\n")
+                raise subprocess.CalledProcessError(1, "tmux")   # codex query fails
+            return types.SimpleNamespace(stdout="")
+        with mock.patch.object(relay.tmuxlib, "tmux", side_effect=fake), \
+             mock.patch.dict(os.environ, {"TMUX_PANE": "%1"}):
+            self.assertEqual(relay.find_panes("s"), {"claude": "%2"})
+
+    def test_duplicate_stamps_leave_the_second_role_unresolved(self):
+        rows = [("%0", "node", "x"), ("%1", "python3", "relay"), ("%2", "node", "y")]
+        listing = "\n".join("\t".join(r) for r in rows) + "\n"
+        stamps = {"@aipair-claude-pane": "%2", "@aipair-codex-pane": "%2"}   # both point at %2
+        def fake(*a, **k):
+            if a[0] == "list-panes":
+                return types.SimpleNamespace(stdout=listing)
+            if a[0] == "show-options":
+                return types.SimpleNamespace(stdout=stamps.get(a[-1], "") + "\n")
+            return types.SimpleNamespace(stdout="")
+        with mock.patch.object(relay.tmuxlib, "tmux", side_effect=fake), \
+             mock.patch.dict(os.environ, {"TMUX_PANE": "%1"}):
+            self.assertEqual(relay.find_panes("s"), {"claude": "%2"})
 
     def test_layout_order_when_nothing_identifies_them(self):
         with panes(("%0", "foo", "x"), ("%1", "bash", "shell"), ("%2", "bar", "y")), \
