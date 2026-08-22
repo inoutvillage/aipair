@@ -6,8 +6,21 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false          # a red floor (3.8) must not hide a red tip (3.13), or vice versa
+      matrix:
+        # Test the SUPPORTED floor (aipair-install.sh requires python3 >= 3.8) and a current
+        # release. run-all.sh classifies by shebang, so the python files (relay + 6 libs +
+        # peer-log + the .py tests) and everything the shell tests invoke as `python3` all run
+        # on the matrix interpreter. tmux/shellcheck come from apt and are the same across lanes.
+        python-version: ['3.8', '3.13']
+    name: test (py${{ matrix.python-version }})
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
       - name: Install tmux and shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux shellcheck
       - name: Versions
