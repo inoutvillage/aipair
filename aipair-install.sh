@@ -22,7 +22,7 @@
 #
 # Notes:
 #   - Install dir is fixed to ~/.local/bin: aipair-relay-here resolves $HOME/.local/bin/aipair-relay,
-#     and aipair-relay / peer-log must live in the same directory (they import each other
+#     and aipair-relay / peer-log / aipair-corelib / aipair-loglib must live in the same directory (they import each other
 #     by path). Files are copied, never symlinked.
 #   - Notice blocks for ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md are delimited by
 #     <!-- aipair:start --> / <!-- aipair:end -->. Re-running replaces the block in place; it never
@@ -384,7 +384,7 @@ done
 # same-directory import check (aipair-relay imports peer-log + aipair-corelib + aipair-loglib by path)
 for f in aipair-relay peer-log; do
   if ! "$BIN_DIR/$f" --help >/dev/null 2>&1; then
-    fail "$BIN_DIR/$f --help failed — the six files must sit together in $BIN_DIR (they import each other by path)"
+    fail "$BIN_DIR/$f --help failed — all ${#FILES[@]} bin files must sit together in $BIN_DIR (they import each other by path)"
     exit 1
   fi
 done

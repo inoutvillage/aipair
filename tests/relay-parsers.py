@@ -542,5 +542,121 @@ class LoglibStandalone(unittest.TestCase):
         self.assertIs(relay.turn_texts, relay.loglib.turn_texts)
 
 
+class ResponseAttribution(unittest.TestCase):
+    """The loglib functions that decide whether a completed turn is the answer to OUR poke —
+    the source of truth for delivery. Fixtures are real jsonl / rollout shapes."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="aipair-attrib.")
+    def tearDown(self):
+        self.tmp.cleanup()
+    def w(self, name, rows):
+        p = os.path.join(self.tmp.name, name)
+        with open(p, "w", encoding="utf-8") as fh:
+            for r in rows:
+                fh.write((r if isinstance(r, str) else json.dumps(r)) + "\n")
+        return p
+
+    # ---- Codex: turn_id pairing -------------------------------------------------
+    def _cx_user(self, ts, text, turn=None):
+        p = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}
+        if turn is not None:
+            p["internal_chat_message_metadata_passthrough"] = {"turn_id": turn}
+        return {"timestamp": ts, "type": "response_item", "payload": p}
+    def _ev(self, ts, kind, turn):
+        return {"timestamp": ts, "type": "event_msg", "payload": {"type": kind, "turn_id": turn}}
+
+    def test_codex_turn_id_match(self):
+        p = self.w("cx.jsonl", [
+            self._ev("2026-08-21T00:00:01Z", "task_started", "T1"),
+            self._cx_user("2026-08-21T00:00:02Z", "review relay-id:abcd", "T1"),
+            self._ev("2026-08-21T00:00:09Z", "task_complete", "T1")])
+        anchor, comp = relay.codex_response_complete(p, "relay-id:abcd")
+        self.assertEqual(anchor, epoch("2026-08-21T00:00:01Z"))
+        self.assertEqual(comp, epoch("2026-08-21T00:00:09Z"))
+
+    def test_codex_ignores_completion_of_a_different_turn(self):
+        p = self.w("cx.jsonl", [
+            self._ev("2026-08-21T00:00:01Z", "task_started", "T1"),
+            self._cx_user("2026-08-21T00:00:02Z", "review relay-id:abcd", "T1"),
+            self._ev("2026-08-21T00:00:05Z", "task_complete", "T0")])   # a foreign turn's completion
+        anchor, comp = relay.codex_response_complete(p, "relay-id:abcd")
+        self.assertEqual(anchor, epoch("2026-08-21T00:00:01Z")); self.assertIsNone(comp)
+
+    def test_codex_not_yet_complete(self):
+        p = self.w("cx.jsonl", [
+            self._ev("2026-08-21T00:00:01Z", "task_started", "T1"),
+            self._cx_user("2026-08-21T00:00:02Z", "x relay-id:abcd", "T1")])
+        anchor, comp = relay.codex_response_complete(p, "relay-id:abcd")
+        self.assertEqual(anchor, epoch("2026-08-21T00:00:01Z")); self.assertIsNone(comp)
+
+    def test_codex_metadata_missing_falls_back_to_preceding_start(self):
+        # no turn_id on the nonce user → nearest preceding task_started is the turn; complete
+        # only counts if it is after the nonce
+        p = self.w("cx.jsonl", [
+            self._ev("2026-08-21T00:00:01Z", "task_started", "T1"),
+            self._cx_user("2026-08-21T00:00:03Z", "x relay-id:abcd"),   # no turn_id
+            self._ev("2026-08-21T00:00:09Z", "task_complete", "T1")])
+        anchor, comp = relay.codex_response_complete(p, "relay-id:abcd")
+        self.assertEqual(anchor, epoch("2026-08-21T00:00:01Z"))
+        self.assertEqual(comp, epoch("2026-08-21T00:00:09Z"))
+
+    def test_codex_nonce_absent(self):
+        p = self.w("cx.jsonl", [self._ev("2026-08-21T00:00:01Z", "task_started", "T1")])
+        self.assertEqual(relay.codex_response_complete(p, "relay-id:zzz"), (None, None))
+
+    # ---- Claude: parentUuid ancestry -------------------------------------------
+    def _cl_user(self, uuid, parent, text, ts="2026-08-21T00:00:05Z"):
+        return {"type": "user", "uuid": uuid, "parentUuid": parent, "timestamp": ts, "message": {"content": text}}
+    def _cl_asst(self, uuid, parent, text="ok"):
+        return {"type": "assistant", "uuid": uuid, "parentUuid": parent,
+                "message": {"content": [{"type": "text", "text": text}]}}
+
+    def test_claude_ancestor_match(self):
+        p = self.w("cl.jsonl", [
+            self._cl_user("u1", None, "review relay-id:abcd"),
+            self._cl_asst("a1", "u1"), self._cl_asst("a2", "a1")])   # a2's chain a2→a1→u1
+        self.assertTrue(relay.claude_response_attributed(p, "relay-id:abcd"))
+
+    def test_claude_unrelated_last_assistant(self):
+        p = self.w("cl.jsonl", [
+            self._cl_user("u1", None, "review relay-id:abcd"),
+            self._cl_asst("a1", "u1"),
+            self._cl_user("u2", None, "a different, later human turn"),
+            self._cl_asst("a2", "u2")])   # a2's chain a2→u2 (not u1)
+        self.assertFalse(relay.claude_response_attributed(p, "relay-id:abcd"))
+
+    def test_claude_cyclic_chain_terminates(self):
+        # a1→a2→a1 cycle, nonce not in it → returns False without hanging
+        p = self.w("cl.jsonl", [
+            self._cl_user("u1", None, "review relay-id:abcd"),
+            self._cl_asst("a1", "a2"), self._cl_asst("a2", "a1")])
+        self.assertFalse(relay.claude_response_attributed(p, "relay-id:abcd"))
+
+    def test_claude_nonce_absent(self):
+        p = self.w("cl.jsonl", [self._cl_asst("a1", None)])
+        self.assertFalse(relay.claude_response_attributed(p, "relay-id:zzz"))
+
+    # ---- find_poke_ts / turn_texts ---------------------------------------------
+    def test_find_poke_ts_per_agent_and_missing(self):
+        cl = self.w("cl.jsonl", [self._cl_user("u1", None, "hi relay-id:abcd", ts="2026-08-21T00:00:05Z")])
+        self.assertEqual(relay.find_poke_ts("claude", cl, "relay-id:abcd"), epoch("2026-08-21T00:00:05Z"))
+        cx = self.w("cx.jsonl", [self._cx_user("2026-08-21T00:00:07Z", "hi relay-id:abcd", "T1")])
+        self.assertEqual(relay.find_poke_ts("codex", cx, "relay-id:abcd"), epoch("2026-08-21T00:00:07Z"))
+        self.assertIsNone(relay.find_poke_ts("codex", cx, "relay-id:nope"))
+
+    def test_turn_texts_agent_and_time_window(self):
+        p = self.w("cx.jsonl", [
+            {"timestamp": "2026-08-21T00:00:01Z", "type": "response_item",
+             "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "too early"}]}},
+            {"timestamp": "2026-08-21T00:00:10Z", "type": "response_item",
+             "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "in window"}]}},
+            {"timestamp": "2026-08-21T00:00:30Z", "type": "response_item",
+             "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "not assistant"}]}}])
+        since = epoch("2026-08-21T00:00:05Z"); until = epoch("2026-08-21T00:00:12Z")
+        self.assertEqual(relay.turn_texts("codex", p, since, until), ["in window"])
+        # the +2s grace at the upper bound is included
+        self.assertIn("in window", relay.turn_texts("codex", p, since, epoch("2026-08-21T00:00:08Z")))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

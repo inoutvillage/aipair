@@ -20,7 +20,8 @@ def claude_done_ts(path, since):
     """Epoch of the latest completed Claude turn after `since`, else None."""
     last_ts = last_sr = None
     try:
-        for line in open(path, "r", encoding="utf-8", errors="replace"):
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+          for line in fh:
             try:
                 d = peerlog.json.loads(line)
             except ValueError:
@@ -40,7 +41,8 @@ def codex_done_ts(path, since):
     """Epoch of the latest completed Codex turn (task_complete) after `since`, else None."""
     last_kind = last_ts = None
     try:
-        for line in open(path, "r", encoding="utf-8", errors="replace"):
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+          for line in fh:
             try:
                 d = peerlog.json.loads(line)
             except ValueError:
@@ -117,7 +119,8 @@ def codex_response_complete(path, probe):
     nonce_ts = None
     nonce_turn = None
     try:
-        for line in open(path, "r", encoding="utf-8", errors="replace"):
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+          for line in fh:
             try:
                 d = peerlog.json.loads(line)
             except ValueError:
@@ -169,7 +172,8 @@ def claude_response_attributed(path, probe):
     last_assist_uuid = None
     nonce_uuid = None
     try:
-        for line in open(path, "r", encoding="utf-8", errors="replace"):
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+          for line in fh:
             try:
                 d = peerlog.json.loads(line)
             except ValueError:
