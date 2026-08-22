@@ -5,24 +5,44 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
-      fail-fast: false          # a red floor (3.8) must not hide a red tip (3.13), or vice versa
+      fail-fast: false          # a red floor must not hide a red tip (python or tmux), or vice versa
       matrix:
-        # Test the SUPPORTED floor (aipair-install.sh requires python3 >= 3.8) and a current
-        # release. run-all.sh classifies by shebang, so the python files (relay + 5 libs +
-        # peer-log + the .py tests — 6 sibling modules) and everything the shell tests invoke as `python3` all run
-        # on the matrix interpreter. tmux/shellcheck come from apt and are the same across lanes.
-        python-version: ['3.8', '3.13']
-    name: test (py${{ matrix.python-version }})
+        # Cover the SUPPORTED floors and a current release without a full cross-product:
+        #   - python 3.8 is the floor (aipair-install.sh requires python3 >= 3.8);
+        #   - tmux 3.1 is the floor (README「必要環境」: `split-window -l 30%` is 3.1+), built from
+        #     source since the distro ships 3.4. session-name.sh auto-detects tmux < 3.2 and skips
+        #     the `#{session_path}`-based legacy/collision cases (that path is a safe non-adopt,
+        #     covered by its [10] simulation); everything else runs on the real 3.1 binary.
+        # run-all.sh classifies by shebang, so the python files (relay + 5 libs + peer-log + the
+        # .py tests) and everything the shell tests invoke as `python3` run on the matrix python.
+        include:
+          - { python: '3.8',  tmux: distro }   # python floor, distro tmux (3.4)
+          - { python: '3.13', tmux: distro }   # current python, distro tmux
+          - { python: '3.13', tmux: '3.1' }    # tmux floor, built from source
+    name: test (py${{ matrix.python }}, tmux ${{ matrix.tmux }})
     steps:
       - uses: actions/checkout@v4
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python ${{ matrix.python }}
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
-      - name: Install tmux and shellcheck
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux shellcheck
+          python-version: ${{ matrix.python }}
+      - name: Install shellcheck + tmux (${{ matrix.tmux }})
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          if [ "${{ matrix.tmux }}" = distro ]; then
+            sudo apt-get install -y -qq tmux
+          else
+            sudo apt-get install -y -qq libevent-dev libncurses-dev build-essential bison pkg-config
+            v='${{ matrix.tmux }}'
+            curl -fsSL "https://github.com/tmux/tmux/releases/download/$v/tmux-$v.tar.gz" -o tmux.tgz
+            tar xzf tmux.tgz
+            ( cd "tmux-$v" && ./configure && make -j"$(nproc)" && sudo make install )
+            hash -r
+          fi
       - name: Versions
         run: |
           tmux -V; python3 --version; bash --version | head -1; shellcheck --version | head -2

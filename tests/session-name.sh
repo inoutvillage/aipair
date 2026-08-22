@@ -41,6 +41,14 @@ start_pair() {  # headless real start: --version makes the agent panes exit at o
 }
 swapcase_last() { python3 -c 'import os,sys; d,b=os.path.split(sys.argv[1]); print(os.path.join(d,b.swapcase()))' "$1"; }
 
+# #{session_path} and `list-sessions -f` are tmux 3.2+. On older tmux the legacy/collision
+# cases that read session_path can't hold — the code degrades to a safe non-adopt (proven by
+# [10]'s 3.1 simulation) — so skip exactly those assertions when the real tmux is < 3.2.
+SP=1; _tv="$("$REAL_TMUX" -V | sed -E 's/^tmux (next-)?//')"; _maj="${_tv%%.*}"; _rest="${_tv#*.}"; _min="${_rest%%[!0-9]*}"
+[ -n "$_min" ] || _min=0
+if [ "${_maj:-0}" -lt 3 ] 2>/dev/null || { [ "${_maj:-0}" -eq 3 ] && [ "$_min" -lt 2 ]; } 2>/dev/null; then SP=0; fi
+[ "$SP" = 1 ] || echo "# note: real tmux $_tv < 3.2 -> session_path-based legacy/collision cases skip (3.1 path covered by [10])"
+
 echo "# [1] distinct directories with the same basename get distinct names"
 NA=$(aipair name "$W/a/api"); NB=$(aipair name "$W/b/api")
 if [ "$NA" != "$NB" ]; then pass "a/api ($NA) != b/api ($NB)"; else flunk "same name for a/api and b/api"; fi
@@ -56,6 +64,7 @@ if [ -n "$CI_DIR" ]; then
   chk "$(aipair name "$SW")" "$(aipair name "$CI_DIR")" "case variants of one dir → one name (case-insensitive fs at $CI_DIR)"
 else echo "skip case-insensitive fs test (repo is on a case-sensitive fs)"; fi
 
+if [ "$SP" = 1 ]; then
 echo "# [3] legacy (hash-less) session of the SAME directory is adopted"
 tmux new-session -d -s aipair-api -c "$W/a/api"
 chk "$(aipair name "$W/a/api")" "aipair-api" "name → legacy"
@@ -64,6 +73,7 @@ chk "$(aipair stop "$W/b/api")" "aipair: no running session $NB" "stop other dir
 if alive aipair-api; then pass "legacy still alive"; else flunk "legacy killed"; fi
 chk "$(aipair stop "$W/a/api")" "aipair: stopped aipair-api" "stop same dir kills legacy"
 if alive aipair-api; then flunk "legacy still alive"; else pass "legacy gone"; fi
+else echo "skip [3] legacy same-dir adoption (needs #{session_path}, 3.2+; 3.1 safe-miss covered by [10])"; fi
 
 echo "# [4] legacy session of ANOTHER dir whose pane cd'ed here is NOT adopted (session_path, not pane cwd)"
 tmux new-session -d -s aipair-api -c "$W/b/api"
@@ -73,17 +83,18 @@ chk "$(tmux list-panes -s -t =aipair-api -F '#{pane_current_path}')" "$W/a/api" 
 chk "$(aipair name "$W/a/api")" "$NA" "a/api still resolves to its hashed name"
 chk "$(aipair stop "$W/a/api")" "aipair: no running session $NA" "stop a/api does not kill b/api's legacy"
 if alive aipair-api; then pass "b/api legacy survived"; else flunk "b/api legacy killed"; fi
-chk "$(aipair name "$W/b/api")" "aipair-api" "b/api still owns it"
+if [ "$SP" = 1 ]; then chk "$(aipair name "$W/b/api")" "aipair-api" "b/api still owns it"; else echo "skip [4] b/api-adopts-legacy (needs #{session_path}, 3.2+)"; fi
 tmux kill-session -t =aipair-api
 
 if [ -n "$CI_DIR" ]; then
   echo "# [5] legacy identity compares by inode (-ef): created under another spelling"
   LN="$(aipair name "$CI_DIR" | sed -E 's/-[0-9a-f]{12}$//')"
   tmux new-session -d -s "$LN" -c "$SW"
-  chk "$(aipair name "$CI_DIR")" "$LN" "legacy created with swapped-case -c is adopted"
+  if [ "$SP" = 1 ]; then chk "$(aipair name "$CI_DIR")" "$LN" "legacy created with swapped-case -c is adopted"; else echo "  skip [5] swapped-case legacy adoption (needs #{session_path}, 3.2+)"; fi
   tmux kill-session -t "=$LN"
 fi
 
+if [ "$SP" = 1 ]; then
 echo "# [6] a new-format session that belongs to ANOTHER directory (hash collision) is never attached/stopped"
 tmux new-session -d -s "$NA" -c "$W/b/api"          # a/api's name, but b/api's session_path
 for cmd in name stop attach; do
@@ -93,6 +104,7 @@ done
 if alive "$NA"; then pass "the foreign session is untouched"; else flunk "the foreign session was killed"; fi
 chk "$(aipair name "$W/b/api")" "$NB" "b/api itself is unaffected"
 tmux kill-session -t "=$NA"
+else echo "skip [6] foreign-collision detection (foreign session has no @aipair-dir; needs #{session_path}, 3.2+ — documented 3.1 limit; real aipair sessions carry @aipair-dir and stay safe, see [10])"; fi
 
 echo "# [7] a pair of directories whose 6-hex prefixes collide (the old suffix length) get distinct 12-hex names"
 read -r C1 C2 < <(python3 - "$(cd "$W" && pwd -P)" <<'PY'
@@ -128,14 +140,14 @@ if command -v script >/dev/null; then
   tmux new-session -d -s aipair-api -c "$W/a/api"      # legacy for the SAME dir, coexisting
   chk "$(aipair name "$W/a/api")" "$NA" "new-format wins over legacy of the same dir"
   chk "$(aipair stop "$W/a/api")" "aipair: stopped $NA" "stop kills the new-format session"
-  chk "$(aipair name "$W/a/api")" "aipair-api" "…then the legacy one is adopted"
+  if [ "$SP" = 1 ]; then chk "$(aipair name "$W/a/api")" "aipair-api" "…then the legacy one is adopted"; else echo "  skip [8] legacy adoption after new-format stop (needs #{session_path}, 3.2+)"; fi
   tmux kill-session -t =aipair-api
 
   echo "# [9] owner stamp (@aipair-dir) survives 'attach-session -c', which rewrites session_path"
   start_pair "$W/a/api"
   chk "$(tmux show -t "$NA" -v @aipair-dir)" "$(cd "$W/a/api" && pwd -P)" "@aipair-dir stamped at creation"
   timeout 2 script -qec "tmux attach -t '=$NA' -c '$W/b/api'" /dev/null >/dev/null 2>&1 || true
-  chk "$(tmux display-message -p -t "$NA" '#{session_path}')" "$W/b/api" "(precondition) session_path now points at b/api"
+  if [ "$SP" = 1 ]; then chk "$(tmux display-message -p -t "$NA" '#{session_path}')" "$W/b/api" "(precondition) session_path now points at b/api"; else echo "    skip [9] session_path precondition (3.2+; @aipair-dir ownership below holds on 3.1)"; fi
   chk "$(aipair name "$W/a/api")" "$NA" "a/api still owns its session (no false 'hash collision')"
   chk "$(aipair name "$W/b/api")" "$NB" "b/api is not fooled by the rewritten session_path"
   chk "$(aipair stop "$W/a/api")" "aipair: stopped $NA" "stop a/api still works"
