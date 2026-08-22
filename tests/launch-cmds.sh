@@ -10,7 +10,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd -P)"; REPO="$(dirname "$HERE")"
 REAL_TMUX="$(command -v tmux)" || { echo "tmux not found" >&2; exit 2; }
 W="$(mktemp -d "${TMPDIR:-/tmp}/aipair-launch.XXXXXX")"; SOCKET="aipair-launch-$$-$RANDOM"
-cleanup() { "$REAL_TMUX" -L "$SOCKET" kill-server 2>/dev/null || true; rm -rf "$W"; }; trap cleanup EXIT
+cleanup() { "$REAL_TMUX" -L "$SOCKET" kill-server 2>/dev/null || true; rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SOCKET" 2>/dev/null || true; rm -rf "$W"; }; trap cleanup EXIT
 mkdir -p "$W/bin" "$W/proj"
 for s in claude codex aipair-relay peer-log; do
   printf '#!/usr/bin/env bash\necho "cmd=%s self=${AI_SELF:-} peer=${AI_PEER:-}"\nfor a in "$@"; do printf "[%%s]\\n" "$a"; done\n' "$s" > "$W/bin/$s"
@@ -18,6 +18,16 @@ done
 printf '#!/usr/bin/env bash\nexit 0\n' > "$W/bin/clear"
 printf '#!/usr/bin/env bash\nexec %q -L %q "$@"\n' "$REAL_TMUX" "$SOCKET" > "$W/bin/tmux"
 chmod +x "$W"/bin/*; export PATH="$W/bin:$REPO/bin:$PATH"
+# Preflight: prove the tmux shim provably targets the PRIVATE socket before anything runs, so a
+# broken shim can never touch the user's default server (guardrail; same as the other tmux tests).
+# Then kill-server so the dry-run checks below still see a pristine (server-less) private socket.
+"$REAL_TMUX" -L "$SOCKET" new-session -d -s probe 2>/dev/null || true
+want="$("$REAL_TMUX" -L "$SOCKET" display-message -p -t probe '#{socket_path}' 2>/dev/null || true)"
+got="$(tmux display-message -p -t probe '#{socket_path}' 2>/dev/null || true)"
+"$REAL_TMUX" -L "$SOCKET" kill-server 2>/dev/null || true
+if [ -z "$got" ] || [ "$got" != "$want" ] || [ "$(basename "$got")" != "$SOCKET" ]; then
+  echo "tmux shim not effective (got '$got', want '$want') — refusing to touch the default server" >&2; exit 2
+fi
 # Hermetic: nothing from the parent environment (a live pair, a user's AIPAIR_* settings)
 # may leak into the checked lines.
 unset TMUX AI_SELF AI_PEER BASH_ENV ENV

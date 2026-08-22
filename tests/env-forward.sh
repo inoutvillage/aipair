@@ -28,6 +28,14 @@ cat > "$W/bin/aipair-relay" <<SHIM
 SHIM
 chmod +x "$W"/bin/*
 export PATH="$W/bin:$REPO/bin:$PATH"; unset TMUX
+# Preflight: prove the tmux shim provably targets the PRIVATE socket before anything runs, so a
+# broken shim can never touch the user's default server (guardrail; same as the other tmux tests).
+"$REAL_TMUX" -L "$SOCKET" new-session -d -s probe 2>/dev/null
+want="$("$REAL_TMUX" -L "$SOCKET" display-message -p -t probe '#{socket_path}')"
+got="$(tmux display-message -p -t probe '#{socket_path}')"
+if [ "$got" != "$want" ] || [ "$(basename "$got")" != "$SOCKET" ]; then
+  echo "tmux shim not effective (got '$got', want '$want') — refusing to touch the default server" >&2; exit 2
+fi
 "$REAL_TMUX" -L "$SOCKET" kill-server 2>/dev/null || true
 
 fail=0; n=0
