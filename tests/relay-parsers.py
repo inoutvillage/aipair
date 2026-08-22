@@ -79,9 +79,10 @@ class EnvHelpers(unittest.TestCase):
 
 
 def panes(*rows):
-    """Fake `tmux list-panes -F '#{pane_id}\\t#{pane_current_command}\\t#{pane_title}'` output."""
+    """Fake `tmux list-panes -F '#{pane_id}\\t#{pane_current_command}\\t#{pane_title}'` output.
+    find_panes now lives in aipair-tmuxlib and calls that module's `tmux`, so patch there."""
     out = "\n".join("\t".join(r) for r in rows) + "\n"
-    return mock.patch.object(relay, "tmux", return_value=types.SimpleNamespace(stdout=out))
+    return mock.patch.object(relay.tmuxlib, "tmux", return_value=types.SimpleNamespace(stdout=out))
 
 
 class FindPanes(unittest.TestCase):
@@ -118,6 +119,86 @@ PLAN_SCREEN = """\
    2. Yes, manually approve edits
    3. Tell Claude what to change
 """
+
+
+class TmuxHelpers(unittest.TestCase):
+    """aipair-tmuxlib: the tmux runner's pane helpers. Every real subprocess is faked by
+    patching aipair-tmuxlib's own `tmux` (the helpers call it within that module)."""
+    def _tmux(self, side_effect):
+        return mock.patch.object(relay.tmuxlib, "tmux", side_effect=side_effect)
+
+    def test_current_session_ok_and_error(self):
+        with self._tmux(lambda *a, **k: types.SimpleNamespace(stdout="sess-1\n")):
+            self.assertEqual(relay.current_session(), "sess-1")
+        import subprocess
+        with self._tmux(subprocess.CalledProcessError(1, "tmux")):
+            self.assertIsNone(relay.current_session())
+
+    def test_own_pane(self):
+        import subprocess
+        # no TMUX_PANE → None (no tmux call)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(relay.own_pane("s"))
+        with mock.patch.dict(os.environ, {"TMUX_PANE": "%2"}):
+            with self._tmux(lambda *a, **k: types.SimpleNamespace(stdout="%0\n%2\n%3\n")):
+                self.assertEqual(relay.own_pane("s"), "%2")     # our pane belongs to the session
+            with self._tmux(lambda *a, **k: types.SimpleNamespace(stdout="%0\n%3\n")):
+                self.assertIsNone(relay.own_pane("s"))          # our pane is in another session
+            with self._tmux(subprocess.CalledProcessError(1, "tmux")):
+                self.assertIsNone(relay.own_pane("s"))
+
+    def test_cancel_copy_mode_only_cancels_when_in_mode(self):
+        calls = []
+        def fake(*a, **k):
+            calls.append(a)
+            if a[:1] == ("display-message",):
+                return types.SimpleNamespace(stdout=self._mode + "\n")
+            return types.SimpleNamespace(stdout="")
+        self._mode = "1"                                        # pane IS in copy-mode
+        with self._tmux(fake), mock.patch.object(relay.tmuxlib.time, "sleep"):
+            relay.cancel_copy_mode("%0")
+        self.assertTrue(any(a[:2] == ("send-keys", "-t") and "cancel" in a for a in calls), "sends the cancel key")
+        calls.clear(); self._mode = "0"                        # pane NOT in copy-mode
+        with self._tmux(fake), mock.patch.object(relay.tmuxlib.time, "sleep"):
+            relay.cancel_copy_mode("%0")
+        self.assertFalse(any(a[:1] == ("send-keys",) for a in calls), "no cancel when not in copy-mode")
+
+    def test_pane_busy_fast_path_and_diff_boundary(self):
+        # fast path: 'esc to interrupt' visible → busy immediately
+        with self._tmux(lambda *a, **k: types.SimpleNamespace(stdout="working... esc to interrupt")):
+            self.assertTrue(relay.pane_busy("%0"))
+        # two captures identical → idle
+        seq = iter(["same\nlines\nhere", "same\nlines\nhere"])
+        with self._tmux(lambda *a, **k: types.SimpleNamespace(stdout=next(seq))), \
+             mock.patch.object(relay.tmuxlib.time, "sleep"):
+            self.assertFalse(relay.pane_busy("%0"))
+        # 2 lines changed (< 3) → NOT busy (idle animation tolerance)
+        seq = iter(["a\nb\nc\nd", "a\nX\nY\nd"])
+        with self._tmux(lambda *a, **k: types.SimpleNamespace(stdout=next(seq))), \
+             mock.patch.object(relay.tmuxlib.time, "sleep"):
+            self.assertFalse(relay.pane_busy("%0"))
+        # 3 lines changed (>= 3) → busy
+        seq = iter(["a\nb\nc\nd", "a\nX\nY\nZ"])
+        with self._tmux(lambda *a, **k: types.SimpleNamespace(stdout=next(seq))), \
+             mock.patch.object(relay.tmuxlib.time, "sleep"):
+            self.assertTrue(relay.pane_busy("%0"))
+
+    def test_capture_pane_and_set_title(self):
+        with self._tmux(lambda *a, **k: types.SimpleNamespace(stdout="screen")):
+            self.assertEqual(relay.capture_pane("%0"), "screen")
+        seen = []
+        with self._tmux(lambda *a, **k: seen.append(a) or types.SimpleNamespace(stdout="")):
+            relay.set_pane_title("%0", "hi"); relay.set_pane_title("", "no-op")
+        self.assertEqual(len([a for a in seen if a[:1] == ("select-pane",)]), 1, "empty pane → no call")
+
+
+class TmuxlibStandalone(unittest.TestCase):
+    def test_loads_without_relay(self):
+        loader = importlib.machinery.SourceFileLoader("tmuxlib_standalone", os.path.join(BIN, "aipair-tmuxlib"))
+        tl = importlib.util.module_from_spec(importlib.util.spec_from_loader("tmuxlib_standalone", loader))
+        loader.exec_module(tl)
+        self.assertTrue(callable(tl.tmux) and callable(tl.find_panes))
+        self.assertIs(relay.find_panes, relay.tmuxlib.find_panes)
 
 
 class PlanDialog(unittest.TestCase):

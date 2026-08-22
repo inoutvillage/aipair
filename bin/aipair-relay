@@ -119,6 +119,22 @@ codex_response_complete = loglib.codex_response_complete
 claude_response_attributed = loglib.claude_response_attributed
 make_fragment = loglib.make_fragment
 
+# --- tmux runner + pane helpers live in aipair-tmuxlib (D3: split, increment 3 = A3) --
+# The subprocess `tmux(...)` wrapper and pane discovery/inspection; stdlib only. Bound in so
+# relay code and tests keep calling them unqualified / as relay.X.
+_TMUXLIB = os.path.join(os.path.dirname(os.path.realpath(__file__)), "aipair-tmuxlib")
+_tl_loader = importlib.machinery.SourceFileLoader("aipairtmuxlib", _TMUXLIB)
+tmuxlib = importlib.util.module_from_spec(importlib.util.spec_from_loader("aipairtmuxlib", _tl_loader))
+_tl_loader.exec_module(tmuxlib)
+tmux = tmuxlib.tmux
+current_session = tmuxlib.current_session
+find_panes = tmuxlib.find_panes
+own_pane = tmuxlib.own_pane
+set_pane_title = tmuxlib.set_pane_title
+cancel_copy_mode = tmuxlib.cancel_copy_mode
+pane_busy = tmuxlib.pane_busy
+capture_pane = tmuxlib.capture_pane
+
 USE_COLOR = True
 C = {"claude": "\033[1;36m", "codex": "\033[1;32m", "relay": "\033[1;35m",
      "warn": "\033[1;31m", "ok": "\033[1;32m", "dim": "\033[2m", "off": "\033[0m"}
@@ -181,107 +197,6 @@ def dim(s):
 def oneline(s, n=180):
     s = " ".join(s.split())
     return s if len(s) <= n else s[: n - 1] + "…"
-
-
-# --- tmux helpers ----------------------------------------------------------- #
-def tmux(*args, check=True, capture=False):
-    return subprocess.run(["tmux", *args], check=check,
-                          capture_output=capture, text=True)
-
-
-def current_session():
-    try:
-        return tmux("display-message", "-p", "#{session_name}", capture=True).stdout.strip()
-    except subprocess.CalledProcessError:
-        return None
-
-
-def find_panes(session):
-    """Identify the claude/codex panes. Titles set by aipair ('claude'/'codex')
-    get overwritten by the CLIs at runtime, so fall back to the running command
-    and finally to aipair's layout order (claude, codex, bridge)."""
-    out = tmux("list-panes", "-t", session,
-               "-F", "#{pane_id}\t#{pane_current_command}\t#{pane_title}",
-               capture=True).stdout
-    self_pane = os.environ.get("TMUX_PANE")
-    panes, leftovers = {}, []
-    for line in out.splitlines():
-        pid, cmd, title = (line.split("\t", 2) + ["", ""])[:3]
-        if pid == self_pane:
-            continue
-        t, cl = title.strip().lower(), cmd.strip().lower()
-        if "claude" not in panes and (t.startswith("claude") or cl == "claude"):
-            panes["claude"] = pid
-        elif "codex" not in panes and (t.startswith("codex") or cl == "codex"):
-            panes["codex"] = pid
-        elif cl not in ("bash", "zsh", "sh", "fish", "python3", "python"):
-            leftovers.append(pid)
-    if "claude" not in panes and leftovers:
-        panes["claude"] = leftovers.pop(0)
-    if "codex" not in panes and leftovers:
-        panes["codex"] = leftovers.pop(0)
-    return panes
-
-
-def own_pane(session):
-    """自分（relay）が走っている tmux ペインを返す。
-    タイトルは `aipair` が起動時に一度セットするだけなので、`aipair-relay-here` で
-    張り直すと実態と食い違ったまま残る（2026-08-17 実例: endless で走っているのに
-    タイトルは "auto review loop" のまま）。relay 自身が名乗れば起動経路によらず正しくなる。
-    TMUX_PANE が対象セッションに属さない場合は None（--session を明示して外から
-    回した時に、無関係なペインを改名しないため）。"""
-    pid = os.environ.get("TMUX_PANE")
-    if not pid:
-        return None
-    try:
-        out = tmux("list-panes", "-t", session, "-F", "#{pane_id}", capture=True).stdout
-    except subprocess.CalledProcessError:
-        return None
-    return pid if pid in out.split() else None
-
-
-def set_pane_title(pane, title):
-    if pane:
-        tmux("select-pane", "-t", pane, "-T", title, check=False)
-
-
-def cancel_copy_mode(pane):
-    """A pane left in copy-mode (e.g. the human scrolled it with the mouse)
-    silently eats send-keys input — cancel it before injecting anything."""
-    if tmux("display-message", "-p", "-t", pane, "#{pane_in_mode}",
-            capture=True).stdout.strip() != "0":
-        tmux("send-keys", "-t", pane, "-X", "cancel", check=False)
-        time.sleep(0.2)
-
-
-def pane_busy(pane):
-    """Target TUI is mid-turn (streaming)?
-    速判定: 'esc to interrupt'（Codex は常時表示・Claude Code は間欠表示）。
-    フォールバック: 1秒あけた2回キャプチャの差分が3行以上 — 実行中は転写が流れて
-    複数行が動く。アイドルの TUI にも毎秒その場で動く行（完了バッジのアニメ・
-    ヒント行・ステータスライン等）があるため、全一致比較だとアイドルの Claude
-    ペインを延々 busy と誤判定する（2026-08-14 実バグ: 60分の busy-wait 満了で
-    poke が配達不可となり relay 停止）。"""
-    try:
-        first = tmux("capture-pane", "-p", "-t", pane, capture=True).stdout
-    except subprocess.CalledProcessError:
-        return False
-    if "esc to interrupt" in first.lower():
-        return True
-    time.sleep(1.0)
-    try:
-        second = tmux("capture-pane", "-p", "-t", pane, capture=True).stdout
-    except subprocess.CalledProcessError:
-        return False
-    if first == second:
-        return False
-    a = first.splitlines()
-    b = second.splitlines()
-    if len(a) < len(b):
-        a += [""] * (len(b) - len(a))
-    elif len(b) < len(a):
-        b += [""] * (len(a) - len(b))
-    return sum(1 for x, y in zip(a, b) if x != y) >= 3
 
 
 BUSY_WAIT = 90  # poke 前に相手ペインのアイドルを待つ上限秒（超過後は注入続行。--busy-wait で変更可）
@@ -825,10 +740,6 @@ def gate_or_message(a, gate_state, cwd):
 
 # --- plan-approval dialog handling ------------------------------------------ #
 PLAN_QUESTION = "Would you like to proceed?"
-
-
-def capture_pane(pane):
-    return tmux("capture-pane", "-p", "-t", pane, capture=True).stdout
 
 
 def newest_plan():
