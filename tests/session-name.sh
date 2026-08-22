@@ -118,6 +118,9 @@ if command -v script >/dev/null; then
   chk "$(tmux show -t "$NA" -v mouse)" "on" "mouse on"
   chk "$(tmux show -t "$NA" -v pane-border-status)" "top" "pane-border-status top"
   chk "$(tmux list-panes -s -t "=$NA" -F '#{pane_title}' | grep -c -E '^(claude|codex|bridge)' || true)" "3" "pane titles claude/codex/bridge"
+  # @aipair-codex-pane must be recorded (peer resolves the pair's Codex by this pane's process)
+  CODEX_PANE="$(tmux list-panes -s -t "=$NA" -F '#{pane_id} #{pane_title}' | awk '$2=="codex"{print $1}')"
+  chk "$(tmux show -t "$NA" -v @aipair-codex-pane)" "$CODEX_PANE" "@aipair-codex-pane points at the codex pane (real tmux set)"
   tmux new-session -d -s aipair-api -c "$W/a/api"      # legacy for the SAME dir, coexisting
   chk "$(aipair name "$W/a/api")" "$NA" "new-format wins over legacy of the same dir"
   chk "$(aipair stop "$W/a/api")" "aipair: stopped $NA" "stop kills the new-format session"

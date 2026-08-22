@@ -345,12 +345,15 @@ def _ppid_from_stat(data):
 
 
 def _descendants(root):
-    """All pids under `root` (transitively), from /proc. Empty where /proc is absent (macOS)."""
+    """Pids under `root`, breadth-first (shallowest first). Empty where /proc is absent (macOS).
+    Order matters: the pair's OWN codex sits directly under the pane shell, while a nested
+    codex-in-codex is strictly deeper — walking shallowest-first lets the caller take the pair's
+    own rollout and never a nested subprocess's (even when the nested one is newer)."""
     children = {}
     try:
         names = os.listdir("/proc")
     except OSError:
-        return set()
+        return []
     for name in names:
         if not name.isdigit():
             continue
@@ -361,17 +364,36 @@ def _descendants(root):
             continue
         if ppid is not None:
             children.setdefault(ppid, []).append(int(name))
-    seen, stack = set(), [root]
-    while stack:
-        for c in children.get(stack.pop(), ()):
-            if c not in seen:
-                seen.add(c)
-                stack.append(c)
-    return seen
+    order, seen, queue = [], set(), [root]
+    while queue:
+        nxt = []
+        for p in queue:
+            for c in sorted(children.get(p, ())):
+                if c not in seen:
+                    seen.add(c)
+                    order.append(c)
+                    nxt.append(c)
+        queue = nxt
+    return order
+
+
+def _valid_rollout(path):
+    """A genuine Codex rollout under CODEX_SESSIONS — not merely any open file whose name
+    happens to contain 'rollout-'. Canonicalises before the prefix check so a symlink or
+    '..' cannot smuggle an outside path in."""
+    base = os.path.basename(path)
+    if not (base.startswith("rollout-") and base.endswith(".jsonl")):
+        return False
+    root = os.path.realpath(CODEX_SESSIONS)
+    try:
+        rp = os.path.realpath(path)
+    except OSError:
+        return False
+    return rp.startswith(root + os.sep)
 
 
 def _open_rollouts(pid):
-    """Rollout paths the process `pid` currently holds open (codex keeps its fd open)."""
+    """Genuine Codex rollouts (under CODEX_SESSIONS) the process `pid` holds open."""
     out = []
     try:
         entries = os.listdir("/proc/%d/fd" % pid)
@@ -382,7 +404,7 @@ def _open_rollouts(pid):
             tgt = os.readlink("/proc/%d/fd/%s" % (pid, name))
         except OSError:
             continue
-        if "rollout-" in tgt and tgt.endswith(".jsonl"):
+        if _valid_rollout(tgt):
             out.append(tgt)
     return out
 
@@ -404,17 +426,13 @@ def codex_via_pane(cwd):
     if not (ppid and ppid.isdigit()):
         return None
     want = _norm(cwd)
-    best = None
+    # BFS order → the shallowest process holding a cwd-matching rollout is the pair's OWN codex;
+    # a nested codex-in-codex sits deeper, so its (possibly newer) rollout never wins.
     for pid in _descendants(int(ppid)):
         for roll in _open_rollouts(pid):
-            if codex_cwd(roll) != want:
-                continue
-            try:
-                if best is None or os.path.getmtime(roll) > os.path.getmtime(best):
-                    best = roll
-            except OSError:
-                pass
-    return best
+            if codex_cwd(roll) == want:
+                return roll
+    return None
 
 
 def codex_since(cwd, since, limit=CODEX_SCAN_LIMIT):

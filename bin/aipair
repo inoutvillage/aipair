@@ -319,7 +319,11 @@ CODEX=$(tmux split-window -h -l 50% -t "$CLAUDE" -c "$DIR" -P -F '#{pane_id}')
 # Session options via the pane id: set-option (tmux 3.2a) rejects the "=" exact
 # form, and a bare name could prefix-match another session (see running()).
 tmux set -t "$CLAUDE" @aipair-dir "$DIR"          # owner stamp, read by session_dir_of
-tmux set -t "$CLAUDE" @aipair-codex-pane "$CODEX" >/dev/null 2>&1 || true  # peer-log resolves the pair's Codex by the process this pane runs (its open rollout fd = exact identity)
+# peer-log resolves the pair's Codex by the process THIS pane runs (its open rollout fd =
+# exact identity), so the pane id must be recorded. Warn loudly on failure rather than
+# swallowing it (a silent miss would drop peer back to the weaker launch-time pin).
+tmux set -t "$CLAUDE" @aipair-codex-pane "$CODEX" 2>/dev/null \
+  || echo "aipair: warning: could not record @aipair-codex-pane; peer falls back to the launch-time Codex pin" >&2
 tmux set -t "$CLAUDE" pane-border-status top >/dev/null 2>&1 || true
 tmux set -t "$CLAUDE" mouse on >/dev/null 2>&1 || true
 
