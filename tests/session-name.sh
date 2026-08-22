@@ -58,6 +58,19 @@ else echo "skip case-insensitive fs test (repo is on a case-sensitive fs)"; fi
 
 echo "# [3] legacy (hash-less) session of the SAME directory is adopted"
 tmux new-session -d -s aipair-api -c "$W/a/api"
+# --- DIAG (temporary) ---
+echo "DIAG tmux -V: $(tmux -V)"
+echo "DIAG list-sessions raw:"; tmux list-sessions -F '  name=[#{session_name}] optlen? aipdir=[#{@aipair-dir}] path=[#{session_path}]' 2>&1
+echo "DIAG x1f-split (what session_dir_of parses):"
+while IFS=$'\x1f' read -r dn dop dp; do echo "  parsed name=[$dn] opt=[$dop] path=[$dp]"; done < <(tmux list-sessions -F $'#{session_name}\x1f#{@aipair-dir}\x1f#{session_path}' 2>/dev/null)
+DIAGCANON="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$W/a/api")"
+DIAGSP="$(tmux list-sessions -F $'#{session_name}\x1f#{session_path}' 2>/dev/null | awk -F$'\x1f' '$1=="aipair-api"{print $2}')"
+echo "DIAG canon(a/api)=[$DIAGCANON]  session_path=[$DIAGSP]"
+if [ "$DIAGSP" -ef "$DIAGCANON" ]; then echo "DIAG -ef: MATCH"; else echo "DIAG -ef: NO-MATCH"; fi
+[ "$DIAGSP" = "$DIAGCANON" ] && echo "DIAG string: MATCH" || echo "DIAG string: NO-MATCH"
+echo "DIAG aipair name stderr:"; aipair name "$W/a/api" 2>&1 1>/dev/null | sed 's/^/  /'
+echo "DIAG aipair name stdout: [$(aipair name "$W/a/api" 2>/dev/null)]"
+# --- /DIAG ---
 chk "$(aipair name "$W/a/api")" "aipair-api" "name → legacy"
 chk "$(aipair name "$W/b/api")" "$NB" "other dir with same basename does not adopt it"
 chk "$(aipair stop "$W/b/api")" "aipair: no running session $NB" "stop other dir leaves it alone (no prefix match)"
