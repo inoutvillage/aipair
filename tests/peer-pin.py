@@ -111,10 +111,13 @@ class ClaudePin(Base):
             self.assertIsNone(pl.claude_file(self.CWD),
                               "never fall back to a different session while pinned")
 
-    def test_a_glob_metachar_in_the_pin_is_ignored(self):
-        new = self.claude(self.CWD, self.OTHER, 900)
-        with mock.patch.dict(os.environ, {"AIPAIR_CLAUDE_SESSION": "*"}):
-            self.assertEqual(pl.claude_file(self.CWD), new, "a non-uuid pin must not glob-match")
+    def test_a_malformed_pin_fails_closed(self):
+        # a set-but-invalid pin must NOT silently fall back to the newest (that would revive
+        # the very cross-session mixing the pin exists to prevent) — read nothing instead.
+        self.claude(self.CWD, self.OTHER, 900)
+        for bad in ("*", "x; echo hi", "../../etc/passwd", "short"):
+            with mock.patch.dict(os.environ, {"AIPAIR_CLAUDE_SESSION": bad}):
+                self.assertIsNone(pl.claude_file(self.CWD), f"malformed pin {bad!r} must fail closed")
 
 
 class CodexPin(Base):
@@ -146,6 +149,16 @@ class CodexPin(Base):
         self.rollout("old", self.CWD, "2026-08-21T00:00:00Z", 100)
         self.assertIsNone(pl.codex_since(self.CWD, epoch("2026-08-21T00:10:00Z")))
 
+    def test_high_res_since_excludes_a_rollout_started_earlier_in_the_same_second(self):
+        # the pair launches at 00:10:00.500; an unrelated Codex opened at 00:10:00.100 —
+        # same whole second, but BEFORE the launch. A second-granular stamp would keep it;
+        # the high-resolution epoch excludes it, leaving only the pair (.800).
+        unrelated = self.rollout("same-sec-before", self.CWD, "2026-08-21T00:10:00.100Z", 150)
+        pair = self.rollout("pair", self.CWD, "2026-08-21T00:10:00.800Z", 200)
+        since = epoch("2026-08-21T00:10:00.500Z")
+        self.assertEqual(pl.codex_since(self.CWD, since), pair)
+        self.assertNotEqual(pl.codex_since(self.CWD, since), unrelated)
+
     def test_since_stays_put_when_a_newer_unrelated_rollout_appears(self):
         self.seed()
         first = pl.codex_since(self.CWD, self.since)
@@ -175,12 +188,12 @@ class LoadIntegration(Base):
             f, _ = pl.load("codex", self.CWD, show_tools=False)
         self.assertEqual(f, pair, "load() pins codex to the pair when AIPAIR_CODEX_SINCE is set")
 
-    def test_load_codex_garbage_since_falls_back(self):
-        newer = self.rollout("newer", self.CWD, "2026-08-21T00:20:00Z", 900)
+    def test_load_codex_garbage_since_fails_closed(self):
+        self.rollout("newer", self.CWD, "2026-08-21T00:20:00Z", 900)
         self.rollout("older", self.CWD, "2026-08-21T00:10:00Z", 200)
         with mock.patch.dict(os.environ, {"AIPAIR_CODEX_SINCE": "not-a-number"}):
             f, _ = pl.load("codex", self.CWD, show_tools=False)
-        self.assertEqual(f, newer, "a non-numeric pin falls back to the normal newest/follow")
+        self.assertIsNone(f, "a set-but-non-numeric pin fails closed, never the newest")
 
 
 if __name__ == "__main__":

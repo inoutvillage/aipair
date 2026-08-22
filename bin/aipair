@@ -258,18 +258,32 @@ else
 fi
 # Pin the transcript `peer` reads to THIS pair, so it can never drift to another
 # Claude/Codex that merely shares the cwd (peer-log otherwise takes the newest session
-# for the dir — see its AIPAIR_CLAUDE_SESSION / AIPAIR_CODEX_SINCE handling). Claude gets
-# a fixed session id (its log is <id>.jsonl); Codex has no such flag, so we stamp the
-# launch epoch and pin to the rollout it opens at/after it. Both are honoured from the
-# environment when already set (aipair generates them otherwise), which also makes the
-# launch lines deterministic for tests.
+# for the dir). Claude gets a fixed session id (its log is <id>.jsonl) — an exact,
+# race-free pin. Codex has no --session-id flag, so we stamp the launch time; peer-log
+# reads the earliest rollout for the cwd that STARTED at/after it, which excludes every
+# Codex that predates the launch. (The one residual: a Codex that starts in the same cwd
+# during the brief launch window has no id to tell it apart — documented in the README.)
+# A high-resolution epoch via python3 (a hard dep) — `date +%s` is whole-second and macOS
+# `date` has no %N, so a second-granular stamp would let an unrelated rollout that opened
+# earlier in the same second slip past the filter.
+#
+# Both pins are honoured from the environment when already set (generated otherwise, which
+# also makes the launch lines deterministic for tests) — but a caller-supplied value is
+# VALIDATED and never expanded raw into a pane's command line: it is quoted with q() and
+# must be a UUID / a number, so `AIPAIR_CLAUDE_SESSION='x; rm -rf ~ #'` is refused, not run.
 PAIR_SID="${AIPAIR_CLAUDE_SESSION:-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')}"
-PAIR_SINCE="${AIPAIR_CODEX_SINCE:-$(date +%s)}"
-PAIR_PINS="AIPAIR_CLAUDE_SESSION=$PAIR_SID AIPAIR_CODEX_SINCE=$PAIR_SINCE"
+if ! [[ "$PAIR_SID" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+  echo "aipair: AIPAIR_CLAUDE_SESSION must be a UUID (got '$PAIR_SID')" >&2; exit 2
+fi
+PAIR_SINCE="${AIPAIR_CODEX_SINCE:-$(python3 -c 'import time; print(time.time())')}"
+if ! [[ "$PAIR_SINCE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+  echo "aipair: AIPAIR_CODEX_SINCE must be a number (got '$PAIR_SINCE')" >&2; exit 2
+fi
+PAIR_PINS="AIPAIR_CLAUDE_SESSION=$(q "$PAIR_SID") AIPAIR_CODEX_SINCE=$(q "$PAIR_SINCE")"
 # AI_SELF / AI_PEER let each agent's `peer` command target the other. They are
 # passed with `env` rather than `export …;` because that is the one spelling
 # sh, bash, zsh and fish all accept (fish has no `export`).
-CLAUDE_LINE="clear; env AI_SELF=claude AI_PEER=codex $PAIR_PINS claude --session-id $PAIR_SID $CLAUDE_FLAGS"
+CLAUDE_LINE="clear; env AI_SELF=claude AI_PEER=codex $PAIR_PINS claude --session-id $(q "$PAIR_SID") $CLAUDE_FLAGS"
 CODEX_LINE="clear; env AI_SELF=codex AI_PEER=claude $PAIR_PINS codex $CODEX_FLAGS"
 # Every AIPAIR_* the relay reads is pinned to THIS process's value (empty where unset) on
 # the relay's own command. A pre-existing tmux server may hold a stale value from an

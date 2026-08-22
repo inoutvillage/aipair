@@ -24,8 +24,10 @@ unset TMUX AI_SELF AI_PEER BASH_ENV ENV
 while IFS= read -r v; do unset "$v"; done < <(compgen -v AIPAIR_ || true)
 # Fixed peer pins so the launch lines are deterministic (aipair honours pre-set values;
 # it generates a random uuid / the wall-clock epoch otherwise — covered by [1c]).
-export AIPAIR_CLAUDE_SESSION=SID AIPAIR_CODEX_SINCE=SINCE
-P="AIPAIR_CLAUDE_SESSION=SID AIPAIR_CODEX_SINCE=SINCE"   # the two env pins on every pane line
+S=11111111-1111-1111-1111-111111111111   # a valid fixed UUID (aipair now validates the pin)
+K=1700000000                             # a valid fixed epoch (aipair validates it is numeric)
+export AIPAIR_CLAUDE_SESSION="$S" AIPAIR_CODEX_SINCE="$K"
+P="AIPAIR_CLAUDE_SESSION=$S AIPAIR_CODEX_SINCE=$K"   # the two env pins on every pane line
 mkdir -p "$W/zdot" "$W/xdg"     # empty rc dirs so zsh/fish run without the user's config
 
 fail=0; n=0
@@ -40,27 +42,27 @@ J=$'\n'
 
 echo "# [1] loop defaults"
 chk "$(run loop bridge)" "cmd=aipair-relay self=bridge peer=${J}[--max-rounds]${J}[20]${J}[--stop]${J}[完了です]${J}[--stop-side]${J}[codex]" "bridge: relay with default args"
-chk "$(run loop claude)" "cmd=claude self=claude peer=codex${J}[--session-id]${J}[SID]${J}[--dangerously-skip-permissions]" "claude: --session-id pin + bypass under --unsafe, AI_SELF/AI_PEER exported"
+chk "$(run loop claude)" "cmd=claude self=claude peer=codex${J}[--session-id]${J}[$S]${J}[--dangerously-skip-permissions]" "claude: --session-id pin + bypass under --unsafe, AI_SELF/AI_PEER exported"
 chk "$(run loop codex)"  "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]" "codex: bypass flag under --unsafe, AI_SELF/AI_PEER exported"
 chk "$(line loop session)" "$(aipair name "$W/proj")" "session line = aipair name"
 
 echo "# [1b] D1: safe by default, permission-bypass only with --unsafe"
 # safe default (no --unsafe): agents get NO flags (their normal permission prompts)
-chk "$(env AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id SID " "interactive: peer pins + --session-id, no bypass flag by default"
+chk "$(env AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id $S " "interactive: peer pins + --session-id, no bypass flag by default"
 chk "$(env AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^codex:  *//p')" "clear; env AI_SELF=codex AI_PEER=claude $P codex " "interactive: codex peer pins, no bypass flag by default"
 # --unsafe adds the bypass flags
-chk "$(env AIPAIR_UNSAFE=1 AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id SID --dangerously-skip-permissions" "AIPAIR_UNSAFE=1: bypass flag added"
+chk "$(env AIPAIR_UNSAFE=1 AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id $S --dangerously-skip-permissions" "AIPAIR_UNSAFE=1: bypass flag added"
 # explicit flags win even in safe mode
-chk "$(env AIPAIR_CLAUDE_FLAGS='--model opus' AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id SID --model opus" "explicit AIPAIR_CLAUDE_FLAGS wins in safe mode"
+chk "$(env AIPAIR_CLAUDE_FLAGS='--model opus' AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id $S --model opus" "explicit AIPAIR_CLAUDE_FLAGS wins in safe mode"
 # `aipair loop` without --unsafe is refused (exit 2), nothing printed to stdout
 n=$((n+1)); rc=0; out="$(AIPAIR_DRY_RUN=1 aipair loop "$W/proj" 2>/dev/null)" || rc=$?
 if [ "$rc" = 2 ] && [ -z "$out" ]; then echo "ok   loop without --unsafe → exit 2, no launch"; else echo "FAIL loop refuse: rc=$rc out=$out"; fail=1; fi
 # loop ALWAYS carries the bypass flag under --unsafe, even if the user blanks/customises flags
-chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CLAUDE_FLAGS= AIPAIR_CODEX_FLAGS= AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id SID --dangerously-skip-permissions" "loop: empty AIPAIR_CLAUDE_FLAGS still gets the bypass"
+chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CLAUDE_FLAGS= AIPAIR_CODEX_FLAGS= AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id $S --dangerously-skip-permissions" "loop: empty AIPAIR_CLAUDE_FLAGS still gets the bypass"
 chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CODEX_FLAGS= AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^codex:  *//p')" "clear; env AI_SELF=codex AI_PEER=claude $P codex --dangerously-bypass-approvals-and-sandbox" "loop: empty AIPAIR_CODEX_FLAGS still gets the bypass"
-chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CLAUDE_FLAGS='--model opus' AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id SID --dangerously-skip-permissions --model opus" "loop: bypass is prepended, custom flags follow"
+chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CLAUDE_FLAGS='--model opus' AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id $S --dangerously-skip-permissions --model opus" "loop: bypass is prepended, custom flags follow"
 # the bypass is a FIXED token BEFORE the fragment, so a '#' in the fragment can't comment it out
-chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CLAUDE_FLAGS='--model opus # --dangerously-skip-permissions' AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id SID --dangerously-skip-permissions --model opus # --dangerously-skip-permissions" "loop: a '#' in the fragment cannot comment out the bypass (it is prepended)"
+chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CLAUDE_FLAGS='--model opus # --dangerously-skip-permissions' AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id $S --dangerously-skip-permissions --model opus # --dangerously-skip-permissions" "loop: a '#' in the fragment cannot comment out the bypass (it is prepended)"
 
 echo "# [1c] with no pins pre-set, aipair generates a real session id + epoch and pins to them"
 GEN="$(env -u AIPAIR_CLAUDE_SESSION -u AIPAIR_CODEX_SINCE AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^claude:  *//p')"
@@ -69,7 +71,21 @@ gsess="$(printf '%s\n' "$GEN" | sed -n 's/.*--session-id \([^ ]*\).*/\1/p')"
 gsince="$(printf '%s\n' "$GEN" | sed -n 's/.*AIPAIR_CODEX_SINCE=\([^ ]*\).*/\1/p')"
 n=$((n+1)); if printf '%s' "$gsid" | grep -qE '^[0-9a-fA-F-]{16,}$'; then echo "ok   generated AIPAIR_CLAUDE_SESSION looks like a uuid"; else echo "FAIL generated session id: '$gsid'"; fail=1; fi
 chk "$gsess" "$gsid" "claude --session-id equals the exported AIPAIR_CLAUDE_SESSION pin"
-n=$((n+1)); if printf '%s' "$gsince" | grep -qE '^[0-9]+$'; then echo "ok   generated AIPAIR_CODEX_SINCE is an epoch"; else echo "FAIL generated since: '$gsince'"; fail=1; fi
+n=$((n+1)); if printf '%s' "$gsince" | grep -qE '^[0-9]+([.][0-9]+)?$'; then echo "ok   generated AIPAIR_CODEX_SINCE is an epoch"; else echo "FAIL generated since: '$gsince'"; fail=1; fi
+
+echo "# [1d] a caller-supplied pin is validated (no shell injection, fail-closed)"
+for bad in 'x; echo PIN_INJECTED #' '$(touch /tmp/aipair-pwn)' 'a b' 'notauuid'; do
+  n=$((n+1)); rc=0; out="$(env AIPAIR_CLAUDE_SESSION="$bad" AIPAIR_DRY_RUN=1 aipair "$W/proj" 2>/dev/null)" || rc=$?
+  if [ "$rc" = 2 ] && [ -z "$out" ] && ! printf '%s' "$out" | grep -q PIN_INJECTED; then
+    echo "ok   AIPAIR_CLAUDE_SESSION='$bad' → refused (exit 2, nothing printed)"
+  else echo "FAIL bad session pin not refused: rc=$rc out=$out"; fail=1; fi
+done
+for bad in '1; rm -rf /' '1e3' 'abc'; do
+  n=$((n+1)); rc=0; out="$(env AIPAIR_CODEX_SINCE="$bad" AIPAIR_DRY_RUN=1 aipair "$W/proj" 2>/dev/null)" || rc=$?
+  if [ "$rc" = 2 ] && [ -z "$out" ]; then echo "ok   AIPAIR_CODEX_SINCE='$bad' → refused (exit 2)"; else echo "FAIL bad since not refused: rc=$rc out=$out"; fail=1; fi
+done
+# a valid fractional epoch IS accepted
+n=$((n+1)); if env AIPAIR_CODEX_SINCE=1700000000.5 AIPAIR_DRY_RUN=1 aipair "$W/proj" >/dev/null 2>&1; then echo "ok   AIPAIR_CODEX_SINCE=1700000000.5 accepted"; else echo "FAIL fractional epoch rejected"; fail=1; fi
 
 echo "# [2] values with shell metacharacters arrive as ONE argument each"
 chk "$(run loop bridge "AIPAIR_STOP=it's done" | sed -n '5p')" "[it's done]" "apostrophe in AIPAIR_STOP"
@@ -89,7 +105,7 @@ chk "$(line loop title AIPAIR_ENDLESS=1 'AIPAIR_ALL_DONE=fin')" "relay ● endle
 echo "# [4] agent flags are shell fragments (documented, backwards compatible)"
 # `start` (interactive) mode: loop always appends the bypass flag, so test the fragment
 # semantics here where AIPAIR_*_FLAGS maps 1:1 to argv.
-chk "$(run start claude 'AIPAIR_CLAUDE_FLAGS=')" "cmd=claude self=claude peer=codex${J}[--session-id]${J}[SID]" "empty flags → only the --session-id pin"
+chk "$(run start claude 'AIPAIR_CLAUDE_FLAGS=')" "cmd=claude self=claude peer=codex${J}[--session-id]${J}[$S]" "empty flags → only the --session-id pin"
 chk "$(run start claude 'AIPAIR_CLAUDE_FLAGS=--model opus' | sed -n '4,5p' | paste -sd' ')" "[--model] [opus]" "two words → two arguments (after the --session-id pin)"
 chk "$(run start codex 'AIPAIR_CODEX_FLAGS=--append-system-prompt "a b" -q' | sed -n '2,4p' | paste -sd' ')" "[--append-system-prompt] [a b] [-q]" "quoted word stays one argument"
 
@@ -100,7 +116,7 @@ chk "$(line start title)" "bridge  (claude × codex — peer-log both --watch)" 
 echo "# [6] the same lines under every installed shell (sh/dash/bash/zsh/fish)"
 STOPV='it'"'"'s "x" $HOME;'
 WANT_BRIDGE="cmd=aipair-relay self=bridge peer=${J}[--max-rounds]${J}[20]${J}[--stop]${J}[$STOPV]${J}[--stop-side]${J}[codex]"
-WANT_CLAUDE="cmd=claude self=claude peer=codex${J}[--session-id]${J}[SID]${J}[--dangerously-skip-permissions]"
+WANT_CLAUDE="cmd=claude self=claude peer=codex${J}[--session-id]${J}[$S]${J}[--dangerously-skip-permissions]"
 LINE_BRIDGE="$(line loop bridge "AIPAIR_STOP=$STOPV")"; LINE_CLAUDE="$(line loop claude)"
 for sh in sh dash bash zsh fish; do
   if ! command -v "$sh" >/dev/null 2>&1; then echo "skip $sh (not installed)"; continue; fi

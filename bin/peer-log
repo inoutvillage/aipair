@@ -55,9 +55,11 @@ def claude_file(cwd):
     非英数字をすべて '-' に置換する（日本語・'_' を含むパスで空振りするバグの修正。
     aipair-relay.claude_glob() と同一ロジックに統一）。"""
     pin = os.environ.get("AIPAIR_CLAUDE_SESSION")
-    if pin and re.fullmatch(r"[A-Za-z0-9-]+", pin):
-        hits = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", pin + ".jsonl"))
-        return hits[0] if hits else None   # pinned: never fall back to a different session
+    if pin:                                     # a pin is set (aipair always sets a uuid)
+        if re.fullmatch(r"[0-9A-Za-z_-]{8,}", pin):   # also blocks path/glob metachars
+            hits = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", pin + ".jsonl"))
+            return hits[0] if hits else None   # pinned: never fall back to a different session
+        return None                            # malformed pin → fail CLOSED (no mixing), not the newest
     enc = re.sub(r"[^A-Za-z0-9]", "-", cwd)
     d = os.path.join(CLAUDE_PROJECTS, enc)
     if not os.path.isdir(d):
@@ -472,11 +474,12 @@ def _codex_pick(cwd, current):
     AIPAIR_CODEX_SINCE (never drifts to an unrelated Codex sharing the cwd), else the newest
     for cwd followed across a restart (codex_follow)."""
     since = os.environ.get("AIPAIR_CODEX_SINCE")
-    if since:
+    if since:                                     # a pin is set (aipair always sets an epoch)
         try:
-            return codex_since(cwd, float(since))
+            secs = float(since)
         except ValueError:
-            pass                                  # garbage in the env: fall back to normal following
+            return None                           # malformed pin → fail CLOSED (no mixing), not the newest
+        return codex_since(cwd, secs)
     return codex_follow(cwd, current)
 
 
