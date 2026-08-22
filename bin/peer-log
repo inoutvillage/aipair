@@ -18,8 +18,10 @@ Usage:
 import argparse
 import glob
 import json
+import math
 import os
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -27,6 +29,11 @@ from datetime import datetime, timezone
 HOME = os.path.expanduser("~")
 CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
 CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
+# Pin validation — identical in spirit to the launcher (bin/aipair): a caller-supplied
+# pin is trusted only when it is a canonical UUID / a finite non-negative number.
+# Anything else fails CLOSED (read nothing) rather than reviving cross-session mixing.
+_UUID_RE = re.compile(r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\Z")
+_NUM_RE = re.compile(r"[0-9]+(\.[0-9]+)?\Z")   # no sign, no exponent, no nan/inf
 
 # ANSI colors (agent tag + dim role); disabled when not a tty or --no-color.
 TAG = {"claude": "\033[1;36m", "codex": "\033[1;32m", "bridge": "\033[1;35m"}
@@ -56,7 +63,7 @@ def claude_file(cwd):
     aipair-relay.claude_glob() と同一ロジックに統一）。"""
     pin = os.environ.get("AIPAIR_CLAUDE_SESSION")
     if pin:                                     # a pin is set (aipair always sets a uuid)
-        if re.fullmatch(r"[0-9A-Za-z_-]{8,}", pin):   # also blocks path/glob metachars
+        if _UUID_RE.match(pin):                 # strict UUID only (also blocks path/glob metachars)
             hits = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", pin + ".jsonl"))
             return hits[0] if hits else None   # pinned: never fall back to a different session
         return None                            # malformed pin → fail CLOSED (no mixing), not the newest
@@ -317,6 +324,99 @@ class CodexIndex:
 CODEX_INDEX = CodexIndex()
 
 
+def _tmux(*args):
+    """Run a tmux query, returning its trimmed stdout or None (never raises)."""
+    try:
+        r = subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (r.stdout.strip() or None) if r.returncode == 0 else None
+
+
+def _ppid_from_stat(data):
+    """PPID out of the contents of /proc/<pid>/stat (comm may contain spaces and ')')."""
+    rp = data.rfind(")")
+    if rp < 0:
+        return None
+    try:
+        return int(data[rp + 2:].split()[1])   # after ')': state, ppid, ...
+    except (ValueError, IndexError):
+        return None
+
+
+def _descendants(root):
+    """All pids under `root` (transitively), from /proc. Empty where /proc is absent (macOS)."""
+    children = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return set()
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/" + name + "/stat", "r", encoding="utf-8", errors="replace") as fh:
+                ppid = _ppid_from_stat(fh.read())
+        except OSError:
+            continue
+        if ppid is not None:
+            children.setdefault(ppid, []).append(int(name))
+    seen, stack = set(), [root]
+    while stack:
+        for c in children.get(stack.pop(), ()):
+            if c not in seen:
+                seen.add(c)
+                stack.append(c)
+    return seen
+
+
+def _open_rollouts(pid):
+    """Rollout paths the process `pid` currently holds open (codex keeps its fd open)."""
+    out = []
+    try:
+        entries = os.listdir("/proc/%d/fd" % pid)
+    except OSError:
+        return out
+    for name in entries:
+        try:
+            tgt = os.readlink("/proc/%d/fd/%s" % (pid, name))
+        except OSError:
+            continue
+        if "rollout-" in tgt and tgt.endswith(".jsonl"):
+            out.append(tgt)
+    return out
+
+
+def codex_via_pane(cwd):
+    """Exact, race-free identity: the rollout FILE the pair's Codex process has open right now.
+    aipair records the Codex pane (@aipair-codex-pane); we take that pane's process tree and read
+    the open rollout fd of its codex process, matched to cwd. Linux+tmux only — returns None
+    elsewhere (and on any hiccup), so the caller falls back to the launch-time pin."""
+    if not os.environ.get("TMUX"):
+        return None
+    sess = _tmux("display-message", "-p", "#{session_name}")
+    if not sess:
+        return None
+    pane = _tmux("show-options", "-t", sess, "-qv", "@aipair-codex-pane")
+    if not pane:
+        return None
+    ppid = _tmux("display-message", "-p", "-t", pane, "#{pane_pid}")
+    if not (ppid and ppid.isdigit()):
+        return None
+    want = _norm(cwd)
+    best = None
+    for pid in _descendants(int(ppid)):
+        for roll in _open_rollouts(pid):
+            if codex_cwd(roll) != want:
+                continue
+            try:
+                if best is None or os.path.getmtime(roll) > os.path.getmtime(best):
+                    best = roll
+            except OSError:
+                pass
+    return best
+
+
 def codex_since(cwd, since, limit=CODEX_SCAN_LIMIT):
     """The pair's own rollout: the EARLIEST rollout for cwd whose session started at/after
     `since` (the pair-launch epoch aipair stamps as AIPAIR_CODEX_SINCE). Unlike codex_newest
@@ -475,11 +575,12 @@ def _codex_pick(cwd, current):
     for cwd followed across a restart (codex_follow)."""
     since = os.environ.get("AIPAIR_CODEX_SINCE")
     if since:                                     # a pin is set (aipair always sets an epoch)
-        try:
-            secs = float(since)
-        except ValueError:
-            return None                           # malformed pin → fail CLOSED (no mixing), not the newest
-        return codex_since(cwd, secs)
+        if not _NUM_RE.match(since):
+            return None                           # nan / inf / -1 / 1e3 / garbage → fail CLOSED
+        secs = float(since)
+        if not math.isfinite(secs) or secs < 0:   # defensive: the regex already guarantees this
+            return None
+        return codex_via_pane(cwd) or codex_since(cwd, secs)   # exact identity, else the launch-time pin
     return codex_follow(cwd, current)
 
 

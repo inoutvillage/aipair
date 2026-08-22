@@ -213,10 +213,12 @@ peer-log codex --full      # セッション全体
 > **ペア相手への固定**: `aipair` は起動時に相手セッションを pin する。
 > - **Claude は厳密**: 固定の `--session-id <uuid>` で起動し、ログは `<uuid>.jsonl` に確定する。
 >   同じ作業ディレクトリで別の Claude が動いていても、`peer` はそのペアの Claude だけを読む。
-> - **Codex は起動時刻ベース**（Codex に session-id 指定フラグが無いため）: 起動時刻（高精度 epoch）を
->   stamp し、`peer` は「その cwd で**起動時刻以降に開かれた最古**の rollout」を読む。これで**起動前から
->   動いていた別 Codex は確実に除外**される。残る唯一の曖昧さは、**起動直後の同一 cwd で別 Codex が
->   立ち上がる**狭い競合窓（識別する id が無い）。実運用ではまず起きないが、厳密保証は Claude 側のみ。
+> - **Codex はプロセス実体で固定**（Codex に session-id 指定フラグが無いため）: aipair は Codex ペインを
+>   記録し、`peer` は**そのペインのプロセスが「今まさに開いている」rollout ファイル**を `/proc` から解決
+>   して読む（fd = 実体そのものなので、同じ cwd で別 Codex が何個動いていても混線しない・厳密）。
+>   `/proc` や tmux が無い環境（例: macOS）やプロセス特定前は、**起動時刻（高精度 epoch）以降に開かれた
+>   最古の rollout**へ自動フォールバックする（起動前の別 Codex は除外。この経路の残る曖昧さは「起動直後の
+>   同一 cwd での並行起動」のみ）。
 > - pin は環境変数 `AIPAIR_CLAUDE_SESSION` / `AIPAIR_CODEX_SINCE` で運ぶ（通常は自動。明示指定は検証され、
 >   UUID / 数値でなければ起動を拒否＝不正値でのセッション混線を防ぐ）。下の表参照。
 > - aipair 外で素の `peer-log` を使う場合は pin が無いので従来どおり「その cwd の最新セッション」を読む。
@@ -254,7 +256,7 @@ peer-log codex --full      # セッション全体
 | `AIPAIR_GATE_TIMEOUT` / `AIPAIR_GATE_ROUNDS` | `600` / `3` | ゲートのタイムアウト秒／差し戻しの上限回数（到達で relay は exit 6） |
 | `AIPAIR_ALLOW_UNTESTED_DIALOGS` | （未設定＝off） | `1` で、claude/codex が検証済み版と違っても**プラン承認・質問リレーの自動操作を続ける**（既定は不一致なら自動 OFF。→「版ゲート」） |
 | `AIPAIR_CLAUDE_SESSION` | （自動＝新規 uuid） | `peer` を起動ペアの Claude に固定する内部 pin。この id で `claude --session-id` を起動し、ログ `<id>.jsonl` を一意に指す（厳密固定）。明示指定は**UUID でなければ起動拒否**、peer-log 側も不正値なら fail-closed。通常は不要 |
-| `AIPAIR_CODEX_SINCE` | （自動＝起動時の高精度 epoch） | `peer` を起動ペアの Codex に固定する内部 pin。Codex に session-id 指定が無いため、この epoch 以降に開かれた最古の cwd 一致 rollout を「そのペアの Codex」とみなす（起動前の別 Codex は除外。残る競合は上記「ペア相手への固定」参照）。明示指定は**数値でなければ起動拒否**、peer-log 側も不正値なら混線させず何も読まない（fail-closed）。通常は不要 |
+| `AIPAIR_CODEX_SINCE` | （自動＝起動時の高精度 epoch） | Codex pin の**フォールバック**（主経路は `/proc` によるプロセス実体固定。上記「ペア相手への固定」参照）。`/proc`・tmux が無い環境やプロセス特定前に、この epoch 以降に開かれた最古の cwd 一致 rollout を読む。明示指定は**数値（非 nan/inf/負）でなければ起動拒否**、peer-log 側も不正値なら fail-closed。通常は不要 |
 | `AIPAIR_NO_VERSION_GATE` | （未設定＝off） | `1` で起動時の版チェック自体をしない |
 
 `AIPAIR_*_FLAGS` 以外の値は**そのまま 1 引数**として relay に渡る（`'`・空白・`$`・`;` を含んでも壊れない。launcher がシングルクォートで包む）。

@@ -119,6 +119,13 @@ class ClaudePin(Base):
             with mock.patch.dict(os.environ, {"AIPAIR_CLAUDE_SESSION": bad}):
                 self.assertIsNone(pl.claude_file(self.CWD), f"malformed pin {bad!r} must fail closed")
 
+    def test_a_non_canonical_id_with_a_matching_file_is_still_refused(self):
+        # only a strict UUID is honoured: a plausible-looking id that has its own .jsonl on
+        # disk must not be read just because it passes a loose [alnum-_]{8,} check.
+        self.claude(self.CWD, "not-a-real-uuid", 900)
+        with mock.patch.dict(os.environ, {"AIPAIR_CLAUDE_SESSION": "not-a-real-uuid"}):
+            self.assertIsNone(pl.claude_file(self.CWD), "non-canonical id must fail closed even with a file")
+
 
 class CodexPin(Base):
     CWD = "/x/proj"
@@ -159,6 +166,17 @@ class CodexPin(Base):
         self.assertEqual(pl.codex_since(self.CWD, since), pair)
         self.assertNotEqual(pl.codex_since(self.CWD, since), unrelated)
 
+    def test_a_concurrent_rollout_inside_the_launch_window_is_the_known_residual(self):
+        # DOCUMENTED LIMITATION (Codex has no session-id): if an unrelated Codex opens in the
+        # SAME cwd AFTER the launch stamp but BEFORE the pair's own rollout, codex_since (earliest
+        # at/after `since`) selects it. Time cannot tell them apart; only Claude's --session-id is
+        # a hard guarantee. This test pins the behaviour so it stays visible, not hidden.
+        since = epoch("2026-08-21T00:10:00.000Z")
+        concurrent = self.rollout("concurrent", self.CWD, "2026-08-21T00:10:00.300Z", 150)
+        self.rollout("pair", self.CWD, "2026-08-21T00:10:00.800Z", 200)
+        self.assertEqual(pl.codex_since(self.CWD, since), concurrent,
+                         "known residual: an in-window concurrent Codex is picked (time is not identity)")
+
     def test_since_stays_put_when_a_newer_unrelated_rollout_appears(self):
         self.seed()
         first = pl.codex_since(self.CWD, self.since)
@@ -188,12 +206,62 @@ class LoadIntegration(Base):
             f, _ = pl.load("codex", self.CWD, show_tools=False)
         self.assertEqual(f, pair, "load() pins codex to the pair when AIPAIR_CODEX_SINCE is set")
 
-    def test_load_codex_garbage_since_fails_closed(self):
+    def test_load_codex_bad_since_fails_closed(self):
         self.rollout("newer", self.CWD, "2026-08-21T00:20:00Z", 900)
         self.rollout("older", self.CWD, "2026-08-21T00:10:00Z", 200)
-        with mock.patch.dict(os.environ, {"AIPAIR_CODEX_SINCE": "not-a-number"}):
-            f, _ = pl.load("codex", self.CWD, show_tools=False)
-        self.assertIsNone(f, "a set-but-non-numeric pin fails closed, never the newest")
+        for bad in ("not-a-number", "nan", "inf", "-1", "1e3", "  5", "0x10"):
+            with mock.patch.dict(os.environ, {"AIPAIR_CODEX_SINCE": bad}):
+                f, _ = pl.load("codex", self.CWD, show_tools=False)
+            self.assertIsNone(f, f"AIPAIR_CODEX_SINCE={bad!r} must fail closed, never the newest")
+
+
+class ProcIdentity(Base):
+    """Exact identity: peer-log resolves the pair's Codex by the rollout FILE its process holds
+    open (via the recorded @aipair-codex-pane), so it never depends on launch time at all."""
+    CWD = "/x/proj"
+
+    def test_ppid_from_stat_handles_comm_with_spaces_and_parens(self):
+        self.assertEqual(pl._ppid_from_stat("1234 (co)d ex) S 74009 1 1 0 -1"), 74009)
+        self.assertEqual(pl._ppid_from_stat("42 (bash) S 7 0"), 7)
+        self.assertIsNone(pl._ppid_from_stat("garbage without paren"))
+
+    def test_resolves_the_pane_codex_open_rollout_not_a_newer_unrelated_one(self):
+        ours = self.rollout("ours", self.CWD, "2026-08-21T00:00:00Z", 100)      # the pair's (older)
+        self.rollout("theirs", self.CWD, "2026-08-21T00:30:00Z", 900)           # newer, unrelated
+        def fake_tmux(*a):
+            if a[0] == "display-message" and a[-1] == "#{session_name}": return "aipair-x"
+            if a[0] == "show-options": return "%5"
+            if a[0] == "display-message": return "1000"                          # pane_pid
+            return None
+        with mock.patch.object(pl, "_tmux", side_effect=fake_tmux), \
+             mock.patch.object(pl, "_descendants", return_value={1000, 1001}), \
+             mock.patch.object(pl, "_open_rollouts", side_effect=lambda pid: [ours] if pid == 1001 else []), \
+             mock.patch.dict(os.environ, {"TMUX": "/tmp/sock"}):
+            self.assertEqual(pl.codex_via_pane(self.CWD), ours)
+
+    def test_returns_none_without_tmux_or_the_pane_option(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("TMUX", None)
+            self.assertIsNone(pl.codex_via_pane(self.CWD))                       # no TMUX → give up
+        def no_opt(*a):
+            return "aipair-x" if a[-1] == "#{session_name}" else None            # option unset
+        with mock.patch.object(pl, "_tmux", side_effect=no_opt), \
+             mock.patch.dict(os.environ, {"TMUX": "/tmp/sock"}):
+            self.assertIsNone(pl.codex_via_pane(self.CWD))
+
+    def test_codex_pick_prefers_pane_identity_over_the_launch_time_pin(self):
+        ours = self.rollout("ours", self.CWD, "2026-08-21T00:20:00Z", 300)      # what the process holds
+        self.rollout("since-earliest", self.CWD, "2026-08-21T00:10:00Z", 200)   # what codex_since would pick
+        with mock.patch.object(pl, "codex_via_pane", return_value=ours), \
+             mock.patch.dict(os.environ, {"AIPAIR_CODEX_SINCE": "1700000000"}):
+            self.assertEqual(pl._codex_pick(self.CWD, None), ours)
+
+    def test_codex_pick_falls_back_to_since_when_the_process_is_not_found(self):
+        pair = self.rollout("pair", self.CWD, "2026-08-21T00:10:00Z", 200)
+        self.rollout("before", self.CWD, "2026-08-21T00:00:00Z", 100)
+        with mock.patch.object(pl, "codex_via_pane", return_value=None), \
+             mock.patch.dict(os.environ, {"AIPAIR_CODEX_SINCE": str(epoch("2026-08-21T00:10:00Z"))}):
+            self.assertEqual(pl._codex_pick(self.CWD, None), pair)
 
 
 if __name__ == "__main__":
