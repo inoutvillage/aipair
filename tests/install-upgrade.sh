@@ -21,7 +21,8 @@ chk "[ $rc -eq 0 ]" "installer exits 0 (got $rc)"
 chk "[ ! -e '$TH/.local/bin/aipair-queue' ]" "stale aipair-queue removed from bin"
 chk "ls '$TH/.local/bin/'aipair-queue.removed-* >/dev/null 2>&1" "stale aipair-queue moved to .removed-*"
 chk "[ -f '$TH/.local/bin/aipair-corelib' ]" "aipair-corelib installed"
-chk "printf '%s' \"\$out\" | grep -q 'retired'" "installer reports the retirement"
+echo "$out" | grep -q "retired" && retired=1 || retired=0
+chk "[ $retired -eq 1 ]" "installer reports the retirement"
 chk "env -u TMUX HOME='$TH' '$TH/.local/bin/aipair-relay' --help >/dev/null 2>&1" "installed relay loads corelib (--help ok)"
 
 # --- retire FAILURE must fail the install (a dangerous stale binary left runnable is not ok) ---
@@ -37,7 +38,8 @@ else
   rc=0; out="$(env -u TMUX HOME="$TH2" bash "$REPO/aipair-install.sh" 2>&1)" || rc=$?
   chk "[ $rc -ne 0 ]" "retire mv failure → installer exits non-zero (got $rc)"
   chk "[ -e '$TH2/.local/bin/aipair-queue' ]" "stale aipair-queue is left in place on failure (not silently gone)"
-  chk "printf '%s' \"\$out\" | grep -qi 'could not retire'" "installer reports the retire failure"
+  echo "$out" | grep -qi "could not retire" && reported=1 || reported=0
+  chk "[ $reported -eq 1 ]" "installer reports the retire failure"
   chmod u+w "$TH2/.local/bin" 2>/dev/null || true; rm -rf "$TH2"
 fi
 
