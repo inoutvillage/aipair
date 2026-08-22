@@ -105,17 +105,21 @@ def _schema_probe_claude(records):
         if d.get("type") != "assistant" and inner_role != "assistant":
             continue
         if (d.get("type") == "assistant" and msg is not None and "stop_reason" in msg
-                and d.get("timestamp") is not None and d.get("uuid") is not None):
-            return ("ok", "assistant+stop_reason+timestamp+uuid 確認")
+                and d.get("timestamp") is not None and d.get("uuid") is not None
+                and "parentUuid" in d):
+            return ("ok", "assistant+stop_reason+timestamp+uuid+parentUuid 確認")
         # assistant-ish but not the shape the relay reads → remember the first concrete drift.
+        # claude_response_attributed walks BOTH uuid and parentUuid, so both are required.
         if d.get("type") != "assistant":
             drift = drift or "assistant メッセージだが type!='assistant'（型名ドリフト）"
         elif msg is None or "stop_reason" not in msg:
             drift = drift or "assistant に message.stop_reason が無い（完了検知不能）"
         elif d.get("timestamp") is None:
             drift = drift or "assistant に timestamp が無い"
-        else:
+        elif d.get("uuid") is None:
             drift = drift or "assistant に uuid が無い（応答帰属チェーン不能）"
+        else:
+            drift = drift or "assistant に parentUuid が無い（応答帰属チェーン不能）"
     return ("mismatch", drift) if drift else ("unverified", "完了 assistant ターン未確認")
 
 
