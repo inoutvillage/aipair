@@ -94,16 +94,18 @@ legacy_session_name() {
 # (`attach-session -c` rewrites it), which is why new sessions get the option.
 # Neither follows pane_current_path, which moves with any `cd` typed in a pane
 # (a session for /b/api whose pane cd'ed into /a/api must not be mistaken for
-# /a/api's pair and killed by `aipair stop /a/api`). list-sessions + string
-# match, because display-message, send-keys and set-option do not accept the
-# "=name" exact-target form (tmux 3.2a). Fields are separated by \x1f (not tab:
-# tab is IFS whitespace, so an empty @aipair-dir field would be swallowed).
+# /a/api's pair and killed by `aipair stop /a/api`).
+#
+# A `-f` client-side filter selects the one session named exactly $1, so we read
+# a single value per call and never split a multi-field line: tmux 3.4 escapes
+# control bytes in -F output (a \x1f separator comes back as the literal "\037"),
+# which silently broke an earlier one-line, \x1f-delimited parse. $1 is always an
+# aipair-generated name ([A-Za-z0-9_-]), safe to embed in the filter expression.
 session_dir_of() {
-  local name opt path
-  while IFS=$'\x1f' read -r name opt path; do
-    if [ "$name" = "$1" ]; then printf '%s' "${opt:-$path}"; return 0; fi
-  done < <(tmux list-sessions -F $'#{session_name}\x1f#{@aipair-dir}\x1f#{session_path}' 2>/dev/null)
-  return 0
+  local opt
+  opt="$(tmux list-sessions -f "#{==:#{session_name},$1}" -F '#{@aipair-dir}' 2>/dev/null | head -1)"
+  if [ -n "$opt" ]; then printf '%s' "$opt"; return 0; fi
+  printf '%s' "$(tmux list-sessions -f "#{==:#{session_name},$1}" -F '#{session_path}' 2>/dev/null | head -1)"
 }
 # Same directory? -ef compares device+inode, so spelling/case differences on
 # case-insensitive filesystems don't matter; the string fallback keeps a pair
