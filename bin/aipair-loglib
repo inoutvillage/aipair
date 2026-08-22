@@ -184,42 +184,40 @@ def codex_response_complete(path, probe):
 
 
 def claude_response_attributed(path, probe):
-    """最後の assistant エントリの parentUuid チェーンに nonce の user エントリが
-    含まれるか（= その完了ターンは poke を読んで走った応答か）。
+    """最後の assistant エントリの祖先チェーンに nonce の user エントリが含まれるか
+    （= その完了ターンは poke を読んで走った応答か）。
 
-    Claude Code は busy 中の投入を「実行中ターンへのターン内注入」または
-    「次ターンの入力」として扱うが、どちらでも応答側のエントリチェーンは
-    nonce エントリを祖先に持つ。タイムスタンプ比較と違いキュー順序に依存しない
-    （Codex レビュー指摘の UUID 対応付け）。
+    Claude Code は busy 中の投入を「実行中ターンへのターン内注入」または「次ターンの入力」
+    として扱うが、どちらでも応答側のエントリチェーンは nonce エントリを祖先に持つ。
+    タイムスタンプ比較と違いキュー順序に依存しない（Codex レビュー指摘の UUID 対応付け）。
 
     ★ context compaction の橋渡し（2026-08-23 実機バグ）: Claude Code は文脈圧縮時に
     `{type:"system", subtype:"compact_boundary", parentUuid:None}` の新ルートを書き、
-    parentUuid チェーンを**切断**する。境界より前の会話は継続スレッドへ要約され、境界の
-    後ろに新しい user/assistant がぶら下がる。そのため「poke → 圧縮 → 応答」の順に
-    なると、応答側チェーンは境界ルートで止まり pre-compaction の nonce に到達できず、
-    正当な応答が永久に棄却されてループが停止する（本セッションで実際に発生）。
-    → チェーンが compact_boundary に達し、かつ nonce エントリが**その境界より前の行**に
-    在れば（＝圧縮された文脈の一部＝現ターンが応答している対象）帰属とみなす。行位置で
-    判定するので、境界より後ろの別 nonce を取り違えない（その場合は通常のチェーン一致）。"""
-    entries = {}          # uuid -> parentUuid
-    boundary_pos = {}     # uuid -> 行位置（compact_boundary の system ルートのみ）
+    parentUuid チェーンを切断する。「poke → 圧縮 → 応答」の順だと応答側チェーンが境界ルートで
+    止まり pre-compaction の nonce に到達できず、正当な応答が永久に棄却されてループが停止する
+    （本セッションで実発生）。境界エントリは切れた parentUuid の代わりに **正確な圧縮前祖先**を
+    指す `logicalParentUuid` を持つ（実ログの全 compact_boundary で確認）。よって境界では
+    logicalParentUuid を親として通常の祖先探索を続ければ、位置ヒューリスティックのように別
+    ブランチの nonce を誤帰属せず、真の祖先だけを辿れる。logicalParentUuid が無い境界は
+    **fail-closed**（そこで打ち切り＝False 側）にする。"""
+    parent = {}           # uuid -> 次に辿る uuid（境界では logicalParentUuid、通常は parentUuid）
     last_assist_uuid = None
     nonce_uuid = None
-    nonce_pos = None
-    idx = -1
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
           for line in fh:
-            idx += 1
             try:
                 d = peerlog.json.loads(line)
             except ValueError:
                 continue
             u = d.get("uuid")
             if u:
-                entries[u] = d.get("parentUuid")
                 if d.get("type") == "system" and d.get("subtype") == "compact_boundary":
-                    boundary_pos[u] = idx
+                    # 圧縮は parentUuid を None にする。logicalParentUuid が真の祖先。
+                    # 欠落時は None のまま＝この境界で探索が止まる（fail-closed）。
+                    parent[u] = d.get("logicalParentUuid")
+                else:
+                    parent[u] = d.get("parentUuid")
             t = d.get("type")
             if t == "assistant":
                 last_assist_uuid = u
@@ -232,7 +230,6 @@ def claude_response_attributed(path, probe):
                               for b in (content or []) if isinstance(b, dict))
                 if hit:
                     nonce_uuid = u
-                    nonce_pos = idx
     except OSError:
         return False
     if not (last_assist_uuid and nonce_uuid):
@@ -242,9 +239,6 @@ def claude_response_attributed(path, probe):
     while u and u not in seen:
         if u == nonce_uuid:
             return True
-        # context-compaction の橋渡し: 境界ルートに達し、nonce がその境界より前なら帰属
-        if u in boundary_pos and nonce_pos is not None and nonce_pos < boundary_pos[u]:
-            return True
         seen.add(u)
-        u = entries.get(u)
+        u = parent.get(u)
     return False

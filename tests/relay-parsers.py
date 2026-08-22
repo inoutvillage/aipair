@@ -774,6 +774,12 @@ class SchemaProbe(unittest.TestCase):
         no_ts = [{"type": "assistant", "uuid": "u1",
                   "message": {"role": "assistant", "content": [], "stop_reason": "end_turn"}}]
         self.assertEqual(relay.schema_probe("claude", no_ts)[0], "mismatch")
+        # parentUuid removed → the attribution chain (claude_response_attributed) can't walk
+        no_parent = [{"type": "assistant", "timestamp": "t", "uuid": "u1",
+                      "message": {"role": "assistant", "content": [], "stop_reason": "end_turn"}}]
+        st, reason = relay.schema_probe("claude", no_parent)
+        self.assertEqual(st, "mismatch")
+        self.assertIn("parentUuid", reason)
 
     def test_claude_one_good_turn_wins_over_earlier_partials(self):
         # a bad-shaped record BEFORE a good one still resolves ok (one good line proves the schema)
@@ -1193,40 +1199,52 @@ class ResponseAttribution(unittest.TestCase):
         p = self.w("cl.jsonl", [self._cl_asst("a1", None)])
         self.assertFalse(relay.claude_response_attributed(p, "relay-id:zzz"))
 
-    def _compact(self, uuid):
-        # Claude Code's context-compaction root: a system entry with parentUuid None that
-        # SEVERS the chain (everything before it was folded into the continued thread).
-        return {"type": "system", "subtype": "compact_boundary", "uuid": uuid, "parentUuid": None,
-                "timestamp": "2026-08-21T00:10:00Z"}
+    def _compact(self, uuid, logical):
+        # Claude Code's context-compaction root: parentUuid is None (the chain is SEVERED), but
+        # logicalParentUuid points to the TRUE pre-compaction ancestor. Missing → fail-closed.
+        d = {"type": "system", "subtype": "compact_boundary", "uuid": uuid, "parentUuid": None,
+             "timestamp": "2026-08-21T00:10:00Z"}
+        if logical is not None:
+            d["logicalParentUuid"] = logical
+        return d
 
     def test_claude_attribution_bridges_a_compaction_boundary(self):
-        # poke → compaction → response: the answer's chain roots at the boundary and can NEVER
-        # reach the pre-compaction nonce. The bridge attributes it because the nonce sits before
-        # the boundary (= part of the compacted context). Real 2026-08-23 loop-stall bug.
+        # poke → compaction → response. parentUuid is severed at the boundary; logicalParentUuid
+        # points back into the pre-compaction thread, so the ancestry walk still reaches the
+        # nonce. Real 2026-08-23 loop-stall bug.
         p = self.w("cl.jsonl", [
-            self._cl_user("u1", "be015162", "next task relay-id:abcd"),   # nonce, pre-compaction
-            self._compact("BND"),                                          # compaction boundary
-            self._cl_user("u2", "BND", "<compaction summary continuation>"),
-            self._cl_asst("a1", "u2"), self._cl_asst("a2", "a1")])         # a2→a1→u2→BND (stops at BND)
+            self._cl_user("u1", None, "next task relay-id:abcd"),      # nonce (pre-compaction)
+            self._cl_asst("pre", "u1"),                                # pre-compaction response
+            self._compact("BND", "pre"),                               # logicalParentUuid → pre → u1
+            self._cl_user("u2", "BND", "<summary continuation>"),
+            self._cl_asst("a1", "u2"), self._cl_asst("a2", "a1")])     # a2→a1→u2→BND→(logical)pre→u1
         self.assertTrue(relay.claude_response_attributed(p, "relay-id:abcd"),
-                        "a response after a compaction must still attribute to a pre-boundary poke")
+                        "a response after compaction reaches a pre-boundary poke via logicalParentUuid")
 
-    def test_claude_bridge_only_for_a_nonce_before_the_boundary_it_hits(self):
-        # A poke delivered AFTER the boundary that is NOT the most-recent turn must not be
-        # falsely attributed: here the last assistant answers a later, different turn (wxyz),
-        # and abcd's own answer was an earlier assistant. abcd is after the boundary, so the
-        # position guard (nonce_pos < boundary_pos) is False → no bridge, and abcd is not in
-        # the last assistant's chain → correctly unattributed.
+    def test_claude_bridge_follows_logicalParentUuid_not_line_position(self):
+        # The nonce is on an OLD SIBLING branch that PRECEDES the boundary but is NOT its logical
+        # ancestor. A position heuristic ("nonce before boundary → attributed") would wrongly say
+        # True; following logicalParentUuid (→ the 'main' branch) correctly says False. This is
+        # the mis-attribution Codex flagged in the first (line-position) implementation.
         p = self.w("cl.jsonl", [
-            self._compact("BND"),                                          # line 0
-            self._cl_user("u1", "BND", "poke relay-id:abcd"),              # line 1 (after boundary)
-            self._cl_asst("a1", "u1"),
-            self._cl_user("u2", "BND", "a later different turn relay-id:wxyz"),
-            self._cl_asst("a2", "u2")])                                    # last asst a2→u2 (not u1)
+            self._cl_user("sib", None, "an unrelated old branch relay-id:abcd"),  # sibling nonce
+            self._cl_asst("main", None),                               # the real logical ancestor
+            self._compact("BND", "main"),                              # logicalParentUuid → main (not sib)
+            self._cl_user("u2", "BND", "<summary continuation>"),
+            self._cl_asst("a1", "u2")])                                # a1→u2→BND→(logical)main→None
         self.assertFalse(relay.claude_response_attributed(p, "relay-id:abcd"),
-                         "abcd is post-boundary and not in the last chain → not bridged")
-        self.assertTrue(relay.claude_response_attributed(p, "relay-id:wxyz"),
-                        "the turn actually being answered still matches via the normal chain")
+                         "a sibling-branch nonce not on the logicalParentUuid chain is NOT attributed")
+
+    def test_claude_bridge_fail_closed_without_logicalParentUuid(self):
+        # A compact_boundary with NO logicalParentUuid severs the chain irrecoverably → the walk
+        # stops at the boundary (fail-closed) rather than guessing.
+        p = self.w("cl.jsonl", [
+            self._cl_user("u1", None, "poke relay-id:abcd"),
+            self._compact("BND", None),                                # no logicalParentUuid
+            self._cl_user("u2", "BND", "<summary continuation>"),
+            self._cl_asst("a1", "u2")])                                # a1→u2→BND→None (stops)
+        self.assertFalse(relay.claude_response_attributed(p, "relay-id:abcd"),
+                         "a boundary without logicalParentUuid fails closed, not open")
 
     def test_claude_no_boundary_means_no_bridge(self):
         # Without a compaction boundary, a severed chain (root parentUuid None, non-boundary)
@@ -1235,7 +1253,7 @@ class ResponseAttribution(unittest.TestCase):
             self._cl_user("u1", None, "poke relay-id:abcd"),
             {"type": "system", "uuid": "S", "parentUuid": None, "timestamp": "2026-08-21T00:10:00Z"},  # NOT a compact_boundary
             self._cl_user("u2", "S", "later"),
-            self._cl_asst("a1", "u2")])                                    # a1→u2→S (S is not a boundary) 
+            self._cl_asst("a1", "u2")])                                    # a1→u2→S (S is not a boundary)
         self.assertFalse(relay.claude_response_attributed(p, "relay-id:abcd"))
 
     # ---- find_poke_ts / turn_texts ---------------------------------------------
