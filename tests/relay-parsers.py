@@ -157,6 +157,41 @@ class FindPanes(unittest.TestCase):
              mock.patch.dict(os.environ, {"TMUX_PANE": "%1"}):
             self.assertEqual(relay.find_panes("s"), {"claude": "%2"})
 
+    def test_codex_only_stamp_keeps_codex_and_infers_claude_from_the_rest(self):
+        # backward compat: a pair started before the claude/bridge stamps existed has ONLY
+        # @aipair-codex-pane. Codex stays pinned by its stamp; the genuinely-UNSET claude role is
+        # inferred from the remaining panes (not a hard fail). node/node is ambiguous to the
+        # heuristic, but codex is already locked to %2, so claude can only be %0.
+        rows = [("%0", "node", "x"), ("%1", "python3", "relay"), ("%2", "node", "y")]
+        listing = "\n".join("\t".join(r) for r in rows) + "\n"
+        stamps = {"@aipair-codex-pane": "%2"}   # claude stamp UNSET
+        def fake(*a, **k):
+            if a[0] == "list-panes":
+                return types.SimpleNamespace(stdout=listing)
+            if a[0] == "show-options":
+                return types.SimpleNamespace(stdout=stamps.get(a[-1], "") + "\n")
+            return types.SimpleNamespace(stdout="")
+        with mock.patch.object(relay.tmuxlib, "tmux", side_effect=fake), \
+             mock.patch.dict(os.environ, {"TMUX_PANE": "%1"}):
+            self.assertEqual(relay.find_panes("s"), {"codex": "%2", "claude": "%0"})
+
+    def test_a_stamp_pointing_at_the_relays_own_pane_is_unresolved(self):
+        # relay wrongly launched from the codex pane (%2). @aipair-codex-pane=%2 == self must NOT
+        # resolve codex to the relay's own pane (it would then monitor / poke itself). Codex is
+        # unresolved; claude (unset) is inferred from the rest.
+        rows = [("%0", "claude", "claude"), ("%2", "node", "codex")]
+        listing = "\n".join("\t".join(r) for r in rows) + "\n"
+        stamps = {"@aipair-codex-pane": "%2"}   # points at self
+        def fake(*a, **k):
+            if a[0] == "list-panes":
+                return types.SimpleNamespace(stdout=listing)
+            if a[0] == "show-options":
+                return types.SimpleNamespace(stdout=stamps.get(a[-1], "") + "\n")
+            return types.SimpleNamespace(stdout="")
+        with mock.patch.object(relay.tmuxlib, "tmux", side_effect=fake), \
+             mock.patch.dict(os.environ, {"TMUX_PANE": "%2"}):
+            self.assertEqual(relay.find_panes("s"), {"claude": "%0"})   # codex(self) unresolved
+
     def test_duplicate_stamps_leave_the_second_role_unresolved(self):
         rows = [("%0", "node", "x"), ("%1", "python3", "relay"), ("%2", "node", "y")]
         listing = "\n".join("\t".join(r) for r in rows) + "\n"

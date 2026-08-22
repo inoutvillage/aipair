@@ -30,56 +30,54 @@ def session_option(session, opt):
 
 
 def find_panes(session):
-    """Identify the claude/codex panes. Titles set by aipair ('claude'/'codex')
-    get overwritten by the CLIs at runtime, so fall back to the running command
-    and finally to aipair's layout order (claude, codex, bridge)."""
+    """Identify the claude/codex panes. Prefer the pane ids aipair stamped
+    (@aipair-claude-pane / @aipair-codex-pane) — deterministic, no title/command guessing
+    (Codex runs as `node`, titles get overwritten). Rules, per role:
+      - a live, unique stamp that is not the relay's own pane → RESOLVED (locked);
+      - a genuinely UNSET stamp → inferred from the remaining panes by the title/command/order
+        heuristic below (keeps old codex-only pairs working across an upgrade, and pure-legacy
+        sessions where neither stamp is set);
+      - a stamp that is dead / duplicate / points at self / unreadable → UNRESOLVED, and NOT
+        inferred, so the relay refuses to start rather than guess (it checks both roles present).
+    Applying self_pane to stamps too stops a relay wrongly started from an agent pane from
+    resolving that pane as an agent and then monitoring / poking itself."""
     out = tmux("list-panes", "-t", "=" + session,   # "=" = exact match: a prefix (aipair-ai)
                "-F", "#{pane_id}\t#{pane_current_command}\t#{pane_title}",   # must not hit aipair-aipair
                capture=True).stdout
-    live = {ln.split("\t", 1)[0] for ln in out.splitlines() if ln}
-    # Prefer the pane ids aipair stamped (@aipair-claude-pane / @aipair-codex-pane): deterministic,
-    # no title/command guessing (Codex runs as `node`, titles get overwritten). CRITICAL: the moment
-    # EITHER stamp exists this is a stamped session — the title/command heuristic is then forbidden,
-    # because on an ambiguous node/node layout it can REVERSE the roles. Honour only live, unique
-    # stamps; a missing / dead / duplicate / unreadable side is left UNRESOLVED so the relay refuses
-    # to start rather than guess (bin/aipair-relay checks claude+codex are both present). The plain
-    # heuristic runs only for a genuinely legacy session where NEITHER stamp is set.
-    stamp, any_set = {}, False
+    rows = [(ln.split("\t", 2) + ["", ""])[:3] for ln in out.splitlines() if ln]
+    live = {pid for pid, _, _ in rows}
+    self_pane = os.environ.get("TMUX_PANE")
+
+    resolved, used, unset_roles = {}, set(), []
     for role in ("claude", "codex"):
         try:
             pid = session_option(session, "@aipair-" + role + "-pane")
         except subprocess.CalledProcessError:
-            any_set = True          # query failed on a live session — anomalous, never read as "unset"
-            continue
-        if pid:
-            any_set = True
-            stamp[role] = pid
-    if any_set:
-        resolved, used = {}, set()
+            continue                       # query failed → unresolved (never inferred, never "unset")
+        if not pid:
+            unset_roles.append(role)       # genuinely unset → infer from the remaining panes
+        elif pid in live and pid != self_pane and pid not in used:
+            resolved[role] = pid           # live, unique, not self → locked
+            used.add(pid)
+        # else: dead / self / duplicate → unresolved (skipped; not inferred)
+
+    if unset_roles:
+        heur, leftovers = {}, []
+        for pid, cmd, title in rows:
+            if pid in used or pid == self_pane:
+                continue
+            t, cl = title.strip().lower(), cmd.strip().lower()
+            if "claude" in unset_roles and "claude" not in heur and (t.startswith("claude") or cl == "claude"):
+                heur["claude"] = pid
+            elif "codex" in unset_roles and "codex" not in heur and (t.startswith("codex") or cl == "codex"):
+                heur["codex"] = pid
+            elif cl not in ("bash", "zsh", "sh", "fish", "python3", "python"):
+                leftovers.append(pid)
         for role in ("claude", "codex"):
-            pid = stamp.get(role)
-            if pid and pid in live and pid not in used:
-                resolved[role] = pid
-                used.add(pid)
-        return resolved
-    self_pane = os.environ.get("TMUX_PANE")
-    panes, leftovers = {}, []
-    for line in out.splitlines():
-        pid, cmd, title = (line.split("\t", 2) + ["", ""])[:3]
-        if pid == self_pane:
-            continue
-        t, cl = title.strip().lower(), cmd.strip().lower()
-        if "claude" not in panes and (t.startswith("claude") or cl == "claude"):
-            panes["claude"] = pid
-        elif "codex" not in panes and (t.startswith("codex") or cl == "codex"):
-            panes["codex"] = pid
-        elif cl not in ("bash", "zsh", "sh", "fish", "python3", "python"):
-            leftovers.append(pid)
-    if "claude" not in panes and leftovers:
-        panes["claude"] = leftovers.pop(0)
-    if "codex" not in panes and leftovers:
-        panes["codex"] = leftovers.pop(0)
-    return panes
+            if role in unset_roles and role not in heur and leftovers:
+                heur[role] = leftovers.pop(0)
+        resolved.update(heur)
+    return resolved
 
 
 def own_pane(session):
