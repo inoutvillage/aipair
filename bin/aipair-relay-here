@@ -22,6 +22,7 @@
 #   AIPAIR_ENDLESS     連続モード(1でon)  AIPAIR_TASK_LIST / AIPAIR_NEXT_ASK / AIPAIR_ALL_DONE
 #   AIPAIR_GATE / AIPAIR_GATE_TIMEOUT / AIPAIR_GATE_ROUNDS  停止ゲート
 #   AIPAIR_ALLOW_UNTESTED_DIALOGS / AIPAIR_NO_VERSION_GATE  版ゲート
+#   AIPAIR_ALLOW_UNTESTED_SCHEMA / AIPAIR_NO_SCHEMA_PROBE  JSONL schema ゲート
 # 例: AIPAIR_MAX_ROUNDS=100 AIPAIR_ENDLESS=1 aipair-relay-here --print
 set -uo pipefail
 
@@ -202,6 +203,8 @@ truthy() {
 }
 if truthy "${AIPAIR_ALLOW_UNTESTED_DIALOGS:-}" && ! has_extra --allow-untested-dialogs; then ENV_ARGS+=(--allow-untested-dialogs); fi
 if truthy "${AIPAIR_NO_VERSION_GATE:-}"        && ! has_extra --no-version-gate;        then ENV_ARGS+=(--no-version-gate); fi
+if truthy "${AIPAIR_ALLOW_UNTESTED_SCHEMA:-}" && ! has_extra --allow-untested-schema; then ENV_ARGS+=(--allow-untested-schema); fi
+if truthy "${AIPAIR_NO_SCHEMA_PROBE:-}"        && ! has_extra --no-schema-probe;        then ENV_ARGS+=(--no-schema-probe); fi
 if [ -n "${AIPAIR_GATE:-}" ]         && ! has_extra --gate;         then ENV_ARGS+=(--gate "$AIPAIR_GATE"); fi
 if [ -n "${AIPAIR_GATE_TIMEOUT:-}" ] && ! has_extra --gate-timeout; then ENV_ARGS+=(--gate-timeout "$AIPAIR_GATE_TIMEOUT"); fi
 if [ -n "${AIPAIR_GATE_ROUNDS:-}" ]  && ! has_extra --gate-rounds;  then ENV_ARGS+=(--gate-rounds "$AIPAIR_GATE_ROUNDS"); fi
@@ -214,7 +217,8 @@ RELAY_ENV=()
 for v in AIPAIR_STOP AIPAIR_STOP_SIDE AIPAIR_MAX_ROUNDS AIPAIR_ENDLESS \
          AIPAIR_TASK_LIST AIPAIR_NEXT_ASK AIPAIR_ALL_DONE \
          AIPAIR_GATE AIPAIR_GATE_TIMEOUT AIPAIR_GATE_ROUNDS \
-         AIPAIR_ALLOW_UNTESTED_DIALOGS AIPAIR_NO_VERSION_GATE; do
+         AIPAIR_ALLOW_UNTESTED_DIALOGS AIPAIR_NO_VERSION_GATE \
+         AIPAIR_ALLOW_UNTESTED_SCHEMA AIPAIR_NO_SCHEMA_PROBE; do
   RELAY_ENV+=("$v=${!v-}")
 done
 CMD=(env "${RELAY_ENV[@]}" "$RELAY" --adopt --session "$SESSION" --dir "$DIR")

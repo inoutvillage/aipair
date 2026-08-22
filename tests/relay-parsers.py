@@ -725,6 +725,135 @@ class VersionGate(unittest.TestCase):
         self.assertFalse(a.no_plan_review or a.no_question_relay, "opt-in keeps them on")
 
 
+class SchemaProbe(unittest.TestCase):
+    """The JSONL schema feature-probe (corelib.schema_probe/schema_gate + relay.probe_log_schema):
+    the version gate only sees --version strings, so the core relay also probes the real
+    transcript keys it reads (claude: type==assistant + message.stop_reason + timestamp + uuid;
+    codex: type==event_msg + payload.type task_started/complete + timestamp). Only POSITIVE drift
+    (a record of the right kind missing the keyed sub-field) trips 'mismatch'; a bare/nascent log
+    stays 'unverified' so a fresh pair never false-alarms."""
+
+    def a(self, allow=False):
+        return types.SimpleNamespace(no_plan_review=False, no_question_relay=False,
+                                     allow_untested_schema=allow, schema_mismatch=False)
+
+    # a fully-shaped, completed Claude assistant turn (the exact shape claude_done_ts reads)
+    CLA_OK = [{"type": "assistant", "timestamp": "2026-08-22T00:00:00Z", "uuid": "u1",
+               "parentUuid": None,
+               "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}],
+                           "stop_reason": "end_turn"}}]
+    # a well-formed completed Codex turn
+    COD_OK = [{"type": "session_meta", "payload": {"cwd": "/x"}},
+              {"type": "event_msg", "timestamp": "t", "payload": {"type": "task_complete", "turn_id": "T1"}}]
+
+    def test_claude_ok_on_a_well_formed_turn(self):
+        st, _r = relay.schema_probe("claude", self.CLA_OK)
+        self.assertEqual(st, "ok")
+
+    def test_claude_empty_and_nascent_are_unverified(self):
+        # empty, and a log with only summary/user records (no assistant turn yet) → can't tell
+        self.assertEqual(relay.schema_probe("claude", [])[0], "unverified")
+        nascent = [{"type": "summary", "summary": "x"},
+                   {"type": "user", "message": {"role": "user", "content": "hello"}}]
+        self.assertEqual(relay.schema_probe("claude", nascent)[0], "unverified")
+
+    def test_claude_mismatch_positive_drift_only(self):
+        # renamed top-level type (inner role still assistant) → drift
+        renamed = [{"type": "agent", "timestamp": "t", "uuid": "u1",
+                    "message": {"role": "assistant", "content": [], "stop_reason": "end_turn"}}]
+        self.assertEqual(relay.schema_probe("claude", renamed)[0], "mismatch")
+        # stop_reason key removed from the assistant message → completion undetectable
+        no_sr = [{"type": "assistant", "timestamp": "t", "uuid": "u1",
+                  "message": {"role": "assistant", "content": []}}]
+        self.assertEqual(relay.schema_probe("claude", no_sr)[0], "mismatch")
+        # uuid removed → attribution chain impossible
+        no_uuid = [{"type": "assistant", "timestamp": "t",
+                    "message": {"role": "assistant", "content": [], "stop_reason": "end_turn"}}]
+        self.assertEqual(relay.schema_probe("claude", no_uuid)[0], "mismatch")
+        # timestamp removed
+        no_ts = [{"type": "assistant", "uuid": "u1",
+                  "message": {"role": "assistant", "content": [], "stop_reason": "end_turn"}}]
+        self.assertEqual(relay.schema_probe("claude", no_ts)[0], "mismatch")
+
+    def test_claude_one_good_turn_wins_over_earlier_partials(self):
+        # a bad-shaped record BEFORE a good one still resolves ok (one good line proves the schema)
+        mixed = [{"type": "assistant", "message": {"role": "assistant"}},  # missing keys
+                 self.CLA_OK[0]]
+        self.assertEqual(relay.schema_probe("claude", mixed)[0], "ok")
+
+    def test_codex_ok_on_complete_or_started(self):
+        self.assertEqual(relay.schema_probe("codex", self.COD_OK)[0], "ok")
+        started = [{"type": "event_msg", "timestamp": "t", "payload": {"type": "task_started", "turn_id": "T1"}}]
+        self.assertEqual(relay.schema_probe("codex", started)[0], "ok")  # same envelope proves it
+
+    def test_codex_nascent_is_unverified(self):
+        self.assertEqual(relay.schema_probe("codex", [])[0], "unverified")
+        only_meta_and_user = [{"type": "session_meta", "payload": {"cwd": "/x"}},
+                              {"type": "response_item", "payload": {"type": "message", "role": "user",
+                                                                    "content": [{"text": "hi"}]}}]
+        self.assertEqual(relay.schema_probe("codex", only_meta_and_user)[0], "unverified")
+
+    def test_codex_mismatch_positive_drift_only(self):
+        renamed = [{"type": "turn", "timestamp": "t", "payload": {"type": "task_complete", "turn_id": "T1"}}]
+        self.assertEqual(relay.schema_probe("codex", renamed)[0], "mismatch")   # not under event_msg
+        no_ts = [{"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "T1"}}]
+        self.assertEqual(relay.schema_probe("codex", no_ts)[0], "mismatch")
+
+    def test_unknown_agent_and_non_dicts_are_unverified(self):
+        self.assertEqual(relay.schema_probe("other", self.CLA_OK)[0], "unverified")
+        self.assertEqual(relay.schema_probe("claude", ["not a dict", 5, None])[0], "unverified")
+        self.assertEqual(relay.schema_probe("claude", None)[0], "unverified")
+
+    def test_schema_gate_mismatch_degrades_like_version_gate(self):
+        a = self.a()
+        rows, bad = relay.schema_gate(a, {"claude": ("mismatch", "x"), "codex": ("ok", "y")})
+        self.assertEqual(bad, ["claude"])
+        self.assertTrue(a.no_plan_review and a.no_question_relay, "dialogs off on schema drift")
+        self.assertTrue(a.schema_mismatch)
+        self.assertEqual([st for _n, st, _r in rows], ["mismatch", "ok"])
+
+    def test_schema_gate_unverified_never_trips(self):
+        a = self.a()
+        rows, bad = relay.schema_gate(a, {"claude": ("unverified", ""), "codex": ("unverified", "")})
+        self.assertEqual(bad, [])
+        self.assertFalse(a.no_plan_review or a.no_question_relay or a.schema_mismatch)
+
+    def test_schema_gate_allow_untested_keeps_dialogs_on(self):
+        a = self.a(allow=True)
+        rows, bad = relay.schema_gate(a, {"claude": ("mismatch", "x"), "codex": ("mismatch", "y")})
+        self.assertEqual(bad, ["claude", "codex"])
+        self.assertFalse(a.no_plan_review or a.no_question_relay or a.schema_mismatch,
+                         "opt-in acknowledges the drift and keeps automation on")
+
+    def test_probe_log_schema_reads_the_pinned_log(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            for d in self.CLA_OK:
+                fh.write(json.dumps(d) + "\n")
+            path = fh.name
+        try:
+            self.assertEqual(relay.probe_log_schema("claude", path)[0], "ok")
+        finally:
+            os.unlink(path)
+        # no pinned log / missing file → unverified, never a mismatch
+        self.assertEqual(relay.probe_log_schema("claude", None), ("unverified", "ログ未特定"))
+        self.assertEqual(relay.probe_log_schema("codex", "/no/such/file.jsonl")[0], "unverified")
+
+    def test_read_records_tails_and_skips_junk(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            fh.write("not json\n")                      # unparseable → skipped
+            fh.write(json.dumps("a bare string") + "\n")  # valid JSON but not a dict → skipped
+            for i in range(5):
+                fh.write(json.dumps({"type": "assistant", "i": i}) + "\n")
+            path = fh.name
+        try:
+            recs = relay.read_records(path)
+            self.assertEqual([d.get("i") for d in recs], [0, 1, 2, 3, 4])   # 7 lines → 5 dict records
+            self.assertEqual(len(relay.read_records(path, tail_lines=2)), 2)  # bounded to the tail
+        finally:
+            os.unlink(path)
+        self.assertEqual(relay.read_records("/no/such/file.jsonl"), [])
+
+
 class DialogSendScrape(unittest.TestCase):
     """aipair-dialoglib: multi-tab scrape, capture failure, plan revise/approve, question
     answer, watch present/absent. tmux/capture/delivery hooks are injected → patch there."""
@@ -829,7 +958,10 @@ class ModuleLayout(unittest.TestCase):
         for lib in ("corelib", "loglib", "tmuxlib", "deliverylib", "dialoglib", "peerlog"):
             self.assertTrue(hasattr(relay, lib), f"relay must load {lib}")
         self.assertIs(relay.parse_version, relay.corelib.parse_version)
+        self.assertIs(relay.schema_probe, relay.corelib.schema_probe)
+        self.assertIs(relay.schema_gate, relay.corelib.schema_gate)
         self.assertIs(relay.claude_done_ts, relay.loglib.claude_done_ts)
+        self.assertIs(relay.read_records, relay.loglib.read_records)
         self.assertIs(relay.find_panes, relay.tmuxlib.find_panes)
         self.assertIs(relay.poke, relay.deliverylib.poke)
         self.assertIs(relay.detect_plan_dialog, relay.dialoglib.detect_plan_dialog)
@@ -940,12 +1072,15 @@ class CorelibStandalone(unittest.TestCase):
         self.assertEqual(core.parse_version("2.1.238 (Claude Code)"), "2.1.238")
         self.assertTrue(core.hit_stop(["完了です。"], ["完了です"]))
         self.assertEqual(core.scrub_output("a\x00b"), "a b")
+        self.assertEqual(core.schema_probe("claude", [])[0], "unverified")   # pure, no relay needed
         self.assertEqual(core.TESTED_VERSIONS, relay.TESTED_VERSIONS)
 
     def test_relay_reexports_are_the_corelib_objects(self):
         # relay.X is bound to the corelib implementation (not a stale copy)
         self.assertIs(relay.parse_version, relay.corelib.parse_version)
         self.assertIs(relay.version_gate, relay.corelib.version_gate)
+        self.assertIs(relay.schema_probe, relay.corelib.schema_probe)
+        self.assertIs(relay.schema_gate, relay.corelib.schema_gate)
 
 
 class LoglibStandalone(unittest.TestCase):
@@ -955,11 +1090,13 @@ class LoglibStandalone(unittest.TestCase):
         ll = importlib.util.module_from_spec(importlib.util.spec_from_loader("loglib_standalone", loader))
         loader.exec_module(ll)                       # raises if it referenced relay-only globals
         self.assertTrue(callable(ll.claude_done_ts) and callable(ll.turn_texts))
+        self.assertTrue(callable(ll.read_records) and ll.read_records("/no/such/file") == [])
         self.assertEqual(ll.make_fragment("hello world", 5), relay.make_fragment("hello world", 5))
 
     def test_relay_reexports_are_the_loglib_objects(self):
         self.assertIs(relay.claude_done_ts, relay.loglib.claude_done_ts)
         self.assertIs(relay.turn_texts, relay.loglib.turn_texts)
+        self.assertIs(relay.read_records, relay.loglib.read_records)
 
 
 class ResponseAttribution(unittest.TestCase):

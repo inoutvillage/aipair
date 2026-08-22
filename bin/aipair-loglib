@@ -7,12 +7,35 @@
 import importlib.machinery
 import importlib.util
 import os
+from collections import deque
 
 # reuse peer-log's parsers (same SourceFileLoader pattern as aipair-relay)
 _PEERLOG = os.path.join(os.path.dirname(os.path.realpath(__file__)), "peer-log")
 _loader = importlib.machinery.SourceFileLoader("peerlog", _PEERLOG)
 peerlog = importlib.util.module_from_spec(importlib.util.spec_from_loader("peerlog", _loader))
 _loader.exec_module(peerlog)
+
+
+# --- schema feature-probe input --------------------------------------------- #
+def read_records(path, tail_lines=800):
+    """Decode the last `tail_lines` JSON objects from a jsonl/rollout transcript (skipping
+    unparseable lines), newest-biased and memory-bounded via a deque so the schema probe stays
+    cheap on a huge log. Returns a list of dicts; [] on a missing path or any OSError. Feeds
+    corelib.schema_probe (the relay composes them in probe_log_schema)."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = deque(fh, maxlen=tail_lines) if tail_lines else list(fh)
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            d = peerlog.json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(d, dict):
+            out.append(d)
+    return out
 
 
 # --- turn-completion detection --------------------------------------------- #

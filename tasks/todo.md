@@ -1,0 +1,233 @@
+# aipair — 外部コードレビュー（2026-08-21 受領）対応
+
+## チェックボックスの意味（endless relay が読むファイルなので厳密に）
+- `- [ ]` = **着手可**（承認済み・依存解消済み）。endless モードの Codex はここからだけ次を選ぶ
+- `- [x]` = 完了（検証済み）
+- **判断待ちはこのファイルに置かない** → `tasks/decisions.md`（`[?]` D1〜D3）。決まったら具体タスクに落としてここへ移す
+
+## 事実確認（確定）— レビュー 10 件、事実誤認ゼロ
+
+| # | 指摘 | 結果 | 根拠 |
+|---|---|---|---|
+| 1 | 既定で permission bypass 起動 | 事実 | `bin/aipair:91-92`（README:19-20 で告知あり）→ D1 |
+| 2 | queue が merge 前に本番 DB へ migrate deploy、expand-only 検証なし | 事実 | `bin/aipair-queue:204-217`, `:222-275` → D2 / F8 |
+| 3 | tmux セッション名が basename のみで衝突 | バグ | `bin/aipair:21-24`（導出は 1 箇所、relay 側は `#{session_name}` を読むだけ）→ F1 ✅ |
+| 4 | relay 102KB 単一ファイル | 事実 | 101,898 bytes / トップレベル def・class 55 → D3 |
+| 5 | tests / CI なし | 事実 | `tests/` `.github/` 不在 → F6 |
+| 6 | TUI 文字列依存・版ゲートなし | 事実 | `capture-pane` 14 箇所。README:61 の検証済み版表に実行時ゲートなし → F5 |
+| 7 | `BRIDGE_CMD` のクォート崩れ | 事実 | `bin/aipair:70,76-78` → F2 |
+| 8 | peer-log の毎周期 glob | 事実（指摘より悪い） | glob 後に全ファイル `getmtime` → 500 件 open、1.5 秒ごと（`bin/peer-log:66-68,269`）→ F3 |
+| 9 | グローバル CLAUDE.md / AGENTS.md 注入 | 事実 | `aipair-install.sh:39-40`（書き込み自体は marker/backup/検証付き）→ F7 |
+| 10 | 停止条件が Codex 自己申告（最終メッセージ冒頭 100 字） | 事実 | `bin/aipair-relay:885-895` → F4 |
+
+分割時に効く事実: queue が relay を `SourceFileLoader` でモジュール読み込み（`bin/aipair-queue:44-50`）／`aipair-relay-here:26` が `~/.local/bin/aipair-relay` をハードコード／installer は `bin/*` をフラット配置／`peer-log` と relay のログ探索は手動同期の重複コード（`bin/peer-log:50`）。
+
+## 着手可タスク（依存順）
+
+- [x] **F1. セッション名衝突の修正**（P0 バグ）— `bin/aipair`、回帰テスト `tests/session-name.sh`
+  - `aipair-<basename>-<正規化パスの sha1 先頭 12 桁>`（6 桁は約 5k ディレクトリで衝突が見つかったため 48 bit に）。正規化 = realpath + 大小文字を区別しない FS ではディスク上の綴りに統一（`canon_dir`: 各階層を `listdir` → NFC 正規化 + casefold 一致かつ `samefile` のエントリに置換。case-sensitive FS では完全一致が必ず存在するので `Case`/`case` は別のまま）。
+  - **既存セッションの所有者判定は、作成時にセッションへ stamp する user option `@aipair-dir`（正規化 DIR）を優先**し、それが無い旧形式セッションだけ `#{session_path}`（作成時 `new-session -c` の値。`attach-session -c` で書き換わるので新形式では使わない）に fallback。比較は `-ef`（dev+inode、文字列一致を fallback）。新形式セッションが同名でも別ディレクトリのものなら「hash collision」として `name`/`attach`/`stop` とも exit 1（触らない）。新形式が無い時だけ旧形式 `aipair-<basename>` を同じ照合で引き継ぐ。`pane_current_path` は可変なので不使用。
+  - tmux 3.2a の実測: `-t NAME` は前方一致 → has-session / list-panes / kill-session / attach は `=NAME` で完全一致。`set-option` / `display-message` / `send-keys` は `=` を受け付けないので、ペイン ID 指定か `list-sessions -F` の文字列完全一致で代替。
+  - Codex レビュー（2026-08-21〜22）で追加した回帰ケース: (a) 別 dir の旧セッションの pane が対象 dir に `cd` していても採用しない／`stop` で巻き込まない、(b) DrvFs の大小文字違いが同一名・ext4 の `Case`/`case` は別名、(c) 別綴り `-c` の旧セッションを `-ef` で引き継ぐ、(d) 新旧共存時は新形式優先、(e) 同名だが別 `session_path` の新形式セッション → `name`/`stop`/`attach` が「hash collision」で exit 1 し対象を殺さない、(f) 6 桁では衝突するパスの組（テスト内で birthday 探索で生成）が 12 桁では別名、(g) 新形式セッションに `attach-session -c 別dir` で `session_path` を書き換えても `@aipair-dir` により元 dir のセッションと識別され、別 dir 側も誤採用しない。
+  - テストの隔離: `set -euo pipefail`、一意 socket（`aipair-test-$$-$RANDOM`）、shim 経由の `#{socket_path}` を実 tmux `-L` の値と照合してから開始、cleanup は常に `"$REAL_TMUX" -L "$SOCKET" kill-server`（bare `tmux` を一切使わない）。
+  - 検証: `bash tests/session-name.sh` → 38 ケース全通過。並列 2 本同時実行も両方全通過（互いのサーバーに干渉しない）。本番ペア `aipair-aipair` / `aipair-iovillage-cms` は無傷。`script` が無い環境では実起動ケースを skip。
+- [x] **F2. シェル文字列組み立ての是正** — `bin/aipair` 起動セクション、回帰テスト `tests/launch-cmds.sh`
+  - 仕様（互換維持）: `AIPAIR_CLAUDE_FLAGS` / `AIPAIR_CODEX_FLAGS` は**ペインのシェルが解釈するシェル断片**（`"--model opus"` → 2 引数、`'--append-system-prompt "a b"'` の引用符も有効、空文字 = フラグ無し）。README に明記。
+  - それ以外の `AIPAIR_*`（`STOP` / `STOP_SIDE` / `MAX_ROUNDS` / `TASK_LIST` / `NEXT_ASK` / `ALL_DONE`）は bash 配列で組み立て、`q()` が必要な語だけ**シングルクォート包み**（`'it'\''s'`）にして 1 本の行にする。`printf %q` は不採用: C ロケールで `完了です` が `$'\345…'` になり画面で読めない。
+  - 起動行は `clear; env AI_SELF=… AI_PEER=… <cmd> …` 形式（Codex 指摘: fish に `export` は無い。`env` 接頭は sh/bash/zsh/fish 共通）。副作用: ペインのシェル自体には `AI_*` が残らない（エージェントとその子プロセスには渡る。人間がエージェント終了後に同じペインで `peer` を打つと両ログ表示の fallback）。
+  - 真偽値 env（`AIPAIR_ENDLESS` / `AIPAIR_DRY_RUN`）は `env_on()` で relay の `_env_bool` と同じ解釈（`strip().lower()` 後に `0/false/no/off` 以外が on）。`${v,,}` は macOS bash 3.2 で構文エラーなので `tr` で実装。以前は launcher が `AIPAIR_ENDLESS=0` でも `--endless` を付け relay の解釈を上書きしていたバグも同時に解消。
+  - `AIPAIR_DRY_RUN=1`: 3 ペインへ打ち込む行・セッション名・bridge タイトルを表示して終了（何も起動しない）。README の env 表に追加。
+  - 検証: `bash tests/launch-cmds.sh` → 34 ケース。表示行を**実際にシェルで評価**し、claude/codex/aipair-relay/peer-log/clear のシムが受け取った argv を比較。親環境の `AIPAIR_*`・`AI_*`・`TMUX`・`BASH_ENV` を全 unset（Codex の汚染環境再現 `AIPAIR_STOP=from-parent AIPAIR_ENDLESS=1 AIPAIR_MAX_ROUNDS=77` でも全通過）。インストール済みの各シェル（sh/dash/bash/zsh/fish）で同じ行を評価して argv 一致を確認する条件付きケース付き。`DRY_RUN` の on 5 値は dry run、off 4 値は私設 socket で実起動されることを確認。`tests/session-name.sh` 38 ケースも再実行して全通過。
+  - 未検証（仮説）: zsh / fish はこのマシンに無く skip（`sh` は bash への symlink）。fish 互換は公式ドキュメント（`export` 非対応、`env VAR=x cmd` 可）に基づく。入っている環境で `tests/launch-cmds.sh` を回せば自動で検証される。
+  - 範囲外メモ: `templates/vscode-tasks.json:71,86` の単体起動タスクは `bash -ic "export AI_SELF=… && claude --dangerously-skip-permissions"` のまま（bash 明示なので `export` は可。bypass 直書きの是正は D1 の対象）。
+- [x] **F3. Codex rollout 追従の修正 + 探索キャッシュ** — `bin/peer-log`（共有ロジック `CodexIndex`）、`bin/aipair-relay`（利用側）、テスト `tests/codex-follow.py`
+  - 欠陥 1（追従）: relay の `refresh_codex_lock` が `max(files)`（全体で最新 1 件）しか cwd 照合せず、別 cwd の Codex が動いている間は自分の cwd の新 rollout を永遠に見逃した（2026-08-21 に aipair / iovillage-cms の 2 ペア同時稼働で実際に踏める状態だった）。
+  - 欠陥 2（探索コスト）: `--watch`（1.5 秒周期）と relay（約 1 秒周期）が毎回 `glob` + 全 rollout の `getmtime` + ソートを繰り返していた（Codex 指摘で 1 回目の修正では 1 行目の `open` しかキャッシュしておらず未解消 → 2 回目で解消）。
+  - 修正（peer-log に集約し relay は `peerlog.` 経由で共用 → 手動同期の重複コードを解消）:
+    - `codex_cwd(path)`: rollout 1 行目（session_meta.cwd、書かれたら不変）を path → 正規化 cwd でキャッシュ。書きかけ（改行なし）はキャッシュせず再読、壊れた 1 行目は `""` で確定。
+    - `CodexIndex`（増分インベントリ）: 初回だけ全走査（glob + 全ファイル stat）、以後は **新しい rollout が現れうるディレクトリだけ**（sessions ルート／最新の年・月ディレクトリ／最新 2 日分の日ディレクトリ）を stat し、mtime が動いた時だけ list（ファイル作成は親ディレクトリの mtime を動かす。追記は動かさないが cwd は不変なので不要）。cwd ごとの新旧判定は**その cwd の直近 20 本だけ** stat（それより古いものは直近の全走査時の mtime）。安全網として 60 秒ごとに全再走査（想定外の場所に現れた rollout・`codex resume` で古い rollout に追記されたケース・消えたファイルの忘却はここで拾う）。mtime 粒度が粗い FS 向けに「2 秒以内に更新されたディレクトリは再 list」。監視ディレクトリは**存在しなくても `None` として監視し続ける**（sessions ルート未作成の新規マシン・空ルート・削除→再作成でも、出現を通常 poll で検知。Codex 指摘 3 回目で追加）。**消えたものを返さない 3 層**（Codex 指摘 4 回目）: 監視ディレクトリの消失は即 `full_scan()` で index を作り直す／日ディレクトリ再 list 時に消えたファイルを index から除去／監視外（キャッシュ mtime）の候補を返す前に必ず stat で存在確認し無ければ除去して再選択。`load()` は**探索（glob / stat / exists）を含む全体**を `OSError` で保護し、消えた場合 `(None, [])`（Claude 側 `claude_file` の glob→stat 競合も包含）。`codex_follow` は current の mtime 取得を `try` にし、消えていれば `codex_newest` で最初からやり直す（Codex 指摘 5 回目: `exists()` 直後の削除 TOCTOU）。
+    - `codex_newest(cwd, newer_than, limit, exclude)` / `codex_follow(cwd, current)`（`current` より新しい cwd 一致が現れた時だけ乗り換え。旧ファイルは消えないので消失検知は使わない）。`--watch` は agent ごとに pin を保持。relay の `refresh_codex_lock` → `codex_follow`、`lock_codex`（新セッション待ちの間 毎秒呼ばれる）→ `codex_newest(exclude=seen)`、adopt 走査 → `codex_newest`。
+  - 検証: `python3 tests/codex-follow.py` → 33 ケース全通過。追従（A 旧 / B 最新 / A 中間で A 中間へ、B に釣られない／A の新 rollout で乗り換え／書きかけ・壊れた 1 行目／`open` が増えない／`limit`／relay 3 関数）に加え、走査コスト: 300 本の他 cwd 履歴がある状態で**静かな 2 回目の poll は glob 0・listdir 0・stat ≤ 監視ディレクトリ数 + 自 cwd 2 本 + current**、履歴 301 本の cwd でも stat ≤ 監視ディレクトリ数 + 20、最新日ディレクトリの新ファイル／翌日ディレクトリの新ファイルは全走査なしで検知、古い日ディレクトリの新ファイルと resume 追記は全再走査で検知、消えたファイルは即スキップ→全再走査で忘却、ルート未作成／空／削除→再作成の 3 ケースは全再走査なしで検知、25 本（監視 20 本超）作成後のルート削除で `None` かつ `load()` 無例外→再作成を検知、監視外候補の消失で次候補へ、日ディレクトリ再 list での除去、読込直前の消失、`exists()` 直後の current 削除で次候補へ、`load()` が探索中の消失（codex / claude）で無例外。実アーカイブ（142 rollout）: cold 804 ms → **warm poll 1.14 ms / stat 7 / glob 0 / listdir 0**。実環境スモーク: `peer-log codex`・`peer-log both --watch`・`aipair-relay --help` OK。
+  - 注意: 稼働中の relay（`~/.local/bin`）は旧コード。次回のインストール（`aipair-install.sh`）で反映。
+- [x] **F6. テスト基盤** — `tests/run-all.sh`（一括ランナー）、`.github/workflows/ci.yml`、新規 `tests/relay-parsers.py`・`tests/queue-state.py`（先行の `session-name.sh` / `launch-cmds.sh` / `codex-follow.py` と合わせ 5 系統）
+  - `tests/run-all.sh`: 検査対象は **shebang で自動判別**（`aipair-install.sh` / `bin/*` / `tests/*` の bash → `bash -n` + `shellcheck -S warning`、python3 → compile。判別不能なスクリプトは FAIL、`bin/peer` や runner 自身を含む必須ファイルが集合に無ければ FAIL — Codex 指摘で `bin/peer` と runner 自身の漏れを修正）→ 全テスト（実行ループだけ runner 自身を除外）。shellcheck 未導入なら **skip を明示**、CI では必ず実行。1 つでも失敗で exit 1、各結果を summary に列挙。
+  - `.github/workflows/ci.yml`: push / PR で ubuntu-latest、`apt-get install tmux shellcheck` → `bash tests/run-all.sh`。
+  - `tests/relay-parsers.py`（23 ケース）: `hit_stop`（最終メッセージ冒頭 100 字のみ・ナレーション複数・文中言及で止まらない）／`_env_str|int|bool`（不正値は exit 2、真偽値は launcher と同じ）／`find_panes`（タイトル・コマンド・レイアウト順の fallback、自ペイン除外。`tmux()` をモック）／`detect_plan_dialog`（画面から番号を読む・bypass 優先・プランパス抽出・非表示時 None）／`detect_question_dialog` + `_question_block`（フッターが最終行の時だけ・Chat about this 必須・プラン優先・タブバー有無）／`claude_done_ts` / `codex_done_ts`（stop_reason / task_started→complete・`since`）／`parse_claude` / `parse_codex`（meta 除外・tool 表示・壊れ行）。
+  - `tests/queue-state.py`（6 ケース）: `next_task` は最初の top-level `- [ ]`（ネスト行は無視）／`[ ]`→`[>]`→`[x]` と `[!] 要人間` → 人間が `[ ]` に戻すと再投入／ユーザーの同時編集で行番号がずれても行内容一致で書換、未知行は False、末尾改行維持／欠損・空ファイル／`task_prompt` が行をそのまま含む。
+  - 実行: `bash tests/run-all.sh` → 5 系統すべて緑（34 + 38 checks、33 + 6 + 23 tests）。shellcheck はこのマシンに無い → Codex が 0.10.0 を一時展開して CI と同じ `-S warning` を実行し 5 件検出（SC2088 ×2 installer の表示用 `~`／SC2033 `attach()` 関数名が `tmux attach` と衝突／SC2046 `unset $(compgen …)`／SC2164 runner の `cd`）→ 全件修正（局所 disable は installer の表示文字列 1 箇所のみ、他は改名・ループ化・`|| exit 1`）。**修正後の shellcheck 再実行は Codex 側で確認**（私の環境では未実行）。
+  - README に「テスト・CI」節（各テストの対象と方式、TUI は fixture 固定で実 UI 変更時は fixture 更新）を追加。
+- [x] **F4. 停止条件に機械ゲート（opt-in）** — `bin/aipair-relay`（`--gate` / `--gate-timeout` / `--gate-rounds`、env `AIPAIR_GATE*`）、テスト `tests/relay-parsers.py` `StopGate`、README「停止ゲート」節 + env 表
+  - 停止ワード検知時（通常モードの claude/codex 側停止、endless のレビュー合格）に `--gate` のシェルコマンドを `--dir` で実行。成功なら従来どおり停止／次タスクへ（`gate_state.fails` を 0 に戻す＝endless ではタスクごとに上限）。失敗なら **Codex ではなく Claude に差し戻し**（出力末尾 40 行・1500 字を 1 行に畳んで添付。コンポーザへの入力は改行で送信されるため）。`--gate-rounds`（既定 3）回で **exit 6**（`aipair-queue` は非 0 を `[!] 要人間` にするので整合）。タイムアウト（既定 600 秒）は失敗扱い。
+  - 差し戻しは既存の配達経路を再利用: Codex 側停止では `msg_claude`/`back_text` を差し替えてダイアログ経由（plan / question）も含む通常の配達へ、Claude 側停止では Claude へ直接 poke して state を `claude` のまま維持。未指定（既定）は分岐に入らず挙動変更なし。
+  - 検証: `StopGate` 4 ケース（`run_gate` の成功/失敗/stdout+stderr/timeout/`--dir` で実行、`gate_tail` の 1 行化と上限、`gate_message` の内容、`gate_or_message` の状態機械: ゲート無し→通過／成功→通過＆カウンタ 0／失敗→差し戻し文＆カウント／上限で `(False, None)`／成功でリセット）。`bash tests/run-all.sh` 5 系統すべて緑。`aipair-relay --help` に表示。
+  - Codex レビュー（2026-08-22）で 4 点修正: (P0) タイムアウト時にゲートを **新プロセスグループ（`start_new_session=True`）で起動→`os.killpg` TERM→KILL**、`... & wait` の孫プロセスも道連れにする（`subprocess.run(timeout=)` はシェルしか殺さず孤児が残っていた）。(P1) ゲートは **正規化済み cwd** で実行（`gate_or_message(a, gate_state, cwd)`。生の `a.dir` だと引用符付き `~` で FileNotFoundError）。(P1) 差し戻し文中のコマンド表示も **1 行化 + 200 字上限**（複数行 `AIPAIR_GATE` が poke に改行を入れて途中送信されるのを防止）。(境界) `--gate-timeout` / `--gate-rounds` / `--max-rounds` / `--plan-rounds` / `--question-rounds` の **CLI 値も 1 以上を起動時検証**（argparse `type=int` は 0・負数を通す。env は `_env_int` が既に検証）。
+  - 追加テスト: プロセスグループ kill（marker が後から作られない）／正規化 cwd での実行／複数行コマンドが poke に改行を入れない／`CliBoundaries`（実スクリプトを subprocess 起動し、CLI・env の非正整数と不正 stop-side が exit 2）。`tests/relay-parsers.py` 33 ケース、`bash tests/run-all.sh` 5 系統すべて緑。
+  - Codex レビュー 2 巡目（2026-08-22）で 4 点修正: (P0) `_kill_group` は **TERM → 0.5s 猶予 → 無条件 SIGKILL → `proc.wait` で刈り取り**。`(trap '' TERM; sleep; touch marker) & wait` で親シェルだけ TERM 死→子が TERM 無視でも 0.25s で SIGKILL され marker が作られない（旧実装は killpg(pgid,0) がゾンビ親を「生存」と誤検知して 2s 空回り＋子が仕事を終える窓が残った）。(P1) ゲート出力は **別スレッドで drain しリングバッファで末尾 256KB のみ保持**（`yes` 系の無限出力で OOM しない・パイプ満杯で待ちが詰まらない。切り詰め時は先頭に明示）。(P1) 出力は **`errors="replace"` でデコード**（`printf '\377'` の非 UTF-8 でクラッシュしない）。(P2) **exit 6 を一元化**: relay の終了タイトル `reason[6]="停止ゲート失敗"`／`aipair-queue` の `RELAY_EXIT[6]`／README の終了コード表・タイトル例。
+  - Codex レビュー 3 巡目（2026-08-22）で 3 点修正: (P0) `run_gate` を **`try/finally` で timeout・KeyboardInterrupt・正常終了のいずれでも必ず `_kill_group`＋reader.join** するように。Ctrl-C は cleanup 後に **再送出**（別セッションのゲートを孤児化しない）。PGID は **Popen 直後に捕捉**して kill に使う（reap 後の pid 再利用グループへの誤送信を防止）。(P1) **バックグラウンドジョブを残してシェルが正常終了**（`(sleep 1; touch x) & true`）してもグループごと後始末。バッファは reader.join 後にのみ結合（同時変更を回避）。(P1) 出力を **`scrub_output` で無害化**: ANSI CSI/OSC/裸 ESC を除去、改行・タブ以外の制御文字を空白化 → `tmux send-keys` の `embedded null byte` と ESC のキー誤解釈を防ぐ。範囲は `unicodedata.category=="Cc"` 全体（C0＋**DEL 0x7f**＋**C1 0x80-0x9f**。`ord<32` だけでは DEL/C1 が漏れる — Codex 4 巡目指摘）。
+  - 未検証（仮説）: 実 TUI 上での差し戻し配達（poke 経路自体は既存のものを流用）。実機では `AIPAIR_GATE=false aipair loop` で「差し戻し → 3 回で exit 6」を確認するのが良い。
+- [x] **F5. 版ゲート** — `bin/aipair-relay`（`TESTED_VERSIONS` / `parse_version` / `detect_version` / `version_gate`、`--allow-untested-dialogs` / `--no-version-gate`、env `AIPAIR_ALLOW_UNTESTED_DIALOGS` / `AIPAIR_NO_VERSION_GATE`）、テスト `tests/relay-parsers.py` `VersionGate`、README「版ゲート」節 + env 表
+  - 起動時に `claude --version` / `codex --version` を取得（`--version` の出力から最初のドット区切り数値を抽出）。検証済み `TESTED_VERSIONS`（claude 2.1.238 / codex 0.149.0、README 表と一致）と**不一致または取得不可**なら、**プラン承認ダイアログと質問リレーの自動操作だけを OFF**（`a.no_plan_review` / `a.no_question_relay` を立てる）。**poke 往復・transcript 読取は継続**。起動バナーに各 CLI の版と OFF 理由を表示。
+  - オプトアウト: `--allow-untested-dialogs`（不一致でも自動操作を続行）、`--no-version-gate`（版チェック自体をしない）。既定は「不一致なら安全側に倒す」。gate は自動操作を OFF にするだけで、明示指定の `--no-plan-review` 等を ON に戻すことはない。
+  - 検証: `VersionGate` 6 ケース（`parse_version` の各形式・None／`detect_version` が binary 実行・FileNotFound・timeout で None／一致→ダイアログ ON のまま／不一致→両方 OFF・rows の status／取得不可→未検証扱い／`--allow-untested-dialogs` で ON 維持しつつ bad は報告）。実機の `claude`/`codex` で `detect_version` が実際に版を返すことも確認。`bash tests/run-all.sh` 5 系統すべて緑。
+  - Codex レビュー 2 巡目（2026-08-22）で 3 点修正: (P1) `parse_version` は **prerelease/build suffix を保持**（`2.1.238-beta.1` を検証済み `2.1.238` と別物として mismatch 扱い）。(P1) `detect_version` は **`returncode != 0` を取得不可（None）**に（`--version` が非 0 終了で stdout に数字があっても検証済み扱いしない）。(P1) 新 env（`AIPAIR_GATE*` / `AIPAIR_ALLOW_UNTESTED_DIALOGS` / `AIPAIR_NO_VERSION_GATE`）を **`bin/aipair`（loop 分岐）と `bin/aipair-relay-here`（ENV_ARGS）の両起動経路でフラグへ展開**（既存 tmux server は新セッションに env を継がせないため無言で無効になっていた。`AIPAIR_GATE*` も同じ穴だった）。`aipair-relay-here` に `AIPAIR_RELAY_BIN` 上書き（テスト用）も追加。
+  - 追加テスト: `tests/env-forward.sh`（**既存の private tmux server**に対し `aipair loop` と `aipair-relay-here --print` を実行し、relay が実際にフラグを受け取ることを確認 / 7 checks）、`VersionGate` に prerelease→mismatch・非 0 終了→None。`bash tests/run-all.sh` 6 系統すべて緑。
+  - Codex レビュー 3 巡目（2026-08-22）で 3 点修正: (P1) **stale env の打ち消し**: 既存 tmux server が古い `AIPAIR_*` を保持していると、現在値が空/0 でもペインに残って relay に読まれる（意図しないゲート実行・版ゲート無効化、stale な不正整数で `_env_int` が起動前に exit 2）。→ `bin/aipair`・`bin/aipair-relay-here` の両方で、relay が読む**全 `AIPAIR_*` を現在プロセスの値（未設定は空）で `env VAR=… relay …` として明示上書き**（フラグ変換に加えて）。(P2) `aipair-relay-here` の `truthy()` を **前後 trim のみ**に（`tr -d [:space:]` で全空白除去だと `"f alse"` を false 化して relay の `_env_bool` と食い違う）。(SC) `tests/env-forward.sh` の `AIPAIR_CLAUDE_FLAGS=` を `=''` に（ShellCheck SC1007）。テスト用に `aipair-relay-here` へ `AIPAIR_RELAY_BIN` 上書きを追加。
+  - 追加テスト（`tests/env-forward.sh` 14 checks）: relay シムが **argv と受領 env の両方をダンプ**し、(1) 現在値がフラグ＆env に伝わる、(1b) **既存 server の stale `AIPAIR_GATE='stale gate'`/`NVG=1`/`AUD=1` が現在の空値で打ち消され**、argv に `--gate` が出ず relay env も空、(2) `relay-here --print` の launch 行が env pin とフラグを含む、を確認。`bash tests/run-all.sh` 6 系統すべて緑。
+  - Codex レビュー 4 巡目（2026-08-22）で 3 点修正: (P1) parse_version を版トークン全体を捕捉する正規表現に（先頭は数字に接続しない d.d、末尾は必ず英数字＝区切りで終わらない）。2.1.238.1 / 2.1.238rc1 / 0.149.0.1 が検証済み 3 要素版へ切り詰められず mismatch になる。(P1) detect_version に errors="replace" を追加（非 UTF-8 の --version 出力で UnicodeDecodeError を出さず安全側＝取得不可へ）。(SC2034) tests/env-forward.sh の未使用変数 out を削除。
+  - 追加テスト: parse_version の 4 要素版・glued suffix（TESTED_VERSIONS.values() に含まれない）・末尾区切り、detect_version の非 UTF-8 出力。bash tests/run-all.sh 6 系統すべて緑（relay パーサ 49）。
+  - 注意: TESTED_VERSIONS と README「必要環境」表は手動同期。稼働中 relay は旧コード → 次回インストールで反映。
+
+  - Codex レビュー 5 巡目（2026-08-22）で 1 点修正: (P1) 非 UTF-8 の --version 出力を「取得不可」に。errors="replace" はデコード例外を防ぐだけで、置換後の文字列を解析すると検証済み数字が拾えてしまい docstring/契約（安全側＝取得不可）と矛盾していた。→ 出力に置換文字 U+FFFD が含まれたら parse せず None を返す。version_gate はこれを未検証扱いにしダイアログ自動操作を OFF。
+  - 追加テスト: 非 UTF-8 出力（U+FFFD 混じり）で detect_version が None、version_gate が両ダイアログを OFF。bash tests/run-all.sh 6 系統すべて緑（relay パーサ 50）。
+
+- [x] **F8. migration の allowlist ゲート** — `bin/aipair-queue`（`screen_migration_sql` / `screen_migration_files`、merge_phase フック、`--allow-unsafe-migrations`）、テスト `tests/migration-screen.py`、README + docstring
+  - D2 の結論に依らず、本番適用経路の防御として追加（`prisma migrate deploy` は破壊的で、コードが本番に出る前に本番 DB へ当たるため）。merge_phase が PR の migration `.sql`（`gh pr diff --name-only` の `prisma/migrations/*.sql`）を **適用前に検査**。違反なら `deploy_migrations` を呼ばず（本番 DB 未変更のまま）`[!] 要人間` 保留。
+  - 許可（追加系のみ）: `CREATE TABLE` / `ALTER TABLE … ADD COLUMN`（NOT NULL は DEFAULT 付きのみ・複数 ADD 可）/ `CREATE [UNIQUE] INDEX [CONCURRENTLY]` / `CREATE TYPE` / `ALTER TYPE … ADD VALUE` / `CREATE EXTENSION` / `COMMENT ON`。**それ以外は全拒否** — DROP・DROP COLUMN・`SET NOT NULL`・型変更・RENAME・TRUNCATE・DELETE/UPDATE・DEFAULT 無し必須列・`$$…$$` の**コード本体**（DO/CREATE FUNCTION 等、先頭キーワードが非許可なので拒否。`$$…$$` は文字列リテラルとして lex し、`COMMENT ON … IS $$…$$` のようなデータ用途は許可）・パースできない文字列・括弧不整合・構文不完全。SQL コメント（`--` / `/* */`）除去・`;` 分割は文字列リテラル内を除外・大小文字非依存。
+  - `--allow-unsafe-migrations` で検査スキップ（手動レビュー済みの時のみ）。
+  - 検証: `tests/migration-screen.py`（8 tests）— 許可 13・拒否 12 の SQL fixture、複文で 1 つでも違反ならファイル拒否・該当文を報告、空/コメントのみは vacuously OK、文字列内 `;` で分割しない、`screen_migration_files` の複数ファイル・違反ファイル特定・読めないファイルは拒否。`bash tests/run-all.sh` 8 系統すべて緑。
+  - Codex レビュー 2 巡目（2026-08-22, P0×2 + P1）で全面強化: (P0) 正規表現でなく **ステートフル lexer** に。文字列 `'…'`/識別子 `"…"`/コメント/`;`/`$$…$$` を状態遷移で処理し、リテラル内の `--`・`/* */`・`;`・キーワードに騙されない。トークン列で照合するので `ADD COLUMN "DEFAULT" … NOT NULL`（識別子 DEFAULT を DEFAULT 句と誤認）・`ADD CONSTRAINT …`（COLUMN でない）・`RENAME VALUE 'ADD VALUE'`（文字列内 ADD VALUE）を正しく拒否。閉じない引用符/コメントも拒否。(P1) **検査対象を PR head SHA に固定**: 内容をローカル作業ツリーではなく `git show <headRefOid>:<path>` で読む（`read_blob_at`）→ 検査。適用直前に `checkout <sha>`（`checkout_detached`）で作業ツリーを固定し、検査後・マージ直前の 2 箇所で head 未更新を再確認（動いていたら保留）。→ 検査＝適用＝マージが同一コミット。
+  - 追加テスト（`tests/migration-screen.py` 9 tests）: 敵対 5 種（コメント/引用符偽装・DEFAULT 識別子・ADD CONSTRAINT・RENAME VALUE）＋閉じない引用符/コメント、`read_blob_at` が **dirty worktree を無視して commit 内容を読む**（worktree を DROP に書き換えても検査は safe な commit を見る）。`bash tests/run-all.sh` 8 系統すべて緑。
+  - Codex レビュー 3 巡目（2026-08-22, P0 + P1×2）で更に強化: (P0) SHA 固定の **fail-open / TOCTOU** 解消 — head 取得失敗（`pr_head_sha=""`）も必ず保留、`gh pr merge` 全試行に **`--match-head-commit <head>`**（サーバ側で head 不一致なら拒否）、検査後・マージ直前の再確認も取得失敗を保留扱いに。(P1) `ADD COLUMN` が**非引用の bare identifier / schema-qualified table 名**も受理（`ALTER TABLE users ADD COLUMN age INTEGER` を通す。CONSTRAINT 等は文脈で拒否）。(P1) lexer/照合を**構文妥当性まで検証**: ブロックコメントの**ネスト**追従、各許可形式を**終端まで照合**（`CREATE TABLE DROP TABLE …`・`ADD VALUE`（値無し）・括弧不整合・余剰トークンを拒否）。dollar-quote は文字列リテラル扱い（DO/FUNCTION 本体は先頭キーワードで拒否）。
+  - 追加テスト: 許可 15・拒否 13 の構文 fixture、`MergePhaseHeadPinning`（gh/git をモックし、head 取得失敗・マージ直前の head 変更・再確認失敗はすべて保留かつ非マージ、安定 head は `--match-head-commit` 付きでマージ）。`tests/migration-screen.py` 13 tests、`bash tests/run-all.sh` 8 系統すべて緑。
+  - Codex レビュー 4 巡目（2026-08-22, P0 + P1）で更に強化: (P0) merge 後の成功判定を state だけでなく **MERGED かつ headRefOid == 固定 head** に。別主体が別コミットを外部マージして MERGED になっても成功扱いせず保留（`--merge` なので PR の headRefOid はマージされたコミットのまま＝判別可能）。(P1) 各許可形式を **canonical subset として終端まで消費**し、残余トークンを拒否（`_match_group` で対応する閉じ括弧位置まで消費 → 以降にトークンがあれば拒否）。`CREATE TABLE/INDEX/TYPE/EXTENSION/COMMENT ON … <balanced> DROP TABLE …`、`ADD COLUMN`（型必須・action verb 混入拒否）を全て拒否。
+  - 追加 fixture 7（残余トークン 5 + 型無し + DROP 混入）+ 5（composite/shell type・extension schema・COMMENT NULL・index USING）、`test_foreign_merge_of_a_different_head_is_not_success`。tests/migration-screen.py 14 tests、bash tests/run-all.sh 8 系統すべて緑。
+
+  - Codex レビュー 5 巡目（2026-08-22, P0 + P1×2 + テスト欠落）で更に強化: (P0) 検査対象を **deploy が実際に当てる pending 全件**に。head を先に checkout してから `prisma migrate status` の pending 集合（PR 分＋既存未適用）を parse（`parse_pending_migrations`）して全件検査（`screen_pending_migrations`）。PR 差分だけの検査だと main に残った破壊的 migration を見逃す。解釈不能な status は保留。read_blob_at は不要になり削除（checkout 後の作業ツリー＝deploy 対象を読む）。(P1) `_split_actions` が `[]` 深さも追跡し配列型/配列 DEFAULT（`TEXT[] DEFAULT ARRAY['a','b']`）を許可、末尾空 action を保持して `…INTEGER,` を拒否。`_parens_balanced` も `()`/`[]` 両方に。(P1) **危険動詞のグローバル拒否**（DROP/TRUNCATE/INSERT/GRANT/REVOKE/MERGE/DO/… がどこに出ても拒否）で `CREATE TABLE (DROP TABLE …)`・`CREATE INDEX(…DROP…)`・`COMMENT ON DROP TABLE …` を封鎖、COMMENT ON は対象種別も検証。
+  - テスト欠落を修正: 前回「追加した」と述べた余剰トークン 7 件が実際には fixture に入っていなかった（Codex 指摘）→ ALLOWED 24 / REJECTED 30 を全面書き直しし grep 確認。PendingSet（parse・up-to-date・解釈不能→保留・pending 全件検査で pre-existing DROP 捕捉）を追加。tests/migration-screen.py 17 tests、bash tests/run-all.sh 8 系統すべて緑。
+
+  - Codex レビュー 6 巡目（2026-08-22, P0 + P1×2 + P2）で修正: (P0) 直前の編集で **`prod_env` 定義が消えており migration PR は必ずクラッシュ**していた → 復元。さらに `deploy_migrations(cwd, env)` に変更し、merge_phase で `prod_env` を**一度だけ**取得して screen_pending_migrations と deploy_migrations に**同じ env** を渡す（別 DB を検査・適用しない）。(P1) pending parser を **fail-closed** に: 名前取得開始後の非空行が有効な ASCII migration 名でなければ（未知形式・非 ASCII 含む）`None` で保留、blank でリスト終端。(P1) **DELETE/UPDATE は `ON DELETE`/`ON UPDATE` の文脈のみ許可**（直前トークンが `ON` でない DELETE/UPDATE はどこでも拒否）→ `CREATE TABLE (DELETE FROM …)`・`CREATE INDEX(UPDATE …)` を封鎖。(P2) pending SQL 読み込みを `with open` + **strict UTF-8**（不正 UTF-8 は解析不能として保留、ResourceWarning も解消）。
+  - 追加テスト: FK の ON DELETE/UPDATE 許可、group 内 bare DELETE/UPDATE 拒否、parser の部分解釈/非 ASCII→保留、非 UTF-8 migration→保留、migration PR が merge_phase を通り screen と deploy に同一 env オブジェクトが渡ることを検証。tests/migration-screen.py 21 tests、bash tests/run-all.sh 8 系統すべて緑（`-W error::ResourceWarning` でも警告なし）。
+
+  - Codex レビュー 7 巡目（2026-08-22, P0 + P1×2 + P2）で修正: (P0) `migrate status` 判定を **fail-closed** に。`parse_pending_migrations(rc, text)` に rc を渡し、clean は **rc==0 かつ既知肯定文への行単位完全一致**（`_UP_TO_DATE`）のみ（`"…is not up to date!"` の部分一致を排除）。pending 一覧の後は footer allowlist と異常語（error/panic/truncat）を最後まで検証し、未知/異常行は保留。`deploy_migrations` の事後確認も共通 `migrate_status_clean` に統一。(P1) **`SET NOT NULL` を明示拒否**（`_ACTION_VERBS` に `SET` 追加 + `SET NOT NULL` 隣接のグローバル拒否）。(P1) localhost ガードを **URL パース + `ipaddress`** に（`urlsplit().hostname` を正規化し `localhost`/`127.0.0.0/8`/`::1` 等の loopback 全体を拒否、host 判定不能も安全側で拒否）。(P2) `prod_env` が `.env.production` の **不正 UTF-8 で `UnicodeDecodeError` を捕捉**して保留（キュー全体の例外終了を防止）。
+  - 追加テスト: SET NOT NULL 拒否、rc/行完全一致/footer 異常/truncation の status 判定、`migrate_status_clean` の rc 要件、loopback ガード（localhost/LOCALHOST/127.0.0.2/[::1] vs 本番ホスト）、prod_env の非 UTF-8 と loopback 拒否。tests/migration-screen.py 26 tests、bash tests/run-all.sh 8 系統すべて緑（ResourceWarning なし）。
+
+  - Codex レビュー 8 巡目（2026-08-22, P0 + P1）で更に強化: (P0) status 判定を全面 fail-closed に。異常語 `_STATUS_ANOMALY`（error/panic/truncat/fail/warning/could not/not up to date）を**出力全体**へ適用、pending header 時は**想定終了コード（rc==1）以外を拒否**（rc=-1/0/2/137 は保留）、footer は substring でなく **`_FOOTER_RE.fullmatch`**（`Warning: migrate deploy could not …` を通さない）。`migrate_status_clean` も rc==0＋既知肯定文の行完全一致＋異常語なし。(P1) loopback ガードを **PostgreSQL-URI aware** に: netloc から userinfo/port を除き **複数 host（`host1,host2`）を個別判定**、各 host は **percent-decode（`local%68ost`）・末尾ドット・`[::1]`・`*.localhost`・`socket.inet_aton` による IPv4 短縮/整数表記（`127.1`/`2130706433`）** を解決して 127.0.0.0/8・::1 を拒否。
+  - 追加テスト: rc 別 pending 保留、clean 行＋末尾 ERROR は非 clean、footer Warning 保留、loopback バイパス 11 種（localhost./foo.localhost/127.1/2130706433/local%68ost/多 host）と本番ホスト許可。tests/migration-screen.py 29 tests、bash tests/run-all.sh 8 系統すべて緑。
+
+  - Codex レビュー 9 巡目（2026-08-22, P0 + P1 + P2）で更に強化: (P0) footer を `to apply\b.*` の任意後続許可から **既知の文型のみ fullmatch**（`to apply (this|these|the)? (pending)? migrations,? run (the following command)?:?` 等）に。`To apply only the listed migrations; others were omitted` を保留。(P1) loopback ガードに **Unix-domain socket（decode 後の絶対パス host `%2Fvar%2Frun%2Fpostgresql`・`%2Ftmp`）** と **unspecified アドレス（`0.0.0.0`・`::`＝ローカル listener 到達）** を追加拒否（`ip.is_unspecified` + `inet_aton` 先頭 0）。(P2) 異常語検索の false-positive を解消: `_STATUS_ANOMALY` を**行頭アンカー/単語境界**（`^\s*(error|warning|panic|fatal)\b` + `\bcould not\b`/`\btruncat`/`\bnot up to date\b`）にし、裸の `fail` を排除。さらに **migration 名の区間を異常語検索から除外**（ヘッダ前と footer のみ検査）→ `20260822000000_add_failed_login_count` や host `db-failover.example.com` を誤拒否しない。
+  - 追加テスト: footer の任意後続文保留・正規 footer 許可、名前/host の `fail` 誤検知なし、loopback バイパス Unix socket 2 種 + `0.0.0.0`/`::`。tests/migration-screen.py 31 tests、bash tests/run-all.sh 8 系統すべて緑。
+
+  - Codex レビュー 10 巡目（2026-08-22, P0 + P1）で更に強化: (P0) footer 判定を `_is_footer_line`（2 つの exact 正規表現）に。実 Prisma の `To apply migrations in production run prisma migrate deploy.` 等の案内文を許可しつつ、コマンド行は **`[$ ] [npx|yarn|pnpm] prisma migrate deploy [.]` のみ**に限定 → `$ prisma migrate reset --force`・`$ rm -rf /`・`$ prisma migrate deploy && curl evil` を保留（旧 `\$ .*` の任意コマンド許可を排除）。(P1) ヘッダ前診断の異常語に **DB 状態の既知フレーズ**を追加（`failed migration`/`found failed`/`diverged`/`drift detected`/`migration history`/`not found locally`/`not in a valid state`）。Prisma は接続エラー・履歴 divergence・failed migration・通常 pending がいずれも rc=1 で終了コードでは区別できないため、フレーズで判定。空白入りフレーズなので名前 `…_add_failed_login_count` や host `db-failover…` は誤検知しない。
+  - 追加テスト: production footer 許可 + shell コマンド 3 種保留、DB 状態診断 6 種の保留。tests/migration-screen.py 33 tests、bash tests/run-all.sh 8 系統すべて緑。
+
+  - Codex レビュー 11 巡目（2026-08-22, P0×2）で更に強化: (P0) footer instruction が `prisma migrate (deploy|dev)` の両方を許可（Prisma の実出力は development 行『…run prisma migrate dev.』と production 行『…run prisma migrate deploy.』の 2 行併記）。(P0) loopback ガードが **`?host=` / `?hostaddr=` query パラメータ**も解析（`parse_qs`）: libpq/Prisma は `host` を Unix-domain socket ディレクトリとして使い netloc host を無視するため、`?host=/tmp`・`?host=%2Fvar%2Frun%2Fpostgresql`・`?hostaddr=127.0.0.1`/`::1` を拒否（`_host_is_loopback` を再利用）。通常の `?sslmode=require` や実ホスト指定は許可。
+  - 追加テスト: dev+prod 2 行 footer の許可、query host/hostaddr の loopback バイパス 4 種 + 通常 query 許可。tests/migration-screen.py 34 tests、bash tests/run-all.sh 8 系統すべて緑。
+
+  - Codex レビュー 12 巡目（2026-08-22, P1）で修正: loopback ガードの `?host=`/`?hostaddr=` 解析で **複数 host・空 host** を処理。`parse_qs(..., keep_blank_values=True)`（空 host= は libpq のデフォルト Unix socket＝local）＋各値をカンマ分割して全要素を `_host_is_loopback` に通す。`?host=db.prod,localhost`・`?host=db.prod,%2Ftmp`・`?hostaddr=10.0.0.5,127.0.0.1`・`?host=` を拒否、`?host=db.prod,other.prod` は許可。tests/migration-screen.py 34 tests、bash tests/run-all.sh 8 系統すべて緑。
+
+- [x] **F9. ペア内 tmux 操作のガードレール周知**（2026-08-21 の障害起点、`tasks/lessons.md` 参照）— `templates/claude-md-block.md` / `templates/codex-agents-block.md` / `.claude/skills/aipair-setup/SKILL.md`、回帰テスト `tests/broadcast-blocks.sh`
+  - 両周知ブロックの Notes に「ペア内で tmux を使うテストは専用サーバー（`tmux -L <名前>` / `-S`）必須。`$TMUX` が `TMUX_TMPDIR` より優先されるので `TMUX_TMPDIR` 隔離は効かない。引数無しの `tmux kill-server` は本番ペアを巻き込むので禁止、破壊前に `#{socket_path}` で確認」を追記。`aipair-setup` スキルに同趣旨の「安全メモ」節（`tasks/lessons.md` へのポインタ付き）。
+  - installer の marker ブロック更新で既存環境にも次回インストールで反映される。**temp HOME で `aipair-install.sh` を実走**し、guardrail が `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` の両方に入り、marker が各 1 対・「残りはバイト一致」検証を通ることを確認（smoke も自セッションのみ生成・撤収でペア無傷）。
+  - 回帰テスト `tests/broadcast-blocks.sh`（10 checks）: 両テンプレ＋スキルが `kill-server` / `tmux -L` / `tasks/lessons.md` を含み、marker が各 1 対であること。`bash tests/run-all.sh` 7 系統すべて緑。
+> **F7. グローバル CLAUDE.md / AGENTS.md 注入の縮小**（P2）は調査の結果、**社長判断が要る設計項目**と判明し `tasks/decisions.md` の **D4** へ移動（着手承認済みの `- [ ]` だけをこのリストに残すルールに従う）。
+> 調査結論: Claude は `--append-system-prompt-file` で aipair セッションにスコープ可能（動作確認済み）、Codex は per-session の綺麗な追記手段が無くグローバル/`AGENTS.md` 依存（非対称）。グローバル注入を削るのは既存ユーザーの挙動変更なので方針決定待ち。
+
+## D3 relay 分割（案A）— 残り増分（社長承認済み・順次実装）
+
+> 案B（純粋関数テスト網 = `tests/relay-parsers.py` 52 ケース）完了。案A は `bin/aipair-corelib` への
+> 抽出（増分1）を実施済み。残りを increment 単位の `- [ ]` にする。各 increment は「移設 → relay は
+> `SourceFileLoader` + 名前束ねで従来どおり呼ぶ → tests 緑 → installer に同梱 → smoke」を満たすこと。
+> 実戦投入済みの統合コードなので、tmux 結合が薄い順に、テストが緑を保つ範囲で少しずつ割る。
+
+- [x] **A2. ログ/ターン検出ヘルパの抽出** — `claude_done_ts` / `codex_done_ts` / `turn_texts` /
+  `find_poke_ts` / `codex_response_complete` / `claude_response_attributed` / `make_fragment` を
+  **`bin/aipair-loglib`**（peer-log を SourceFileLoader で読む・tmux 非依存）へ抽出。relay は名前束ねで従来どおり呼ぶ。
+  installer に配布/preflight/ロード確認を追加。`LoglibStandalone`（単体ロード + relay 再公開の同一性）と既存 `DoneTimestamps`/transcript テストで担保。end-to-end（temp HOME で installer→relay ロード→smoke）確認済み。relay-parsers 54 tests・9 系統緑。
+- [x] **A3. tmux ランナー/ペイン操作の抽出** — `tmux()` / `find_panes` / `own_pane` /
+  `current_session` / `capture_pane` / `pane_busy` / `cancel_copy_mode` / `set_pane_title` を
+  **`bin/aipair-tmuxlib`**（stdlib のみ・色定数不使用）へ抽出。relay は名前束ねで従来どおり呼ぶ。installer 配布/preflight/ロード確認 + README 追記。テスト: `TmuxHelpers`（`current_session` 正常/例外・`own_pane` の TMUX_PANE 有無/別セッション/例外・`cancel_copy_mode` の in-mode 分岐・`pane_busy` の fast path と差分 3 行境界・`capture_pane`/`set_pane_title`）、`TmuxlibStandalone`（単体ロード + 再公開同一性）。既存 `FindPanes` は tmuxlib.tmux へパッチ先修正。end-to-end（installer→relay ロード→smoke）確認済み。relay-parsers 71・9 系統緑。
+- [x] **A4. 配達（poke）の抽出** — `poke` / `submit_enter` / `paste_text` / `press` を **`bin/aipair-deliverylib`** へ。relay への循環 import なし。tmux 系（`tmux`/`cancel_copy_mode`/`pane_busy`）・`dim`・`dialog_on_screen`（`_dialog_on_screen`）・`BUSY_WAIT` を relay が**明示注入**（`deliverylib.X = …`、main で `deliverylib.BUSY_WAIT = max(60, a.busy_wait)`）。未注入 `tmux` は RuntimeError で明示。テスト `Delivery`（press/paste の copy-mode 解除、submit_enter の confirm/badge 成功・ダイアログ検知で Enter 中止・3 回再試行失敗、poke の nonce 確認で probe 返却・配達失敗で falsy かつ Enter 撃たない・busy 待機後続行／fake clock で高速化）、`DeliverylibStandalone`（単体ロード・安全既定・未注入 tmux 例外・再公開同一性）。installer/README 同梱。end-to-end 確認済み。relay-parsers 80・9 系統緑。
+- [x] **A5. ダイアログ検出/応答の抽出** — `detect_plan_dialog` / `detect_question_dialog` / `_question_block` / `scrape_questions` / `send_plan_feedback` / `send_question_answer`（+ `_dialog_on_screen`→`dialog_on_screen`・`newest_plan`）とダイアログ定数/正規表現（`PLAN_QUESTION` / `QUESTION_FOOTER` / `QUESTION_CHAT_LABEL` / `_OPT_RE` / `_SEP_RE`）を **`bin/aipair-dialoglib`** へ。relay 循環 import 無し。host が tmux/capture・配達（press/paste_text/submit_enter）・make_fragment・dim を注入。**`deliverylib.dialog_on_screen` を dialoglib の検出関数へ再ポイント**（A4 で relay._dialog_on_screen を注入していた箇所）。`PLAN_QUESTION` は relay の `claude_matches_pane` が使うため再公開。既存 Plan/Question fixture のパッチ先を `relay.dialoglib.*` に修正。テスト `DialogSendScrape`（2 タブ scrape・capture 失敗・plan revise（submit_enter+watch confirm）・plan approve（BTab+watch/badge/失敗）・question answer（watch 有無）／fake clock）、`DialoglibStandalone`（単体ロード・未注入例外・再公開同一性・deliverylib 再ポイント確認）。installer/README 同梱。end-to-end 確認。relay-parsers 88・9 系統緑。
+- [x] **A6. relay を薄いランチャ化（最終化）** — `main()` の状態機械 + オーケストレーション核（env 解析・色/ログ・log-locking + `LogWatch`・停止ゲート runner・poke 文面）は relay に残し、6 sibling モジュール（peer-log / corelib / loglib / tmuxlib / deliverylib / dialoglib）を先頭でロード・束ねる形に整理。relay docstring に **module layout** を明記。`aipair-relay-here` に **ライブラリ・ロード検証**（`"$RELAY" --help` で全 sibling の import を確認 → 不完全インストールは bridge ペインで crash させず relay-here 時点で loud に die）を追加。installer は 6 lib の配布/preflight/ロード確認済み。テスト: `tests/relay-here-libcheck.sh`（完全一式は load gate 通過・1 lib 欠落で非 0 + 「ロードできない」）、`ModuleLayout`（6 lib ロード・各代表 binding が lib 実装を指す・deliverylib→dialoglib 注入・核は relay に残存）。relay 当初 111KB→81KB / 30 defs。10 テスト系統緑。
+依存: A2 → A3 →（A4, A5 は A3 後・並行可）→ A6。**A2〜A6 すべて完了（D3 案A 完了）**。
+
+## 依存関係
+F1 ✅ → F2 ✅ → F3 ✅ → F6 ✅ → F4 ✅ → F5 ✅ → F9 ✅ → F8 ✅。**F7 は D4（社長判断待ち）へ移動**。D1〜D3（`decisions.md`）は方針確定後に具体タスク化してここへ追加。
+
+## レビュー
+- F1（2026-08-22、Codex 指摘 計 5 件 + 補足 1 件反映後）: `bin/aipair`・README 1 段落・`tests/session-name.sh` 新規。38 ケース全通過（逐次 + 並列 2 本）。
+  未検証（仮説）: tmux 内からの `switch-client -t =NAME`（ヘッドレスで実行不能。attach と同じ target-session 解決なので同挙動の見込み）／macOS APFS の NFC/NFD（コードは `unicodedata.normalize("NFC")` で対応、README では「未検証」と明記）。
+
+## 追記: マージ後のレビュー対応（CI 互換・診断）— すべて main マージ済み・CI 緑
+
+> F1〜F9 / D1〜D4 完了後、PR #1 を main へ入れた後の Codex レビューで判明した互換・診断の追対応。
+> いずれも todo の新規タスクではなくレビュー派生。記録のため完了ログとして残す。
+
+- [x] **tmux 3.4 互換**（PR #1 内で対応）— `list-sessions -F` が制御バイト（`\x1f`）を `\037` に
+  エスケープする挙動で `session_dir_of` のパースが破綻 → CI（ubuntu-24.04 / tmux 3.4）が赤。
+  区切り依存を排し、テスト用サーバの空落ち（exit-empty）と `kill-server`→`new-session` 競合にも対処。
+- [x] **tmux 3.1 の所有者/衝突ガード復活**（PR #2, main `5febec1`）— `list-sessions -f`・`#{session_path}`
+  は共に 3.2+（対応下限は 3.1）。3.1 で `-f` がエラー→握り潰しで `session_dir_of` が空を返し、legacy
+  採用だけでなく所有者・ハッシュ衝突チェックまで無効化されていた。区切りも `-f` も使わない単一経路
+  （`list-sessions -F '#{session_name}'` で厳密存在確認 → `display-message -p '#{@aipair-dir}'`/
+  `'#{session_path}'` の単値取得）に統一し 3.1〜3.4 全対応。回帰テスト [10]（tmux 3.1 をシムで再現）追加。
+- [x] **衝突診断に `@aipair-dir` 表示 + コメント/テスト修正**（PR #3, main `e21ac78`）— hash-collision の
+  inspect 行が `#{session_path}` のみで tmux 3.1 では所有者が見えなかった → `#{@aipair-dir}` を追加。
+  採番コメントを「@aipair-dir 優先」へ更新。`tests/session-name.sh` の未エスケープ `` `script` ``
+  （コマンド置換で `script` 起動しうる）を修正。
+
+## 外部レビュー #2（2026-08-22 受領）— トリアージ
+
+> 現行 main に対する2度目の外部レビュー（総合 7.0/10）。最優先の P0 のみ即対応・main マージ済み。
+> 残りは着手前に方針判断が要るもの（`[?]`→decisions 相当）と、承認済みで着手可のものを分ける。
+
+- [x] **P0. `peer` を起動ペアのセッションへ pin**（PR #4, main `aca462c`）— bin/aipair（Claude=`--session-id`、
+  Codex=`AIPAIR_CODEX_SINCE`）／bin/peer-log（uuid glob 解決・codex_since 最古 pin）／tests/peer-pin.py 13件。
+  README も更新（peer 説明・pin env・「6本」ドリフト修正）。
+
+### 残（未承認＝着手前に社長/ユーザー判断。ここでは記録のみ、自動着手対象にしない）
+- P1: `aipair loop` を既存セッションに対して実行すると relay を起動せず attach で終わる（しかも既存
+  Claude/Codex は unsafe で起動し直されない）。案: 既存ペアなら bridge で relay を開始 / または「既存
+  session には適用不可」と明示エラー。→ 挙動の選択が要る。
+- P1: 自走モードがフル権限バイパス必須。readonly / workspace-write のみ / push 禁止 等の中間モードが無い。
+  → Codex の `--sandbox`/approval 連携など設計判断が要る。
+- P1: 版ゲートが TUI 文字列にしか掛からず、JSONL schema（stop_reason/parentUuid/turn 検出など）依存の
+  コア relay は版不一致でも動き続ける。→ ゲート概念をコアへ拡張する設計。
+- P1: relay 分割の続き（本体まだ ~82KB。helper 5個を外した段階）。→ D3 案A 残り（メインループ移設）を
+  「触れた時に段階的に」。
+- P2: CI が ubuntu 単一＋実 CLI 無し。→ tmux/OS マトリクス、境界の E2E（実 claude/codex は困難）。
+- P2: tmux セッション作成の途中失敗に rollback（trap で partial session を kill）が無い。
+- P2: README と実装のドキュメントドリフト（今回「6本」は修正。他も棚卸し）。
+- P3: グローバル `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` 注入（D4 で現状維持決定済。レビューは再指摘）。
+
+## 外部レビュー #3（2026-08-22, 総合 7.5/10）— 優先4項目 + README 対応
+
+> `peer` の identity 修正後の再レビュー。最優先4項目を PR #8（main `156c66c`, CI 緑）で対応。
+
+- [x] **#1 relay の Codex 同定を peer-log と一本化**（最優先）— relay の adopt/lock/refresh を
+  `codex_via_pane(cwd) or <従来>` にし、identity を単一 source of truth 化（`peer` と `relay-here` が
+  別セッションを追う矛盾を解消）。非対応/未起動時のみ従来 mtime 方式へフォールバック。
+- [x] **#2 aipair-relay-here の cwd を `@aipair-dir` 基準に** — `--dir "$PWD"` を撤去、対象セッションの
+  `@aipair-dir`（無い旧セッションのみ $PWD）を正とし、明示 `--dir` で上書き可。
+- [x] **#3 既存ペアへの `aipair loop` を無言 attach → exit 3 でエラー誘導**（`aipair-relay-here` を案内）。
+- [x] **#4 起動を transactional 化** — `new-session` 直後に EXIT trap で kill、完成後に解除（build 途中
+  失敗で half-built セッションを残さない）。
+- [x] **#10 README の安全既定の矛盾修正** — 「既定で許可確認なし」を `--unsafe` 使用時の注意へ。
+
+### #1〜#4 の Codex レビュー派生の精緻化（マージ済み）
+- [x] PR #9 `167d879`: relay identity を解決済み pane に固定（TMUX_PANE 非依存）／一時失敗で drift しない／
+  session 完全一致（=name）／`--dir` を canonical 化。
+- [x] PR #10 `aaac803`: 初回 lock の mtime fail-open 停止／capability を明示 pane で安定化／非-/proc fallback を
+  `codex_since` で peer と共有／relay-here に canon_dir。
+- [x] PR #11 `cf03290`: `@aipair-codex-since` を peer-log 同等に検証（fail-closed）／必須メタデータ保存失敗を fatal 化。
+
+### 残（外部レビュー #3 の #5〜#12・着手可）
+- [x] **#5 `aipair status`＋ pane ID 保存**（main 反映予定）— 起動時に `@aipair-claude-pane` /
+  `@aipair-codex-pane` / `@aipair-bridge-pane` を必須メタデータとして保存（保存失敗は transactional trap で
+  ロールバック）。`find_panes` はこの記録を最優先（無ければ従来ヒューリスティック）＝Codex=node・タイトル
+  上書きへの依存を排除。`aipair status` サブコマンドで claude/codex/bridge の pane と running/idle を表示。
+- [x] **#6 版ゲートを JSONL schema の feature probe まで拡張** — `bin/aipair-corelib`（`schema_probe`/`schema_gate`）、`bin/aipair-loglib`（`read_records`）、`bin/aipair-relay`（起動バナー＋実行時 latch `schema_watch`、`--allow-untested-schema`/`--no-schema-probe`、env `AIPAIR_ALLOW_UNTESTED_SCHEMA`/`AIPAIR_NO_SCHEMA_PROBE`）、`bin/aipair`・`bin/aipair-relay-here`（env 転送＋stale 打ち消し）、テスト `tests/relay-parsers.py` `SchemaProbe`、README「版ゲート／schema ゲート」。
+  - 動機（レビュー #3 P1）: 版ゲートは `--version` 文字列しか見ず、**コア relay がログを「キー」で読む**（claude: `type=="assistant"`＋`message.stop_reason`＋`timestamp`＋`uuid`/`parentUuid`／codex: `type=="event_msg"`＋`payload.type` task_started/complete＋`timestamp`）依存はノーチェックだった。CLI 更新で版文字列が「検証済み」のままキーが移動するとターン検出が黙って壊れる。
+  - `schema_probe(agent, records)` は純関数（corelib）で 3 値 `ok`/`unverified`/`mismatch`。**積極的ドリフトのみ mismatch**（その種のレコードは在るのに relay が読むサブフィールドが欠落）＝空/生まれたてログは `unverified` で**ブロックしない**（起動直後の誤検知ゼロ）。claude は「型名ドリフト（inner role=assistant だが type≠assistant）／stop_reason 欠落／timestamp 欠落／uuid 欠落」、codex は「task 事件が event_msg 外／timestamp 欠落」を検出。1 本でも整形式なら即 ok。
+  - 起動時は明示 pin（`--claude-log`/`--codex-log`）だけ probe できる（`aipair loop` はログ未生成→`unverified`）。実運用のドリフトは**実行時 latch**が拾う: メインループ先頭で `schema_watch()` が tracked ログを bounded tail 読み（`read_records`＝deque で末尾800行・メモリ有界）→ probe、エージェントごとに一度だけ latch。`mismatch` で大きく警告＋ベル、`--allow-untested-schema` 未指定なら版ゲートと同じ安全姿勢（ダイアログ自動操作 OFF・`a.schema_mismatch`）。
+  - 検証: `SchemaProbe` 15 ケース（claude/codex の ok・空/nascent=unverified・各ドリフト=mismatch・1本先勝ち・schema_gate の劣化/unverified 不発/allow・`probe_log_schema`/`read_records` の tail・junk スキップ・欠損=unverified）。**実データ**（本セッションの claude jsonl・codex rollout）で ok＝誤検知ゼロを確認。`tests/env-forward.sh`（14→**28 checks**）で新 env 2 本の転送＋stale 打ち消しを確認。`bash tests/run-all.sh` 10 系統すべて緑（relay パーサ 108）。
+  - 派生（同 PR・private-socket 衛生の完遂）: `tests/env-forward.sh`・`tests/session-name.sh` の cleanup が private `-L` **socket ファイルも削除**するように（従来は `kill-server` のみで死んだ socket inode が /tmp に蓄積＝`tasks/lessons.md` ガードレール）。PR #17 が install テストで行った隔離を残り 2 テストへ展開し、`run-all` 全体が private socket をゼロリーク。既定 server は前後 4 セッションで不変。
+  - 注意: `TESTED_VERSIONS` と README「必要環境」表は手動同期のまま。稼働中 relay は旧コード→次回インストールで反映（installer は corelib/loglib を配布済み）。
+- [ ] #7 `aipair-relay`（~81KB）を通常の Python package 化（SourceFileLoader 依存注入からの脱却）。
+- [ ] #8/#9 CI を実 CLI の nightly smoke/E2E ＋ Python 3.8/tmux 3.1 の matrix に。
+- [x] **#11 installer の global 注入 opt-out**（main 反映予定）— `--no-global-instructions`（＋env
+  `AIPAIR_NO_GLOBAL_INSTRUCTIONS=1`）で `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` への注入をスキップ
+  （既存ブロックは非破壊）。usage/README/install-upgrade テスト追加。
+
+  - Codex レビュー派生（マージ済み）: PR #16 `ab03cd3` opt-out を CI で検証する `tests/install-global-optout.sh`（claude/codex を `--version` 応答する shim にして global-instructions 分岐を実走）＋ installer の env bool を `bin/aipair` の `env_on` と同じ正規化（trim + lowercase）に統一。PR #17 `4069ff8` 両 install テスト（`install-global-optout.sh` / `install-upgrade.sh`）の installer smoke を **専用 private tmux socket（`-L`）** に隔離（実 tmux を一意 socket へ転送する wrapper を shim ディレクトリに追加し `#{socket_path}` を検証してから実行・後始末で kill-server + socket 削除）→ 既定/本番 server を一切触らない（`tasks/lessons.md` ガードレール）。両 CI 緑。
+- [ ] #12 `SECURITY.md` / README に threat model（`--unsafe`・ログ読取・tmux 入力注入・自律編集の境界）。

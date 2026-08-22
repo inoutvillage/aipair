@@ -269,6 +269,8 @@ if [ "$cmd" = loop ]; then
   # every AIPAIR_* the relay reads from the environment must be expanded onto its argv.
   env_on "${AIPAIR_ALLOW_UNTESTED_DIALOGS:-}" && bridge+=(--allow-untested-dialogs)
   env_on "${AIPAIR_NO_VERSION_GATE:-}"        && bridge+=(--no-version-gate)
+  env_on "${AIPAIR_ALLOW_UNTESTED_SCHEMA:-}" && bridge+=(--allow-untested-schema)
+  env_on "${AIPAIR_NO_SCHEMA_PROBE:-}"        && bridge+=(--no-schema-probe)
   [ -n "${AIPAIR_GATE:-}" ]         && bridge+=(--gate "$AIPAIR_GATE")
   [ -n "${AIPAIR_GATE_TIMEOUT:-}" ] && bridge+=(--gate-timeout "$AIPAIR_GATE_TIMEOUT")
   [ -n "${AIPAIR_GATE_ROUNDS:-}" ]  && bridge+=(--gate-rounds "$AIPAIR_GATE_ROUNDS")
@@ -312,7 +314,8 @@ CODEX_LINE="clear; env AI_SELF=codex AI_PEER=claude $PAIR_PINS codex $CODEX_FLAG
 RELAY_ENV_VARS=(AIPAIR_STOP AIPAIR_STOP_SIDE AIPAIR_MAX_ROUNDS AIPAIR_ENDLESS
                 AIPAIR_TASK_LIST AIPAIR_NEXT_ASK AIPAIR_ALL_DONE
                 AIPAIR_GATE AIPAIR_GATE_TIMEOUT AIPAIR_GATE_ROUNDS
-                AIPAIR_ALLOW_UNTESTED_DIALOGS AIPAIR_NO_VERSION_GATE)
+                AIPAIR_ALLOW_UNTESTED_DIALOGS AIPAIR_NO_VERSION_GATE
+                AIPAIR_ALLOW_UNTESTED_SCHEMA AIPAIR_NO_SCHEMA_PROBE)
 if [ "$cmd" = loop ]; then
   bridge_env=(AI_SELF=bridge)
   for v in "${RELAY_ENV_VARS[@]}"; do bridge_env+=("$v=${!v-}"); done
