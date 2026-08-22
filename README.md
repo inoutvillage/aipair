@@ -210,10 +210,16 @@ peer-log codex --full      # セッション全体
 
 `peer-log` の主なオプション: `--dir DIR`（既定 cwd）・`--last N`・`--full`・`--tools`・`--watch`・`--no-color`。
 
-> **ペア相手への固定**: `aipair` は起動時に相手セッションを pin する（Claude は固定の `--session-id`、Codex は起動 epoch）。
-> これにより `peer` は**同じ作業ディレクトリで別の Claude/Codex が動いていても**、起動したペアの相手だけを読む。
-> pin は環境変数 `AIPAIR_CLAUDE_SESSION` / `AIPAIR_CODEX_SINCE` で運ばれる（通常は自動。下の表参照）。
-> aipair 外で素の `peer-log` を使う場合は pin が無いので従来どおり「その cwd の最新セッション」を読む。
+> **ペア相手への固定**: `aipair` は起動時に相手セッションを pin する。
+> - **Claude は厳密**: 固定の `--session-id <uuid>` で起動し、ログは `<uuid>.jsonl` に確定する。
+>   同じ作業ディレクトリで別の Claude が動いていても、`peer` はそのペアの Claude だけを読む。
+> - **Codex は起動時刻ベース**（Codex に session-id 指定フラグが無いため）: 起動時刻（高精度 epoch）を
+>   stamp し、`peer` は「その cwd で**起動時刻以降に開かれた最古**の rollout」を読む。これで**起動前から
+>   動いていた別 Codex は確実に除外**される。残る唯一の曖昧さは、**起動直後の同一 cwd で別 Codex が
+>   立ち上がる**狭い競合窓（識別する id が無い）。実運用ではまず起きないが、厳密保証は Claude 側のみ。
+> - pin は環境変数 `AIPAIR_CLAUDE_SESSION` / `AIPAIR_CODEX_SINCE` で運ぶ（通常は自動。明示指定は検証され、
+>   UUID / 数値でなければ起動を拒否＝不正値でのセッション混線を防ぐ）。下の表参照。
+> - aipair 外で素の `peer-log` を使う場合は pin が無いので従来どおり「その cwd の最新セッション」を読む。
 
 ---
 
@@ -247,8 +253,8 @@ peer-log codex --full      # セッション全体
 | `AIPAIR_GATE` | （未設定＝無し） | **停止ゲート**: 停止ワード検出後に実行するシェルコマンド（例 `npm test`）。成功した時だけ停止／次タスクへ。失敗は出力を添えて Claude に差し戻す（→ 下の「停止ゲート」） |
 | `AIPAIR_GATE_TIMEOUT` / `AIPAIR_GATE_ROUNDS` | `600` / `3` | ゲートのタイムアウト秒／差し戻しの上限回数（到達で relay は exit 6） |
 | `AIPAIR_ALLOW_UNTESTED_DIALOGS` | （未設定＝off） | `1` で、claude/codex が検証済み版と違っても**プラン承認・質問リレーの自動操作を続ける**（既定は不一致なら自動 OFF。→「版ゲート」） |
-| `AIPAIR_CLAUDE_SESSION` | （自動＝新規 uuid） | `peer` を起動ペアの Claude に固定する内部 pin。この id で `claude --session-id` を起動し、ログ `<id>.jsonl` を一意に指す。明示指定で上書き可（通常は不要） |
-| `AIPAIR_CODEX_SINCE` | （自動＝起動時の epoch 秒） | `peer` を起動ペアの Codex に固定する内部 pin。Codex には session-id 指定が無いため、この epoch 以降に開かれた最古の rollout を「そのペアの Codex」とみなす。明示指定で上書き可（通常は不要） |
+| `AIPAIR_CLAUDE_SESSION` | （自動＝新規 uuid） | `peer` を起動ペアの Claude に固定する内部 pin。この id で `claude --session-id` を起動し、ログ `<id>.jsonl` を一意に指す（厳密固定）。明示指定は**UUID でなければ起動拒否**、peer-log 側も不正値なら fail-closed。通常は不要 |
+| `AIPAIR_CODEX_SINCE` | （自動＝起動時の高精度 epoch） | `peer` を起動ペアの Codex に固定する内部 pin。Codex に session-id 指定が無いため、この epoch 以降に開かれた最古の cwd 一致 rollout を「そのペアの Codex」とみなす（起動前の別 Codex は除外。残る競合は上記「ペア相手への固定」参照）。明示指定は**数値でなければ起動拒否**、peer-log 側も不正値なら混線させず何も読まない（fail-closed）。通常は不要 |
 | `AIPAIR_NO_VERSION_GATE` | （未設定＝off） | `1` で起動時の版チェック自体をしない |
 
 `AIPAIR_*_FLAGS` 以外の値は**そのまま 1 引数**として relay に渡る（`'`・空白・`$`・`;` を含んでも壊れない。launcher がシングルクォートで包む）。
