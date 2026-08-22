@@ -341,6 +341,9 @@ tmux set -t "$CLAUDE" @aipair-dir "$DIR"          # owner stamp, read by session
 # swallowing it (a silent miss would drop peer back to the weaker launch-time pin).
 tmux set -t "$CLAUDE" @aipair-codex-pane "$CODEX" 2>/dev/null \
   || echo "aipair: warning: could not record @aipair-codex-pane; peer falls back to the launch-time Codex pin" >&2
+# The same launch epoch peer reads from AIPAIR_CODEX_SINCE, saved on the session so the relay
+# uses the IDENTICAL Codex picker (codex_since) in the non-/proc fallback — peer and relay agree.
+tmux set -t "$CLAUDE" @aipair-codex-since "$PAIR_SINCE" 2>/dev/null || true
 tmux set -t "$CLAUDE" pane-border-status top >/dev/null 2>&1 || true
 tmux set -t "$CLAUDE" mouse on >/dev/null 2>&1 || true
 

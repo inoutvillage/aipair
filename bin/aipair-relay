@@ -364,13 +364,47 @@ def lock_claude(cwd, seen, pane, baseline):
     return fresh[0] if fresh else None
 
 
+# The pair's launch epoch (peer's AIPAIR_CODEX_SINCE), read once from the session option
+# @aipair-codex-since. Lets the relay share peer's EXACT fallback picker (codex_since) when
+# /proc identity is unavailable (macOS), so the two never diverge onto different Codex sessions.
+_CODEX_SINCE_EPOCH = None
+
+
+def read_codex_since(session):
+    global _CODEX_SINCE_EPOCH
+    try:
+        v = tmuxlib.tmux("show-options", "-t", session, "-qv", "@aipair-codex-since",
+                         capture=True).stdout.strip()
+        _CODEX_SINCE_EPOCH = float(v) if v else None
+    except (subprocess.CalledProcessError, ValueError):
+        _CODEX_SINCE_EPOCH = None
+
+
+def codex_fallback(cwd, tracked_or_none, seen=None):
+    """Non-/proc Codex picker. When the launch epoch is known, use codex_since — the SAME pick
+    peer makes — so peer and relay agree on macOS. Legacy sessions without the epoch keep the old
+    behaviour (lock: newest-unseen; refresh: follow-newer)."""
+    if _CODEX_SINCE_EPOCH is not None:
+        return peerlog.codex_since(cwd, _CODEX_SINCE_EPOCH)
+    if seen is not None:
+        return peerlog.codex_newest(cwd, exclude=seen)
+    return peerlog.codex_follow(cwd, tracked_or_none)
+
+
 def lock_codex(cwd, seen, pane):
     """Newest rollout for cwd that did not exist when the relay started (`seen`).
     Polled every second while waiting for the pair's Codex to show up, so it goes
     through peerlog's incremental index rather than re-walking the archive. `pane` is the
     relay's OWN resolved codex pane, so the /proc identity looks at THIS pair (never the
-    caller's session)."""
-    return peerlog.codex_via_pane(cwd, pane) or peerlog.codex_newest(cwd, exclude=seen)
+    caller's session). identity-capable but momentarily unresolved → return None and keep
+    waiting; NEVER fall to the mtime heuristic there (it could mis-pin a same-cwd Codex from
+    the very first lock — 2026-08-22 review)."""
+    ident = peerlog.codex_via_pane(cwd, pane)
+    if ident:
+        return ident
+    if peerlog.codex_identity_capable(pane):
+        return None
+    return codex_fallback(cwd, None, seen=seen)
 
 
 def refresh_codex_lock(tracked_path, cwd, pane):
@@ -386,7 +420,7 @@ def refresh_codex_lock(tracked_path, cwd, pane):
     elif peerlog.codex_identity_capable(pane):
         return tracked_path        # identity は使えるが今この瞬間は未解決 → drift させず現状維持
     else:
-        newest = peerlog.codex_follow(cwd, tracked_path)
+        newest = codex_fallback(cwd, tracked_path)
     if newest and newest != tracked_path:
         dim(f"codex rollout ローテート検知 → 追従: {os.path.basename(newest)}")
         return newest
@@ -822,6 +856,7 @@ def main():
         print(c("warn", "aipair-relay: not inside tmux and --session not given"), file=sys.stderr)
         return 2
     panes = find_panes(session)
+    read_codex_since(session)   # for the non-/proc fallback: share peer's codex_since picker
     if "claude" not in panes or "codex" not in panes:
         print(c("warn", f"aipair-relay: could not find claude+codex panes in '{session}' "
                         f"(found: {panes}). Start with `aipair loop`."), file=sys.stderr)
@@ -904,7 +939,13 @@ def main():
             # ONE source of truth with peer-log: the rollout the pair's Codex process actually
             # holds open (codex_via_pane), not merely the newest for the cwd — so `peer` and the
             # relay never diverge onto two different same-cwd Codex sessions (2026-08-22 review).
-            f = peerlog.codex_via_pane(cwd, panes["codex"]) or peerlog.codex_newest(cwd)
+            ident = peerlog.codex_via_pane(cwd, panes["codex"])
+            if ident:
+                f = ident
+            elif peerlog.codex_identity_capable(panes["codex"]):
+                f = None                       # capable but not resolved yet → wait, don't mis-pin
+            else:
+                f = codex_fallback(cwd, None)
             if f:
                 tracked["codex"] = f
                 dim(f"adopt: codex = {os.path.basename(f)}")
