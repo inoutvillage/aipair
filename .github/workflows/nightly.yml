@@ -4,10 +4,11 @@ name: nightly-smoke
 # aipair's own installer smoke against them (a real 3-pane pair started with `--version` flags,
 # then torn down), so a breaking change in either CLI's startup / version output surfaces here.
 #
-# NOTE: an AUTHENTICATED end-to-end round-trip (a real poke → agent reply → relay) additionally
-# needs ANTHROPIC + OPENAI credentials as repo secrets + API budget; the `e2e` step below skips
-# unless BOTH secrets are set, and fails (not silently passes) once both are present but the
-# round-trip is still unimplemented.
+# NOTE: the AUTHENTICATED end-to-end round-trip (a real poke → agent reply → relay) additionally
+# needs ANTHROPIC + OPENAI credentials as repo secrets + API budget. The `e2e` step below SKIPS
+# unless BOTH secrets are set; when they are, it starts a real pair in a throw-away dir, drives a
+# one-round-trip with a unique nonce, verifies the nonce reached claude AND the relay delivered a
+# poke to codex, and tears the session down either way (fail-closed on any missing signal).
 on:
   schedule:
     - cron: '37 18 * * *'   # daily ~03:37 JST
@@ -55,13 +56,74 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
+          set -u
           if [ -z "${ANTHROPIC_API_KEY:-}" ] || [ -z "${OPENAI_API_KEY:-}" ]; then
             echo "skip: the round-trip E2E needs BOTH ANTHROPIC_API_KEY and OPENAI_API_KEY repo"
             echo "secrets (+ API budget) — not run."
             exit 0
           fi
-          # Both credentials are present, so the round-trip is expected to run. It is not built
-          # yet, so FAIL loudly rather than pass silently — a standing reminder to implement it.
-          echo "both ANTHROPIC_API_KEY and OPENAI_API_KEY are set, but the poke -> reply -> relay" >&2
-          echo "round-trip E2E is not implemented yet — failing instead of passing silently." >&2
+          # Both credentials are present → run a real one-round-trip: drive claude with a first
+          # prompt carrying a unique nonce, and require that (a) the nonce reaches claude's
+          # transcript AND (b) claude's turn completes so the relay delivers a poke to codex — the
+          # relay stamps every delivery `relay-id:<hex>`, which then appears raw in codex's rollout.
+          # Both signals within the timeout = a genuine poke → reply → relay round-trip. Anything
+          # else FAILS (fail-closed). The session is always torn down (trap), pass or fail.
+          export PATH="$HOME/.local/bin:$PATH"          # aipair-install.sh installed the CLIs here
+          command -v aipair >/dev/null 2>&1 || { echo "E2E FAIL: aipair not on PATH after install" >&2; exit 1; }
+          # A tmux server inherits the environment of the process that STARTS it, not of a later
+          # client that attaches. Any server the smoke step left behind began WITHOUT these keys,
+          # so its panes could never authenticate. Kill it so `aipair loop` spawns a FRESH server
+          # under this step's env (both keys included), which the claude/codex panes inherit.
+          tmux kill-server 2>/dev/null || true
+
+          WORK="$(mktemp -d)"
+          printf '# e2e\n- [ ] echo the token\n' > "$WORK/todo.md"
+          SID="$(cat /proc/sys/kernel/random/uuid)"
+          NONCE="E2E-$(cat /proc/sys/kernel/random/uuid)"
+          export AIPAIR_UNSAFE=1 AIPAIR_MAX_ROUNDS=2 AIPAIR_CLAUDE_SESSION="$SID"
+          NAME="$(aipair name "$WORK")"
+
+          dump() {   # leave a readable trail in the run log on failure
+            echo "----- bridge (relay) pane -----" >&2
+            b="$(tmux show-options -t "$NAME" -qv @aipair-bridge-pane 2>/dev/null)"
+            [ -n "$b" ] && tmux capture-pane -pt "$b" 2>/dev/null | tail -40 >&2 || true
+            echo "----- transcripts -----" >&2
+            peer-log both --dir "$WORK" --full --tools 2>/dev/null | tail -80 >&2 || true
+          }
+          cleanup() { aipair stop "$WORK" >/dev/null 2>&1 || tmux kill-server 2>/dev/null || true; rm -rf "$WORK"; }
+          trap cleanup EXIT
+
+          # `aipair loop` builds a DETACHED session, then `exec tmux attach` (needs a tty). `script`
+          # supplies a pty and `timeout` bounds the attach; the session it built persists after the
+          # attach client is killed, and the agents keep running in their panes.
+          timeout 25 script -qec "aipair loop '$WORK'" /dev/null >/dev/null 2>&1 || true
+          tmux has-session -t "=$NAME" 2>/dev/null || { echo "E2E FAIL: the pair session was not created" >&2; dump; exit 1; }
+          claude_pane="$(tmux show-options -t "$NAME" -qv @aipair-claude-pane 2>/dev/null)"
+          [ -n "$claude_pane" ] || { echo "E2E FAIL: no claude pane recorded on the session" >&2; dump; exit 1; }
+
+          # Wait for claude to come up (its <SID>.jsonl transcript appears once it starts), then act
+          # as the human first mover and inject the nonce prompt. The round-trip poll is the real
+          # gate, so proceed after a bounded wait even if the file check is slow.
+          for _ in $(seq 1 15); do
+            find "$HOME/.claude/projects" -name "$SID.jsonl" 2>/dev/null | grep -q . && break
+            sleep 2
+          done
+          sleep 3
+          tmux send-keys -t "$claude_pane" -l "Reply with EXACTLY this token and nothing else: $NONCE"
+          sleep 1
+          tmux send-keys -t "$claude_pane" Enter
+
+          saw_nonce=0; saw_relay=0
+          for _ in $(seq 1 90); do        # up to ~180s for the round-trip
+            peer-log claude --dir "$WORK" --full 2>/dev/null | grep -qF "$NONCE" && saw_nonce=1
+            peer-log codex  --dir "$WORK" --full 2>/dev/null | grep -qE 'relay-id:[0-9a-f]+' && saw_relay=1
+            [ "$saw_nonce" = 1 ] && [ "$saw_relay" = 1 ] && break
+            sleep 2
+          done
+          if [ "$saw_nonce" = 1 ] && [ "$saw_relay" = 1 ]; then
+            echo "E2E PASS: nonce $NONCE reached claude, claude completed a turn, and the relay delivered a poke to codex (relay-id seen)."
+            exit 0
+          fi
+          echo "E2E FAIL: round-trip incomplete (nonce_in_claude=$saw_nonce relay_to_codex=$saw_relay)." >&2
+          dump
           exit 1
