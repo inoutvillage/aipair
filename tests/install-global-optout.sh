@@ -10,7 +10,6 @@ command -v tmux    >/dev/null 2>&1 || { echo "skip install-global-optout (no tmu
 command -v python3 >/dev/null 2>&1 || { echo "skip install-global-optout (no python3)"; exit 0; }
 
 SH="$(mktemp -d "${TMPDIR:-/tmp}/aipair-optout-shims.XXXXXX")"
-trap 'rm -rf "$SH"' EXIT
 mkdir -p "$SH/bin"
 # Respond to --version anywhere on the argv (dep check calls `claude --version`; the smoke start
 # runs `claude --session-id <uuid> --version`). Otherwise exit 0 so the pane just returns to a shell.
@@ -25,6 +24,23 @@ for a in "$@"; do [ "$a" = --version ] && { echo "codex-cli 0.149.0"; exit 0; };
 exit 0
 SHIM
 chmod +x "$SH/bin/claude" "$SH/bin/codex"
+
+# The installer smoke-starts a real pair, which talks to tmux. Force EVERY tmux call (the
+# installer's and the aipair it launches) onto a PRIVATE -L socket so we NEVER create/kill
+# sessions on the user's default/production server (tasks/lessons.md guardrail). exit-empty off
+# keeps the private server alive between calls (tmux 3.4 exits an empty server at once).
+REAL_TMUX="$(command -v tmux)"; SOCKET="aipair-optout-$$-$RANDOM"
+printf '#!/usr/bin/env bash\n%q -L %q start-server 2>/dev/null || true\n%q -L %q set-option -g exit-empty off 2>/dev/null || true\nexec %q -L %q "$@"\n' \
+  "$REAL_TMUX" "$SOCKET" "$REAL_TMUX" "$SOCKET" "$REAL_TMUX" "$SOCKET" > "$SH/bin/tmux"; chmod +x "$SH/bin/tmux"
+trap '"$REAL_TMUX" -L "$SOCKET" kill-server 2>/dev/null || true; rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SOCKET" 2>/dev/null || true; rm -rf "$SH"' EXIT   # replaces the earlier rm-only trap
+# Refuse to run unless the shim provably targets the private socket (never the default server).
+"$REAL_TMUX" -L "$SOCKET" new-session -d -s probe 2>/dev/null
+want="$("$REAL_TMUX" -L "$SOCKET" display-message -p -t probe '#{socket_path}')"
+got="$(PATH="$SH/bin:$PATH" tmux display-message -p -t probe '#{socket_path}')"
+"$REAL_TMUX" -L "$SOCKET" kill-session -t probe 2>/dev/null || true
+if [ "$got" != "$want" ] || [ "$(basename "$got")" != "$SOCKET" ]; then
+  echo "tmux shim not effective (got '$got', want '$want') — refusing to touch the default server" >&2; exit 2
+fi
 
 fail=0; n=0
 chk() { n=$((n+1)); if eval "$1"; then echo "ok   $2"; else echo "FAIL $2"; fail=1; fi; }
