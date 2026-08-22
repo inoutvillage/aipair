@@ -51,8 +51,6 @@ Endless mode (--endless, opt-in; 既定は従来どおり停止ワードで終�
   終端は Codex の --all-done 宣言のみ。--max-rounds は安全キャップとして残る。
   --gate CMD（env AIPAIR_GATE）: 停止ワード検知後に CMD を --dir で実行し、exit 0 の時だけ停止／次タスクへ。
   失敗は出力の末尾を添えて Claude に差し戻す（--gate-rounds 回（既定 3）で exit 6）。未指定なら従来どおり。
-  ⚠ aipair-queue は「exit 0 = 1タスク完了」を前提に PR/マージへ進むため、
-    キュー実行では --endless を使わないこと。
 
 Turn detection (verified against real logs):
   • Claude: latest `assistant` entry whose stop_reason != "tool_use"  → turn done
@@ -1424,7 +1422,7 @@ def main():
                     help="safety cap (default 20 / env AIPAIR_MAX_ROUNDS)")
     ap.add_argument("--endless", action="store_true", default=_env_bool("AIPAIR_ENDLESS"),
                     help="停止ワードで終了せず「次のタスクへ」を促し続ける連続モード。"
-                         "終端は Codex の --all-done 宣言のみ（aipair-queue とは併用不可 / env AIPAIR_ENDLESS）")
+                         "終端は Codex の --all-done 宣言のみ（env AIPAIR_ENDLESS）")
     ap.add_argument("--no-endless", action="store_true",
                     help="AIPAIR_ENDLESS が効いている環境で、この1本だけ連続モードを切る")
     ap.add_argument("--next-ask", default=_env_str("AIPAIR_NEXT_ASK", "次のタスクをください"),
@@ -1696,7 +1694,7 @@ def main():
         w = LogWatch(tracked["claude"])
         return lambda p: w.claude_input(p)
 
-    # 終了理由を exit code で区別する（aipair-queue 等の orchestrator が成否を判別するため）:
+    # 終了理由を exit code で区別する（外部 orchestrator が成否を判別できるように）:
     #   0=停止ワード検知（正常完了） 3=最大往復キャップ 4=poke配達失敗
     #   5=プラン/質問リレー上限・選択肢欠落
     code = 0

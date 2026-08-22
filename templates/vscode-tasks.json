@@ -24,7 +24,7 @@
       "command": "wsl.exe",
       "args": [
         "--cd", "${workspaceFolder}",
-        "bash", "-ic", "aipair loop"
+        "bash", "-ic", "aipair loop --unsafe"
       ],
       "presentation": {
         "reveal": "always",

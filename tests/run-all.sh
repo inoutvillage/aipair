@@ -25,7 +25,7 @@ done
 for must in bin/peer bin/aipair bin/aipair-relay-here aipair-install.sh tests/run-all.sh; do
   printf '%s\n' "${SH[@]}" | grep -qx "$must" || { note "FAIL $must missing from the bash set"; fail=1; }
 done
-for must in bin/peer-log bin/aipair-relay bin/aipair-queue; do
+for must in bin/peer-log bin/aipair-relay; do
   printf '%s\n' "${PY[@]}" | grep -qx "$must" || { note "FAIL $must missing from the python set"; fail=1; }
 done
 

@@ -36,7 +36,7 @@ echo "# [1] aipair loop into an EXISTING server forwards gate + version env as f
 rm -f "$W/relay-argv"
 AIPAIR_NO_VERSION_GATE=1 AIPAIR_ALLOW_UNTESTED_DIALOGS=1 AIPAIR_GATE='npm test' \
   AIPAIR_GATE_TIMEOUT=120 AIPAIR_GATE_ROUNDS=2 AIPAIR_CLAUDE_FLAGS='' AIPAIR_CODEX_FLAGS='' \
-  timeout 8 script -qec "aipair loop '$W/proj'" /dev/null >/dev/null 2>&1 || true
+  AIPAIR_UNSAFE=1 timeout 8 script -qec "aipair loop '$W/proj'" /dev/null >/dev/null 2>&1 || true
 if wait_file "$W/relay-argv"; then
   argv="$(cat "$W/relay-argv")"
   chk_has "$argv" "--no-version-gate" "aipair loop → --no-version-gate"
@@ -55,7 +55,7 @@ AIPAIR_GATE='stale gate' AIPAIR_NO_VERSION_GATE=1 AIPAIR_ALLOW_UNTESTED_DIALOGS=
 rm -f "$W/relay-argv"
 AIPAIR_GATE='' AIPAIR_NO_VERSION_GATE='' AIPAIR_ALLOW_UNTESTED_DIALOGS='' \
   AIPAIR_CLAUDE_FLAGS='' AIPAIR_CODEX_FLAGS='' \
-  timeout 8 script -qec "aipair loop '$W/proj'" /dev/null >/dev/null 2>&1 || true
+  AIPAIR_UNSAFE=1 timeout 8 script -qec "aipair loop '$W/proj'" /dev/null >/dev/null 2>&1 || true
 if wait_file "$W/relay-argv"; then
   argv="$(grep '^ARGV' "$W/relay-argv")"; envl="$(grep '^GATE=' "$W/relay-argv")"
   n=$((n+1)); if printf '%s' "$argv" | grep -qF -- "--gate"; then echo "FAIL stale gate leaked into argv: $argv"; fail=1; else echo "ok   no stale --gate flag"; fi

@@ -27,16 +27,30 @@ mkdir -p "$W/zdot" "$W/xdg"     # empty rc dirs so zsh/fish run without the user
 fail=0; n=0
 chk() { n=$((n+1)); if [ "$1" = "$2" ]; then echo "ok   $3"; else echo "FAIL $3"; printf -- '--- got ---\n%s\n--- want ---\n%s\n' "$1" "$2"; fail=1; fi; }
 # line MODE PANE [VAR=value ...] → the command line aipair would type into PANE
-line() { local mode="$1" pane="$2"; shift 2; env "$@" AIPAIR_DRY_RUN=1 aipair "$mode" "$W/proj" | sed -n "s/^$pane:  *//p"; }
+# AIPAIR_UNSAFE=1 so loop-mode launch tests get past the D1 safety gate (they exercise the
+# bridge/relay args, not the gate — which has its own section below).
+line() { local mode="$1" pane="$2"; shift 2; env AIPAIR_UNSAFE=1 "$@" AIPAIR_DRY_RUN=1 aipair "$mode" "$W/proj" | sed -n "s/^$pane:  *//p"; }
 # run MODE PANE [VAR=value ...] → what the pane's shell does with that line (argv dump)
 run() { bash -c "$(line "$@")"; }
 J=$'\n'
 
 echo "# [1] loop defaults"
 chk "$(run loop bridge)" "cmd=aipair-relay self=bridge peer=${J}[--max-rounds]${J}[20]${J}[--stop]${J}[完了です]${J}[--stop-side]${J}[codex]" "bridge: relay with default args"
-chk "$(run loop claude)" "cmd=claude self=claude peer=codex${J}[--dangerously-skip-permissions]" "claude: default flag, AI_SELF/AI_PEER exported"
-chk "$(run loop codex)"  "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]" "codex: default flag, AI_SELF/AI_PEER exported"
+chk "$(run loop claude)" "cmd=claude self=claude peer=codex${J}[--dangerously-skip-permissions]" "claude: bypass flag under --unsafe, AI_SELF/AI_PEER exported"
+chk "$(run loop codex)"  "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]" "codex: bypass flag under --unsafe, AI_SELF/AI_PEER exported"
 chk "$(line loop session)" "$(aipair name "$W/proj")" "session line = aipair name"
+
+echo "# [1b] D1: safe by default, permission-bypass only with --unsafe"
+# safe default (no --unsafe): agents get NO flags (their normal permission prompts)
+chk "$(env AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex claude " "interactive: no bypass flag by default"
+chk "$(env AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^codex:  *//p')" "clear; env AI_SELF=codex AI_PEER=claude codex " "interactive: codex no bypass flag by default"
+# --unsafe adds the bypass flags
+chk "$(env AIPAIR_UNSAFE=1 AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex claude --dangerously-skip-permissions" "AIPAIR_UNSAFE=1: bypass flag added"
+# explicit flags win even in safe mode
+chk "$(env AIPAIR_CLAUDE_FLAGS='--model opus' AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex claude --model opus" "explicit AIPAIR_CLAUDE_FLAGS wins in safe mode"
+# `aipair loop` without --unsafe is refused (exit 2), nothing printed to stdout
+n=$((n+1)); rc=0; out="$(AIPAIR_DRY_RUN=1 aipair loop "$W/proj" 2>/dev/null)" || rc=$?
+if [ "$rc" = 2 ] && [ -z "$out" ]; then echo "ok   loop without --unsafe → exit 2, no launch"; else echo "FAIL loop refuse: rc=$rc out=$out"; fail=1; fi
 
 echo "# [2] values with shell metacharacters arrive as ONE argument each"
 chk "$(run loop bridge "AIPAIR_STOP=it's done" | sed -n '5p')" "[it's done]" "apostrophe in AIPAIR_STOP"

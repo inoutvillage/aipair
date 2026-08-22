@@ -7,7 +7,7 @@ description: aipair（Claude Code × Codex CLI を tmux で並走させるツー
 
 ## このスキルの目的
 
-aipair リポジトリを clone した直後のユーザーが、**1 セッション内の質問応答だけで** aipair 一式（`aipair` / `aipair-relay` / `aipair-relay-here` / `peer` / `peer-log` / `aipair-queue`、Claude 用スキル、`~/.claude/CLAUDE.md` と `~/.codex/AGENTS.md` への周知ブロック）を導入し、**tmux セッションが実際に立つところまで**確認できるようにする。
+aipair リポジトリを clone した直後のユーザーが、**1 セッション内の質問応答だけで** aipair 一式（`aipair` / `aipair-relay` / `aipair-relay-here` / `peer` / `peer-log`、Claude 用スキル、`~/.claude/CLAUDE.md` と `~/.codex/AGENTS.md` への周知ブロック）を導入し、**tmux セッションが実際に立つところまで**確認できるようにする。
 
 実作業はすべて **`aipair-install.sh`（冪等・非対話）に任せる**。このスキルは「診断を読んで説明する」「承認を取る」「オプションを決めて呼ぶ」「結果をそのまま報告する」だけを行う。
 

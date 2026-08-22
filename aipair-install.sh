@@ -22,7 +22,7 @@
 #
 # Notes:
 #   - Install dir is fixed to ~/.local/bin: aipair-relay-here resolves $HOME/.local/bin/aipair-relay,
-#     and aipair-relay / peer-log / aipair-queue must live in the same directory (they import each other
+#     and aipair-relay / peer-log must live in the same directory (they import each other
 #     by path). Files are copied, never symlinked.
 #   - Notice blocks for ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md are delimited by
 #     <!-- aipair:start --> / <!-- aipair:end -->. Re-running replaces the block in place; it never
@@ -40,7 +40,7 @@ CLAUDE_MD="$AH/.claude/CLAUDE.md"
 CODEX_AGENTS="$AH/.codex/AGENTS.md"
 TMUX_MIN="3.1"; TMUX_MIN_MAJOR=3; TMUX_MIN_MINOR=1
 PY_MIN="3.8";   PY_MIN_MAJOR=3;   PY_MIN_MINOR=8
-FILES=(aipair aipair-relay aipair-relay-here peer peer-log aipair-queue)
+FILES=(aipair aipair-relay aipair-relay-here peer peer-log)
 SKILLS=(aipair-setup aipair-relay)
 MARK_START='<!-- aipair:start -->'
 MARK_END='<!-- aipair:end -->'
@@ -84,7 +84,7 @@ done
 # missing templates/codex-agents-block.md would surface only AFTER CLAUDE.md was
 # already rewritten, as a Python traceback (PM review #2).
 _missing=""
-for _f in bin/aipair bin/aipair-relay bin/aipair-relay-here bin/peer bin/peer-log bin/aipair-queue \
+for _f in bin/aipair bin/aipair-relay bin/aipair-relay-here bin/peer bin/peer-log \
           templates/vscode-tasks.json templates/claude-md-block.md templates/codex-agents-block.md \
           .claude/skills/aipair-setup/SKILL.md .claude/skills/aipair-relay/SKILL.md; do
   [ -f "$REPO_DIR/$_f" ] || _missing="$_missing $_f"
@@ -366,14 +366,14 @@ for f in "${FILES[@]}"; do
     ok "$dst installed"
   fi
 done
-# same-directory import check (aipair-relay imports peer-log, aipair-queue imports aipair-relay, by path)
-for f in aipair-relay peer-log aipair-queue; do
+# same-directory import check (aipair-relay imports peer-log by path)
+for f in aipair-relay peer-log; do
   if ! "$BIN_DIR/$f" --help >/dev/null 2>&1; then
     fail "$BIN_DIR/$f --help failed — the six files must sit together in $BIN_DIR (they import each other by path)"
     exit 1
   fi
 done
-ok "aipair-relay / peer-log / aipair-queue start from $BIN_DIR (--help exits 0)"
+ok "aipair-relay / peer-log start from $BIN_DIR (--help exits 0)"
 
 # --- skills ------------------------------------------------------------------
 for s in "${SKILLS[@]}"; do
@@ -530,5 +530,5 @@ smoke_test || exit 1
 echo "done: $N_OK ok, $N_SKIP skip, $N_WARN warn, $N_FAIL fail"
 if [ "$N_WARN" -gt 0 ]; then echo "      (warnings above need your attention, but the install itself is complete)"; fi
 echo "next: open a NEW shell (so PATH applies), cd into a project, run: aipair"
-echo "      both agents start with permission-bypass flags by default; see README to change that (AIPAIR_CLAUDE_FLAGS / AIPAIR_CODEX_FLAGS)"
+echo "      safe by default (normal permission prompts); permission-bypass is opt-in via --unsafe / AIPAIR_UNSAFE=1, required for aipair loop"
 exit 0

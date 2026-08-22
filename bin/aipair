@@ -9,6 +9,10 @@
 #   aipair stop  [dir]   kill the session for dir
 #   aipair name  [dir]   print the tmux session name for dir
 #
+#   --unsafe (or AIPAIR_UNSAFE=1): launch agents with permission-bypass flags.
+#   Required for `aipair loop`; optional for interactive `aipair` (default: agents
+#   keep their normal permission prompts).
+#
 # Layout:
 #   ┌───────────────┬───────────────┐
 #   │    claude     │     codex     │   two agents, same working dir
@@ -16,6 +20,17 @@
 #   │  bridge: peer-log both --watch │   live merged conversation (for you)
 #   └───────────────────────────────┘
 set -euo pipefail
+
+# --- safety: --unsafe / AIPAIR_UNSAFE opt-in to permission-bypass -------------
+# Without it, agents run with their normal permission prompts. `aipair loop` (the
+# unattended relay) REQUIRES it, since the relay cannot answer those prompts.
+UNSAFE=0
+case " ${AIPAIR_UNSAFE:-} " in *" 1 "*|*" true "*|*" yes "*|*" on "*) UNSAFE=1 ;; esac
+_args=()
+for _a in "$@"; do
+  if [ "$_a" = "--unsafe" ]; then UNSAFE=1; else _args+=("$_a"); fi
+done
+set -- ${_args[@]+"${_args[@]}"}
 
 # Canonical absolute path of a directory: symlinks resolved and, on
 # case-insensitive filesystems (WSL DrvFs, macOS APFS by default), every
@@ -128,6 +143,16 @@ else
 fi
 
 # "=" = exact match; a bare name also prefix-matches (aipair-api → aipair-api-7f39ac).
+if [ "$cmd" = loop ] && [ "$UNSAFE" != 1 ]; then
+  echo "aipair: 'aipair loop' runs the relay unattended and must drive both agents through" >&2
+  echo "        their permission prompts, so it needs permission-bypass. Re-run as one of:" >&2
+  echo "          aipair loop --unsafe [dir]" >&2
+  echo "          AIPAIR_UNSAFE=1 aipair loop [dir]" >&2
+  echo "        That launches: claude --dangerously-skip-permissions /" >&2
+  echo "                       codex  --dangerously-bypass-approvals-and-sandbox" >&2
+  exit 2
+fi
+
 running() { tmux has-session -t "=$NAME" 2>/dev/null; }
 # (named attach_session, not attach: a function called `attach` shadows the word in
 #  `tmux attach` for shellcheck SC2033)
@@ -173,8 +198,16 @@ env_on() {
 # Launch flags are SHELL FRAGMENTS, parsed by the shell in the pane:
 # AIPAIR_CLAUDE_FLAGS='--model opus' is two arguments and
 # '--append-system-prompt "a b"' keeps "a b" together. Empty = no flags.
-CLAUDE_FLAGS="${AIPAIR_CLAUDE_FLAGS---dangerously-skip-permissions}"
-CODEX_FLAGS="${AIPAIR_CODEX_FLAGS---dangerously-bypass-approvals-and-sandbox}"
+# The permission-bypass defaults apply ONLY in --unsafe mode; the plain safe
+# default is no flags, so each agent shows its normal permission prompts. An
+# explicit AIPAIR_*_FLAGS always wins (set it empty to force no flags).
+if [ "$UNSAFE" = 1 ]; then
+  CLAUDE_FLAGS="${AIPAIR_CLAUDE_FLAGS---dangerously-skip-permissions}"
+  CODEX_FLAGS="${AIPAIR_CODEX_FLAGS---dangerously-bypass-approvals-and-sandbox}"
+else
+  CLAUDE_FLAGS="${AIPAIR_CLAUDE_FLAGS-}"
+  CODEX_FLAGS="${AIPAIR_CODEX_FLAGS-}"
+fi
 
 # Everything else from the environment travels as ONE argument each, whatever it
 # contains (apostrophes, spaces, $, ;), thanks to cmdline.
