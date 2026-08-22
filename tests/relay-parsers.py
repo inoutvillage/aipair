@@ -323,8 +323,8 @@ class TmuxlibStandalone(unittest.TestCase):
 
 class PlanDialog(unittest.TestCase):
     def detect(self, screen):
-        with mock.patch.object(relay, "capture_pane", return_value=screen), \
-             mock.patch.object(relay, "newest_plan", return_value=None):
+        with mock.patch.object(relay.dialoglib, "capture_pane", return_value=screen), \
+             mock.patch.object(relay.dialoglib, "newest_plan", return_value=None):
             return relay.detect_plan_dialog("%0")
 
     def test_reads_numbers_from_the_screen(self):
@@ -356,7 +356,7 @@ QUESTION_SCREEN = """\
 
 class QuestionDialog(unittest.TestCase):
     def detect(self, screen):
-        with mock.patch.object(relay, "capture_pane", return_value=screen):
+        with mock.patch.object(relay.dialoglib, "capture_pane", return_value=screen):
             return relay.detect_question_dialog("%0")
 
     def test_detects_chat_number_only_while_the_footer_is_the_last_line(self):
@@ -366,7 +366,7 @@ class QuestionDialog(unittest.TestCase):
         self.assertIsNone(self.detect("Would you like to proceed?\n" + QUESTION_SCREEN), "plan dialog wins")
 
     def test_question_block_text(self):
-        block = relay._question_block(QUESTION_SCREEN)
+        block = relay.dialoglib._question_block(QUESTION_SCREEN)
         self.assertIn("Pick a database", block)
         self.assertIn("1. Postgres", block)
         self.assertIn("2. SQLite", block)
@@ -375,8 +375,8 @@ class QuestionDialog(unittest.TestCase):
 
     def test_single_question_without_tab_bar(self):
         screen = "\n".join(l for l in QUESTION_SCREEN.splitlines() if "Submit" not in l) + "\n"
-        self.assertIn("Pick a database", relay._question_block(screen))
-        self.assertIsNone(relay._question_block("no footer here\n1. a\n2. b\n"))
+        self.assertIn("Pick a database", relay.dialoglib._question_block(screen))
+        self.assertIsNone(relay.dialoglib._question_block("no footer here\n1. a\n2. b\n"))
 
     def test_poke_text_is_capped(self):
         text = relay.question_poke_codex(["q" * 5000], limit=300)
@@ -619,6 +619,103 @@ class VersionGate(unittest.TestCase):
         rows, bad = relay.version_gate(a, {"claude": "9.9.9", "codex": None})
         self.assertEqual(bad, ["claude", "codex"])
         self.assertFalse(a.no_plan_review or a.no_question_relay, "opt-in keeps them on")
+
+
+class DialogSendScrape(unittest.TestCase):
+    """aipair-dialoglib: multi-tab scrape, capture failure, plan revise/approve, question
+    answer, watch present/absent. tmux/capture/delivery hooks are injected → patch there."""
+    def setUp(self):
+        self.dg = relay.dialoglib
+        clk = [1000.0]
+        def _sleep(s): clk[0] += (s or 0.01)
+        def _time(): clk[0] += 0.001; return clk[0]
+        self.q = [mock.patch.object(self.dg.time, "sleep", side_effect=_sleep),
+                  mock.patch.object(self.dg.time, "time", side_effect=_time),
+                  mock.patch.object(self.dg, "dim")]
+        for x in self.q: x.start()
+    def tearDown(self):
+        for x in self.q: x.stop()
+
+    Q1 = ("← ☐ Database  ☒ Cache  ✔ Submit →\n─────\nPick a database\n"
+          "❯ 1. Postgres\n   2. SQLite\n   3. Chat about this\n\nEnter to select · Esc")
+    Q2 = ("← ☐ Database  ☒ Cache  ✔ Submit →\n─────\nPick a cache\n"
+          "❯ 1. Redis\n   2. Memcached\n   3. Chat about this\n\nEnter to select · Esc")
+
+    def test_scrape_two_tabs(self):
+        caps = iter([self.Q1, self.Q1, self.Q2])   # read Q1, press Right, read Q2
+        presses = []
+        with mock.patch.object(self.dg, "capture_pane", side_effect=lambda p: next(caps)), \
+             mock.patch.object(self.dg, "press", side_effect=lambda p, k: presses.append(k)):
+            blocks = self.dg.scrape_questions("%0")
+        self.assertEqual(len(blocks), 2)
+        self.assertIn("Pick a database", blocks[0]); self.assertIn("Pick a cache", blocks[1])
+        self.assertIn("Right", presses, "moves to the next tab with a non-destructive Right")
+
+    def test_scrape_capture_failure_stops_cleanly(self):
+        import subprocess
+        with mock.patch.object(self.dg, "capture_pane", side_effect=subprocess.CalledProcessError(1, "tmux")):
+            self.assertEqual(self.dg.scrape_questions("%0"), [])
+
+    def test_plan_revise_uses_submit_enter_with_watch_confirm(self):
+        w = mock.Mock(); w.claude_resolved.return_value = False; w.claude_input.return_value = True
+        seen = {}
+        with mock.patch.object(self.dg, "press") as press, \
+             mock.patch.object(self.dg, "paste_text") as paste, \
+             mock.patch.object(self.dg, "submit_enter", side_effect=lambda p, confirm=None, badge=True: seen.update(confirm=confirm, badge=badge) or True) as se:
+            ok = self.dg.send_plan_feedback("%0", {"tell": "3"}, "please change X", approve=False, watch=w)
+        self.assertTrue(ok)
+        press.assert_any_call("%0", "3")                 # 'Tell Claude what to change'
+        paste.assert_called_once()
+        w.reset.assert_called_once()
+        self.assertTrue(seen["confirm"]())               # confirm wired to the watch
+        self.assertFalse(seen["badge"], "watch present → badge not used")
+
+    def test_plan_approve_uses_btab_and_confirms_via_watch(self):
+        w = mock.Mock(); w.claude_resolved.side_effect = [False, True]; w.claude_input.return_value = False
+        with mock.patch.object(self.dg, "press") as press, mock.patch.object(self.dg, "paste_text"), \
+             mock.patch.object(self.dg, "tmux", return_value=types.SimpleNamespace(stdout="")):
+            ok = self.dg.send_plan_feedback("%0", {"tell": "3"}, "ok", approve=True, watch=w)
+        self.assertTrue(ok)
+        press.assert_any_call("%0", "BTab")              # feedback-approve is Shift+Tab
+
+    def test_plan_approve_badge_fallback_without_watch(self):
+        with mock.patch.object(self.dg, "press"), mock.patch.object(self.dg, "paste_text"), \
+             mock.patch.object(self.dg, "tmux", return_value=types.SimpleNamespace(stdout="running esc to interrupt")):
+            self.assertTrue(self.dg.send_plan_feedback("%0", {"tell": "3"}, "ok", approve=True, watch=None))
+
+    def test_plan_approve_failure_when_not_confirmed(self):
+        w = mock.Mock(); w.claude_resolved.return_value = False; w.claude_input.return_value = False
+        with mock.patch.object(self.dg, "press"), mock.patch.object(self.dg, "paste_text"):
+            self.assertFalse(self.dg.send_plan_feedback("%0", {"tell": "3"}, "x", approve=True, watch=w))
+
+    def test_question_answer_with_and_without_watch(self):
+        # with watch: chat pressed, answer pasted, submit_enter confirm=watch.claude_input, badge False
+        w = mock.Mock(); w.claude_input.return_value = True
+        seen = {}
+        with mock.patch.object(self.dg, "press") as press, mock.patch.object(self.dg, "paste_text") as paste, \
+             mock.patch.object(self.dg, "submit_enter", side_effect=lambda p, confirm=None, badge=True: seen.update(c=confirm, b=badge) or True):
+            self.assertTrue(self.dg.send_question_answer("%0", {"chat": "3"}, "my answer", watch=w))
+        press.assert_any_call("%0", "3"); paste.assert_called_once()
+        self.assertTrue(seen["c"]()); self.assertFalse(seen["b"])
+        # without watch: badge fallback (confirm None → badge True)
+        seen.clear()
+        with mock.patch.object(self.dg, "press"), mock.patch.object(self.dg, "paste_text"), \
+             mock.patch.object(self.dg, "submit_enter", side_effect=lambda p, confirm=None, badge=True: seen.update(c=confirm, b=badge) or True):
+            self.dg.send_question_answer("%0", {"chat": "3"}, "a", watch=None)
+        self.assertIsNone(seen["c"]); self.assertTrue(seen["b"])
+
+
+class DialoglibStandalone(unittest.TestCase):
+    def test_loads_without_relay(self):
+        loader = importlib.machinery.SourceFileLoader("dg_standalone", os.path.join(BIN, "aipair-dialoglib"))
+        dg = importlib.util.module_from_spec(importlib.util.spec_from_loader("dg_standalone", loader))
+        loader.exec_module(dg)                            # raises if it imported relay
+        self.assertIn("Would you like to proceed?", dg.PLAN_QUESTION)
+        with self.assertRaises(RuntimeError):
+            dg.capture_pane("%0")                          # not injected → explicit error
+        self.assertIs(relay.detect_plan_dialog, relay.dialoglib.detect_plan_dialog)
+        # the delivery re-press guard now points at dialoglib's probe
+        self.assertIs(relay.deliverylib.dialog_on_screen, relay.dialoglib.dialog_on_screen)
 
 
 class DoneTimestamps(unittest.TestCase):

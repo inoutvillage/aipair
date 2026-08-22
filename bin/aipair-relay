@@ -150,6 +150,30 @@ paste_text = deliverylib.paste_text
 submit_enter = deliverylib.submit_enter
 poke = deliverylib.poke
 
+# --- dialog detection + response live in aipair-dialoglib (D3: increment 5 = A5) --------
+# Plan-approval / AskUserQuestion detection and the send-back, plus the dialog constants.
+# No relay import (no cycle); relay injects tmux/capture, delivery (press/paste/submit) and
+# make_fragment. Its dialog_on_screen probe also replaces the one injected into deliverylib.
+_DIALOGLIB = os.path.join(os.path.dirname(os.path.realpath(__file__)), "aipair-dialoglib")
+_dg_loader = importlib.machinery.SourceFileLoader("aipairdialoglib", _DIALOGLIB)
+dialoglib = importlib.util.module_from_spec(importlib.util.spec_from_loader("aipairdialoglib", _dg_loader))
+_dg_loader.exec_module(dialoglib)
+dialoglib.capture_pane = capture_pane
+dialoglib.tmux = tmux
+dialoglib.press = press
+dialoglib.paste_text = paste_text
+dialoglib.submit_enter = submit_enter
+dialoglib.make_fragment = make_fragment
+deliverylib.dialog_on_screen = dialoglib.dialog_on_screen   # (re)point the re-press guard (D3 A5)
+newest_plan = dialoglib.newest_plan
+detect_plan_dialog = dialoglib.detect_plan_dialog
+detect_question_dialog = dialoglib.detect_question_dialog
+scrape_questions = dialoglib.scrape_questions
+send_plan_feedback = dialoglib.send_plan_feedback
+send_question_answer = dialoglib.send_question_answer
+PLAN_QUESTION = dialoglib.PLAN_QUESTION      # used by claude_matches_pane (still in relay)
+QUESTION_FOOTER = dialoglib.QUESTION_FOOTER
+
 USE_COLOR = True
 C = {"claude": "\033[1;36m", "codex": "\033[1;32m", "relay": "\033[1;35m",
      "warn": "\033[1;31m", "ok": "\033[1;32m", "dim": "\033[2m", "off": "\033[0m"}
@@ -210,30 +234,12 @@ def dim(s):
 
 
 deliverylib.dim = dim            # inject the real logger into the delivery module (D3 A4)
+dialoglib.dim = dim              # …and into the dialog module (D3 A5)
 
 
 def oneline(s, n=180):
     s = " ".join(s.split())
     return s if len(s) <= n else s[: n - 1] + "…"
-
-
-
-
-def _dialog_on_screen(pane):
-    """Claude の選択ダイアログ（プラン承認/AskUserQuestion）が表示中か。
-    Enter 再打鍵の直前ガード専用 — 1回目の Enter が実は送信に成功していて、
-    高速ターンがもうダイアログを出している場合、盲目の再打鍵は選択肢を
-    誤確定するため（Codex ペインではどちらのマーカーも出ないので常に False）。"""
-    try:
-        cap = capture_pane(pane)
-    except subprocess.CalledProcessError:
-        return False
-    lines = [l for l in cap.splitlines() if l.strip()]
-    return bool(lines) and (PLAN_QUESTION in cap
-                            or lines[-1].lstrip().startswith(QUESTION_FOOTER))
-
-
-deliverylib.dialog_on_screen = _dialog_on_screen    # inject the dialog probe (D3 A4)
 
 
 # --- log file locking (lock onto the loop's freshly-spawned sessions) ------- #
@@ -602,90 +608,6 @@ def gate_or_message(a, gate_state, cwd):
     return False, gate_message(a.gate, out, n, a.gate_rounds)
 
 
-# --- plan-approval dialog handling ------------------------------------------ #
-PLAN_QUESTION = "Would you like to proceed?"
-
-
-def newest_plan():
-    files = glob.glob(os.path.expanduser("~/.claude/plans/*.md"))
-    return max(files, key=os.path.getmtime) if files else None
-
-
-def detect_plan_dialog(pane):
-    """Parse Claude's plan-approval dialog from the pane, if currently shown.
-
-    Option numbers are read from the screen (they vary across versions), so we
-    match by label text. Returns {"tell", "yes", "yes_label", "plan"} or None.
-    """
-    try:
-        out = capture_pane(pane)
-    except subprocess.CalledProcessError:
-        return None
-    lines = out.splitlines()
-    qi = next((i for i, l in enumerate(lines) if PLAN_QUESTION in l), None)
-    if qi is None:
-        return None
-    tell = yes = yes_label = None
-    for line in lines[qi + 1:]:
-        m = re.match(r"\s*(?:❯\s*)?(\d+)\.\s+(.+?)\s*$", line)
-        if not m:
-            continue
-        num, label = m.group(1), m.group(2)
-        low = label.lower()
-        if tell is None and "tell claude what to change" in low:
-            tell = num
-        if low.startswith("yes") and (yes is None or "bypass" in low):
-            yes, yes_label = num, label
-    if not (tell or yes):
-        return None
-    m = re.search(r"[^\s·]*\.claude/plans/[^\s]+\.md", out)
-    plan = os.path.expanduser(m.group(0)) if m else newest_plan()
-    return {"tell": tell, "yes": yes, "yes_label": yes_label, "plan": plan}
-
-
-def send_plan_feedback(pane, dialog, text, approve, watch=None):
-    """'Tell Claude what to change' → paste review → Enter (revise the plan)
-    or shift+tab (approve with this feedback).
-    watch: Claude ログの LogWatch。**本文送信（Enter/BTab）の直前にチェックポイントを
-    置き直し**、それ以降の追記だけで成立を判定する（Codex レビュー指摘: tell 押下等の
-    先行操作が書く行を証拠に数えない）。実測（過去ログ）では tell 経路の tool_result は
-    `the user said:\\n<本文>` と送信後の本文を含む＝書かれるのは Enter 時点なので、
-    成立条件は「tool_result 追記（解決）」または「本文断片の入力行追記」。
-    None のときは画面バッジにフォールバック（ログ未特定時のみ・信頼度低）。"""
-    press(pane, dialog["tell"])
-    time.sleep(0.8)
-    paste_text(pane, text[:4000])
-    time.sleep(0.5)
-    confirm = None
-    if watch is not None:
-        watch.reset()
-        frag = make_fragment(text)
-        confirm = lambda: watch.claude_resolved() or watch.claude_input(frag)
-    if approve:
-        # feedback付き承認は Shift+Tab。直前の paste バーストに吸収されると未承認の
-        # まま relay が claude 待ちへ進み永久停止するため、ログ上の解決で成立を確認する
-        # （Codex レビュー指摘）。BTab は通常コンポーザでは権限モード切替のため、
-        # Enter と違い盲目の再打鍵は不可 — 失敗時は False を返して呼び出し元に
-        # 停止させ、人に委ねる。
-        press(pane, "BTab")
-        deadline = time.time() + 7
-        while time.time() < deadline:
-            if confirm is not None:
-                if confirm():
-                    return True
-            else:
-                try:
-                    cap = tmux("capture-pane", "-p", "-t", pane, capture=True).stdout
-                except subprocess.CalledProcessError:
-                    cap = ""
-                if "esc to interrupt" in cap.lower():
-                    return True
-            time.sleep(0.5)
-        dim("Shift+Tab 後に承認の成立を確認できず（吸収された可能性）")
-        return False
-    return submit_enter(pane, confirm=confirm, badge=confirm is None)
-
-
 def approval_took_effect(pane, confirm=None):
     """プラン承認キー（数字）押下後、ダイアログ消失（画面）またはログ上の解決
     （confirm = LogWatch.claude_resolved）で成立を確認する。
@@ -721,111 +643,6 @@ def plan_poke_codex(plan_path, ok):
             f"人間に伝言を頼まないでください）。修正が不要なら本文の冒頭に「{ok}」と明記してください。")
 
 
-# --- AskUserQuestion dialog handling ----------------------------------------- #
-QUESTION_CHAT_LABEL = "chat about this"
-QUESTION_FOOTER = "Enter to select"   # ダイアログ表示中のみ画面最下行に出るフッター
-_OPT_RE = re.compile(r"\s*(?:❯\s*)?(?:[☐☒✔]\s*)?(\d+)\.\s+(.+?)\s*$")
-_SEP_RE = re.compile(r"^\s*─{4,}\s*$")
-
-
-def detect_question_dialog(pane):
-    """Parse Claude's AskUserQuestion (選択式質問) dialog from the pane, if shown.
-
-    Signature: numbered option lines + a numbered "Chat about this" action
-    (label is version-stable; the number varies with the current question's
-    option count, so it is read from the screen) + the dialog footer
-    ("Enter to select …") as the LAST non-empty line. The footer sits at the
-    pane bottom only while the dialog is live — idle screens end with the
-    composer/status bars — which kills false positives from dialog-looking
-    text in the transcript (e.g. a pasted screen dump).
-    Returns {"chat": "<number>"} or None.
-    """
-    try:
-        out = capture_pane(pane)
-    except subprocess.CalledProcessError:
-        return None
-    if PLAN_QUESTION in out:
-        return None
-    lines = [l for l in out.splitlines() if l.strip()]
-    if not lines or not lines[-1].lstrip().startswith(QUESTION_FOOTER):
-        return None
-    chat = None
-    opts = 0
-    for line in lines:
-        m = _OPT_RE.match(line)
-        if not m:
-            continue
-        if QUESTION_CHAT_LABEL in m.group(2).lower():
-            chat = m.group(1)
-        else:
-            opts += 1
-    return {"chat": chat} if (chat and opts) else None
-
-
-def _question_block(out):
-    """キャプチャ画面から現在表示中の質問ブロック（質問文＋選択肢）を1行テキストで抽出。"""
-    lines = out.splitlines()
-    nonempty = [i for i, l in enumerate(lines) if l.strip()]
-    if not nonempty or not lines[nonempty[-1]].lstrip().startswith(QUESTION_FOOTER):
-        return None
-    footer_i = nonempty[-1]
-    opt_is = [i for i in range(footer_i) if _OPT_RE.match(lines[i])]
-    if not opt_is:
-        return None
-    chat_i = next((i for i in opt_is
-                   if QUESTION_CHAT_LABEL in _OPT_RE.match(lines[i]).group(2).lower()),
-                  footer_i)
-    # タブバー（"← ☐ … ✔ Submit →"）の直後から。単問でバーが無ければ質問文の直前の罫線から
-    bar_i = next((i for i in range(min(opt_is[0], chat_i) - 1, -1, -1)
-                  if "Submit" in lines[i] and any(ch in lines[i] for ch in "☐☒✔")
-                  and not _OPT_RE.match(lines[i])), None)
-    if bar_i is not None:
-        start = bar_i + 1
-    else:
-        seps = [i for i in range(opt_is[0]) if _SEP_RE.match(lines[i])]
-        start = (seps[-1] + 1) if seps else max(0, opt_is[0] - 4)
-    block = [l for l in lines[start:chat_i]
-             if l.strip() and not _SEP_RE.match(l)
-             and "type something" not in l.lower() and l.strip() != "Submit"]
-    text = " ".join(" ".join(l.split()) for l in block).strip()
-    return text or None
-
-
-def scrape_questions(pane):
-    """タブ移動（→）で呼び出し1回分の全質問ブロックを画面から収集する。
-
-    未回答の AskUserQuestion tool_use はセッション jsonl に書かれない（回答後に
-    初めて追記される — 2026-07-23 実測）ため、全質問の完全ソースは画面のみ。
-    画面には現在の1問しか出ないが、タブバーの ☐/☒ 数が総問数を示し、→ は選択を
-    確定しない非破壊キーなので、1問ずつ送って読む。単問（タブバー無し）は移動なし。"""
-    blocks = []
-    stagnant = 0
-    for _ in range(12):  # 最大4問 + 再読リトライ分の安全マージン
-        try:
-            out = capture_pane(pane)
-        except subprocess.CalledProcessError:
-            break
-        block = _question_block(out)
-        if block and block not in blocks:
-            blocks.append(block)
-            stagnant = 0
-            bar = next((l for l in out.splitlines()
-                        if "Submit" in l and any(ch in l for ch in "☐☒")), "")
-            total = (bar.count("☐") + bar.count("☒")) or 1
-            if len(blocks) >= total:
-                break
-            # 新しいタブを読めた時だけ → を押す。stale 画面で重ね押しすると
-            # タブを飛ばして質問を取りこぼすため、切替待ちは押さずに再読する
-            press(pane, "Right")
-            time.sleep(0.6)
-        else:
-            stagnant += 1
-            if stagnant >= 4:
-                break
-            time.sleep(0.5)
-    return blocks
-
-
 def question_poke_codex(blocks, limit=3000):
     qtext = " ".join(f"◆{i}問目: {b}" for i, b in enumerate(blocks, 1))
     if len(qtext) > limit:
@@ -835,28 +652,6 @@ def question_poke_codex(blocks, limit=3000):
             "送信されます—人間に伝言を頼まないでください。各質問について「N問目: 選択肢M（ラベル）」"
             "の形で選択を明示し、根拠を一言添えてください。どの選択肢も不適切なら、その旨と"
             "代替案を明記してください。 " + qtext)
-
-
-def send_question_answer(pane, qdlg, text, watch=None):
-    """質問ダイアログ →「Chat about this」→ 回答本文をペースト → Enter。
-
-    実測（2026-07-23）: chat 押下でダイアログは即座に「User declined to answer
-    questions」として解決しコンポーザへ戻る。回答は後追いのユーザーメッセージとして
-    ペースト送信する（Claude の decline 反応ターン中でもキューされて確実に届き、
-    Claude は回答を読んで続行する）。操作列は send_plan_feedback と同型。"""
-    press(pane, qdlg["chat"])
-    time.sleep(0.8)
-    # chat 押下で decline の tool_result が先に書かれる（実測）ため、チェックポイントを
-    # ここで置き直し、以降の「本文の入力行」（user 文字列 or queue-operation）だけを
-    # Enter の証拠にする。None のときは画面バッジにフォールバック（信頼度低）。
-    confirm = None
-    if watch is not None:
-        watch.reset()
-        frag = make_fragment(text)
-        confirm = lambda: watch.claude_input(frag)
-    paste_text(pane, text[:4000])
-    time.sleep(0.5)
-    return submit_enter(pane, confirm=confirm, badge=confirm is None)
 
 
 # --------------------------------------------------------------------------- #
