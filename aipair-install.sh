@@ -390,27 +390,38 @@ for f in "${RETIRED[@]}"; do
     fi
   fi
 done
-for f in "${FILES[@]}"; do
-  src="$REPO_DIR/bin/$f"; dst="$BIN_DIR/$f"
-  mkdir -p "$(dirname "$dst")" || { fail "cannot create $(dirname "$dst")"; exit 1; }
-  case "$f" in */*) X=false ;; *) X=true ;; esac   # only top-level entrypoints are executable
+install_one() {  # $1 = repo-relative bin path (e.g. aipair-relay or aipairlib/relay.py). backup + copy.
+  local f="$1" src="$REPO_DIR/bin/$1" dst="$BIN_DIR/$1" X
+  mkdir -p "$(dirname "$dst")" || { fail "cannot create $(dirname "$dst")"; return 1; }
+  case "$f" in */*) X=false ;; *) X=true ;; esac   # only top-level entrypoints/launchers are executable
   if [ -f "$dst" ] && same_file "$src" "$dst"; then
-    if $X && [ ! -x "$dst" ]; then chmod +x "$dst" || { fail "cannot chmod +x $dst"; exit 1; }; fi
-    skip "$dst is up to date"
-    continue
+    if $X && [ ! -x "$dst" ]; then chmod +x "$dst" || { fail "cannot chmod +x $dst"; return 1; }; fi
+    skip "$dst is up to date"; return 0
   fi
   if [ -e "$dst" ]; then
-    cp -p "$dst" "$dst.bak-$TS" || { fail "cannot back up $dst"; exit 1; }
-    cp "$src" "$dst" || { fail "cannot install $dst"; exit 1; }
-    if $X; then chmod +x "$dst" || { fail "cannot chmod +x $dst"; exit 1; }; fi
+    cp -p "$dst" "$dst.bak-$TS" || { fail "cannot back up $dst"; return 1; }
+    cp "$src" "$dst" || { fail "cannot install $dst"; return 1; }
+    if $X; then chmod +x "$dst" || { fail "cannot chmod +x $dst"; return 1; }; fi
     ok "$dst updated (previous copy: $dst.bak-$TS)"
   else
-    cp "$src" "$dst" || { fail "cannot install $dst"; exit 1; }
-    if $X; then chmod +x "$dst" || { fail "cannot chmod +x $dst"; exit 1; }; fi
+    cp "$src" "$dst" || { fail "cannot install $dst"; return 1; }
+    if $X; then chmod +x "$dst" || { fail "cannot chmod +x $dst"; return 1; }; fi
     ok "$dst installed"
   fi
-done
-# import check: the thin entrypoints import the aipairlib package (relay/peerlog + siblings).
+}
+# Two-phase install so a broken package never leaves the previous working install replaced-but-
+# unusable. Phase 1: stage the aipairlib PACKAGE (new/updated files; the old install still uses
+# its own entrypoints + flat libs, so this doesn't disturb it yet).
+for f in "${FILES[@]}"; do case "$f" in aipairlib/*) install_one "$f" || exit 1 ;; esac; done
+# Verify the STAGED package actually imports BEFORE switching the thin entrypoints in — if it is
+# broken, stop here with the previous entrypoints + flat libs still in place (rollback-safe).
+if ! AIPAIR_BIN="$BIN_DIR" python3 -c "import os, sys; sys.path.insert(0, os.environ['AIPAIR_BIN']); import aipairlib.relay, aipairlib.peerlog" 2>/dev/null; then
+  fail "the staged aipairlib package failed to import — the previous entrypoints are left untouched"
+  exit 1
+fi
+# Phase 2: now switch the top-level executables (thin entrypoints + bash launchers).
+for f in "${FILES[@]}"; do case "$f" in aipairlib/*) : ;; *) install_one "$f" || exit 1 ;; esac; done
+# Final check: the installed thin entrypoints run and import the package end-to-end.
 for f in aipair-relay peer-log; do
   if ! "$BIN_DIR/$f" --help >/dev/null 2>&1; then
     fail "$BIN_DIR/$f --help failed — the aipairlib package must sit next to the entrypoints in $BIN_DIR"
