@@ -1,0 +1,52 @@
+name: nightly-smoke
+# The push/PR CI (ci.yml) MOCKS claude/codex — fast and hermetic, but blind to the real CLIs
+# changing under aipair. This nightly job installs the ACTUAL claude + codex from npm and runs
+# aipair's own installer smoke against them (a real 3-pane pair started with `--version` flags,
+# then torn down), so a breaking change in either CLI's startup / version output surfaces here.
+#
+# NOTE: an AUTHENTICATED end-to-end round-trip (a real poke → agent reply → relay) additionally
+# needs ANTHROPIC / OPENAI credentials as repo secrets + API budget; the `e2e` step below is
+# gated on ANTHROPIC_API_KEY and stays skipped until such a secret is configured.
+on:
+  schedule:
+    - cron: '37 18 * * *'   # daily ~03:37 JST
+  workflow_dispatch:
+jobs:
+  real-cli-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install the real claude + codex CLIs (no auth needed for --version)
+        run: |
+          set -eux
+          npm install -g @anthropic-ai/claude-code @openai/codex
+          command -v claude; command -v codex
+          claude --version
+          codex --version
+      - name: Install tmux
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux
+      - name: Versions
+        run: tmux -V; node --version; python3 --version; claude --version; codex --version
+      - name: aipair install + smoke against the REAL CLIs
+        run: |
+          set -eux
+          # The installer's own smoke starts a real pair (AIPAIR_*_FLAGS=--version so no TUI),
+          # asserts 3 panes on a throw-away session, then tears it down. The CI runner's default
+          # tmux server is ephemeral, so no private-socket shim is needed here.
+          bash aipair-install.sh
+      - name: Authenticated end-to-end (opt-in; self-skips without credentials)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "skip: no ANTHROPIC_API_KEY secret configured — real round-trip E2E not run."
+            echo "(To enable: add ANTHROPIC_API_KEY / OPENAI_API_KEY repo secrets, then a minimal"
+            echo " poke → reply → relay round-trip can run here.)"
+            exit 0
+          fi
+          echo "TODO: minimal real poke → reply → relay round-trip (credentials present)."
