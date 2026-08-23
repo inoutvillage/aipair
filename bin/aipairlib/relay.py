@@ -96,7 +96,7 @@ import unicodedata
 # imports / a poke(busy_wait=...) argument, handled inside those modules — no injection here.
 from . import peerlog, corelib, loglib, tmuxlib, deliverylib, dialoglib, logs, review_protocol, gate, log_lock, cli
 from .schema_guard import SchemaGuard
-from .state_machine import ResponseGate
+from .state_machine import ResponseGate, decide_plan_action
 from .gate import run_gate, gate_or_message
 from .cli import build_parser
 from .log_lock import (claude_glob, codex_all, codex_cwd_matches, claude_matches_pane, lock_claude,
@@ -664,52 +664,50 @@ def main():
                     # 承認判定は停止ワードと同じく sentinel の先頭行完全一致で行う。プランの
                     # 自動承認は不可逆な自動操作なので、否定文・引用・指示文中の言及
                     # （「[AIPAIR_PLAN_APPROVED]とは判断できません」等）を絶対に承認にしない。
-                    plan_head = head_line(texts[-1]) if texts else ""
                     dialog = detect_plan_dialog(panes["claude"]) or plan_dialog
                     if text:
                         dim(c("codex", "codex") + ": " + oneline(text))
-                    if not text:
+                    # 承認判定（sentinel 先頭行完全一致・feedback 閾値・修正 vs 承認）は
+                    # state_machine.decide_plan_action の純粋関数へ切り出した（P2-1・plan_flow）。
+                    # ここは「決定 → 副作用（press/send/log/code）」の実行のみ。
+                    decision = decide_plan_action(texts, a.plan_ok, dialog)
+                    if decision.action == "no_text":
                         log(c("warn", "◆ Codex のレビュー本文を取得できず。ダイアログ検知からやり直します。"))
-                    elif dialog is None:
+                    elif decision.action == "no_dialog":
                         log(c("warn", "◆ プランダイアログが見当たりません（人間が操作した？）。通常の待機に戻ります。"))
-                    elif plan_head == a.plan_ok:
-                        # 承認は成立。付帯コメントは《最終メッセージ texts[-1] から先頭 sentinel を
-                        # 除いた残り》で測る（連結全文 text だと先行ナレーションが長いだけで
-                        # feedback 付き承認へ誤分岐する — Codex レビュー）。十分あれば shift+tab、
-                        # 無ければそのまま承認。
-                        extra = plan_extra_comment(texts, a.plan_ok)
-                        if len(extra) > 80 and dialog["tell"]:
-                            log("◆ " + c("ok", "Codex がプラン承認（付帯コメントあり）")
-                                + " → feedback付きで承認（shift+tab）")
-                            if not send_plan_feedback(panes["claude"], dialog, extra, approve=True,
-                                                      watch=claude_watch()):
-                                print(c("warn", "│ ■ feedback付き承認（Shift+Tab）の成立を確認できず。"
-                                                "状態遷移せず停止します。"), flush=True)
-                                print("\a", end="", flush=True)
-                                code = 4
-                                break
-                        else:
-                            log("◆ " + c("ok", "Codex がプラン承認") + f" → 「{dialog['yes_label']}」を選択")
-                            w = claude_watch()
-                            press(panes["claude"], dialog["yes"])
-                            if not approval_took_effect(panes["claude"],
-                                                       confirm=(w.claude_resolved if w else None)):
-                                print(c("warn", "│ ■ プラン承認キーの押下が効いていません（ダイアログ残存）。"
-                                                "状態遷移せず停止します。"), flush=True)
-                                print("\a", end="", flush=True)
-                                code = 4
-                                break
+                    elif decision.action == "approve_feedback":
+                        log("◆ " + c("ok", "Codex がプラン承認（付帯コメントあり）")
+                            + " → feedback付きで承認（shift+tab）")
+                        if not send_plan_feedback(panes["claude"], dialog, decision.payload, approve=True,
+                                                  watch=claude_watch()):
+                            print(c("warn", "│ ■ feedback付き承認（Shift+Tab）の成立を確認できず。"
+                                            "状態遷移せず停止します。"), flush=True)
+                            print("\a", end="", flush=True)
+                            code = 4
+                            break
                         plan_rounds = 0
-                    elif dialog["tell"] is None:
+                    elif decision.action == "approve":
+                        log("◆ " + c("ok", "Codex がプラン承認") + f" → 「{dialog['yes_label']}」を選択")
+                        w = claude_watch()
+                        press(panes["claude"], dialog["yes"])
+                        if not approval_took_effect(panes["claude"],
+                                                   confirm=(w.claude_resolved if w else None)):
+                            print(c("warn", "│ ■ プラン承認キーの押下が効いていません（ダイアログ残存）。"
+                                            "状態遷移せず停止します。"), flush=True)
+                            print("\a", end="", flush=True)
+                            code = 4
+                            break
+                        plan_rounds = 0
+                    elif decision.action == "no_tell_option":
                         print(c("warn", "│ ■ 『Tell Claude what to change』の選択肢が見つからず"
                                         "修正依頼を送れません。停止します。"), flush=True)
                         print("\a", end="", flush=True)
                         code = 5
                         break
-                    else:
+                    else:  # "changes"
                         log("◆ " + c("codex", "Codex が修正を要求")
                             + " → 「Tell Claude what to change」で送信")
-                        if not send_plan_feedback(panes["claude"], dialog, text, approve=False,
+                        if not send_plan_feedback(panes["claude"], dialog, decision.payload, approve=False,
                                                   watch=claude_watch()):
                             print(c("warn", "│ ■ プラン修正依頼の送信を確認できず（Enter失敗）。"
                                             "状態遷移せず停止します。"), flush=True)

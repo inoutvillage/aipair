@@ -1384,16 +1384,53 @@ class PlanApproval(unittest.TestCase):
         # the sentinel itself is stripped; surrounding punctuation trimmed
         self.assertEqual(relay.plan_extra_comment([self.OK], self.OK), "")
 
+    def _dlg(self, tell="2"):
+        return {"tell": tell, "yes": "1", "yes_label": "Yes, and bypass permissions", "plan": "p.md"}
+
     def test_approve_feedback_delivers_extra_not_the_joined_turn(self):
-        # Regression (P1-c, delivery side): the feedback-approve path must DELIVER `extra` (the
-        # final-message comment), never the whole-turn joined `text` — otherwise a long preceding
-        # narration is sent to Claude. Source check: the branch lives in a monolithic main().
+        # Regression (P1-c, delivery side): the feedback-approve path must carry `extra` (the
+        # final-message comment), never the whole-turn joined `text`. P2-1 made the decision a
+        # pure function (decide_plan_action), so assert it directly instead of grepping main():
+        # a long preceding narration + a sentinel-led final message with an extra note →
+        # approve_feedback carrying ONLY the final-message comment.
+        long_extra = "あ" * 100                         # > 80 かつ最終メッセージ由来
+        d = relay.decide_plan_action(["x" * 300, self.OK + "\n" + long_extra], self.OK, self._dlg())
+        self.assertEqual(d.action, "approve_feedback")
+        self.assertEqual(d.payload, long_extra)
+        self.assertNotIn("x", d.payload)                # 先行ナレーションは混入しない
+        # relay は「決定した payload」を approve=True で配達する（text を再計算して送らない）
         with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
             src = fh.read()
-        self.assertIn('send_plan_feedback(panes["claude"], dialog, extra, approve=True', src,
-                      "approve-feedback must deliver the final-message comment (extra)")
-        self.assertNotIn('send_plan_feedback(panes["claude"], dialog, text, approve=True', src,
-                         "must not deliver the whole-turn joined text")
+        self.assertIn('send_plan_feedback(panes["claude"], dialog, decision.payload, approve=True', src)
+        self.assertNotIn('dialog, text, approve=True', src, "must not deliver the whole-turn joined text")
+
+    def test_decide_plan_action_covers_every_branch(self):
+        # P2-1 plan_flow: the plan auto-approval decision (highest-stakes autonomous action) is a
+        # pure, tmux-free function — every branch is unit-covered here.
+        dlg = self._dlg()
+        # sentinel ALONE at the head → plain approve
+        self.assertEqual(relay.decide_plan_action([self.OK], self.OK, dlg).action, "approve")
+        # sentinel at head + short note (≤80) → still plain approve (no feedback churn)
+        self.assertEqual(relay.decide_plan_action([self.OK + "\nLGTM"], self.OK, dlg).action, "approve")
+        # sentinel at head + long note → approve_feedback
+        self.assertEqual(relay.decide_plan_action([self.OK + "\n" + "ok " * 40], self.OK, dlg).action,
+                         "approve_feedback")
+        # long note but the dialog has no "Tell Claude" slot → cannot attach feedback → plain approve
+        self.assertEqual(relay.decide_plan_action([self.OK + "\n" + "ok " * 40], self.OK,
+                                                  self._dlg(tell=None)).action, "approve")
+        # 🔴 safety: sentinel NOT at the head (negated / mid-sentence) must NEVER approve
+        self.assertEqual(relay.decide_plan_action(["なお " + self.OK + " とは判断できません"], self.OK, dlg).action,
+                         "changes")
+        self.assertEqual(relay.decide_plan_action(["2行目に\n" + self.OK], self.OK, dlg).action, "changes")
+        # changes carries the whole-turn text (so Claude sees the full review)
+        chg = relay.decide_plan_action(["please fix the retry logic"], self.OK, dlg)
+        self.assertEqual((chg.action, chg.payload), ("changes", "please fix the retry logic"))
+        # changes requested but no "Tell Claude" slot → fail-closed stop
+        self.assertEqual(relay.decide_plan_action(["fix it"], self.OK, self._dlg(tell=None)).action,
+                         "no_tell_option")
+        # empty review body → no_text; dialog vanished → no_dialog
+        self.assertEqual(relay.decide_plan_action([""], self.OK, dlg).action, "no_text")
+        self.assertEqual(relay.decide_plan_action(["fix it"], self.OK, None).action, "no_dialog")
 
 
 class DialogSendScrape(unittest.TestCase):
@@ -1709,9 +1746,10 @@ class ResponseGateBehavior(unittest.TestCase):
         )
 
     def test_standalone_import_and_relay_reexport(self):
-        self.assertTrue(_imports_without_relay("state_machine", "ResponseGate"))
-        from aipairlib.state_machine import ResponseGate
+        self.assertTrue(_imports_without_relay("state_machine", "ResponseGate", "decide_plan_action"))
+        from aipairlib.state_machine import ResponseGate, decide_plan_action
         self.assertIs(relay.ResponseGate, ResponseGate)
+        self.assertIs(relay.decide_plan_action, decide_plan_action)
 
     def test_arm_sets_lifecycle_and_clear_disables(self):
         g = self._gate(now=42.0)
