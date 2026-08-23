@@ -144,6 +144,33 @@ class SchemaProtocol(unittest.TestCase):
             self.assertIn("allow-untested-schema", doc, "%s must document --allow-untested-schema" % name)
 
 
+class Protocol(unittest.TestCase):
+    """stop/plan sentinel の《契約》— 最終回答の先頭行に単独・完全一致・誤停止/誤承認しない —
+    が README/SECURITY に固定され、コード（corelib.hit_stop）の実挙動と一致すること。値の存在だけ
+    でなく契約文を消したら落ちるように固定する。"""
+    def test_readme_pins_the_head_line_only_contract(self):
+        self.assertIn("先頭行に単独", README,
+                      "README must state sentinels hold only when alone on the leading line")
+        self.assertIn("否定文・引用・文中言及", README,
+                      "README must state 否定文/引用/文中言及 do NOT trigger a stop")
+        self.assertIn("先頭行に `[AIPAIR_PLAN_APPROVED]` を単独で", README,
+                      "README must state plan approval needs the sentinel alone on the leading line")
+
+    def test_security_pins_the_no_false_stop_contract(self):
+        self.assertIn("先頭行に単独", SECURITY)
+        self.assertIn("誤停止/誤承認しない", SECURITY,
+                      "SECURITY must state the head-line-only rule prevents 誤停止/誤承認")
+
+    def test_code_enforces_the_documented_head_line_contract(self):
+        # the doc contract must match code: corelib.hit_stop fires ONLY on a lone leading-line match.
+        self.assertTrue(corelib.hit_stop(["[AIPAIR_REVIEW_OK]"], ["[AIPAIR_REVIEW_OK]"]),
+                        "a lone leading-line sentinel must stop")
+        self.assertFalse(corelib.hit_stop(["なお [AIPAIR_REVIEW_OK] とは限らない"], ["[AIPAIR_REVIEW_OK]"]),
+                         "an inline mention must NOT stop (誤停止しない)")
+        self.assertFalse(corelib.hit_stop(["前置き\n[AIPAIR_REVIEW_OK]"], ["[AIPAIR_REVIEW_OK]"]),
+                         "a sentinel on the 2nd line must NOT stop")
+
+
 def _yaml_jobs(rel):
     """Top-level job keys under a workflow's `jobs:` block (regex, no yaml dep)."""
     lines = _read(rel).splitlines()
@@ -179,15 +206,51 @@ class TodoAndWorkflows(unittest.TestCase):
         for job in jobs:   # every nightly job must be written up in the README nightly 表
             self.assertIn(job, README, "nightly job %s is undocumented in README" % job)
 
-    def test_ci_matrix_rows_match_readme(self):
-        # verify the ACTUAL matrix ROWS (per row), not just that a version string exists somewhere.
+    def test_nightly_authenticated_e2e_pins_from_TESTED_VERSIONS(self):
+        # job 名だけでは、authenticated-e2e が TESTED_VERSIONS 読取をやめて版をハードコードしても通る。
+        # 実際に corelib.TESTED_VERSIONS を実行時に読み、その $CV/$XV で npm 導入することまで固定する。
+        ny = _read(".github/workflows/nightly.yml")
+        self.assertIn("from aipairlib.corelib import TESTED_VERSIONS", ny,
+                      "authenticated-e2e must read the pins from corelib.TESTED_VERSIONS at runtime")
+        self.assertIn('T["claude"]', ny)
+        self.assertIn('T["codex"]', ny)
+        self.assertIn("@anthropic-ai/claude-code@$CV", ny,
+                      "must install the PINNED claude via the TESTED_VERSIONS value ($CV), not a hardcoded version")
+        self.assertIn("@openai/codex@$XV", ny,
+                      "must install the PINNED codex via the TESTED_VERSIONS value ($XV), not a hardcoded version")
+
+    def _ci_matrix_rows(self):
         ci = _read(".github/workflows/ci.yml")
-        rows = set(re.findall(r"\{\s*python:\s*'([^']+)',\s*tmux:\s*'?([^',}\s]+)'?\s*\}", ci))
-        self.assertEqual(rows, {("3.8", "distro"), ("3.13", "distro"), ("3.13", "3.1")},
-                         "ci.yml matrix rows drifted from README「必要環境」（floor 3.8 / current 3.13 / tmux 3.1）: %s"
-                         % sorted(rows))
-        for v in ("3.8", "3.13", "3.1"):   # README must document each version the matrix pins
-            self.assertIn(v, README, "README must document version %s used by CI" % v)
+        return set(re.findall(r"\{\s*python:\s*'([^']+)',\s*tmux:\s*'?([^',}\s]+)'?\s*\}", ci))
+
+    def _readme_lane_rows(self):
+        lines = README.splitlines()
+        start = next((i for i, l in enumerate(lines)
+                      if re.match(r"\|\s*lane\s*\|\s*Python\s*\|\s*tmux\s*\|", l)), None)
+        self.assertIsNotNone(start, "README must have a『| lane | Python | tmux |』3-lane table")
+        rows = set()
+        for l in lines[start + 1:]:
+            if l.strip().startswith("|---"):
+                continue
+            if not l.strip().startswith("|"):
+                break
+            cells = [c.strip() for c in l.strip().strip("|").split("|")]
+            if len(cells) < 3:
+                continue
+            pym = re.search(r"\d+\.\d+", cells[1])
+            tm = ("distro" if "distro" in cells[2]
+                  else (re.search(r"\d+\.\d+", cells[2]).group(0) if re.search(r"\d+\.\d+", cells[2]) else cells[2]))
+            if pym:
+                rows.add((pym.group(0), tm))
+        return rows
+
+    def test_ci_matrix_rows_match_readme(self):
+        # correlate PER ROW: ci.yml の実 matrix 行 == README 3-lane 表の (Python, tmux) 行 == 期待集合。
+        expect = {("3.8", "distro"), ("3.13", "distro"), ("3.13", "3.1")}
+        self.assertEqual(self._ci_matrix_rows(), expect,
+                         "ci.yml matrix rows drifted: %s" % sorted(self._ci_matrix_rows()))
+        self.assertEqual(self._readme_lane_rows(), expect,
+                         "README 3-lane 表の行が ci.yml matrix とずれている: %s" % sorted(self._readme_lane_rows()))
 
     def test_current_behaviour_docs_avoid_the_stale_module_count(self):
         # the aipairlib package grew past the old「5 libs / 6 sibling modules」count (P2-1), so the
