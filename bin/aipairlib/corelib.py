@@ -329,6 +329,18 @@ def schema_fail_closed(a, bad):
     return bool(bad) and not getattr(a, "allow_untested_schema", False)
 
 
+def schema_should_reprobe(latch, latched_path, new_path):
+    """一エージェントの runtime schema 監視について、追跡ログ path が変わったかを見て
+    (reset, skip) を返す（P1-4）。終端 'mismatch' latch は《ひとつのログ》に対するものなので、
+    path が切り替わったら（resume/clear/再起動/rotation）latch をリセットして新ログを未確認から
+    再 probe しなければ、新ログを一生見ない。
+      reset=True … latch/sig を破棄して latched_path を new_path へ更新すべき
+      skip=True  … （path 変化を反映した後の）latch が終端 'mismatch' なので今回の probe は skip"""
+    reset = new_path != latched_path
+    latch_after = None if reset else latch
+    return (reset, latch_after == "mismatch")
+
+
 def schema_latch_step(current, status, allow_untested):
     """一エージェントの runtime schema 監視を進める1ステップ。`current` は latch 状態
     (None=未確認 / 'ok-seen'=ok を観測済みだが監視継続 / 'mismatch'=確定・終端)、`status` は
