@@ -1640,6 +1640,18 @@ class LoglibStandalone(unittest.TestCase):
         self.assertIs(relay.turn_texts, relay.loglib.turn_texts)
         self.assertIs(relay.read_records, relay.loglib.read_records)
 
+    def test_cli_module_is_standalone(self):
+        # P2-1 増分6: argparse + AIPAIR_* env defaults live in a standalone cli module; relay
+        # re-exports _env_* / ENV_USED / build_parser so EnvHelpers and the launch forms are
+        # unchanged.
+        self.assertTrue(_imports_without_relay("cli", "build_parser", "_env_str", "_env_int"))
+        self.assertIs(relay._env_str, relay.cli._env_str)
+        self.assertIs(relay.ENV_USED, relay.cli.ENV_USED)
+        # build_parser produces the real parser (defaults resolve from AIPAIR_* / sentinels)
+        a = relay.build_parser("x").parse_args([])
+        self.assertEqual(a.stop, "[AIPAIR_REVIEW_OK]")
+        self.assertEqual(a.plan_ok, "[AIPAIR_PLAN_APPROVED]")
+
     def test_log_lock_module_is_standalone(self):
         # P2-1 増分4: the log-locking cluster is a standalone module; relay re-exports the lock/
         # refresh functions so codex-follow's relay.lock_codex / relay.refresh_codex_lock etc.
