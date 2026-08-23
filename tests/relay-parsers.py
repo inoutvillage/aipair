@@ -1637,6 +1637,15 @@ class LoglibStandalone(unittest.TestCase):
         self.assertIs(relay.turn_texts, relay.loglib.turn_texts)
         self.assertIs(relay.read_records, relay.loglib.read_records)
 
+    def test_log_lock_module_is_standalone(self):
+        # P2-1 増分4: the log-locking cluster is a standalone module; relay re-exports the lock/
+        # refresh functions so codex-follow's relay.lock_codex / relay.refresh_codex_lock etc.
+        # are unchanged.
+        self.assertTrue(_imports_without_relay("log_lock", "lock_codex", "lock_claude",
+                                               "refresh_claude_lock", "read_codex_since"))
+        self.assertIs(relay.lock_codex, relay.log_lock.lock_codex)
+        self.assertIs(relay.refresh_claude_lock, relay.log_lock.refresh_claude_lock)
+
     def test_gate_module_is_standalone(self):
         # P2-1 増分3: the stop-gate runner is a standalone module (no relay dependency); relay
         # re-exports run_gate so call sites / GateRunner tests are unchanged.
