@@ -19,7 +19,7 @@
       "problemMatcher": []
     },
     {
-      "label": "🔁【AI Pair】相互レビュー・ループ（自走 / Codexが「完了です」で停止）",
+      "label": "🔁【AI Pair】相互レビュー・ループ（自走 / Codexが [AIPAIR_REVIEW_OK] で停止）",
       "type": "shell",
       "command": "wsl.exe",
       "args": [
