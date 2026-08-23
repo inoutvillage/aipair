@@ -1449,14 +1449,17 @@ class ResponseAttribution(unittest.TestCase):
         anchor, comp = relay.codex_response_complete(p, "relay-id:abcd")
         self.assertEqual(anchor, epoch("2026-08-21T00:00:01Z")); self.assertIsNone(comp)
 
-    def test_codex_metadata_missing_falls_back_to_preceding_start(self):
-        # no turn_id on the nonce user → nearest preceding task_started is the turn; complete
-        # only counts if it is after the nonce
+    def test_codex_metadata_missing_is_fail_closed_by_default(self):
+        # P1-3: no turn_id on the nonce user → attribution can't be confirmed. The position
+        # heuristic can misattribute a queued turn, so by DEFAULT it is NOT used — fail-closed.
         p = self.w("cx.jsonl", [
             self._ev("2026-08-21T00:00:01Z", "task_started", "T1"),
             self._cx_user("2026-08-21T00:00:03Z", "x relay-id:abcd"),   # no turn_id
             self._ev("2026-08-21T00:00:09Z", "task_complete", "T1")])
-        anchor, comp = relay.codex_response_complete(p, "relay-id:abcd")
+        self.assertEqual(relay.codex_response_complete(p, "relay-id:abcd"), (None, None),
+                         "default = fail-closed (no position heuristic for autonomous decisions)")
+        # only an EXPLICIT compatibility mode opts into the position fallback
+        anchor, comp = relay.codex_response_complete(p, "relay-id:abcd", allow_position_fallback=True)
         self.assertEqual(anchor, epoch("2026-08-21T00:00:01Z"))
         self.assertEqual(comp, epoch("2026-08-21T00:00:09Z"))
 

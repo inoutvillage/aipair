@@ -912,6 +912,9 @@ def main():
             set_pane_title(own, "relay ■ 終了(schema不一致) / 0往復")   # 走行中タイトルのまま残さない
             return 7
         log(c("dim", "  → --allow-untested-schema: fail-open で継続（ダイアログ自動操作は OFF）"))
+    if a.allow_untested_schema or a.no_schema_probe:
+        log(c("warn", "⚠ compatibility mode: codex 応答帰属で turn_id 欠落時に位置フォールバックを許可"
+                      "（誤帰属の可能性。schema 安全機構を明示的に外した時のみ）"))
     if a.endless:
         log(c("ok", "連続モード=on") + f"（「{stop_phrases[0] if stop_phrases else '[AIPAIR_REVIEW_OK]'}」＝レビュー合格→次のタスクへ）")
         log(f"  タスクリスト={a.task_list}  次を要求={'/'.join(next_ask_phrases)}  "
@@ -1071,7 +1074,10 @@ def main():
         if probe_ts_cache is None:
             return None  # nonce 未着（未配達）— poke_noshow が期限を監視
         if agent == "codex":
-            anchor, comp = codex_response_complete(path, probe)
+            # turn_id 欠落時の位置フォールバックは compatibility mode（schema 安全機構を明示的に
+            # 外した時）だけ許可。既定は帰属不能→(None,None) で fail-closed（下の reject で待機）。
+            anchor, comp = codex_response_complete(
+                path, probe, allow_position_fallback=(a.allow_untested_schema or a.no_schema_probe))
             if anchor is None:
                 return reject("nonce の user アイテム未発見")
             if comp is None:

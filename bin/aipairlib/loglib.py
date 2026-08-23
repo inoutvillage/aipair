@@ -125,7 +125,7 @@ def make_fragment(text, n=48):
     return None
 
 
-def codex_response_complete(path, probe):
+def codex_response_complete(path, probe, allow_position_fallback=False):
     """rollout から nonce の user メッセージを含むタスク（turn_id）を特定し、
     (そのタスクの task_started ts, 同 turn_id の task_complete ts or None) を返す。
     nonce 未発見・所属タスク不明なら (None, None)。
@@ -139,7 +139,11 @@ def codex_response_complete(path, probe):
       を持つ（実ログ確認済み）ので、それをキーに同 turn_id の task_started /
       task_complete を対応付ける。キュー投入時に「時刻上の直前 start」が先行タスク
       を指す誤帰属は、位置推定ではなく ID 対応でそもそも起こらない。
-    メタデータ欠落時のみ「直前の task_started」への位置フォールバック。"""
+    turn_id メタデータが欠落した nonce では帰属が確定できない。既定は fail-closed で
+    (None, None) を返す（位置推定は queue 投入時に先行タスクを誤帰属し得るため、自律運転の
+    停止/承認判定に使ってはならない — P1-3）。allow_position_fallback=True（compatibility
+    mode: 呼び出し側が --allow-untested-schema / --no-schema-probe を明示した時だけ）に限り、
+    従来どおり「直前の task_started」への位置フォールバックを行う。"""
     starts, completes = [], []
     nonce_ts = None
     nonce_turn = None
@@ -171,7 +175,11 @@ def codex_response_complete(path, probe):
         anchor = next((ts for ts, tid in starts if tid == nonce_turn), nonce_ts)
         comp = next((ts for ts, tid in completes if tid == nonce_turn), None)
         return (anchor, comp)
-    # フォールバック（メタデータ無し）: 時刻上の直前 start を所属タスクとみなす
+    # メタデータ（turn_id）欠落: 既定は帰属不能として fail-closed（(None, None)）。位置推定は
+    # 明示的な compatibility mode でのみ許す（P1-3）。
+    if not allow_position_fallback:
+        return (None, None)
+    # フォールバック（compatibility mode）: 時刻上の直前 start を所属タスクとみなす
     turn = None
     for ts, tid in starts:
         if ts <= nonce_ts:

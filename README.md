@@ -439,6 +439,8 @@ aipair-relay --allow-untested-schema       # schema 不一致でも継続=fail-o
 aipair-relay --no-schema-probe             # schema probe 自体をしない（AIPAIR_NO_SCHEMA_PROBE=1）
 ```
 
+- Codex の**応答帰属**は user アイテムの `turn_id`（`internal_chat_message_metadata_passthrough`）で行う。turn_id が欠落すると帰属が確定できないため、**既定は fail-closed**（位置推定は queue 投入時に先行タスクを誤帰属し得るので自律運転の停止/承認判定に使わない）。`--allow-untested-schema` / `--no-schema-probe` を明示したcompatibility mode の時だけ、警告付きで従来の位置フォールバックに退行する。
+
 probe の実装は純関数 `schema_probe`（`bin/aipairlib/corelib.py`）で、`tests/relay-parsers.py` の `SchemaProbe` が
 claude/codex の ok・unverified・各ドリフトを被覆している。
 
