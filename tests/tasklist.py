@@ -54,6 +54,13 @@ class State(unittest.TestCase):
         r = tl.classify("- [!] X\n    blocker: because reasons\n")
         self.assertEqual(r["blocked"], [{"item": "- [!] X", "blocker": "because reasons"}])
 
+    def test_ready_item_is_verbatim_including_trailing_whitespace(self):
+        # 厳密一致タスク ID 契約（Phase 4）のため、行は逐語（末尾空白保持・rstrip しない）。
+        r = tl.classify("- [ ] task A  \n")               # 末尾に空白2つ
+        self.assertEqual(r["ready"], ["- [ ] task A  "])   # verbatim（rstrip されない）
+        b = tl.classify("- [!] Y \n  - blocker: why\n")   # blocked.item も逐語
+        self.assertEqual(b["blocked"][0]["item"], "- [!] Y ")
+
 
 class FailClosed(unittest.TestCase):
     def test_unknown_marker_raises(self):
@@ -91,6 +98,14 @@ class CodeFences(unittest.TestCase):
     def test_info_string_fence_still_ignored(self):
         body = "```python\n- [ ] code sample\n```\n- [x] done\n"
         self.assertEqual(tl.classify(body)["state"], tl.ALL_DONE)
+
+    def test_info_string_line_inside_fence_is_not_a_close(self):
+        # 開始フェンス内の ``` + info string 行を「終了」と誤認すると、以降のコード例が本文として
+        # 解析され未知記法 [?] で TaskListError になっていた（Codex relay-id:c6136219）。
+        body = "```\n```python\n- [?] example inside fence\n```\n- [x] done\n"
+        r = tl.classify(body)                              # 例外を投げない
+        self.assertEqual(r["state"], tl.ALL_DONE)          # フェンス内は全て無視
+        self.assertEqual(r["ready"], [])
 
 
 class SnapshotHash(unittest.TestCase):
