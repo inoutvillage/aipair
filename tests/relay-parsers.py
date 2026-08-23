@@ -1433,6 +1433,22 @@ class PlanApproval(unittest.TestCase):
         self.assertEqual(relay.decide_plan_action(["fix it"], self.OK, None).action, "no_dialog")
 
 
+class QuestionRelayDecision(unittest.TestCase):
+    """P2-1 question_flow: Codex の質問回答をどうするかの判定は純粋関数 decide_question_action。
+    plan と対称に「no_text→再検知 / no_dialog→人間操作 / else→配達」を副作用抜きで被覆する。"""
+    def test_all_branches(self):
+        qdlg = {"chat": "1", "footer": "Chat about this"}
+        d = relay.decide_question_action(["Postgres を選ぶべき"], qdlg)
+        self.assertEqual((d.action, d.payload), ("deliver", "Postgres を選ぶべき"))
+        # 複数行の回答は連結して配達（そのまま中継 — 承認 sentinel は無い）
+        self.assertEqual(relay.decide_question_action(["1行目", "2行目"], qdlg).payload, "1行目\n2行目")
+        # 空本文 → no_text（ダイアログ検知からやり直し・未送信で state を進めない）
+        self.assertEqual(relay.decide_question_action([""], qdlg).action, "no_text")
+        self.assertEqual(relay.decide_question_action([], qdlg).action, "no_text")
+        # 回答中に人間がダイアログを操作 → 消えていれば no_dialog（通常待機へ戻す）
+        self.assertEqual(relay.decide_question_action(["answer"], None).action, "no_dialog")
+
+
 class DialogSendScrape(unittest.TestCase):
     """aipairlib.dialoglib: multi-tab scrape, capture failure, plan revise/approve, question
     answer, watch present/absent. tmux/capture/delivery hooks are injected → patch there."""
@@ -1746,10 +1762,12 @@ class ResponseGateBehavior(unittest.TestCase):
         )
 
     def test_standalone_import_and_relay_reexport(self):
-        self.assertTrue(_imports_without_relay("state_machine", "ResponseGate", "decide_plan_action"))
-        from aipairlib.state_machine import ResponseGate, decide_plan_action
+        self.assertTrue(_imports_without_relay("state_machine", "ResponseGate", "decide_plan_action",
+                                               "decide_question_action"))
+        from aipairlib.state_machine import ResponseGate, decide_plan_action, decide_question_action
         self.assertIs(relay.ResponseGate, ResponseGate)
         self.assertIs(relay.decide_plan_action, decide_plan_action)
+        self.assertIs(relay.decide_question_action, decide_question_action)
 
     def test_arm_sets_lifecycle_and_clear_disables(self):
         g = self._gate(now=42.0)
