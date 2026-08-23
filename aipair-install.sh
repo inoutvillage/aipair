@@ -390,129 +390,221 @@ for f in "${RETIRED[@]}"; do
     fi
   fi
 done
-# ---- transactional install: aipairlib package + top-level entrypoints as ONE staged batch (P2-2)
-# The package (Phase 1) was already staged→verified→atomically-swapped, but the entrypoints (Phase
-# 2) used to be copied one-by-one, so a failure partway through left a MIXED set (new package /
-# new `aipair` beside an old `aipair-relay`). Now both are staged together in a temp dir, the
-# staged thin entrypoints are run against the STAGED package (the thin entrypoints add their own
-# dir to sys.path, so a co-located stage exercises exactly the new combination), and only then are
-# the changed paths switched as one batch guarded by a SINGLE rollback. Any failure — a bad import,
-# a mid-switch mv, or the post-switch --help — restores every backed-up path, so an upgrade is
-# all-or-nothing: never a new package beside old/half-switched entrypoints.
-ENTRYPOINTS=(); for f in "${FILES[@]}"; do case "$f" in aipairlib/*) : ;; *) ENTRYPOINTS+=("$f") ;; esac; done
+# ==== unified install transaction (P2-2) ======================================
+# The whole install — the aipairlib package, the thin entrypoints, the retired flat libs, the
+# skills, the two GLOBAL notice blocks (CLAUDE.md / AGENTS.md) and the optional VS Code tasks — is
+# applied as ONE transaction: EVERY destination (binaries AND the template outputs) is staged and
+# validated BEFORE anything is committed, and every committed change is appended to a single
+# journal so ANY later failure rolls the WHOLE install back. You never end up with new binaries
+# beside a half-updated set of notice files (e.g. CLAUDE.md rewritten but a broken
+# codex-agents-block.md aborting AGENTS.md).
+_JT=(); _JB=()                          # parallel arrays: applied target, its backup ("" = fresh)
+_apply() { _JT+=("$1"); _JB+=("${2:-}"); }
+_txn_rollback() {                       # undo every committed change, newest first
+  local i t b
+  [ "${#_JT[@]}" -gt 0 ] || return 0
+  for (( i=${#_JT[@]}-1 ; i>=0 ; i-- )); do
+    t="${_JT[$i]}"; b="${_JB[$i]}"
+    rm -rf "$t"
+    if [ -n "$b" ] && [ -e "$b" ]; then mv "$b" "$t"; fi
+  done
+}
+_stage_cleanup() { [ -n "${STAGE:-}" ] && rm -rf "${STAGE:-}"; rm -f "${CM_NEW:-}" "${CA_NEW:-}" 2>/dev/null || true; }
+_die() { fail "$1"; _txn_rollback; _stage_cleanup; exit "${2:-1}"; }   # commit-phase failure → roll back
 
-_pkg_current() {  # every aipairlib/* file installed == repo copy
-  local g; for g in "${FILES[@]}"; do case "$g" in aipairlib/*) same_file "$REPO_DIR/bin/$g" "$BIN_DIR/$g" || return 1 ;; esac; done; return 0
+# stage_block FILE TPL OUTFILE — compute FILE's new content (append/replace the marker block) and
+# write it to OUTFILE (a temp next to FILE), WITHOUT touching FILE. Prints the action
+# (same|created|appended|replaced). Exit 4 broken template, 5 damaged block in FILE.
+stage_block() {
+  python3 - "$1" "$2" "$3" "$MARK_START" "$MARK_END" <<'PY'
+import os, sys
+path, tpl, out, S, E = sys.argv[1:6]
+S = S.encode(); E = E.encode()
+block = open(tpl, 'rb').read()
+if block.count(S) != 1 or block.count(E) != 1 or block.find(S) > block.find(E):
+    print("template-broken"); sys.exit(4)
+if not block.endswith(b"\n"):
+    block += b"\n"
+exists = os.path.exists(path)
+old = open(path, 'rb').read() if exists else b""
+s, e = old.count(S), old.count(E)
+if s == 0 and e == 0:
+    if not old:                 sep = b""
+    elif old.endswith(b"\n\n"):  sep = b""
+    elif old.endswith(b"\n"):    sep = b"\n"
+    else:                        sep = b"\n\n"
+    new = old + sep + block
+    action = "appended" if exists else "created"
+elif s == 1 and e == 1 and old.find(S) < old.find(E):
+    i = old.find(S); j = old.find(E) + len(E)
+    if old[j:j+1] == b"\n": j += 1
+    new = old[:i] + block + old[j:]
+    action = "replaced"
+else:
+    print("broken"); sys.exit(5)
+if exists and new == old:
+    print("same"); sys.exit(0)
+os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+with open(out, 'wb') as f:
+    f.write(new)
+print(action)
+PY
 }
 
-EP_CHANGED=()   # only the entrypoints that differ from the repo get backed up + switched
-for f in "${ENTRYPOINTS[@]}"; do same_file "$REPO_DIR/bin/$f" "$BIN_DIR/$f" || EP_CHANGED+=("$f"); done
-PKG_NEEDS=1; { [ -d "$BIN_DIR/aipairlib" ] && _pkg_current; } && PKG_NEEDS=0
+# commit_block FILE OUTFILE BACKUP — back FILE up to BACKUP (if it exists), atomically move the
+# pre-staged OUTFILE into place, verify exactly one marker pair survived. Exit 6 (restores backup)
+# on a corrupt result. Same filesystem (OUTFILE was staged next to FILE) → mv is atomic.
+commit_block() {
+  python3 - "$1" "$2" "$3" "$MARK_START" "$MARK_END" <<'PY'
+import os, shutil, sys
+path, out, bak, S, E = sys.argv[1:6]
+S = S.encode(); E = E.encode()
+existed = os.path.exists(path)
+if existed:
+    shutil.copy2(path, bak)
+os.replace(out, path)
+chk = open(path, 'rb').read()
+if chk.count(S) != 1 or chk.count(E) != 1 or chk.find(S) > chk.find(E):
+    if existed: shutil.copy2(bak, path)
+    else:       os.remove(path)
+    print("verify-failed"); sys.exit(6)
+print("ok")
+PY
+}
 
-if [ "$PKG_NEEDS" -eq 0 ] && [ "${#EP_CHANGED[@]}" -eq 0 ]; then
-  for f in "${ENTRYPOINTS[@]}"; do [ -x "$BIN_DIR/$f" ] || chmod +x "$BIN_DIR/$f" 2>/dev/null || true; done
-  # nothing to switch, but still confirm the existing thin entrypoints import the existing package
-  for f in aipair-relay peer-log; do
-    "$BIN_DIR/$f" --help >/dev/null 2>&1 || { fail "$BIN_DIR/$f --help failed (existing install broken?) — re-run after fixing $BIN_DIR/aipairlib"; exit 1; }
-  done
-  skip "$BIN_DIR aipairlib package + entrypoints are up to date"
-else
+# commit_notice DEST ACTION STAGED — commit one pre-staged notice block into DEST, journaling the
+# backup so a later failure rolls it back with everything else. ACTION "same" → nothing to do.
+commit_notice() {
+  local file="$1" act="$2" new="$3" bak
+  if [ "$act" = "same" ]; then skip "$file: aipair block already up to date (untouched)"; return 0; fi
+  bak="$file.aipair-bak-$TS"
+  commit_block "$file" "$new" "$bak" >/dev/null || _die "$file: post-write verification failed — rolled back the whole install"
+  if [ -e "$bak" ]; then _apply "$file" "$bak"; else _apply "$file" ""; fi
+  ok "$file: aipair block $act; committed as part of the atomic install"
+}
+
+# ---- STAGE (commit nothing): package + entrypoints -----------------------------
+ENTRYPOINTS=(); for f in "${FILES[@]}"; do case "$f" in aipairlib/*) : ;; *) ENTRYPOINTS+=("$f") ;; esac; done
+_pkg_current() { local g; for g in "${FILES[@]}"; do case "$g" in aipairlib/*) same_file "$REPO_DIR/bin/$g" "$BIN_DIR/$g" || return 1 ;; esac; done; return 0; }
+EP_CHANGED=(); for f in "${ENTRYPOINTS[@]}"; do same_file "$REPO_DIR/bin/$f" "$BIN_DIR/$f" || EP_CHANGED+=("$f"); done
+PKG_NEEDS=1; { [ -d "$BIN_DIR/aipairlib" ] && _pkg_current; } && PKG_NEEDS=0
+STAGE=""; STAGED_BINS=0
+if [ "$PKG_NEEDS" -eq 1 ] || [ "${#EP_CHANGED[@]}" -gt 0 ]; then
   STAGE="$BIN_DIR/.aipair-stage-$TS"; rm -rf "$STAGE"
   mkdir -p "$STAGE/aipairlib" || { fail "cannot create staging dir $STAGE"; exit 1; }
-  for f in "${FILES[@]}"; do
-    cp "$REPO_DIR/bin/$f" "$STAGE/$f" || { fail "cannot stage $f"; rm -rf "$STAGE"; exit 1; }
-  done
-  for f in "${ENTRYPOINTS[@]}"; do
-    chmod +x "$STAGE/$f" || { fail "cannot chmod staged $f"; rm -rf "$STAGE"; exit 1; }
-  done
-  # verify the NEW combination in the stage, before touching anything live:
-  #   (1) the staged package imports; (2) the staged shell launchers parse;
-  #   (3) the staged thin entrypoints import the staged package end-to-end (co-located --help).
+  for f in "${FILES[@]}"; do cp "$REPO_DIR/bin/$f" "$STAGE/$f" || { _stage_cleanup; fail "cannot stage $f"; exit 1; }; done
+  for f in "${ENTRYPOINTS[@]}"; do chmod +x "$STAGE/$f" || { _stage_cleanup; fail "cannot chmod staged $f"; exit 1; }; done
+  # verify the NEW combination in the stage (import + shell parse + co-located --help)
   if ! AIPAIR_STAGE="$STAGE" python3 -c "import os, sys; sys.path.insert(0, os.environ['AIPAIR_STAGE']); import aipairlib.relay, aipairlib.peerlog" 2>/dev/null; then
-    rm -rf "$STAGE"; fail "the new aipairlib package failed to import — kept the previous install unchanged"; exit 1
+    _stage_cleanup; fail "the new aipairlib package failed to import — kept the previous install unchanged"; exit 1
   fi
   for f in aipair aipair-relay-here peer; do
-    bash -n "$STAGE/$f" 2>/dev/null || { rm -rf "$STAGE"; fail "staged $f has a shell syntax error — kept the previous install unchanged"; exit 1; }
+    bash -n "$STAGE/$f" 2>/dev/null || { _stage_cleanup; fail "staged $f has a shell syntax error — kept the previous install unchanged"; exit 1; }
   done
   for f in aipair-relay peer-log; do
-    "$STAGE/$f" --help >/dev/null 2>&1 || { rm -rf "$STAGE"; fail "staged $f could not import the staged package (--help) — kept the previous install unchanged"; exit 1; }
+    "$STAGE/$f" --help >/dev/null 2>&1 || { _stage_cleanup; fail "staged $f could not import the staged package (--help) — kept the previous install unchanged"; exit 1; }
   done
+  STAGED_BINS=1
+fi
 
-  # switch changed paths as one batch; SWITCHED records every path to undo on ANY later failure.
-  SWITCHED=()
-  _rollback_install() {
-    local d
-    [ "${#SWITCHED[@]}" -gt 0 ] || return 0
-    for d in "${SWITCHED[@]}"; do
-      if [ "$d" = "aipairlib" ]; then
-        rm -rf "$BIN_DIR/aipairlib"; [ -e "$BIN_DIR/aipairlib.bak-$TS" ] && mv "$BIN_DIR/aipairlib.bak-$TS" "$BIN_DIR/aipairlib"
-      else
-        rm -f "$BIN_DIR/$d"; [ -e "$BIN_DIR/$d.bak-$TS" ] && mv "$BIN_DIR/$d.bak-$TS" "$BIN_DIR/$d"
-      fi
-    done
-  }
+# ---- STAGE (commit nothing): the two GLOBAL notice blocks -----------------------
+# Validate BOTH templates + compute their new content up front, so a broken codex-agents-block.md
+# aborts the install BEFORE any file (binary or notice) is committed.
+CM_NEW=""; CA_NEW=""; CM_ACT="skip"; CA_ACT="skip"
+if [ "$NO_GLOBAL" -eq 0 ]; then
+  CM_NEW="$CLAUDE_MD.aipair-new-$TS"; CA_NEW="$CODEX_AGENTS.aipair-new-$TS"
+  CM_ACT="$(stage_block "$CLAUDE_MD"   "$REPO_DIR/templates/claude-md-block.md"   "$CM_NEW")"   || { _stage_cleanup; fail "$REPO_DIR/templates/claude-md-block.md → $CLAUDE_MD: $CM_ACT (nothing changed)"; exit 1; }
+  CA_ACT="$(stage_block "$CODEX_AGENTS" "$REPO_DIR/templates/codex-agents-block.md" "$CA_NEW")" || { _stage_cleanup; fail "$REPO_DIR/templates/codex-agents-block.md → $CODEX_AGENTS: $CA_ACT (nothing changed)"; exit 1; }
+fi
+
+# ==== COMMIT (journaled): any failure past here rolls the whole batch back =======
+# ---- commit: package + entrypoints ----
+if [ "$STAGED_BINS" -eq 1 ]; then
   if [ "$PKG_NEEDS" -eq 1 ]; then
     if [ -e "$BIN_DIR/aipairlib" ]; then
       rm -rf "$BIN_DIR/aipairlib.bak-$TS"
-      mv "$BIN_DIR/aipairlib" "$BIN_DIR/aipairlib.bak-$TS" || { fail "cannot back up $BIN_DIR/aipairlib"; rm -rf "$STAGE"; exit 1; }
+      mv "$BIN_DIR/aipairlib" "$BIN_DIR/aipairlib.bak-$TS" || _die "cannot back up $BIN_DIR/aipairlib"
+      mv "$STAGE/aipairlib" "$BIN_DIR/aipairlib" || { _apply "$BIN_DIR/aipairlib" "$BIN_DIR/aipairlib.bak-$TS"; _die "cannot install $BIN_DIR/aipairlib"; }
+      _apply "$BIN_DIR/aipairlib" "$BIN_DIR/aipairlib.bak-$TS"
+    else
+      mv "$STAGE/aipairlib" "$BIN_DIR/aipairlib" || _die "cannot install $BIN_DIR/aipairlib"
+      _apply "$BIN_DIR/aipairlib" ""
     fi
-    if ! mv "$STAGE/aipairlib" "$BIN_DIR/aipairlib"; then
-      fail "cannot install $BIN_DIR/aipairlib — rolling back"; SWITCHED+=("aipairlib"); _rollback_install; rm -rf "$STAGE"; exit 1
-    fi
-    SWITCHED+=("aipairlib")
   fi
   if [ "${#EP_CHANGED[@]}" -gt 0 ]; then
     for f in "${EP_CHANGED[@]}"; do
       if [ -e "$BIN_DIR/$f" ]; then
-        cp -p "$BIN_DIR/$f" "$BIN_DIR/$f.bak-$TS" || { fail "cannot back up $BIN_DIR/$f — rolling back this upgrade"; _rollback_install; rm -rf "$STAGE"; exit 1; }
+        cp -p "$BIN_DIR/$f" "$BIN_DIR/$f.bak-$TS" || _die "cannot back up $BIN_DIR/$f"
+        mv "$STAGE/$f" "$BIN_DIR/$f" || _die "cannot install $BIN_DIR/$f"
+        _apply "$BIN_DIR/$f" "$BIN_DIR/$f.bak-$TS"
+      else
+        mv "$STAGE/$f" "$BIN_DIR/$f" || _die "cannot install $BIN_DIR/$f"
+        _apply "$BIN_DIR/$f" ""
       fi
-      if ! mv "$STAGE/$f" "$BIN_DIR/$f"; then
-        fail "cannot install $BIN_DIR/$f — rolling back this upgrade"; _rollback_install; rm -rf "$STAGE"; exit 1
-      fi
-      SWITCHED+=("$f")
     done
   fi
-  rm -rf "$STAGE"
-  # post-switch verification: the INSTALLED entrypoints import the INSTALLED package end-to-end.
-  # A failure here rolls the whole batch back (package + every switched entrypoint).
+  rm -rf "$STAGE"; STAGE=""
   for f in aipair-relay peer-log; do
-    if ! "$BIN_DIR/$f" --help >/dev/null 2>&1; then
-      fail "$BIN_DIR/$f --help failed after install — rolled back package + entrypoints"; _rollback_install; exit 1
-    fi
+    "$BIN_DIR/$f" --help >/dev/null 2>&1 || _die "$BIN_DIR/$f --help failed after install — rolled back package + entrypoints"
   done
-  ok "$BIN_DIR aipairlib package + entrypoints installed (verified the new combo before + after switching)"
+  ok "$BIN_DIR aipairlib package + entrypoints installed (staged + verified the new combo before switching)"
+else
+  for f in "${ENTRYPOINTS[@]}"; do [ -x "$BIN_DIR/$f" ] || chmod +x "$BIN_DIR/$f" 2>/dev/null || true; done
+  for f in aipair-relay peer-log; do
+    "$BIN_DIR/$f" --help >/dev/null 2>&1 || { fail "$BIN_DIR/$f --help failed (existing install broken?) — re-run after fixing $BIN_DIR/aipairlib"; exit 1; }
+  done
+  skip "$BIN_DIR aipairlib package + entrypoints are up to date"
 fi
 ok "aipair-relay / peer-log start from $BIN_DIR (--help exits 0)"
 
-# Now that the aipairlib package is installed AND the entrypoints import it, retire the old flat
-# aipair-*lib files (superseded by the package). Doing this AFTER the import check means a failed
-# package install above leaves the previous working install (old libs) untouched.
+# ---- commit: retire the flat aipair-*lib files superseded by the package ----
 for f in "${SUPERSEDED[@]}"; do
   if [ -e "$BIN_DIR/$f" ]; then
-    if mv "$BIN_DIR/$f" "$BIN_DIR/$f.removed-$TS"; then
-      ok "retired $BIN_DIR/$f (now provided by the aipairlib package; moved to $f.removed-$TS)"
-    else
-      fail "could not retire superseded $BIN_DIR/$f — remove it by hand, then re-run"
-      exit 1
-    fi
+    mv "$BIN_DIR/$f" "$BIN_DIR/$f.removed-$TS" || _die "could not retire superseded $BIN_DIR/$f — remove it by hand, then re-run"
+    _apply "$BIN_DIR/$f" "$BIN_DIR/$f.removed-$TS"
+    ok "retired $BIN_DIR/$f (now provided by the aipairlib package; moved to $f.removed-$TS)"
   fi
 done
 
-# --- skills ------------------------------------------------------------------
+# ---- commit: skills ----
 for s in "${SKILLS[@]}"; do
   src="$REPO_DIR/.claude/skills/$s/SKILL.md"; dst="$SKILLS_DIR/$s/SKILL.md"
-  [ -f "$src" ] || { fail "missing in repo: $src"; exit 1; }
+  [ -f "$src" ] || _die "missing in repo: $src"
   if [ -f "$dst" ] && same_file "$src" "$dst"; then skip "skill $s is up to date ($dst)"; continue; fi
-  mkdir -p "$(dirname "$dst")" || { fail "cannot create $(dirname "$dst")"; exit 1; }
+  mkdir -p "$(dirname "$dst")" || _die "cannot create $(dirname "$dst")"
   if [ -e "$dst" ]; then
-    cp -p "$dst" "$dst.bak-$TS" || { fail "cannot back up $dst"; exit 1; }
-    cp "$src" "$dst" || { fail "cannot install $dst"; exit 1; }
-    ok "skill $s updated ($dst; previous copy: $dst.bak-$TS)"
+    cp -p "$dst" "$dst.bak-$TS" || _die "cannot back up $dst"
+    cp "$src" "$dst" || _die "cannot install $dst"
+    _apply "$dst" "$dst.bak-$TS"; ok "skill $s updated ($dst; previous copy: $dst.bak-$TS)"
   else
-    cp "$src" "$dst" || { fail "cannot install $dst"; exit 1; }
-    ok "skill $s installed ($dst)"
+    cp "$src" "$dst" || _die "cannot install $dst"
+    _apply "$dst" ""; ok "skill $s installed ($dst)"
   fi
 done
+
+# ---- commit: the two GLOBAL notice blocks (from the pre-staged OUTFILEs) ----
+if [ "$NO_GLOBAL" -eq 1 ]; then
+  skip "global AI instructions への注入をスキップ（--no-global-instructions / AIPAIR_NO_GLOBAL_INSTRUCTIONS）"
+  note "対象: $CLAUDE_MD / $CODEX_AGENTS（既存の aipair ブロックがあれば手動で消してください）"
+  note "aipair は動作します。相手ペインの説明は各セッションの env（AI_SELF/AI_PEER）と \`peer --help\` で確認できます"
+else
+  commit_notice "$CLAUDE_MD"   "$CM_ACT" "$CM_NEW"
+  commit_notice "$CODEX_AGENTS" "$CA_ACT" "$CA_NEW"
+fi
+
+# ---- commit: optional VS Code tasks ----
+if [ -n "$VSCODE_DIR" ]; then
+  [ -d "$VSCODE_DIR" ] || _die "--vscode-tasks: not a directory: $VSCODE_DIR"
+  dst="$VSCODE_DIR/.vscode/tasks.json"; src="$REPO_DIR/templates/vscode-tasks.json"
+  if [ -f "$dst" ]; then
+    if same_file "$src" "$dst"; then skip "$dst already equals the template"
+    else skip "$dst exists — not overwriting. Merge the 'tasks' entries yourself, e.g.: cp $src $VSCODE_DIR/.vscode/tasks.aipair.json"; fi
+  else
+    mkdir -p "$VSCODE_DIR/.vscode" || _die "cannot create $VSCODE_DIR/.vscode"
+    cp "$src" "$dst" || _die "cannot write $dst"
+    _apply "$dst" ""; ok "$dst installed (WSL2 launcher tasks; see README)"
+  fi
+fi
 
 # --- PATH --------------------------------------------------------------------
 if path_has_bin; then ok "$BIN_DIR is on PATH"
@@ -525,96 +617,6 @@ else
   esac
   warn "$BIN_DIR is not on PATH — add it yourself (this script does not edit shell rc files):"
   note "$rc:  $line"
-fi
-
-# --- notice blocks -----------------------------------------------------------
-# install_block FILE TEMPLATE — replace/append the marker-delimited block; prints the action.
-# Implemented in python3 for byte-exact handling; result is verified before declaring success.
-install_block() {
-  local file="$1" tpl="$2" res
-  res=$(python3 - "$file" "$tpl" "$TS" "$MARK_START" "$MARK_END" <<'PY'
-import os, shutil, sys
-path, tpl, ts, S, E = sys.argv[1:6]
-S = S.encode(); E = E.encode()
-block = open(tpl, 'rb').read()
-if block.count(S) != 1 or block.count(E) != 1 or block.find(S) > block.find(E):
-    print("template-broken"); sys.exit(4)
-if not block.endswith(b"\n"):
-    block += b"\n"
-exists = os.path.exists(path)
-old = open(path, 'rb').read() if exists else b""
-s, e = old.count(S), old.count(E)
-if s == 0 and e == 0:
-    if not old:              sep = b""
-    elif old.endswith(b"\n\n"): sep = b""
-    elif old.endswith(b"\n"):   sep = b"\n"
-    else:                       sep = b"\n\n"
-    new = old + sep + block
-    action = "appended" if exists else "created"
-elif s == 1 and e == 1 and old.find(S) < old.find(E):
-    i = old.find(S); j = old.find(E) + len(E)
-    if old[j:j+1] == b"\n": j += 1
-    new = old[:i] + block + old[j:]
-    action = "replaced"
-else:
-    print("broken"); sys.exit(5)
-if exists and new == old:
-    print("same"); sys.exit(0)
-bak = None
-if exists:
-    bak = f"{path}.aipair-bak-{ts}"
-    shutil.copy2(path, bak)
-else:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-tmp = path + ".aipair-tmp"
-with open(tmp, 'wb') as f:
-    f.write(new)
-os.replace(tmp, path)
-# verify from the file on disk, not from memory
-chk = open(path, 'rb').read()
-good = (chk == new and chk.count(S) == 1 and chk.count(E) == 1)
-if good:
-    if action == "replaced":
-        ci = chk.find(S); cj = chk.find(E) + len(E)
-        if chk[cj:cj+1] == b"\n": cj += 1
-        good = (chk[:ci] == old[:i]) and (chk[cj:] == old[j:]) and (chk[ci:cj] == block)
-    else:
-        good = chk.startswith(old) and chk[len(old):] == sep + block
-if not good:
-    if bak: shutil.copy2(bak, path)
-    else:   os.remove(path)
-    print("verify-failed"); sys.exit(6)
-print(action + ("" if bak is None else f" (backup: {bak})"))
-PY
-  ) ; local rc=$?
-  case "$rc:$res" in
-    0:same)              skip "$file: aipair block already up to date (untouched)" ;;
-    0:*)                 ok "$file: aipair block $res; verified that the rest of the file is byte-identical" ;;
-    *:broken)            fail "$file: found a damaged aipair block (markers missing or duplicated). Fix it by hand, then re-run. File left untouched."; return 1 ;;
-    *:template-broken)   fail "$tpl: template must contain exactly one start and one end marker"; return 1 ;;
-    *:verify-failed)     fail "$file: post-write verification failed — restored the backup, nothing changed"; return 1 ;;
-    *)                   fail "$file: block install failed (python exit $rc: $res)"; return 1 ;;
-  esac
-}
-if [ "$NO_GLOBAL" -eq 1 ]; then
-  skip "global AI instructions への注入をスキップ（--no-global-instructions / AIPAIR_NO_GLOBAL_INSTRUCTIONS）"
-  note "対象: $CLAUDE_MD / $CODEX_AGENTS（既存の aipair ブロックがあれば手動で消してください）"
-  note "aipair は動作します。相手ペインの説明は各セッションの env（AI_SELF/AI_PEER）と \`peer --help\` で確認できます"
-else
-  install_block "$CLAUDE_MD"   "$REPO_DIR/templates/claude-md-block.md"   || exit 1
-  install_block "$CODEX_AGENTS" "$REPO_DIR/templates/codex-agents-block.md" || exit 1
-fi
-
-# --- optional: VS Code tasks ---------------------------------------------------
-if [ -n "$VSCODE_DIR" ]; then
-  if [ ! -d "$VSCODE_DIR" ]; then fail "--vscode-tasks: not a directory: $VSCODE_DIR"; exit 1; fi
-  dst="$VSCODE_DIR/.vscode/tasks.json"; src="$REPO_DIR/templates/vscode-tasks.json"
-  if [ -f "$dst" ]; then
-    if same_file "$src" "$dst"; then skip "$dst already equals the template"
-    else skip "$dst exists — not overwriting. Merge the 'tasks' entries yourself, e.g.: cp $src $VSCODE_DIR/.vscode/tasks.aipair.json"; fi
-  else
-    mkdir -p "$VSCODE_DIR/.vscode" && cp "$src" "$dst" && ok "$dst installed (WSL2 launcher tasks; see README)" || { fail "cannot write $dst"; exit 1; }
-  fi
 fi
 
 # --- smoke test ----------------------------------------------------------------
