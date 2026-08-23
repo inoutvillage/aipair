@@ -95,6 +95,7 @@ import unicodedata
 # as relay.X. The delivery<->dialog cycle, the shared logger, and the idle budget are now real
 # imports / a poke(busy_wait=...) argument, handled inside those modules — no injection here.
 from . import peerlog, corelib, loglib, tmuxlib, deliverylib, dialoglib, logs
+from .schema_guard import SchemaGuard
 from .logs import c, log, dim, configure
 
 # corelib (pure helpers)
@@ -869,7 +870,7 @@ def main():
 
     # Schema feature-probe: the version gate only knows --version strings, so also probe the
     # actual JSONL the core relay reads. At startup only EXPLICIT pins exist (an `aipair loop`
-    # has no log yet → "unverified"); schema_watch() re-probes the tracked logs at runtime.
+    # has no log yet → "unverified"); sg.watch() re-probes the tracked logs at runtime.
     srows, sbad = ([], [])
     if not a.no_schema_probe:
         spin = {"claude": os.path.realpath(os.path.expanduser(a.claude_log)) if a.claude_log else None,
@@ -908,7 +909,7 @@ def main():
             log(c("dim", f"{name} ログschema OK（{reason}）"))
         elif status == "mismatch":
             log(c("warn", f"⚠ {name} ログschema がコア relay の依存と不一致（{reason}）"))
-        # "unverified" at startup is normal (no pinned log yet) → schema_watch() checks at runtime
+        # "unverified" at startup is normal (no pinned log yet) → sg.watch() checks at runtime
     if not a.no_schema_probe and not any(st != "unverified" for _n, st, _r in srows):
         log(c("dim", "ログschema=実行時に検査（起動時はピン待ち）"))
     if sbad:
@@ -993,77 +994,13 @@ def main():
     probe_sent_at = 0.0        # poke 送出時刻（no-show 監視用）
     POKE_NOSHOW = 1800         # nonce がログに現れないまま諦めるまでの秒数
     last_rejected = None       # 帰属棄却した完了 ts（棄却ログを完了値ごと1回に抑制）
-    schema_latched = {"claude": None, "codex": None}   # runtime JSONL schema latch: None→"ok-seen"（監視継続）／"mismatch"（終端）
-    schema_ident = {"claude": None, "codex": None}     # 最後に見たログ世代 ((path,dev,ino), size)。世代切替/縮小で再 probe（P1-4）
-
-    def schema_watch():
-        """Once per agent, probe the tracked transcript for the core schema the relay reads
-        (turn-completion keys). An `aipair loop` has no log at startup, so this — not the
-        startup banner — is where real drift is caught, the first time a pinned log has turns.
-        Latches per (agent, tracked log path): a terminal "mismatch" latch pertains to ONE log,
-        so when the tracked log switches (resume/clear/restart/rotation) the latch resets and the
-        NEW log is re-probed. A mismatch warns loudly + rings the bell and, unless
-        --allow-untested-schema, falls to the version gate's safe posture (dialogs off)."""
-        if a.no_schema_probe:
-            return
-        for agent in ("claude", "codex"):
-            path = tracked[agent]
-            if not path:
-                continue
-            # 追跡ログの世代 identity ((path, dev, ino), size)。pathname だけだと同一 path の
-            # inode 置換や truncate を見逃すため stat まで見る（Codex 指摘）。
-            try:
-                st = os.stat(path)
-                gen, size = (path, st.st_dev, st.st_ino), st.st_size
-            except OSError:
-                gen, size = (path, None, None), None
-            # Claude compaction は同一 path/inode に compact_boundary を追記する（gen/size 増加では
-            # 世代切替を捕まえられない）。size が変わった時だけ末尾を読み最新境界を marker に混ぜ、
-            # 変化が無ければ前回 marker を再利用（無駄読みを避ける）。codex は marker なし。
-            prev = schema_ident[agent]
-            prev_size = prev[1] if prev else None
-            prev_marker = prev[2] if prev else None
-            if agent == "claude" and size != prev_size:
-                marker = latest_compact_boundary(path)
-            else:
-                marker = prev_marker
-            ident = (gen, size, marker)
-            # P1-4: 世代切替（別 path / inode 置換 / rotation / size 縮小=truncate）で latch を
-            # 破棄して未確認から再 probe。同一世代の追記は再 probe、変化なし/終端 mismatch は skip。
-            reset, skip = schema_should_reprobe(schema_latched[agent], schema_ident[agent], ident)
-            if reset:
-                schema_latched[agent] = None
-            schema_ident[agent] = ident
-            if skip:
-                continue
-            status, reason = probe_log_schema(agent, path)
-            schema_latched[agent], action = schema_latch_step(
-                schema_latched[agent], status, a.allow_untested_schema)
-            if action == "ok":
-                dim(f"{agent} ログschema OK（{reason}）")   # 一度だけ通知。以降も監視は続ける
-            elif action in ("stop", "degrade"):
-                print(c("warn", f"│ ■ {agent} のログ JSONL schema がコア relay の依存と不一致（{reason}）。"
-                                "ターン検出／応答帰属が誤動作する可能性があります。claude/codex の版と"
-                                " TESTED schema を確認してください。"), flush=True)
-                print("\a", end="", flush=True)
-                a.schema_mismatch = True
-                if action == "degrade":
-                    a.no_plan_review = True       # fail-open: continue, degrade dialog automation
-                    a.no_question_relay = True
-                else:
-                    a.schema_stop = True          # fail-closed: stop the loop (exit 7)
-            # "unverified" → 監視継続
-
-    def schema_guard():
-        """freshly (re)ロックしたログを《完了判定・poke の前に》probe し、override 無しの
-        schema mismatch なら fail-closed 停止を要求する（True を返す）。ロック直後に必ず呼ぶ
-        ことで「同一ループ内で probe 前に1回自動操作される」経路（parentUuid 欠落等でも
-        claude_done_ts が完了扱いし得るケース）を塞ぐ。"""
-        schema_watch()
-        if a.schema_stop:
-            print(c("warn", "│ ■ ログschema不一致を検出 → fail-closed で停止します（exit 7）。"), flush=True)
-            return True
-        return False
+    # ランタイム JSONL schema 監視は SchemaGuard（bin/aipairlib/schema_guard.py）へ切り出した
+    # （P2-1）。純関数＋probe を注入で受け取り、latch/identity を所有する。単体テスト可能。
+    def _schema_warn(msg, bell=False):
+        print(c("warn", msg), flush=True)
+        if bell:
+            print("\a", end="", flush=True)
+    sg = SchemaGuard(a, tracked, probe_log_schema, latest_compact_boundary, dim, _schema_warn)
 
     def wait_heartbeat(who):
         # 待機フェーズごとに1回だけ表示（None = 表示済み。状態遷移時の time.time() 再セットで再アーム）
@@ -1154,14 +1091,14 @@ def main():
     all_done_hit = False
     try:
         while True:
-            if schema_guard():          # between-iteration drift（latch 済みは安価な no-op）
+            if sg.guard():          # between-iteration drift（latch 済みは安価な no-op）
                 code = 7
                 break
             if state == "claude":
                 if tracked["claude"] is None:
                     tracked["claude"] = lock_claude(cwd, claude_seen, panes["claude"], baseline)
                 # 🔴 ロック直後・完了判定前に probe（P1-a: probe 前に1回 poke される経路を塞ぐ）
-                if tracked["claude"] and schema_guard():
+                if tracked["claude"] and sg.guard():
                     code = 7
                     break
                 done = claude_done_ts(tracked["claude"], since) if tracked["claude"] else None
@@ -1175,7 +1112,7 @@ def main():
                     tracked["claude"] = relocked
                     # 強制 re-lock で新 path へ乗り換えた → response_done（レビュー依頼/停止判定）の
                     # 前に必ず新ログを再 probe。malformed な新ログでは poke せず exit 7（P1-4/Codex）。
-                    if schema_guard():
+                    if sg.guard():
                         code = 7
                         break
                 done = response_done("claude", tracked["claude"], done)
@@ -1279,7 +1216,7 @@ def main():
                 if tracked["codex"] is None:
                     tracked["codex"] = lock_codex(cwd, codex_seen, panes["codex"])
                 # 🔴 ロック直後・完了判定前に probe（P1-a: 全 state 共通）
-                if tracked["codex"] and schema_guard():
+                if tracked["codex"] and sg.guard():
                     code = 7
                     break
                 done = codex_done_ts(tracked["codex"], since) if tracked["codex"] else None
@@ -1359,7 +1296,7 @@ def main():
                 if tracked["codex"] is None:
                     tracked["codex"] = lock_codex(cwd, codex_seen, panes["codex"])
                 # 🔴 ロック直後・完了判定前に probe（P1-a: 全 state 共通）
-                if tracked["codex"] and schema_guard():
+                if tracked["codex"] and sg.guard():
                     code = 7
                     break
                 done = codex_done_ts(tracked["codex"], since) if tracked["codex"] else None
@@ -1403,7 +1340,7 @@ def main():
                 if tracked["codex"] is None:
                     tracked["codex"] = lock_codex(cwd, codex_seen, panes["codex"])
                 # 🔴 ロック直後・完了判定前に probe（P1-a）
-                if tracked["codex"] and schema_guard():
+                if tracked["codex"] and sg.guard():
                     code = 7
                     break
                 done = codex_done_ts(tracked["codex"], since) if tracked["codex"] else None
