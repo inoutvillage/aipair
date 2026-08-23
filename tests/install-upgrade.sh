@@ -191,5 +191,25 @@ else
 fi
 rm -rf "$THB"
 
+# (C) smoke_test failure rolls the WHOLE install back. A new `aipair` can pass `bash -n` staging yet
+# fail to launch a pair (Codex: broken-but-parseable). The commit is only final after smoke passes.
+THC="$(mktemp -d "${TMPDIR:-/tmp}/aipair-upgC.XXXXXX")"; mkdir -p "$THC/.local/bin"
+env -u TMUX PATH="$SHIMD:$PATH" HOME="$THC" bash "$REPO/aipair-install.sh" >/dev/null 2>&1
+if [ -x "$THC/.local/bin/aipair-relay" ] && [ -f "$THC/.claude/CLAUDE.md" ]; then
+  BROKC="$(mktemp -d)"; cp -a "$REPO/aipair-install.sh" "$REPO/bin" "$REPO/templates" "$REPO/.claude" "$BROKC/"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$BROKC/bin/aipair"; chmod +x "$BROKC/bin/aipair"   # valid syntax, fails at runtime
+  mk_stale_bins "$THC"; mk_stale_notices "$THC"
+  rcC=0; env -u TMUX PATH="$SHIMD:$PATH" HOME="$THC" bash "$BROKC/aipair-install.sh" >/dev/null 2>&1 || rcC=$?
+  chk "[ $rcC -ne 0 ]" "smoke failure (broken-but-parseable aipair) → installer exits non-zero (got $rcC)"
+  chk "grep -q 'STALE-$$' '$THC/.local/bin/aipair-relay'" "binaries rolled back after a smoke failure (not left committed)"
+  chk "! grep -q '^exit 1' '$THC/.local/bin/aipair'" "the broken aipair was rolled back (previous copy restored)"
+  chk "grep -q 'CLAUDE-OLD-$$' '$THC/.claude/CLAUDE.md' && ! grep -q 'aipair:start' '$THC/.claude/CLAUDE.md'" "notice blocks rolled back after a smoke failure"
+  chk "! ls -d '$THC/.local/bin/.aipair-stage-'* >/dev/null 2>&1" "staging dir cleaned up after the smoke-failed upgrade"
+  rm -rf "$BROKC"
+else
+  echo "skip P2-2 txn test C (baseline install did not complete)"
+fi
+rm -rf "$THC"
+
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED)"
 exit $fail
