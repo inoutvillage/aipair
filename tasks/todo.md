@@ -1,3 +1,26 @@
+# aipair 改修（社長指示 2026-08-23）— 外部レビュー指摘の優先対応
+
+> 方針: **「推測して動き続ける」より「判定できない場合は止まる（fail-closed）」を優先**。
+> 権限バイパス下で Claude Code / Codex を自律操作するため、**誤停止しない・誤承認しない・
+> 別ターンを誤帰属しない・未知 schema で勝手に継続しない**を利便性より優先する。
+> 優先順位: 1〜7（安全性・正しさ）を新機能より先行。
+
+- [x] **P0-1 停止ワード判定を substring→専用 sentinel の先頭行完全一致へ**（`corelib.hit_stop`）— 否定文・引用・文中言及で誤停止しない。sentinel: `[AIPAIR_REVIEW_OK]` 等。poke も sentinel-at-head 指示へ。
+- [x] **P0-2 プラン承認判定も専用 sentinel＋先頭行完全一致へ**（`relay.py` の `a.plan_ok in final[:80]`）— sentinel: `[AIPAIR_PLAN_APPROVED]`。否定文中の承認を絶対に成立させない。
+- [x] **（1〜4）sentinel protocol 導入＋否定文/引用/文中一致テスト**（8 ケース: 単独=真/後続説明=真/2行目=偽/「まだ〜ではない」=偽/「〜と回答して」=偽/文中=偽/100字以降=偽/複数候補は先頭のみ）
+- [ ] **P1-1 JSONL schema mismatch 時は既定 fail-closed（relay 停止・exit 7）**、`--allow-untested-schema` 明示時のみ継続。README/SECURITY 同期。
+- [ ] **P1-2 schema probe を「ターン完了」だけでなく「応答帰属」まで拡張**（Codex: response_item/turn_id/task_started.turn_id/task_complete.turn_id）。turn completion / response attribution / delivery confirmation / dialog resolution の単位に分割。全て compatible で初めて compatible。
+- [ ] **P1-3 Codex の turn_id 欠落時 fallback 見直し**（`codex_response_complete`）— 通常モードは turn_id 無し→帰属不能→fail-closed。残す場合は compatibility mode 明示＋警告＋自律判定には使わない。
+- [ ] **P1-4 schema latch を agent 単位→agent+tracked log identity（path）単位へ**。log 切替（/resume・/clear・再起動・compaction・rotation）で未確認へ戻し再 probe。
+- [ ] **P1-5 認証付き round-trip E2E を実走**（外部依存: repo secrets + API 予算）。3シグナル成功を最低1回 workflow_dispatch で確認。README は「harness 実装済/未検証」と「E2E 検証済」を混同しない。
+- [ ] **P1-6 nightly を latest smoke（secrets 無）と authenticated-e2e（version pin + secrets 有）に分離**。上流 latest 破壊と aipair 既存版 E2E 破壊を切り分け。
+- [ ] **P2-1 relay state machine を state 単位で分割**（state_machine/review_protocol/schema_guard/plan_flow/question_flow）。relay.py は arg parse/依存構築/起動/exit に寄せる。
+- [ ] **P2-2 installer の transaction 性強化**（package + entrypoints + templates を staging→検証→一括切替、Phase2 途中失敗は entrypoint も自動 rollback）。
+- [ ] **P2-3 README/SECURITY/todo/TESTED_VERSIONS/CI 説明/schema・stop・plan protocol の同期をテスト化**（README の version==TESTED_VERSIONS、README の sentinel==コード定数）。
+- [ ] **P2-4 versioned release 運用開始**（`aipair --version` / git tag / CHANGELOG.md / GitHub Releases）。
+
+---
+
 # aipair — 外部コードレビュー（2026-08-21 受領）対応
 
 ## チェックボックスの意味（endless relay が読むファイルなので厳密に）

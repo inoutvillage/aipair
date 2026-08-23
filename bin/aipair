@@ -252,7 +252,7 @@ fi
 # contains (apostrophes, spaces, $, ;), thanks to cmdline.
 if [ "$cmd" = loop ]; then
   bridge=(aipair-relay --max-rounds "${AIPAIR_MAX_ROUNDS:-20}"
-          --stop "${AIPAIR_STOP:-完了です}" --stop-side "${AIPAIR_STOP_SIDE:-codex}")
+          --stop "${AIPAIR_STOP:-[AIPAIR_REVIEW_OK]}" --stop-side "${AIPAIR_STOP_SIDE:-codex}")
   # 起動直後の暫定タイトル。relay 本体が起動後に実際の設定で名乗り直す
   BRIDGE_TITLE="relay ● 1タスク / max ${AIPAIR_MAX_ROUNDS:-20} / Ctrl-C で停止"
   # AIPAIR_ENDLESS=1: 停止ワードで終わらず「次のタスクへ」を促し続ける連続モード。
@@ -261,9 +261,9 @@ if [ "$cmd" = loop ]; then
   # すべて on にして --endless を付けていたため、README の約束と食い違っていた）。
   if env_on "${AIPAIR_ENDLESS:-}"; then
     bridge+=(--endless --task-list "${AIPAIR_TASK_LIST:-tasks/todo.md}"
-             --next-ask "${AIPAIR_NEXT_ASK:-次のタスクをください}"
-             --all-done "${AIPAIR_ALL_DONE:-全タスク完了}")
-    BRIDGE_TITLE="relay ● endless / max ${AIPAIR_MAX_ROUNDS:-20} / 終端「${AIPAIR_ALL_DONE:-全タスク完了}」/ Ctrl-C で停止"
+             --next-ask "${AIPAIR_NEXT_ASK:-[AIPAIR_NEXT]}"
+             --all-done "${AIPAIR_ALL_DONE:-[AIPAIR_ALL_DONE]}")
+    BRIDGE_TITLE="relay ● endless / max ${AIPAIR_MAX_ROUNDS:-20} / 終端 ${AIPAIR_ALL_DONE:-[AIPAIR_ALL_DONE]} / Ctrl-C で停止"
   fi
   # A pre-existing tmux server does NOT pass this process's env to the new session, so
   # every AIPAIR_* the relay reads from the environment must be expanded onto its argv.

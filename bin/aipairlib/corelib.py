@@ -158,18 +158,31 @@ def schema_gate(a, probes):
     return rows, bad
 
 
+def head_line(text):
+    """メッセージ本文の《先頭の非空行》を strip して返す（無ければ ""）。制御 sentinel は
+    この先頭行との《完全一致》で判定する（部分一致・文中言及・同一行の後続テキストは不成立）。
+    先頭の空行はスキップするが、非空行が現れたらそこで確定する（2行目以降は見ない）。"""
+    for raw in (text or "").splitlines():
+        s = raw.strip()
+        if s:
+            return s
+    return ""
+
+
 def hit_stop(texts, phrases):
-    """停止ワード判定。poke は「本文の冒頭に停止ワードを明記」と指示しているが、
-    エージェントは1ターンに進捗ナレーション（「〜を確認します」等）を複数メッセージ吐くため、
-    連結全文ではなく最終メッセージ（=本文）の冒頭で判定する。連結全文の冒頭100字判定だと
-    ナレーションに押し出されて停止ワードが窓の外に出、永遠に取り逃がす
-    （実運用で 20 往復キャップまで空回りした実バグ）。
-    文中の偶発的な言及（例:「ツールの修正が完了です。ただし本題は…」）での誤停止を
-    防ぐため、冒頭のみ判定は従来どおり維持する。"""
+    """停止／状態遷移の判定。制御信号は自然言語から分離した専用 sentinel
+    （例 [AIPAIR_REVIEW_OK] / [AIPAIR_ALL_DONE]）を使い、**最終 assistant メッセージの
+    先頭の非空行が sentinel と完全一致**した時だけ成立する。
+
+    旧実装は最終メッセージ冒頭100字の substring 一致で、否定文・引用・指示文中の言及
+    （「まだ [AIPAIR_REVIEW_OK] とは言えない」「"[AIPAIR_REVIEW_OK]" と回答してください」）でも
+    誤成立し得た。権限バイパス下で自律運転する relay では誤停止・誤遷移を避けるため、先頭行の
+    完全一致に限定する（＝制御信号が単独で先頭行に置かれた時だけ成立）。進捗ナレーションを
+    複数メッセージ吐くため、連結全文ではなく最終メッセージ texts[-1] で判定する点は従来どおり。"""
     if not texts:
         return False
-    head = " ".join(texts[-1].split())[:100]
-    return any(p in head for p in phrases)
+    line = head_line(texts[-1])
+    return any(line == p for p in phrases if p)
 
 
 # --- stop gate (--gate): a mechanical check on top of the agents' say-so -------- #
