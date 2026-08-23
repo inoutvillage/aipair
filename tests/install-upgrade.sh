@@ -142,5 +142,54 @@ else
 fi
 rm -rf "$TH5"
 
+# --- P2-2 unified transaction: templates share the binary transaction ----------------------------
+# (A) a BROKEN 2nd notice template (codex-agents-block.md) is caught while STAGING — before ANY
+#     commit — so the binaries are NOT installed and the 1st notice file (CLAUDE.md) is untouched.
+# (B) a commit-phase failure (a sabotaged --vscode-tasks, which runs AFTER binaries + both notice
+#     blocks are committed) rolls the WHOLE batch back: binaries AND both notice files return to
+#     their pre-upgrade content. Together these prove templates are in the same all-or-nothing txn.
+mk_stale_notices() {   # $1=HOME — drop plain (block-less) notice files so a re-run must re-commit them
+  printf 'CLAUDE-OLD-%s\n' "$$" > "$1/.claude/CLAUDE.md"
+  printf 'AGENTS-OLD-%s\n' "$$" > "$1/.codex/AGENTS.md"
+}
+mk_stale_bins() { for f in aipair aipair-relay aipair-relay-here peer peer-log; do printf '\n# STALE-%s\n' "$$" >> "$1/.local/bin/$f"; done; }
+
+# (A) broken codex template → nothing committed
+THA="$(mktemp -d "${TMPDIR:-/tmp}/aipair-upgA.XXXXXX")"; mkdir -p "$THA/.local/bin"
+env -u TMUX PATH="$SHIMD:$PATH" HOME="$THA" bash "$REPO/aipair-install.sh" >/dev/null 2>&1
+if [ -x "$THA/.local/bin/aipair-relay" ] && [ -f "$THA/.claude/CLAUDE.md" ]; then
+  BROK="$(mktemp -d)"; mkdir -p "$BROK"; cp -a "$REPO/aipair-install.sh" "$REPO/bin" "$REPO/templates" "$REPO/.claude" "$BROK/"
+  # break the SECOND notice template: delete its end marker → stage_block rejects it (exit 4)
+  grep -v 'aipair:end' "$BROK/templates/codex-agents-block.md" > "$BROK/templates/codex-agents-block.md.x" && mv "$BROK/templates/codex-agents-block.md.x" "$BROK/templates/codex-agents-block.md"
+  mk_stale_bins "$THA"; mk_stale_notices "$THA"
+  rcA=0; env -u TMUX PATH="$SHIMD:$PATH" HOME="$THA" bash "$BROK/aipair-install.sh" >/dev/null 2>&1 || rcA=$?
+  chk "[ $rcA -ne 0 ]" "broken 2nd notice template → installer exits non-zero (got $rcA)"
+  chk "grep -q 'STALE-$$' '$THA/.local/bin/aipair-relay'" "broken template caught at STAGE → binaries NOT committed"
+  chk "grep -q 'CLAUDE-OLD-$$' '$THA/.claude/CLAUDE.md' && ! grep -q 'aipair:start' '$THA/.claude/CLAUDE.md'" "1st notice (CLAUDE.md) NOT committed when the 2nd template is broken"
+  chk "! ls -d '$THA/.local/bin/.aipair-stage-'* >/dev/null 2>&1" "no staging dir left after the aborted install (A)"
+  chk "! ls '$THA/.claude/'CLAUDE.md.aipair-new-* >/dev/null 2>&1" "no staged notice temp left after the aborted install (A)"
+  rm -rf "$BROK"
+else
+  echo "skip P2-2 txn test A (baseline install did not complete)"
+fi
+rm -rf "$THA"
+
+# (B) commit-phase failure rolls back binaries + both notice files
+THB="$(mktemp -d "${TMPDIR:-/tmp}/aipair-upgB.XXXXXX")"; mkdir -p "$THB/.local/bin"
+env -u TMUX PATH="$SHIMD:$PATH" HOME="$THB" bash "$REPO/aipair-install.sh" >/dev/null 2>&1
+if [ -x "$THB/.local/bin/aipair-relay" ] && [ -f "$THB/.claude/CLAUDE.md" ]; then
+  mk_stale_bins "$THB"; mk_stale_notices "$THB"
+  VDIR="$(mktemp -d)"; : > "$VDIR/.vscode"   # sabotage: .vscode is a FILE → mkdir fails in the commit phase
+  rcB=0; env -u TMUX PATH="$SHIMD:$PATH" HOME="$THB" bash "$REPO/aipair-install.sh" --vscode-tasks "$VDIR" >/dev/null 2>&1 || rcB=$?
+  chk "[ $rcB -ne 0 ]" "commit-phase (vscode) failure → installer exits non-zero (got $rcB)"
+  chk "grep -q 'STALE-$$' '$THB/.local/bin/aipair-relay'" "binaries rolled back on a commit-phase failure (unified journal)"
+  chk "grep -q 'CLAUDE-OLD-$$' '$THB/.claude/CLAUDE.md' && ! grep -q 'aipair:start' '$THB/.claude/CLAUDE.md'" "1st notice (CLAUDE.md) rolled back with the binaries"
+  chk "grep -q 'AGENTS-OLD-$$' '$THB/.codex/AGENTS.md' && ! grep -q 'aipair:start' '$THB/.codex/AGENTS.md'" "2nd notice (AGENTS.md) rolled back with the binaries"
+  rm -rf "$VDIR"
+else
+  echo "skip P2-2 txn test B (baseline install did not complete)"
+fi
+rm -rf "$THB"
+
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED)"
 exit $fail
