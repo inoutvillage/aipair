@@ -93,6 +93,30 @@ if wait_file "$W/relay-argv"; then
 else n=$((n+1)); echo "FAIL aipair loop (stale): relay never launched"; fail=1; fi
 reset_server
 
+echo "# [1c] endless AIPAIR_HUMAN_REQUIRED: stale server value is neutralized; custom value reaches argv"
+# a STALE value baked into the server; caller launches endless with it EMPTY. The --human-required
+# flag must be bin/aipair's DEFAULT (from this process's empty env), never the server's stale value,
+# and the pinned AIPAIR_HUMAN_REQUIRED= must be empty (RELAY_ENV_VARS neutralization).
+AIPAIR_HUMAN_REQUIRED='[STALE_HR]' "$REAL_TMUX" -L "$SOCKET" new-session -d -s preh -c /tmp
+rm -f "$W/relay-argv"
+AIPAIR_ENDLESS=1 AIPAIR_HUMAN_REQUIRED='' AIPAIR_CLAUDE_FLAGS='' AIPAIR_CODEX_FLAGS='' \
+  AIPAIR_UNSAFE=1 timeout 8 script -qec "aipair loop '$W/proj'" /dev/null >/dev/null 2>&1 || true
+if wait_file "$W/relay-argv"; then
+  argv="$(cat "$W/relay-argv")"
+  n=$((n+1)); if printf '%s' "$argv" | grep -qF -- "[STALE_HR]"; then echo "FAIL stale AIPAIR_HUMAN_REQUIRED leaked into argv: $argv"; fail=1; else echo "ok   stale AIPAIR_HUMAN_REQUIRED did not leak into --human-required"; fi
+  chk_has "$argv" "--human-required [AIPAIR_HUMAN_REQUIRED]" "empty caller → default HR sentinel (not the server's stale value)"
+else n=$((n+1)); echo "FAIL aipair loop (endless stale HR): relay never launched"; fail=1; fi
+reset_server
+# a CUSTOM value on the aipair loop path reaches argv (proves bin/aipair's bridge wiring, not only relay-here)
+"$REAL_TMUX" -L "$SOCKET" new-session -d -s prehc -c /tmp
+rm -f "$W/relay-argv"
+AIPAIR_ENDLESS=1 AIPAIR_HUMAN_REQUIRED='[CUSTOM_HR]' AIPAIR_CLAUDE_FLAGS='' AIPAIR_CODEX_FLAGS='' \
+  AIPAIR_UNSAFE=1 timeout 8 script -qec "aipair loop '$W/proj'" /dev/null >/dev/null 2>&1 || true
+if wait_file "$W/relay-argv"; then
+  chk_has "$(cat "$W/relay-argv")" "--human-required [CUSTOM_HR]" "aipair loop forwards a custom AIPAIR_HUMAN_REQUIRED to argv"
+else n=$((n+1)); echo "FAIL aipair loop (endless custom HR): relay never launched"; fail=1; fi
+reset_server
+
 echo "# [2] aipair-relay-here --print forwards the same env as flags"
 STUB="$W/relay-stub"; printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB"; chmod +x "$STUB"
 "$REAL_TMUX" -L "$SOCKET" new-session -d -s pair -c "$W/proj"
