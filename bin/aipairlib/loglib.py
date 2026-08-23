@@ -125,16 +125,41 @@ def make_fragment(text, n=48):
     return None
 
 
+def _is_compact_boundary(d):
+    return d.get("type") == "system" and d.get("subtype") == "compact_boundary"
+
+
+def _boundary_marker(d):
+    """compact_boundary レコードの一意 marker。uuid 優先。uuid 欠落境界が連続しても識別できる
+    よう、固定値ではなく timestamp / logicalParentUuid / レコード hash から一意値を作る（Codex）。"""
+    uid = d.get("uuid")
+    if uid:
+        return uid
+    import hashlib
+    blob = peerlog.json.dumps(d, sort_keys=True, default=str, ensure_ascii=False)
+    return "cb:" + hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
+
+
 def latest_compact_boundary(path, tail_bytes=1_000_000):
     """Claude の context compaction は同じ JSONL に `{type:"system", subtype:"compact_boundary"}`
-    を追記する（path/inode 不変・size 増加）。その最新境界の uuid を返す（無ければ None）。
+    を追記する（path/inode 不変・size 増加）。その最新境界の一意 marker を返す（無ければ None）。
     schema latch の世代 identity に混ぜて「同一ログでも compaction 後は未確認へ戻す」ために使う
     （P1-4 / Codex）。末尾のみ読むので巨大ログでも安い。"""
-    uuid = None
+    marker = None
     for d in read_records(path, tail_lines=0, tail_bytes=tail_bytes):
-        if d.get("type") == "system" and d.get("subtype") == "compact_boundary":
-            uuid = d.get("uuid") or uuid or True   # uuid が無くても「境界あり」を示す真値
-    return uuid
+        if _is_compact_boundary(d):
+            marker = _boundary_marker(d)
+    return marker
+
+
+def records_since_compaction(records):
+    """レコード列を《最新 compact_boundary 以降（境界行自体を含む）》へ切り詰めて返す。境界が
+    無ければそのまま。compaction 後の新世代 schema probe が境界前の drift を引きずらないため
+    （P1-4 / Codex）。"""
+    for i in range(len(records) - 1, -1, -1):
+        if _is_compact_boundary(records[i]):
+            return records[i:]
+    return records
 
 
 def codex_response_complete(path, probe, allow_position_fallback=False):

@@ -1156,6 +1156,43 @@ class SchemaLatchStep(unittest.TestCase):
             os.unlink(path2)
         self.assertIsNone(relay.latest_compact_boundary("/no/such/file.jsonl"))
 
+    def test_uuidless_boundaries_get_distinct_markers(self):
+        # P1-4 (Codex): consecutive UUID-less compact_boundary records must be distinguishable, so a
+        # second such compaction is still detected as a new generation.
+        b1 = {"type": "system", "subtype": "compact_boundary",
+              "timestamp": "2026-08-23T01:00:00Z", "logicalParentUuid": "L1"}
+        b2 = {"type": "system", "subtype": "compact_boundary",
+              "timestamp": "2026-08-23T02:00:00Z", "logicalParentUuid": "L2"}
+        m1, m2 = relay.loglib._boundary_marker(b1), relay.loglib._boundary_marker(b2)
+        self.assertIsNotNone(m1)
+        self.assertNotEqual(m1, m2, "UUID-less boundaries must not collapse to one fixed marker")
+
+    def test_probe_restricts_claude_to_records_after_the_latest_boundary(self):
+        # P1-4 (Codex): after a compaction the probe must look only at the post-boundary generation.
+        # A pre-boundary drift + a post-boundary compatible turn must re-verify as OK (not be dragged
+        # back to mismatch by the stale pre-boundary record still in the tail).
+        recs = [
+            {"type": "user", "promptSource": "typed",   # pre-boundary delivery drift (typed text-block)
+             "message": {"role": "user", "content": [{"type": "text", "text": "x"}]}},
+            {"type": "system", "subtype": "compact_boundary", "uuid": "B1"},
+            {"type": "assistant", "timestamp": "t", "uuid": "u1", "parentUuid": None,   # post-boundary OK
+             "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}],
+                         "stop_reason": "end_turn"}},
+        ]
+        # the whole tail would be a mismatch (pre-boundary drift)…
+        self.assertEqual(relay.schema_probe("claude", recs)[0], "mismatch")
+        # …but restricted to post-boundary records it is ok
+        self.assertEqual(relay.schema_probe("claude", relay.records_since_compaction(recs))[0], "ok")
+        # and probe_log_schema (which applies the restriction for claude) reads a file as ok
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            for r in recs:
+                fh.write(json.dumps(r) + "\n")
+            path = fh.name
+        try:
+            self.assertEqual(relay.probe_log_schema("claude", path)[0], "ok")
+        finally:
+            os.unlink(path)
+
     def test_forced_relock_reprobes_before_response_done(self):
         # P1-4 (Codex): the forced re-lock switches tracked["claude"] to a NEW log, then processes
         # its `done`. A schema_guard() must run on the switched log BEFORE response_done, so a
