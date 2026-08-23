@@ -15,7 +15,9 @@ A release is a git tag **`v<version>`** plus its GitHub Release; the tag must eq
    makes no stability promise). No bump happens here otherwise.
 2. In `CHANGELOG.md`, **date the top section**: change `## [X.Y.Z] — unreleased (…)` to
    `## [X.Y.Z] - <YYYY-MM-DD>` (JST release date), add a fresh `## [Unreleased]` above it for the next
-   cycle, and keep the `[X.Y.Z]` compare link at the bottom. This dated section is what the tag publishes.
+   cycle, and fix the bottom link definitions: `[X.Y.Z]` → the **tag/release URL**
+   (`…/releases/tag/vX.Y.Z`) and add `[Unreleased]` → the **compare URL** (`…/compare/vX.Y.Z...HEAD`).
+   This dated section is what the tag publishes (`release.yml` refuses to publish an undated section).
 3. Commit both in one commit: `release: vX.Y.Z`.
 4. Open a PR and let CI pass (doc-sync checks `__version__` == the CHANGELOG top version section and
    that `aipair --version` / `aipair-relay --version` report it). Merge — this is the release commit.
@@ -35,8 +37,9 @@ A release is a git tag **`v<version>`** plus its GitHub Release; the tag must eq
 After a release, choose the next version `NEXT_VERSION` per SemVer — e.g. `0.1.1` for a patch,
 `0.2.0` for features, `1.0.0` for a stable/breaking release — set `bin/aipairlib/__init__.py`
 `__version__ = "<NEXT_VERSION>"`, and **rename the `## [Unreleased]` section** (created by the
-release step above) **to `## [<NEXT_VERSION>] — unreleased (…)`** in the same commit, so `__version__`
-always has its own top version section (doc-sync enforces this). This is where `__version__` is
+release step above) **to `## [<NEXT_VERSION>] — unreleased (…)`** — and rename its bottom link key
+from `[Unreleased]` to `[<NEXT_VERSION>]` (it becomes the tag URL when NEXT_VERSION ships) — in the
+same commit, so `__version__` always has its own top version section (doc-sync enforces this). This is where `__version__` is
 **normally** bumped; the only exception is step 1, which adjusts it together with the heading if the
 release scope changed the intended number.
 
