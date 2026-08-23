@@ -566,20 +566,20 @@ for f in "${SUPERSEDED[@]}"; do
   fi
 done
 
-# ---- commit: skills ----
+# ---- commit: skills (stage → backup → atomic move → journal, so a mid-write failure never leaves
+# a corrupt/untracked file: the temp is on the same filesystem and mv is atomic) ----
 for s in "${SKILLS[@]}"; do
   src="$REPO_DIR/.claude/skills/$s/SKILL.md"; dst="$SKILLS_DIR/$s/SKILL.md"
   [ -f "$src" ] || _die "missing in repo: $src"
   if [ -f "$dst" ] && same_file "$src" "$dst"; then skip "skill $s is up to date ($dst)"; continue; fi
   mkdir -p "$(dirname "$dst")" || _die "cannot create $(dirname "$dst")"
-  if [ -e "$dst" ]; then
-    cp -p "$dst" "$dst.bak-$TS" || _die "cannot back up $dst"
-    cp "$src" "$dst" || _die "cannot install $dst"
-    _apply "$dst" "$dst.bak-$TS"; ok "skill $s updated ($dst; previous copy: $dst.bak-$TS)"
-  else
-    cp "$src" "$dst" || _die "cannot install $dst"
-    _apply "$dst" ""; ok "skill $s installed ($dst)"
-  fi
+  tmp="$dst.aipair-new-$TS"
+  cp "$src" "$tmp" || { rm -f "$tmp"; _die "cannot stage skill $s ($dst)"; }
+  bak=""
+  if [ -e "$dst" ]; then cp -p "$dst" "$dst.bak-$TS" || { rm -f "$tmp"; _die "cannot back up $dst"; }; bak="$dst.bak-$TS"; fi
+  mv "$tmp" "$dst" || { rm -f "$tmp"; _die "cannot install $dst"; }
+  _apply "$dst" "$bak"
+  if [ -n "$bak" ]; then ok "skill $s updated ($dst; previous copy: $bak)"; else ok "skill $s installed ($dst)"; fi
 done
 
 # ---- commit: the two GLOBAL notice blocks (from the pre-staged OUTFILEs) ----
@@ -601,7 +601,9 @@ if [ -n "$VSCODE_DIR" ]; then
     else skip "$dst exists — not overwriting. Merge the 'tasks' entries yourself, e.g.: cp $src $VSCODE_DIR/.vscode/tasks.aipair.json"; fi
   else
     mkdir -p "$VSCODE_DIR/.vscode" || _die "cannot create $VSCODE_DIR/.vscode"
-    cp "$src" "$dst" || _die "cannot write $dst"
+    tmp="$dst.aipair-new-$TS"                       # stage → atomic move (never a partial tasks.json)
+    cp "$src" "$tmp" || { rm -f "$tmp"; _die "cannot stage $dst"; }
+    mv "$tmp" "$dst" || { rm -f "$tmp"; _die "cannot write $dst"; }
     _apply "$dst" ""; ok "$dst installed (WSL2 launcher tasks; see README)"
   fi
 fi
@@ -655,7 +657,11 @@ smoke_test() {
     ok "smoke: 'aipair <tmpdir>' created tmux session '$name' with 3 panes (throw-away left behind — see warning above)"
   fi
 }
-smoke_test || exit 1
+# The smoke test is the final gate: a new `aipair` can pass `bash -n` staging yet fail to actually
+# launch a pair. Treat that like any other commit-phase failure — roll the WHOLE install back
+# (binaries + templates + skills + vscode) via the journal, so a broken-but-parseable upgrade is
+# never left committed.
+smoke_test || _die "smoke test failed (the new install could not launch a pair) — rolled back the whole install"
 
 # --- summary -------------------------------------------------------------------
 echo "done: $N_OK ok, $N_SKIP skip, $N_WARN warn, $N_FAIL fail"
