@@ -1096,24 +1096,44 @@ class SchemaLatchStep(unittest.TestCase):
         self.assertEqual(relay.schema_latch_step(None, "unverified", False), (None, "none"))
         self.assertEqual(relay.schema_latch_step("ok-seen", "unverified", False), ("ok-seen", "none"))
 
-    def test_schema_reprobe_resets_a_terminal_mismatch_when_the_log_switches(self):
-        # P1-4: the latch is per (agent, tracked log path). A terminal "mismatch" pertains to ONE
-        # log; when the tracked log switches (resume/clear/restart/rotation) the latch must reset so
-        # the NEW log is re-probed — otherwise a fresh, healthy log is never looked at again.
-        self.assertEqual(relay.schema_should_reprobe("mismatch", "A.jsonl", "A.jsonl"), (False, True),
-                         "same log + terminal mismatch → skip")
-        self.assertEqual(relay.schema_should_reprobe("mismatch", "A.jsonl", "B.jsonl"), (True, False),
-                         "NEW log → reset the mismatch latch and re-probe")
-        self.assertEqual(relay.schema_should_reprobe("ok-seen", "A.jsonl", "A.jsonl"), (False, False),
-                         "same log, ok-seen → keep probing (veto aspects)")
-        self.assertEqual(relay.schema_should_reprobe("ok-seen", "A.jsonl", "B.jsonl"), (True, False),
-                         "NEW log → reset and re-probe from scratch")
-        self.assertEqual(relay.schema_should_reprobe(None, None, "A.jsonl"), (True, False),
-                         "first path pinned → treat as a switch (probe it)")
-        # wiring guard: schema_watch actually consults the per-path reset (not bypassed)
+    def test_schema_reprobe_uses_a_generation_identity(self):
+        # P1-4: the latch is per (agent, log GENERATION) where generation = ((path, dev, ino), size).
+        # A terminal "mismatch" pertains to ONE generation; a new path OR a same-path inode swap
+        # (rotation) OR a size shrink (truncate/rewrite/compaction) must reset it and re-probe.
+        def ident(path, ino, size, dev=1):
+            return ((path, dev, ino), size)
+        A = ident("A", 10, 100)
+        self.assertEqual(relay.schema_should_reprobe("mismatch", A, ident("A", 10, 100)), (False, True),
+                         "same generation + terminal mismatch → skip")
+        self.assertEqual(relay.schema_should_reprobe("mismatch", A, ident("B", 30, 80)), (True, False),
+                         "different path → reset the mismatch latch")
+        self.assertEqual(relay.schema_should_reprobe("mismatch", A, ident("A", 20, 50)), (True, False),
+                         "SAME path, NEW inode (rotation replaced the file) → reset")
+        self.assertEqual(relay.schema_should_reprobe("mismatch", A, ident("A", 10, 40)), (True, False),
+                         "SAME path+inode, size SHRANK (truncate/rewrite) → reset")
+        self.assertEqual(relay.schema_should_reprobe("ok-seen", A, ident("A", 10, 150)), (False, False),
+                         "same generation, grew (append) → re-probe, no reset")
+        self.assertEqual(relay.schema_should_reprobe("ok-seen", A, ident("A", 10, 100)), (False, True),
+                         "unchanged → incremental skip")
+        self.assertEqual(relay.schema_should_reprobe(None, None, A), (True, False),
+                         "first identity → probe it")
+        # wiring guard: schema_watch consults the generation reset (stat-based) — not bypassed
         with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
             src = fh.read()
-        self.assertIn("schema_should_reprobe(schema_latched[agent], schema_lpath[agent], tracked[agent])", src)
+        self.assertIn("schema_should_reprobe(schema_latched[agent], schema_ident[agent], ident)", src)
+        self.assertIn("st.st_dev, st.st_ino", src, "identity must include inode (same-path rotation)")
+
+    def test_forced_relock_reprobes_before_response_done(self):
+        # P1-4 (Codex): the forced re-lock switches tracked["claude"] to a NEW log, then processes
+        # its `done`. A schema_guard() must run on the switched log BEFORE response_done, so a
+        # malformed new log fails closed (exit 7) instead of driving a review/stop.
+        with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        i_relock = src.index('tracked["claude"] = relocked')
+        i_guard = src.index("schema_guard()", i_relock)
+        i_respond = src.index('response_done("claude", tracked["claude"], done)', i_relock)
+        self.assertLess(i_guard, i_respond,
+                        "schema_guard() must run after the forced re-lock and BEFORE response_done")
 
 
 class SchemaGuardOrdering(unittest.TestCase):

@@ -987,8 +987,7 @@ def main():
     POKE_NOSHOW = 1800         # nonce がログに現れないまま諦めるまでの秒数
     last_rejected = None       # 帰属棄却した完了 ts（棄却ログを完了値ごと1回に抑制）
     schema_latched = {"claude": None, "codex": None}   # runtime JSONL schema latch: None→"ok-seen"（監視継続）／"mismatch"（終端）
-    schema_sig = {"claude": None, "codex": None}       # 最後に probe した (path, size)。変化無ければ再読込しない（増分 probe）
-    schema_lpath = {"claude": None, "codex": None}     # latch/sig が対象とするログ path（P1-4: 切替で latch リセット）
+    schema_ident = {"claude": None, "codex": None}     # 最後に見たログ世代 ((path,dev,ino), size)。世代切替/縮小で再 probe（P1-4）
 
     def schema_watch():
         """Once per agent, probe the tracked transcript for the core schema the relay reads
@@ -1001,27 +1000,25 @@ def main():
         if a.no_schema_probe:
             return
         for agent in ("claude", "codex"):
-            if not tracked[agent]:
+            path = tracked[agent]
+            if not path:
                 continue
-            # P1-4: 追跡ログ path が切り替わった（resume/clear/再起動/rotation）ら latch/sig を
-            # 破棄して新ログを未確認から再 probe。"mismatch" は同一ログ内では終端（skip）。
-            reset, skip = schema_should_reprobe(schema_latched[agent], schema_lpath[agent], tracked[agent])
+            # 追跡ログの世代 identity ((path, dev, ino), size)。pathname だけだと同一 path の
+            # inode 置換や truncate を見逃すため stat まで見る（Codex 指摘）。
+            try:
+                st = os.stat(path)
+                ident = ((path, st.st_dev, st.st_ino), st.st_size)
+            except OSError:
+                ident = ((path, None, None), None)
+            # P1-4: 世代切替（別 path / inode 置換 / rotation / size 縮小=truncate）で latch を
+            # 破棄して未確認から再 probe。同一世代の追記は再 probe、変化なし/終端 mismatch は skip。
+            reset, skip = schema_should_reprobe(schema_latched[agent], schema_ident[agent], ident)
             if reset:
                 schema_latched[agent] = None
-                schema_sig[agent] = None
-                schema_lpath[agent] = tracked[agent]
+            schema_ident[agent] = ident
             if skip:
                 continue
-            # 増分 probe: 追跡ログの (path, size) が前回と同じ＝新規追記が無い → 巨大ログの
-            # 全再読込を避けて skip（path 変化＝resume/rotation は size も変わるので再 probe される）。
-            try:
-                sig = (tracked[agent], os.path.getsize(tracked[agent]))
-            except OSError:
-                sig = None
-            if sig is not None and schema_sig[agent] == sig:
-                continue
-            schema_sig[agent] = sig
-            status, reason = probe_log_schema(agent, tracked[agent])
+            status, reason = probe_log_schema(agent, path)
             schema_latched[agent], action = schema_latch_step(
                 schema_latched[agent], status, a.allow_untested_schema)
             if action == "ok":
@@ -1158,6 +1155,11 @@ def main():
                     relocked = refresh_claude_lock(tracked["claude"], cwd, panes["claude"], force=True)
                     done = claude_done_ts(relocked, since) if relocked != tracked["claude"] else None
                     tracked["claude"] = relocked
+                    # 強制 re-lock で新 path へ乗り換えた → response_done（レビュー依頼/停止判定）の
+                    # 前に必ず新ログを再 probe。malformed な新ログでは poke せず exit 7（P1-4/Codex）。
+                    if schema_guard():
+                        code = 7
+                        break
                 done = response_done("claude", tracked["claude"], done)
                 if done:
                     time.sleep(a.settle)
