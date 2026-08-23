@@ -8,9 +8,11 @@ A release is a git tag **`v<version>`** plus its GitHub Release; the tag must eq
 
 ## Cutting a release
 
-1. **Bump the version** in `bin/aipairlib/__init__.py` (`__version__ = "X.Y.Z"`), choosing the
-   part per SemVer (MAJOR for breaking, MINOR for features, PATCH for fixes). Pre-1.0 (`0.y.z`)
-   makes no stability promise.
+1. **Confirm the version to release.** `__version__` is already the *prepared* version and has its
+   own `## [X.Y.Z] — unreleased` section in `CHANGELOG.md` (it was set when this cycle started — see
+   "Starting the next version"). If the scope changed the intended number, update `__version__` **and**
+   that heading together now (SemVer: MAJOR breaking / MINOR features / PATCH fixes; pre-1.0 `0.y.z`
+   makes no stability promise). No bump happens here otherwise.
 2. In `CHANGELOG.md`, **date the top section**: change `## [X.Y.Z] — unreleased (…)` to
    `## [X.Y.Z] - <YYYY-MM-DD>` (JST release date), add a fresh `## [Unreleased]` above it for the next
    cycle, and keep the `[X.Y.Z]` compare link at the bottom. This dated section is what the tag publishes.
@@ -30,9 +32,12 @@ A release is a git tag **`v<version>`** plus its GitHub Release; the tag must eq
 
 ## Starting the next version
 
-After a release, bump `bin/aipairlib/__init__.py` (`__version__ = "X.Y.Z+1"`) and **rename the
-`## [Unreleased]` section** (created by the release step above) **to `## [X.Y.Z+1] — unreleased (…)`**
-in the same commit, so `__version__` always has its own top version section (doc-sync enforces this).
+After a release, choose the next version `NEXT_VERSION` per SemVer — e.g. `0.1.1` for a patch,
+`0.2.0` for features, `1.0.0` for a stable/breaking release — set `bin/aipairlib/__init__.py`
+`__version__ = "<NEXT_VERSION>"`, and **rename the `## [Unreleased]` section** (created by the
+release step above) **to `## [<NEXT_VERSION>] — unreleased (…)`** in the same commit, so `__version__`
+always has its own top version section (doc-sync enforces this). This is the only place `__version__`
+is bumped.
 
 ## Notes
 
