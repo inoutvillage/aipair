@@ -31,7 +31,7 @@ _MARK_STATE = {" ": "open", "x": "done", "X": "done", "!": "blocked"}
 # 例: `- [ ] task` / `* [x] done` / `  - [!] blocked`。マーカー後は行末 or 空白+本文。
 _ITEM = re.compile(r"^(?P<indent>[ \t]*)[-*+] \[(?P<mark>.)\](?:[ \t]+(?P<text>.*))?$")
 # コードフェンス開始/終了: ``` 以上のバッククォート or ~~~ 以上のチルダ（任意長・行頭インデント許容）。
-_FENCE = re.compile(r"^[ \t]*(?P<fence>`{3,}|~{3,})")
+_FENCE = re.compile(r"^[ \t]*(?P<fence>`{3,}|~{3,})(?P<tail>.*)$")
 # blocker 行: 任意インデント＋（任意の list マーカー）＋ `blocker:` ＋非空理由。
 _BLOCKER = re.compile(r"^[ \t]*(?:[-*+][ \t]+)?blocker:[ \t]*(?P<why>.*\S.*)$", re.IGNORECASE)
 
@@ -57,9 +57,13 @@ def _content_lines(text):
                 open_char, open_len = m.group("fence")[0], len(m.group("fence"))
             else:
                 out.append(line)
-        elif m and m.group("fence")[0] == open_char and len(m.group("fence")) >= open_len:
+        elif (m and m.group("fence")[0] == open_char
+              and len(m.group("fence")) >= open_len
+              and m.group("tail").strip() == ""):
+            # 終了フェンスは同種・開始長以上で、かつ run の後が空白のみ（info string 付き
+            # `` ```python `` は開始専用でありフェンス内では終了と見なさない）。
             open_char, open_len = None, 0
-        # フェンス内（開始・終了行含む）は checkbox 対象外なので out に入れない
+        # フェンス内（開始・終了行含む・info string 行含む）は checkbox 対象外なので out に入れない
     return out
 
 
@@ -108,7 +112,9 @@ def classify(text):
             if not blocker:               # blocker: 欠落 → fail-closed
                 raise TaskListError(
                     "blocked item [!] without a child 'blocker:' line: %r" % line.strip())
-        items.append((_indent_width(line), state, line.rstrip(),
+        # verbatim 行（splitlines で改行のみ除去済み・末尾空白は保持）を ready/blocked.item に
+        # 使う。後続の「厳密一致タスク ID」契約（Phase 4）が逐語一致を要求するため rstrip しない。
+        items.append((_indent_width(line), state, line,
                       (m.group("text") or "").strip(), blocker))
 
     ready = [it[2] for it in items if it[1] == "open"]
