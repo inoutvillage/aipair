@@ -961,6 +961,41 @@ class SchemaProbe(unittest.TestCase):
         # no boundary at all → the aspect does not fire (plain turn stays ok)
         self.assertEqual(relay.schema_probe("claude", [A])[0], "ok")
 
+    def test_claude_attribution_keys_must_be_string_typed(self):
+        # P1-4 (Codex): uuid / parentUuid / logicalParentUuid are used as DICT KEYS by
+        # claude_response_attributed. A truthy but non-string value (object/list/number) would pass
+        # a mere truthiness check yet crash the relay with TypeError: unhashable type. The probe must
+        # flag such type drift as mismatch (→ exit 7) so the crash never happens.
+        A = self.CLA_OK[0]
+        self.assertEqual(relay.schema_probe("claude",
+            [{"type": "assistant", "timestamp": "t", "uuid": {"x": 1}, "parentUuid": None,
+              "message": {"role": "assistant", "content": [], "stop_reason": "end_turn"}}])[0],
+            "mismatch", "assistant uuid=object → mismatch")
+        self.assertEqual(relay.schema_probe("claude",
+            [{"type": "assistant", "timestamp": "t", "uuid": "u1", "parentUuid": ["b"],
+              "message": {"role": "assistant", "content": [], "stop_reason": "end_turn"}}])[0],
+            "mismatch", "assistant parentUuid=list → mismatch")
+        cb_obj = {"type": "system", "subtype": "compact_boundary", "uuid": {"x": 1}, "logicalParentUuid": "L1"}
+        self.assertEqual(relay.schema_probe("claude", [cb_obj, A])[0], "mismatch",
+                         "boundary uuid=object → mismatch")
+        cb_lst = {"type": "system", "subtype": "compact_boundary", "uuid": "B1", "logicalParentUuid": ["L"]}
+        self.assertEqual(relay.schema_probe("claude", [cb_lst, A])[0], "mismatch",
+                         "boundary logicalParentUuid=list → mismatch")
+
+    def test_claude_response_attributed_does_not_crash_on_type_drift(self):
+        # Belt-and-suspenders: even if a non-string uuid/parent slips through, the attribution walker
+        # must not raise (unhashable dict/list) — it fails closed (False) instead.
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            fh.write(json.dumps({"type": "user", "uuid": {"bad": 1}, "parentUuid": None,
+                                 "message": {"content": "relay-id:x"}}) + "\n")
+            fh.write(json.dumps({"type": "assistant", "uuid": ["also", "bad"], "parentUuid": {"n": 1},
+                                 "message": {"content": "y"}}) + "\n")
+            path = fh.name
+        try:
+            self.assertFalse(relay.loglib.claude_response_attributed(path, "relay-id:x"))
+        finally:
+            os.unlink(path)
+
     def test_claude_delivery_drift_only_for_a_typed_input(self):
         # A TYPED human input (promptSource / origin.kind==human) whose content became a text-block
         # array is a delivery drift — claude_input() matches a STRING content, so it can't see it.
