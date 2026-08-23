@@ -474,6 +474,12 @@ def _oneline_cap(s, limit):
     return s if len(s) <= limit else s[:limit - 1] + "…"
 
 
+def oneline(s, n=180):
+    """空白を畳んで n 字に切り詰める汎用ヘルパ（ログ/メッセージ整形。_oneline_cap の既定長版）。"""
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
 def gate_message(cmd, out, n, limit):
     """What Claude gets when the review passed but the gate did not. cmd is folded to one
     line and capped: a multi-line AIPAIR_GATE must not put a newline in the poke body

@@ -1616,6 +1616,9 @@ class CorelibStandalone(unittest.TestCase):
         self.assertEqual(core.scrub_output("a\x00b"), "a b")
         self.assertEqual(core.schema_probe("claude", [])[0], "unverified")   # pure, no relay needed
         self.assertEqual(core.TESTED_VERSIONS, relay.TESTED_VERSIONS)
+        self.assertEqual(core.oneline("a   b\n c", 100), "a b c")   # generic text helper (moved from relay)
+        self.assertEqual(core.oneline("x" * 10, 5), "xxxx…")
+        self.assertIs(relay.oneline, relay.corelib.oneline)          # relay re-exports the corelib helper
 
     def test_relay_reexports_are_the_corelib_objects(self):
         # relay.X is bound to the corelib implementation (not a stale copy)
