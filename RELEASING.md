@@ -8,8 +8,9 @@ A release is a git tag **`v<version>`** plus its GitHub Release; the tag must eq
 
 ## Cutting a release
 
-1. **Confirm the version to release.** `__version__` is already the *prepared* version and has its
-   own `## [X.Y.Z] — unreleased` section in `CHANGELOG.md` (it was set when this cycle started — see
+1. **Confirm the version to release.** Between releases `__version__` is the *prepared* version and
+   has its own `## [X.Y.Z] — unreleased` section in `CHANGELOG.md` (right after a release the top is a
+   fresh `## [Unreleased]` above the last dated version — start the next cycle first, see below) (it was set when this cycle started — see
    "Starting the next version"). If the scope changed the intended number, update `__version__` **and**
    that heading together now (SemVer: MAJOR breaking / MINOR features / PATCH fixes; pre-1.0 `0.y.z`
    makes no stability promise). No bump happens here otherwise.

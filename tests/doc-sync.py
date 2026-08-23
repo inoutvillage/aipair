@@ -272,23 +272,35 @@ class TodoAndWorkflows(unittest.TestCase):
 
 
 class Version(unittest.TestCase):
-    """P2-4: aipairlib.__version__ が唯一の source of truth で、CHANGELOG の prepared 版セクション・
-    `aipair --version` / `aipair-relay --version` の出力・release workflow の tag 検査が一致する。"""
+    """P2-4: aipairlib.__version__ が唯一の source of truth で、CHANGELOG の最上位の版セクション
+    （発行前=prepared / 発行後=Unreleased+dated の両状態）・`aipair --version` /
+    `aipair-relay --version` の出力・release workflow の tag 検査が一致する。"""
     def test_version_is_semver(self):
         self.assertRegex(aipairlib.__version__, SEMVER,
                          "__version__ %r is not SemVer 2.0.0" % aipairlib.__version__)
 
+    @staticmethod
+    def _top_version(text):
+        # the topmost VERSION-numbered『## [X.Y.Z]』section, skipping a『## [Unreleased]』heading.
+        vers = [m for m in re.findall(r"^## \[([^\]]+)\]", text, re.M) if m.lower() != "unreleased"]
+        return vers[0] if vers else None
+
     def test_changelog_top_version_section_matches_version(self):
-        # the TOP『## [X.Y.Z]』section (released with a date, or being prepared) must equal __version__,
-        # so bumping the version without a CHANGELOG entry (or vice versa) fails here. It may be
-        # undated while unreleased (its date is added in the release commit just before the vX.Y.Z
-        # tag is pushed — see RELEASING.md).
-        vers = [m for m in re.findall(r"^## \[([^\]]+)\]", _read("CHANGELOG.md"), re.M)
-                if m.lower() != "unreleased"]
-        self.assertTrue(vers, "CHANGELOG.md has no『## [X.Y.Z]』version section")
-        self.assertEqual(vers[0], aipairlib.__version__,
+        # the TOP version section must equal __version__ (bumping one without the other fails here).
+        top = self._top_version(_read("CHANGELOG.md"))
+        self.assertIsNotNone(top, "CHANGELOG.md has no『## [X.Y.Z]』version section")
+        self.assertEqual(top, aipairlib.__version__,
                          "CHANGELOG.md top version section %s != __version__ %s (bump them together)"
-                         % (vers[0], aipairlib.__version__))
+                         % (top, aipairlib.__version__))
+
+    def test_both_changelog_lifecycle_states_resolve_the_version(self):
+        # BOTH layouts are valid and must resolve the same top version:
+        preparing = "# CL\n\n## [0.2.0] — unreleased (prepared)\n\nwip\n"       # being prepared (undated)
+        released  = "# CL\n\n## [Unreleased]\n\n## [0.2.0] - 2026-09-01\n\nshipped\n"  # right after a release
+        self.assertEqual(self._top_version(preparing), "0.2.0", "prepared layout must resolve the version")
+        self.assertEqual(self._top_version(released), "0.2.0", "post-release layout must resolve the version")
+        # a bare Unreleased with no version section resolves to None (would fail the match test above)
+        self.assertIsNone(self._top_version("# CL\n\n## [Unreleased]\n\nwip\n"))
 
     def test_aipair_version_reports_the_source_of_truth(self):
         r = subprocess.run([os.path.join(REPO, "bin", "aipair"), "--version"],
