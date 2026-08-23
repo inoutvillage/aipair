@@ -96,6 +96,7 @@ import unicodedata
 # imports / a poke(busy_wait=...) argument, handled inside those modules — no injection here.
 from . import peerlog, corelib, loglib, tmuxlib, deliverylib, dialoglib, logs, review_protocol, gate, log_lock, cli
 from .schema_guard import SchemaGuard
+from .state_machine import ResponseGate
 from .gate import run_gate, gate_or_message
 from .cli import build_parser
 from .log_lock import (claude_glob, codex_all, codex_cwd_matches, claude_matches_pane, lock_claude,
@@ -486,18 +487,16 @@ def main():
     question_rounds = 0        # 連続質問リレー回数（Claude のターン完了でリセット）
     q_unconfirmed_warned = False  # 「画面は質問ダイアログだがログ照合できず」の警告を1回に抑制
     last_activity = time.time()
-    probe = None               # 未消化 poke の nonce（ログでの配達確認・応答帰属に使用）
-    probe_ts_cache = None      # 応答判定アンカー ts（nonce 出現 ts → codex は新タスク開始 ts へ前進）
-    probe_sent_at = 0.0        # poke 送出時刻（no-show 監視用）
-    POKE_NOSHOW = 1800         # nonce がログに現れないまま諦めるまでの秒数
-    last_rejected = None       # 帰属棄却した完了 ts（棄却ログを完了値ごと1回に抑制）
     # ランタイム JSONL schema 監視は SchemaGuard（bin/aipairlib/schema_guard.py）へ切り出した
     # （P2-1）。純関数＋probe を注入で受け取り、latch/identity を所有する。単体テスト可能。
-    def _schema_warn(msg, bell=False):
+    def _warn(msg, bell=False):
         print(c("warn", msg), flush=True)
         if bell:
             print("\a", end="", flush=True)
-    sg = SchemaGuard(a, tracked, probe_log_schema, latest_compact_boundary, dim, _schema_warn)
+    sg = SchemaGuard(a, tracked, probe_log_schema, latest_compact_boundary, dim, _warn)
+    # poke 応答帰属ゲート（response_done / poke no-show）も同型で切り出し（P2-1・state_machine.py）。
+    rg = ResponseGate(tracked, find_poke_ts, codex_response_complete,
+                      claude_response_attributed, dim, _warn)
 
     def wait_heartbeat(who):
         # 待機フェーズごとに1回だけ表示（None = 表示済み。状態遷移時の time.time() 再セットで再アーム）
@@ -505,69 +504,6 @@ def main():
         if last_activity is not None and time.time() - last_activity > 30:
             dim(f"… {who} の応答待ち")
             last_activity = None
-
-    def response_done(agent, path, raw_done):
-        """完了検知を「poke への応答」と確定できるときだけ通すゲート。
-        キュー投入では nonce の user メッセージが先行ターンの完了前にログへ出るため
-        「done > nonce_ts」だけでは先行ターンの完了が通ってしまう（Codex レビュー
-        指摘）。codex は turn_id ペアリング（nonce アイテムの turn_id と同じ
-        task_complete の ts を確定値として返す）、claude は「最終 assistant
-        エントリの parentUuid チェーンが nonce エントリを祖先に持つ」ことまで
-        要求する。棄却は新しい完了値のたびに1回だけ可視化する。"""
-        nonlocal probe_ts_cache, last_rejected
-        if not raw_done or not probe:
-            return raw_done
-
-        def reject(reason):
-            nonlocal last_rejected
-            if raw_done != last_rejected:
-                last_rejected = raw_done
-                dim(f"完了を検知したが poke への応答と紐づかず棄却（{reason}）→ 継続監視")
-            return None
-
-        if probe_ts_cache is None:
-            probe_ts_cache = find_poke_ts(agent, path, probe)
-        if probe_ts_cache is None:
-            return None  # nonce 未着（未配達）— poke_noshow が期限を監視
-        if agent == "codex":
-            # 応答帰属ゲートでは turn_id 欠落時の位置フォールバックを《一切使わない》（P1-3 /
-            # Codex レビュー）。位置推定は queue 投入で先行タスクを誤帰属し得るので、それで
-            # 停止 sentinel 判定・レビュー転送・質問回答・プラン自動承認へ進むのは危険。
-            # turn_id で確定できなければ compat mode でも帰属不能→reject（＝人間判断待ちで待機）。
-            anchor, comp = codex_response_complete(path, probe)
-            if anchor is None:
-                return reject("応答帰属不能（turn_id 欠落 or nonce の user アイテム未発見）→ 自律判定に使わず待機")
-            if comp is None:
-                return reject("応答タスク（同 turn_id）が未完了")
-            # texts 窓のアンカーを応答タスク開始時刻へ進める（先行タスク末尾の混入防止）
-            probe_ts_cache = anchor
-            # 確定した応答タスクの完了 ts を返す — raw_done（最新完了）をそのまま
-            # 使うと、応答より後に完了した別タスクを応答として採用してしまう
-            # （Codex レビュー指摘）
-            return comp
-        # claude: nonce 以後の完了 かつ 応答チェーンが nonce エントリを祖先に持つこと
-        if raw_done <= probe_ts_cache:
-            return reject("nonce 以前の完了")
-        if not claude_response_attributed(path, probe):
-            return reject("応答チェーン不一致")
-        return raw_done
-
-    def poke_noshow(agent):
-        """poke の nonce が一定時間ログに現れない = 配達失敗（キュー投入も不成立）。
-        画面検証をすり抜けた未送信をここで確実に検知して停止させる。"""
-        nonlocal probe_ts_cache
-        if not probe or probe_ts_cache is not None or not probe_sent_at:
-            return False
-        if time.time() - probe_sent_at < POKE_NOSHOW:
-            return False
-        if tracked[agent]:
-            probe_ts_cache = find_poke_ts(agent, tracked[agent], probe)
-            if probe_ts_cache is not None:
-                return False
-        print(c("warn", f"│ ■ poke（{probe}）が{POKE_NOSHOW // 60}分経ってもログに現れません。"
-                        "未配達（Enter不成立等）とみなし停止します。コンポーザを確認してください。"), flush=True)
-        print("\a", end="", flush=True)
-        return True
 
     def claude_watch():
         """Claude 宛配達の直前に作る LogWatch（ログ未特定なら None → 画面フォールバック）。"""
@@ -612,15 +548,15 @@ def main():
                     if sg.guard():
                         code = 7
                         break
-                done = response_done("claude", tracked["claude"], done)
+                done = rg.response_done("claude", tracked["claude"], done)
                 if done:
                     time.sleep(a.settle)
-                    done = response_done("claude", tracked["claude"],
+                    done = rg.response_done("claude", tracked["claude"],
                                          claude_done_ts(tracked["claude"], since)) or done
                     rounds += 1
                     question_rounds = 0
                     q_unconfirmed_warned = False
-                    tstart = max(since, probe_ts_cache) if probe else since
+                    tstart = max(since, rg.probe_ts_cache) if rg.probe else since
                     texts = turn_texts("claude", tracked["claude"], tstart, done)
                     text = "\n".join(texts)
                     # endless: Claude の手持ちが尽きた宣言なら、レビューではなく
@@ -649,7 +585,7 @@ def main():
                         code = 4
                         break
                     pending_kind = "next" if ask_next else "review"
-                    probe, probe_ts_cache, probe_sent_at = sent, None, time.time()
+                    rg.arm(sent)
                     since = time.time(); state = "claude" if gate_msg else "codex"; last_activity = time.time()
                 elif (not a.no_plan_review) and (plan_dialog := detect_plan_dialog(panes["claude"])):
                     if plan_rounds >= a.plan_rounds:
@@ -670,7 +606,7 @@ def main():
                         print("\a", end="", flush=True)
                         code = 4
                         break
-                    probe, probe_ts_cache, probe_sent_at = sent, None, time.time()
+                    rg.arm(sent)
                     since = time.time(); state = "codex_plan"; last_activity = time.time()
                 elif (not a.no_question_relay) and detect_question_dialog(panes["claude"]):
                     if question_rounds >= a.question_rounds:
@@ -700,12 +636,12 @@ def main():
                             print("\a", end="", flush=True)
                             code = 4
                             break
-                        probe, probe_ts_cache, probe_sent_at = sent, None, time.time()
+                        rg.arm(sent)
                         since = time.time(); state = "codex_question"; last_activity = time.time()
                 else:
                     if tracked["claude"]:
                         tracked["claude"] = refresh_claude_lock(tracked["claude"], cwd, panes["claude"])
-                    if poke_noshow("claude"):
+                    if rg.noshow("claude"):
                         code = 4
                         break
                     wait_heartbeat("Claude")
@@ -717,12 +653,12 @@ def main():
                     code = 7
                     break
                 done = codex_done_ts(tracked["codex"], since) if tracked["codex"] else None
-                done = response_done("codex", tracked["codex"], done)
+                done = rg.response_done("codex", tracked["codex"], done)
                 if done:
                     time.sleep(a.settle)
-                    done = response_done("codex", tracked["codex"],
+                    done = rg.response_done("codex", tracked["codex"],
                                          codex_done_ts(tracked["codex"], since)) or done
-                    tstart = max(since, probe_ts_cache) if probe else since
+                    tstart = max(since, rg.probe_ts_cache) if rg.probe else since
                     texts = turn_texts("codex", tracked["codex"], tstart, done)
                     text = "\n".join(texts).strip()
                     # 承認判定は停止ワードと同じく sentinel の先頭行完全一致で行う。プランの
@@ -780,12 +716,12 @@ def main():
                             print("\a", end="", flush=True)
                             code = 4
                             break
-                    probe = None  # ダイアログ経由の配達に nonce は無い（帰属ゲート不使用）
+                    rg.clear()    # ダイアログ経由の配達に nonce は無い（帰属ゲート不使用）
                     since = time.time(); state = "claude"; last_activity = time.time()
                 else:
                     if tracked["codex"]:
                         tracked["codex"] = refresh_codex_lock(tracked["codex"], cwd, panes["codex"])
-                    if poke_noshow("codex"):
+                    if rg.noshow("codex"):
                         code = 4
                         break
                     wait_heartbeat("Codex（プランレビュー）")
@@ -797,12 +733,12 @@ def main():
                     code = 7
                     break
                 done = codex_done_ts(tracked["codex"], since) if tracked["codex"] else None
-                done = response_done("codex", tracked["codex"], done)
+                done = rg.response_done("codex", tracked["codex"], done)
                 if done:
                     time.sleep(a.settle)
-                    done = response_done("codex", tracked["codex"],
+                    done = rg.response_done("codex", tracked["codex"],
                                          codex_done_ts(tracked["codex"], since)) or done
-                    tstart = max(since, probe_ts_cache) if probe else since
+                    tstart = max(since, rg.probe_ts_cache) if rg.probe else since
                     texts = turn_texts("codex", tracked["codex"], tstart, done)
                     text = "\n".join(texts).strip()
                     # 配達直前に再検知する（Codex の回答中に人間が操作した可能性があるため）
@@ -824,12 +760,12 @@ def main():
                             print("\a", end="", flush=True)
                             code = 4
                             break
-                    probe = None  # ダイアログ経由の配達に nonce は無い（帰属ゲート不使用）
+                    rg.clear()    # ダイアログ経由の配達に nonce は無い（帰属ゲート不使用）
                     since = time.time(); state = "claude"; last_activity = time.time()
                 else:
                     if tracked["codex"]:
                         tracked["codex"] = refresh_codex_lock(tracked["codex"], cwd, panes["codex"])
-                    if poke_noshow("codex"):
+                    if rg.noshow("codex"):
                         code = 4
                         break
                     wait_heartbeat("Codex（質問回答）")
@@ -841,12 +777,12 @@ def main():
                     code = 7
                     break
                 done = codex_done_ts(tracked["codex"], since) if tracked["codex"] else None
-                done = response_done("codex", tracked["codex"], done)
+                done = rg.response_done("codex", tracked["codex"], done)
                 if done:
                     time.sleep(a.settle)
-                    done = response_done("codex", tracked["codex"],
+                    done = rg.response_done("codex", tracked["codex"],
                                          codex_done_ts(tracked["codex"], since)) or done
-                    tstart = max(since, probe_ts_cache) if probe else since
+                    tstart = max(since, rg.probe_ts_cache) if rg.probe else since
                     texts = turn_texts("codex", tracked["codex"], tstart, done)
                     text = "\n".join(texts)
                     log("● " + c("codex", "Codex 次タスク指示 完了" if pending_kind == "next"
@@ -924,12 +860,12 @@ def main():
                         code = 4
                         break
                     pending_kind = "review"
-                    probe, probe_ts_cache, probe_sent_at = new_probe, None, time.time()
+                    rg.arm(new_probe)
                     since = time.time(); state = "claude"; last_activity = time.time()
                 else:
                     if tracked["codex"]:
                         tracked["codex"] = refresh_codex_lock(tracked["codex"], cwd, panes["codex"])
-                    if poke_noshow("codex"):
+                    if rg.noshow("codex"):
                         code = 4
                         break
                     wait_heartbeat("Codex")

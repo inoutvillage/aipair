@@ -1684,6 +1684,126 @@ class LoglibStandalone(unittest.TestCase):
         self.assertIs(relay.plan_extra_comment, rp.plan_extra_comment)
 
 
+
+class ResponseGateBehavior(unittest.TestCase):
+    """P2-1: the poke/attribution gate — formerly the nested closures response_done / poke_noshow
+    inside main(), which no test could reach — is now ResponseGate in state_machine.py, owning the
+    probe lifecycle with injected pure deps (find_poke_ts / codex_response_complete /
+    claude_response_attributed) + a fake clock. So the fail-closed attribution invariants (P1-2 /
+    P1-3) get direct unit coverage: a turn_id-less codex turn is rejected, never position-guessed."""
+    def _gate(self, *, find=None, codex=None, claude=None, now=1000.0):
+        from aipairlib.state_machine import ResponseGate
+        self.dims = []
+        self.warns = []
+        self.clock = [now]
+        tracked = {"claude": "/c.jsonl", "codex": "/x.jsonl"}
+        self.tracked = tracked
+        return ResponseGate(
+            tracked,
+            find or (lambda *a: 100.0),
+            codex or (lambda *a: (None, None)),
+            claude or (lambda *a: True),
+            lambda m: self.dims.append(m),
+            lambda m, bell=False: self.warns.append((m, bell)),
+            clock=lambda: self.clock[0],
+        )
+
+    def test_standalone_import_and_relay_reexport(self):
+        self.assertTrue(_imports_without_relay("state_machine", "ResponseGate"))
+        from aipairlib.state_machine import ResponseGate
+        self.assertIs(relay.ResponseGate, ResponseGate)
+
+    def test_arm_sets_lifecycle_and_clear_disables(self):
+        g = self._gate(now=42.0)
+        g.arm("NONCE")
+        self.assertEqual((g.probe, g.probe_ts_cache, g.probe_sent_at), ("NONCE", None, 42.0))
+        g.clear()
+        self.assertIsNone(g.probe)
+
+    def test_no_probe_passes_raw_done_through(self):
+        # dialog-path delivery (clear()) → gate disabled → raw completion flows unchanged; and an
+        # un-armed gate never fires a no-show.
+        g = self._gate()
+        g.clear()
+        self.assertEqual(g.response_done("codex", "/x.jsonl", 500.0), 500.0)
+        self.assertFalse(g.noshow("codex"))
+
+    def test_codex_turn_id_returns_response_completion_not_raw(self):
+        # turn_id pairs → the RETURNED ts is the response task's own completion (comp), and the
+        # texts-window anchor advances to the response task start — never raw_done (a later task).
+        g = self._gate(find=lambda *a: 100.0, codex=lambda *a: (150.0, 175.0))
+        g.arm("NONCE")
+        self.assertEqual(g.response_done("codex", "/x.jsonl", 999.0), 175.0)
+        self.assertEqual(g.probe_ts_cache, 150.0)
+
+    def test_codex_missing_turn_id_is_fail_closed(self):
+        # anchor None (turn_id absent / nonce user-item not found) → reject, and NEVER a position
+        # fallback. This is the P1-3 invariant that keeps an unattributable turn out of auto stop.
+        g = self._gate(find=lambda *a: 100.0, codex=lambda *a: (None, None))
+        g.arm("NONCE")
+        self.assertIsNone(g.response_done("codex", "/x.jsonl", 999.0))
+        self.assertTrue(any("自律判定に使わず" in d for d in self.dims))
+
+    def test_codex_response_task_incomplete_rejects(self):
+        g = self._gate(find=lambda *a: 100.0, codex=lambda *a: (150.0, None))
+        g.arm("NONCE")
+        self.assertIsNone(g.response_done("codex", "/x.jsonl", 999.0))
+
+    def test_nonce_not_yet_delivered_waits(self):
+        # find_poke_ts None → the nonce has not landed in the log yet → None (noshow owns the
+        # deadline); no reject log, because nothing is wrong yet.
+        g = self._gate(find=lambda *a: None)
+        g.arm("NONCE")
+        self.assertIsNone(g.response_done("codex", "/x.jsonl", 999.0))
+        self.assertEqual(self.dims, [])
+
+    def test_claude_ancestry_and_ordering(self):
+        g = self._gate(find=lambda *a: 100.0, claude=lambda *a: True)
+        g.arm("NONCE")
+        self.assertEqual(g.response_done("claude", "/c.jsonl", 200.0), 200.0)
+        g.probe_ts_cache = 100.0    # completion at/under the nonce ts → reject
+        self.assertIsNone(g.response_done("claude", "/c.jsonl", 100.0))
+
+    def test_claude_unattributed_rejects(self):
+        g = self._gate(find=lambda *a: 100.0, claude=lambda *a: False)
+        g.arm("NONCE")
+        self.assertIsNone(g.response_done("claude", "/c.jsonl", 200.0))
+
+    def test_reject_dedups_per_completion_value(self):
+        g = self._gate(find=lambda *a: 100.0, claude=lambda *a: False)
+        g.arm("NONCE")
+        g.response_done("claude", "/c.jsonl", 200.0)
+        g.response_done("claude", "/c.jsonl", 200.0)     # same value → not dimmed twice
+        self.assertEqual(sum("棄却" in d for d in self.dims), 1)
+        g.response_done("claude", "/c.jsonl", 300.0)     # new value → dimmed again
+        self.assertEqual(sum("棄却" in d for d in self.dims), 2)
+
+    def test_noshow_silent_when_unarmed_or_within_deadline(self):
+        g = self._gate(now=1000.0)
+        self.assertFalse(g.noshow("codex"))              # not armed
+        g.arm("NONCE")
+        self.clock[0] = 1000.0 + g.POKE_NOSHOW - 1       # just under the deadline
+        self.assertFalse(g.noshow("codex"))
+        self.assertEqual(self.warns, [])
+
+    def test_noshow_fires_past_deadline_when_nonce_absent(self):
+        g = self._gate(now=1000.0, find=lambda *a: None)
+        g.arm("NONCE")
+        self.clock[0] = 1000.0 + g.POKE_NOSHOW + 1
+        self.assertTrue(g.noshow("codex"))
+        self.assertEqual(len(self.warns), 1)
+        self.assertTrue(self.warns[0][1])                # bell=True
+        self.assertIn("未配達", self.warns[0][0])
+
+    def test_noshow_stands_down_if_nonce_appears_late(self):
+        # past the deadline but the nonce has since landed → not a no-show; it caches the ts.
+        g = self._gate(now=1000.0, find=lambda *a: 1234.0)
+        g.arm("NONCE")
+        self.clock[0] = 1000.0 + g.POKE_NOSHOW + 1
+        self.assertFalse(g.noshow("codex"))
+        self.assertEqual(g.probe_ts_cache, 1234.0)
+        self.assertEqual(self.warns, [])
+
 class ResponseAttribution(unittest.TestCase):
     """The loglib functions that decide whether a completed turn is the answer to OUR poke —
     the source of truth for delivery. Fixtures are real jsonl / rollout shapes."""
@@ -1750,16 +1870,21 @@ class ResponseAttribution(unittest.TestCase):
         self.assertEqual(relay.codex_response_complete(p, "relay-id:zzz"), (None, None))
 
     def test_response_done_gate_never_uses_the_position_fallback(self):
-        # P1-3 (integration guard): the AUTONOMOUS attribution gate (response_done) must call
-        # codex_response_complete WITHOUT the position fallback — so a turn_id-less, unattributable
-        # codex turn can never be accepted as a completion and drive an auto stop / review-forward /
-        # question-answer / plan auto-approval. The fallback stays opt-in for diagnostics only.
+        # P1-3 (integration guard): the AUTONOMOUS attribution gate (ResponseGate.response_done,
+        # P2-1: extracted to state_machine.py) must call codex_response_complete WITHOUT the
+        # position fallback — so a turn_id-less, unattributable codex turn can never be accepted as
+        # a completion and drive an auto stop / review-forward / question-answer / plan
+        # auto-approval. The fallback stays opt-in for diagnostics only. Neither the gate module nor
+        # the relay that wires it may ever enable the fallback.
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
+            gate_src = fh.read()
         with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
-            src = fh.read()
-        self.assertIn("anchor, comp = codex_response_complete(path, probe)", src,
+            relay_src = fh.read()
+        self.assertIn("anchor, comp = self._codex_response_complete(path, self.probe)", gate_src,
                       "the gate must call it plainly (no fallback)")
-        self.assertNotIn("allow_position_fallback=True", src, "relay must never enable the fallback")
-        self.assertNotIn("allow_position_fallback=(", src, "relay must never enable the fallback")
+        for src in (gate_src, relay_src):
+            self.assertNotIn("allow_position_fallback=True", src, "the fallback must never be enabled")
+            self.assertNotIn("allow_position_fallback=(", src, "the fallback must never be enabled")
 
     # ---- Claude: parentUuid ancestry -------------------------------------------
     def _cl_user(self, uuid, parent, text, ts="2026-08-21T00:00:05Z"):
