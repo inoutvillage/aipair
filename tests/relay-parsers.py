@@ -1637,6 +1637,12 @@ class LoglibStandalone(unittest.TestCase):
         self.assertIs(relay.turn_texts, relay.loglib.turn_texts)
         self.assertIs(relay.read_records, relay.loglib.read_records)
 
+    def test_gate_module_is_standalone(self):
+        # P2-1 増分3: the stop-gate runner is a standalone module (no relay dependency); relay
+        # re-exports run_gate so call sites / GateRunner tests are unchanged.
+        self.assertTrue(_imports_without_relay("gate", "run_gate"))
+        self.assertIs(relay.run_gate, relay.gate.run_gate)
+
     def test_review_protocol_is_standalone_and_instructs_sentinel_at_head(self):
         # P2-1 増分2: the poke templates are a standalone pure module (no relay dependency), and
         # every stop/next/all-done/plan template instructs the sentinel ALONE on the first line.

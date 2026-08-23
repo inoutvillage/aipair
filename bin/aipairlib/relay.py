@@ -94,8 +94,9 @@ import unicodedata
 # attribute injection). Re-bound below so relay code and tests keep calling them unqualified /
 # as relay.X. The delivery<->dialog cycle, the shared logger, and the idle budget are now real
 # imports / a poke(busy_wait=...) argument, handled inside those modules — no injection here.
-from . import peerlog, corelib, loglib, tmuxlib, deliverylib, dialoglib, logs, review_protocol
+from . import peerlog, corelib, loglib, tmuxlib, deliverylib, dialoglib, logs, review_protocol, gate
 from .schema_guard import SchemaGuard
+from .gate import run_gate
 from .review_protocol import (DEFAULT_POKE_CLAUDE, default_poke_codex, plan_poke_codex,
                               question_poke_codex, endless_poke_claude_pass, endless_poke_codex_next,
                               endless_poke_claude_next, plan_extra_comment)
@@ -533,89 +534,6 @@ class LogWatch:
                                            for b in c):
                 return True
         return False
-
-
-def run_gate(cmd, cwd, timeout):
-    """Run the --gate shell command in cwd. Returns (ok, scrubbed output text).
-
-    The command runs in its OWN process group (start_new_session): a timeout, a
-    KeyboardInterrupt, or a shell that exits while leaving background jobs — all end with
-    the WHOLE group killed and the reader thread joined, so nothing is orphaned. Output is
-    drained on a thread into a fixed-size tail buffer (an unbounded producer like `yes`
-    cannot OOM the relay, a full pipe cannot deadlock the wait); the buffer is read only
-    after the reader has joined. Bytes are decoded errors="replace" and scrubbed of
-    control characters so non-UTF-8 / ANSI output can neither crash the relay nor be typed
-    into the pane as keystrokes."""
-    import threading, collections, signal
-    try:
-        proc = subprocess.Popen(cmd, shell=True, cwd=cwd,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
-    except OSError as e:
-        return False, f"exec error: {e}"
-    try:
-        pgid = os.getpgid(proc.pid)          # captured now: valid while any group member lives
-    except OSError:
-        pgid = proc.pid
-    buf, kept, dropped = collections.deque(), [0], [False]
-
-    def drain():
-        for chunk in iter(lambda: proc.stdout.read(65536), b""):
-            buf.append(chunk); kept[0] += len(chunk)
-            while kept[0] > GATE_OUTPUT_CAP and len(buf) > 1:
-                kept[0] -= len(buf.popleft()); dropped[0] = True
-        proc.stdout.close()
-
-    reader = threading.Thread(target=drain, daemon=True)
-    reader.start()
-    timed_out = False
-    raised = None
-    try:
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-    except BaseException as e:                # Ctrl-C etc.: clean up, then re-raise below
-        raised = e
-    finally:
-        # Always tear the whole group down: timeout, interrupt, or a shell that exited
-        # leaving `&` background jobs still writing. Then join the reader so the buffer is
-        # not mutated while we read it.
-        _kill_group(proc, pgid, signal)
-        reader.join(timeout=5)
-    out = scrub_output(b"".join(buf).decode("utf-8", "replace"))
-    if dropped[0]:
-        out = "…(truncated to the last ~256KB)… " + out
-    if raised is not None:
-        raise raised
-    if timed_out:
-        return False, out + f"\n[gate] timeout after {timeout}s (process group killed): {oneline(cmd, 200)}"
-    return proc.returncode == 0, out
-
-
-def _kill_group(proc, pgid, signal):
-    """Terminate the gate's process group `pgid`. TERM, a short grace for a clean exit,
-    then KILL unconditionally (a child ignoring TERM whose parent shell already exited
-    must still die — escalation is not gated on the group looking dead, since a reaped or
-    zombie leader confuses liveness probes), then reap the shell so it leaves no zombie.
-    pgid is captured at launch, not re-derived here, to avoid signalling a recycled pid."""
-    def killpg(sig):
-        try:
-            os.killpg(pgid, sig)
-        except OSError:
-            try:
-                proc.send_signal(sig)
-            except OSError:
-                pass
-    killpg(signal.SIGTERM)
-    deadline = time.time() + 0.5
-    while time.time() < deadline and proc.poll() is None:
-        time.sleep(0.05)
-    killpg(signal.SIGKILL)            # unconditional: SIGKILL can't be ignored by any group member
-    try:
-        proc.wait(timeout=3)          # reap the shell (no lingering zombie keeps the pgid "alive")
-    except subprocess.TimeoutExpired:
-        pass
 
 
 def gate_or_message(a, gate_state, cwd):
