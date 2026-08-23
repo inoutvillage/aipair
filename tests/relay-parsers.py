@@ -1097,11 +1097,13 @@ class SchemaLatchStep(unittest.TestCase):
         self.assertEqual(relay.schema_latch_step("ok-seen", "unverified", False), ("ok-seen", "none"))
 
     def test_schema_reprobe_uses_a_generation_identity(self):
-        # P1-4: the latch is per (agent, log GENERATION) where generation = ((path, dev, ino), size).
-        # A terminal "mismatch" pertains to ONE generation; a new path OR a same-path inode swap
-        # (rotation) OR a size shrink (truncate/rewrite/compaction) must reset it and re-probe.
-        def ident(path, ino, size, dev=1):
-            return ((path, dev, ino), size)
+        # P1-4: the latch is per (agent, log GENERATION) where
+        # generation identity = ((path, dev, ino), size, compaction-marker). A terminal "mismatch"
+        # pertains to ONE generation; a new path, a same-path inode swap (rotation), a size shrink
+        # (truncate), OR a Claude compaction (same path/inode, size grows, NEW compact_boundary)
+        # must reset it and re-probe.
+        def ident(path, ino, size, dev=1, marker=None):
+            return ((path, dev, ino), size, marker)
         A = ident("A", 10, 100)
         self.assertEqual(relay.schema_should_reprobe("mismatch", A, ident("A", 10, 100)), (False, True),
                          "same generation + terminal mismatch → skip")
@@ -1117,11 +1119,42 @@ class SchemaLatchStep(unittest.TestCase):
                          "unchanged → incremental skip")
         self.assertEqual(relay.schema_should_reprobe(None, None, A), (True, False),
                          "first identity → probe it")
-        # wiring guard: schema_watch consults the generation reset (stat-based) — not bypassed
+        # Claude COMPACTION: same path+inode, size GROWS, a NEW compact_boundary appears → reset
+        # even from a terminal mismatch (the post-compaction structure must be re-probed).
+        self.assertEqual(relay.schema_should_reprobe("mismatch", A, ident("A", 10, 150, marker="B1")),
+                         (True, False), "compaction (new compact_boundary) → reset from mismatch")
+        self.assertEqual(relay.schema_should_reprobe("mismatch", A, ident("A", 10, 150)), (False, True),
+                         "plain append (no new boundary) stays terminal-mismatch skip (no noise)")
+        # a boundary scrolling OUT of the tail window (B1 → None) is NOT a new generation
+        self.assertEqual(relay.schema_should_reprobe("mismatch", ident("A", 10, 150, marker="B1"),
+                                                     ident("A", 10, 200)), (False, True),
+                         "boundary scrolled out → no spurious reset")
+        # wiring guard: schema_watch consults the generation reset (stat + compaction marker)
         with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
             src = fh.read()
         self.assertIn("schema_should_reprobe(schema_latched[agent], schema_ident[agent], ident)", src)
         self.assertIn("st.st_dev, st.st_ino", src, "identity must include inode (same-path rotation)")
+        self.assertIn("latest_compact_boundary(path)", src, "claude identity must fold in compaction")
+
+    def test_latest_compact_boundary(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            fh.write(json.dumps({"type": "assistant", "uuid": "a1"}) + "\n")
+            fh.write(json.dumps({"type": "system", "subtype": "compact_boundary", "uuid": "B1"}) + "\n")
+            fh.write(json.dumps({"type": "system", "subtype": "compact_boundary", "uuid": "B2"}) + "\n")
+            path = fh.name
+        try:
+            self.assertEqual(relay.latest_compact_boundary(path), "B2")  # the LATEST boundary
+        finally:
+            os.unlink(path)
+        # no boundary → None; missing file → None
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            fh.write(json.dumps({"type": "assistant", "uuid": "a1"}) + "\n")
+            path2 = fh.name
+        try:
+            self.assertIsNone(relay.latest_compact_boundary(path2))
+        finally:
+            os.unlink(path2)
+        self.assertIsNone(relay.latest_compact_boundary("/no/such/file.jsonl"))
 
     def test_forced_relock_reprobes_before_response_done(self):
         # P1-4 (Codex): the forced re-lock switches tracked["claude"] to a NEW log, then processes

@@ -331,7 +331,9 @@ def schema_fail_closed(a, bad):
 
 def schema_should_reprobe(latch, last_ident, ident):
     """一エージェントの runtime schema 監視を、追跡ログの《世代 identity》で進める（P1-4）。
-    ident = (generation, size)、generation = (path, st_dev, st_ino)。戻り値 (reset, skip):
+    ident = (generation, size, marker)、generation = (path, st_dev, st_ino)、marker は Claude
+    compaction の最新 compact_boundary（同一 path/inode に追記されるため gen/size では捕まらない
+    切替の検出用。codex は None）。戻り値 (reset, skip):
 
       - 世代の切替（generation が変わる＝別 path / inode 置換 / rotation、または size が《減る》＝
         truncate/再作成/compaction による書き直し）→ (reset=True, skip=False): latch を破棄して
@@ -342,11 +344,14 @@ def schema_should_reprobe(latch, last_ident, ident):
       - 世代切替でない 'mismatch' はその世代の終端 → (False, True): skip。
 
     呼び出し側は reset で latch を None にし、常に last_ident を ident へ更新する。"""
-    last_gen, last_size = last_ident if last_ident else (None, None)
-    gen, size = ident
+    last_gen, last_size, last_marker = last_ident if last_ident else (None, None, None)
+    gen, size, marker = ident
     shrank = (size is not None and last_size is not None and size < last_size)
-    if gen != last_gen or shrank:
-        return (True, False)                 # 新世代 → reset + reprobe
+    # Claude compaction は同一 path/inode に compact_boundary を追記する（gen 不変・size 増加）。
+    # 新しい非 None marker が出たら新世代として reset（末尾窓から流れて None に戻る場合は無視）。
+    new_boundary = (marker is not None and marker != last_marker)
+    if gen != last_gen or shrank or new_boundary:
+        return (True, False)                 # 新世代（path/inode 置換・truncate・compaction）→ reset + reprobe
     if latch == "mismatch":
         return (False, True)                 # 同一世代の終端 mismatch → skip
     if ident == last_ident:
