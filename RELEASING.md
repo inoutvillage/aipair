@@ -36,8 +36,9 @@ After a release, choose the next version `NEXT_VERSION` per SemVer — e.g. `0.1
 `0.2.0` for features, `1.0.0` for a stable/breaking release — set `bin/aipairlib/__init__.py`
 `__version__ = "<NEXT_VERSION>"`, and **rename the `## [Unreleased]` section** (created by the
 release step above) **to `## [<NEXT_VERSION>] — unreleased (…)`** in the same commit, so `__version__`
-always has its own top version section (doc-sync enforces this). This is the only place `__version__`
-is bumped.
+always has its own top version section (doc-sync enforces this). This is where `__version__` is
+**normally** bumped; the only exception is step 1, which adjusts it together with the heading if the
+release scope changed the intended number.
 
 ## Notes
 
