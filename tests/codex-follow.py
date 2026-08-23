@@ -38,7 +38,9 @@ class Fixture(unittest.TestCase):
             mod.CODEX_INDEX.FULL_RESCAN_SECS = 10 ** 9     # only explicit full rescans below
             mod.codex_via_pane = lambda cwd, pane=None: None   # default: no /proc identity → fallback path
             mod.codex_identity_capable = lambda pane=None: False
-        relay.dim = lambda *a, **k: None          # silence the relay's log line
+        # 抽出後、ログ locking 関数は log_lock 側の dim を使うので、そちらも黙らせる（Codex 指摘:
+        # relay.dim だけだと「codex rollout ローテート検知」等の ANSI ログがテスト出力に漏れる）。
+        relay.dim = relay.log_lock.dim = lambda *a, **k: None   # silence relay + log_lock log lines
         relay.log_lock._CODEX_SINCE_EPOCH = None; relay.log_lock._CODEX_SINCE_BAD = False   # reset module globals per test
         self.t0 = 1_700_000_000
         # A-old (t+1) / B-new (t+3, globally newest) / A-mid (t+2)
