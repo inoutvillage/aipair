@@ -285,6 +285,27 @@ class Version(unittest.TestCase):
         vers = [m for m in re.findall(r"^## \[([^\]]+)\]", text, re.M) if m.lower() != "unreleased"]
         return vers[0] if vers else None
 
+    @staticmethod
+    def _changelog_shape(text):
+        # classify the CHANGELOG's top lifecycle SHAPE (not just: does a version exist):
+        #   "prepared" — top『## [X.Y.Z]』heading is UNDATED (no ' - YYYY-MM-DD'); no『## [Unreleased]』above
+        #   "released" — top heading is『## [Unreleased]』(nothing trailing) and the NEXT heading is a
+        #                DATED『## [X.Y.Z] - YYYY-MM-DD』
+        #   "invalid"  — anything else: Unreleased + an UNDATED version, Unreleased alone, a dated
+        #                version with no Unreleased above it, two Unreleased headings, etc.
+        DATED = re.compile(r"^ - \d{4}-\d{2}-\d{2}\s*$")
+        heads = re.findall(r"^## \[([^\]]+)\](.*)$", text, re.M)   # [(name, rest), ...] in document order
+        if not heads:
+            return "invalid"
+        name0, rest0 = heads[0]
+        if name0.lower() == "unreleased":
+            if rest0.strip():                       # '## [Unreleased]' must carry nothing after it
+                return "invalid"
+            if len(heads) < 2 or heads[1][0].lower() == "unreleased":
+                return "invalid"                    # Unreleased alone / two Unreleased headings
+            return "released" if DATED.match(heads[1][1]) else "invalid"   # next version must be DATED
+        return "prepared" if not DATED.match(rest0) else "invalid"   # top version valid only when UNDATED
+
     def test_changelog_top_version_section_matches_version(self):
         # the TOP version section must equal __version__ (bumping one without the other fails here).
         top = self._top_version(_read("CHANGELOG.md"))
@@ -293,13 +314,28 @@ class Version(unittest.TestCase):
                          "CHANGELOG.md top version section %s != __version__ %s (bump them together)"
                          % (top, aipairlib.__version__))
 
-    def test_both_changelog_lifecycle_states_resolve_the_version(self):
-        # BOTH layouts are valid and must resolve the same top version:
+    def test_both_changelog_lifecycle_states_have_a_verified_shape(self):
+        # the two VALID lifecycle SHAPES are accepted and INVALID ones are REJECTED — not merely
+        # "a version can be extracted" (Codex P2 relay-id:d2ece9ce: verify the shape, both signs).
+        shape = self._changelog_shape
         preparing = "# CL\n\n## [0.2.0] — unreleased (prepared)\n\nwip\n"       # being prepared (undated)
         released  = "# CL\n\n## [Unreleased]\n\n## [0.2.0] - 2026-09-01\n\nshipped\n"  # right after a release
+        self.assertEqual(shape(preparing), "prepared")
+        self.assertEqual(shape(released), "released")
         self.assertEqual(self._top_version(preparing), "0.2.0", "prepared layout must resolve the version")
         self.assertEqual(self._top_version(released), "0.2.0", "post-release layout must resolve the version")
-        # a bare Unreleased with no version section resolves to None (would fail the match test above)
+        # INVALID shapes must be rejected:
+        self.assertEqual(shape("# CL\n\n## [Unreleased]\n\n## [0.2.0] — unreleased\n\nx\n"), "invalid",
+                         "Unreleased followed by an UNDATED version is invalid")
+        self.assertEqual(shape("# CL\n\n## [Unreleased]\n\nwip\n"), "invalid",
+                         "a bare Unreleased with no released version below it is invalid")
+        self.assertEqual(shape("# CL\n\n## [0.1.0] - 2026-08-23\n\nx\n"), "invalid",
+                         "a dated version with no『## [Unreleased]』above it is invalid")
+        # the REAL CHANGELOG is in one of the two valid shapes, top version == __version__:
+        real = _read("CHANGELOG.md")
+        self.assertIn(shape(real), ("prepared", "released"),
+                      "CHANGELOG.md is in an invalid lifecycle shape (%s)" % shape(real))
+        self.assertEqual(self._top_version(real), aipairlib.__version__)
         self.assertIsNone(self._top_version("# CL\n\n## [Unreleased]\n\nwip\n"))
 
     def test_aipair_version_reports_the_source_of_truth(self):
