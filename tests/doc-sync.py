@@ -287,24 +287,30 @@ class Version(unittest.TestCase):
 
     @staticmethod
     def _changelog_shape(text):
-        # classify the CHANGELOG's top lifecycle SHAPE (not just: does a version exist):
-        #   "prepared" — top『## [X.Y.Z]』heading is UNDATED (no ' - YYYY-MM-DD'); no『## [Unreleased]』above
-        #   "released" — top heading is『## [Unreleased]』(nothing trailing) and the NEXT heading is a
-        #                DATED『## [X.Y.Z] - YYYY-MM-DD』
-        #   "invalid"  — anything else: Unreleased + an UNDATED version, Unreleased alone, a dated
-        #                version with no Unreleased above it, two Unreleased headings, etc.
-        DATED = re.compile(r"^ - \d{4}-\d{2}-\d{2}\s*$")
-        heads = re.findall(r"^## \[([^\]]+)\](.*)$", text, re.M)   # [(name, rest), ...] in document order
+        # classify the CHANGELOG's top lifecycle SHAPE against the documented contract
+        # (CHANGELOG.md intro / RELEASING.md) — not merely "a version can be extracted":
+        #   "prepared" — top heading is EXACTLY『## [X.Y.Z] — unreleased [ (…)]』(em-dash marker) and
+        #                there is NO『## [Unreleased]』heading anywhere
+        #   "released" — there is exactly ONE『## [Unreleased]』heading, it is FIRST (nothing trailing),
+        #                and the NEXT heading is a DATED『## [X.Y.Z] - YYYY-MM-DD』
+        #   "invalid"  — anything else: a bare『## [X.Y.Z]』or malformed-date top version (no『— unreleased』
+        #                marker), Unreleased not-first / duplicated / alone, next version not dated, etc.
+        PREPARED = re.compile("^ \u2014 unreleased(?:\\s.*)?$")     # ' — unreleased' [ (…)] (em-dash)
+        DATED    = re.compile(r"^ - \d{4}-\d{2}-\d{2}\s*$")        # ' - YYYY-MM-DD'
+        heads = re.findall(r"^## \[([^\]]+)\](.*)$", text, re.M)    # [(name, rest), ...] in document order
         if not heads:
             return "invalid"
+        unrel = [i for i, (n, _) in enumerate(heads) if n.lower() == "unreleased"]
         name0, rest0 = heads[0]
         if name0.lower() == "unreleased":
-            if rest0.strip():                       # '## [Unreleased]' must carry nothing after it
+            # released: the ONLY Unreleased is this first one, nothing trails it, next heading is DATED
+            if unrel != [0] or rest0.strip() or len(heads) < 2:
                 return "invalid"
-            if len(heads) < 2 or heads[1][0].lower() == "unreleased":
-                return "invalid"                    # Unreleased alone / two Unreleased headings
-            return "released" if DATED.match(heads[1][1]) else "invalid"   # next version must be DATED
-        return "prepared" if not DATED.match(rest0) else "invalid"   # top version valid only when UNDATED
+            return "released" if DATED.match(heads[1][1]) else "invalid"
+        # prepared: top is a version carrying the『— unreleased』marker, and NO Unreleased heading exists
+        if unrel:
+            return "invalid"
+        return "prepared" if PREPARED.match(rest0) else "invalid"
 
     def test_changelog_top_version_section_matches_version(self):
         # the TOP version section must equal __version__ (bumping one without the other fails here).
@@ -316,7 +322,8 @@ class Version(unittest.TestCase):
 
     def test_both_changelog_lifecycle_states_have_a_verified_shape(self):
         # the two VALID lifecycle SHAPES are accepted and INVALID ones are REJECTED — not merely
-        # "a version can be extracted" (Codex P2 relay-id:d2ece9ce: verify the shape, both signs).
+        # "a version can be extracted" (Codex relay-id:d2ece9ce then relay-id:3858d106: the prepared
+        # heading must carry the『— unreleased』marker and『Unreleased』must be first and unique).
         shape = self._changelog_shape
         preparing = "# CL\n\n## [0.2.0] — unreleased (prepared)\n\nwip\n"       # being prepared (undated)
         released  = "# CL\n\n## [Unreleased]\n\n## [0.2.0] - 2026-09-01\n\nshipped\n"  # right after a release
@@ -331,6 +338,13 @@ class Version(unittest.TestCase):
                          "a bare Unreleased with no released version below it is invalid")
         self.assertEqual(shape("# CL\n\n## [0.1.0] - 2026-08-23\n\nx\n"), "invalid",
                          "a dated version with no『## [Unreleased]』above it is invalid")
+        self.assertEqual(shape("# CL\n\n## [0.2.0]\n\nwip\n"), "invalid",
+                         "a bare『## [X.Y.Z]』with no『— unreleased』marker is not prepared")
+        self.assertEqual(shape("# CL\n\n## [0.2.0] - someday\n\nwip\n"), "invalid",
+                         "a top version with a MALFORMED date is neither prepared nor released")
+        self.assertEqual(
+            shape("# CL\n\n## [Unreleased]\n\n## [0.2.0] - 2026-09-01\n\n## [Unreleased]\n\nx\n"),
+            "invalid", "a DUPLICATE『## [Unreleased]』below the dated version is invalid")
         # the REAL CHANGELOG is in one of the two valid shapes, top version == __version__:
         real = _read("CHANGELOG.md")
         self.assertIn(shape(real), ("prepared", "released"),
