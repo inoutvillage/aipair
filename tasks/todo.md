@@ -9,7 +9,7 @@
 - [x] **P0-2 プラン承認判定も専用 sentinel＋先頭行完全一致へ**（`relay.py` の `a.plan_ok in final[:80]`）— sentinel: `[AIPAIR_PLAN_APPROVED]`。否定文中の承認を絶対に成立させない。
 - [x] **（1〜4）sentinel protocol 導入＋否定文/引用/文中一致テスト**（8 ケース: 単独=真/後続説明=真/2行目=偽/「まだ〜ではない」=偽/「〜と回答して」=偽/文中=偽/100字以降=偽/複数候補は先頭のみ）
 - [x] **P1-1 JSONL schema mismatch 時は既定 fail-closed（relay 停止・exit 7）**、`--allow-untested-schema` 明示時のみ継続。README/SECURITY 同期。
-- [ ] **P1-2 schema probe を「ターン完了」だけでなく「応答帰属」まで拡張**（Codex: response_item/turn_id/task_started.turn_id/task_complete.turn_id）。turn completion / response attribution / delivery confirmation / dialog resolution の単位に分割。全て compatible で初めて compatible。
+- [x] **P1-2 schema probe を「ターン完了」だけでなく「応答帰属」まで拡張**（Codex: response_item/turn_id/task_started.turn_id/task_complete.turn_id）。turn completion / response attribution / delivery confirmation / dialog resolution の単位に分割。全て compatible で初めて compatible。
 - [ ] **P1-3 Codex の turn_id 欠落時 fallback 見直し**（`codex_response_complete`）— 通常モードは turn_id 無し→帰属不能→fail-closed。残す場合は compatibility mode 明示＋警告＋自律判定には使わない。
 - [ ] **P1-4 schema latch を agent 単位→agent+tracked log identity（path）単位へ**。log 切替（/resume・/clear・再起動・compaction・rotation）で未確認へ戻し再 probe。
 - [ ] **P1-5 認証付き round-trip E2E を実走**（外部依存: repo secrets + API 予算）。3シグナル成功を最低1回 workflow_dispatch で確認。README は「harness 実装済/未検証」と「E2E 検証済」を混同しない。

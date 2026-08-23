@@ -856,6 +856,33 @@ class SchemaProbe(unittest.TestCase):
         no_ts = [{"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "T1"}}]
         self.assertEqual(relay.schema_probe("codex", no_ts)[0], "mismatch")
 
+    def test_codex_attribution_turn_id_drift_is_mismatch(self):
+        # P1-2: the probe also covers RESPONSE ATTRIBUTION (codex_response_complete's turn_id
+        # pairing), not just turn completion. A task event that completes fine but LOST its turn_id
+        # is drift — without it, attribution silently falls back to a time/position heuristic that
+        # can misattribute a queued turn.
+        no_turn = [{"type": "event_msg", "timestamp": "t", "payload": {"type": "task_complete"}}]
+        st, reason = relay.schema_probe("codex", no_turn)
+        self.assertEqual(st, "mismatch")
+        self.assertIn("turn_id", reason)
+        # a user response_item whose metadata passthrough exists but dropped turn_id → drift
+        user_no_turn = [{"type": "event_msg", "timestamp": "t",
+                         "payload": {"type": "task_complete", "turn_id": "T1"}},
+                        {"type": "response_item",
+                         "payload": {"type": "message", "role": "user", "content": [{"text": "x"}],
+                                     "internal_chat_message_metadata_passthrough": {}}}]
+        self.assertEqual(relay.schema_probe("codex", user_no_turn)[0], "mismatch")
+
+    def test_codex_completion_and_attribution_both_required_for_ok(self):
+        # both aspects must be positively present → ok; a fully-shaped completed turn carries turn_id
+        ok = [{"type": "event_msg", "timestamp": "t", "payload": {"type": "task_complete", "turn_id": "T1"}}]
+        self.assertEqual(relay.schema_probe("codex", ok)[0], "ok")
+        # an old-shaped user item WITHOUT the passthrough key at all is NOT positive drift (stays
+        # unverified until a turn_id-bearing task event appears) — a nascent log must not false-alarm
+        nascent_userish = [{"type": "response_item",
+                            "payload": {"type": "message", "role": "user", "content": [{"text": "hi"}]}}]
+        self.assertEqual(relay.schema_probe("codex", nascent_userish)[0], "unverified")
+
     def test_unknown_agent_and_non_dicts_are_unverified(self):
         self.assertEqual(relay.schema_probe("other", self.CLA_OK)[0], "unverified")
         self.assertEqual(relay.schema_probe("claude", ["not a dict", 5, None])[0], "unverified")
