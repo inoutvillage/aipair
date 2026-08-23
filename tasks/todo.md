@@ -19,6 +19,7 @@
   - 増分2（着手済）: **review_protocol** を `bin/aipairlib/review_protocol.py` へ抽出（poke 文面 7 本＋`plan_extra_comment`＝副作用無しの純関数群）。relay は `from .review_protocol import ...` で再エクスポート。standalone import＋sentinel-at-head 指示のテスト追加。残: plan_flow / question_flow / state_machine。
   - 増分3（着手済）: **gate**（停止ゲート実行 `run_gate`/`_kill_group`）を `bin/aipairlib/gate.py` へ抽出（subprocess・プロセスグループ kill の純ロジック・tmux 非依存）。relay は `run_gate` を再エクスポート、UI 依存の `gate_or_message` は relay 残置。standalone import テスト追加。残: plan_flow / question_flow / state_machine。
   - 増分4（着手済）: **log_lock**（各ペインが所有するログの特定・lock/refresh の 12 関数＋`_CODEX_SINCE_*` 状態）を `bin/aipairlib/log_lock.py` へ抽出。relay は lock/refresh を再エクスポート（codex-follow テストは patch 先を `relay.log_lock.*` に更新）。relay.py -227 行（1077 行）。残: plan_flow / question_flow / state_machine（main ループ内で結合度が高い）。
+  - 増分5（着手済）: **gate モジュール完成** — `gate_or_message` を gate.py へ集約（`run_gate`/`_kill_group` と同居）、汎用 `oneline` を corelib へ移し relay は再エクスポート。relay.py 1054 行。dialog scraping（detect_plan_dialog/send_plan_feedback/detect_question_dialog/send_question_answer）は既に dialoglib に在り。残: state_machine（main ループ本体）＝大きな慎重リファクタ。
 - [ ] **P2-2 installer の transaction 性強化**（package + entrypoints + templates を staging→検証→一括切替、Phase2 途中失敗は entrypoint も自動 rollback）。
 - [ ] **P2-3 README/SECURITY/todo/TESTED_VERSIONS/CI 説明/schema・stop・plan protocol の同期をテスト化**（README の version==TESTED_VERSIONS、README の sentinel==コード定数）。
 - [ ] **P2-4 versioned release 運用開始**（`aipair --version` / git tag / CHANGELOG.md / GitHub Releases）。

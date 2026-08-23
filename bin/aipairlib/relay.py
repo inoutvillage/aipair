@@ -96,7 +96,7 @@ import unicodedata
 # imports / a poke(busy_wait=...) argument, handled inside those modules — no injection here.
 from . import peerlog, corelib, loglib, tmuxlib, deliverylib, dialoglib, logs, review_protocol, gate, log_lock
 from .schema_guard import SchemaGuard
-from .gate import run_gate
+from .gate import run_gate, gate_or_message
 from .log_lock import (claude_glob, codex_all, codex_cwd_matches, claude_matches_pane, lock_claude,
                        read_codex_since, codex_fallback, lock_codex, refresh_codex_lock,
                        refresh_claude_lock)
@@ -117,6 +117,7 @@ schema_fail_closed = corelib.schema_fail_closed
 schema_latch_step = corelib.schema_latch_step
 schema_should_reprobe = corelib.schema_should_reprobe
 hit_stop = corelib.hit_stop
+oneline = corelib.oneline
 head_line = corelib.head_line
 scrub_output = corelib.scrub_output
 gate_tail = corelib.gate_tail
@@ -215,9 +216,6 @@ def _env_bool(name, default=False):
     return on
 
 
-def oneline(s, n=180):
-    s = " ".join(s.split())
-    return s if len(s) <= n else s[: n - 1] + "…"
 
 
 class LogWatch:
@@ -309,27 +307,6 @@ class LogWatch:
         return False
 
 
-def gate_or_message(a, gate_state, cwd):
-    """At a stop point, run the gate (in `cwd`, the normalised working dir) if one is set.
-    (True, None)      no gate, or it passed → stop / move on as usual
-    (False, message)  it failed → send Claude back with `message`
-    (False, None)     it failed --gate-rounds times → give up (caller exits 6)"""
-    if not a.gate:
-        return True, None
-    log("◆ 停止ゲート実行: " + _oneline_cap(a.gate, 200))
-    ok, out = run_gate(a.gate, cwd, a.gate_timeout)
-    if ok:
-        log("◆ " + c("ok", "停止ゲート通過"))
-        gate_state["fails"] = 0
-        return True, None
-    gate_state["fails"] += 1
-    n = gate_state["fails"]
-    print(c("warn", f"│ ■ 停止ゲート失敗（{n}/{a.gate_rounds}）: ") + oneline(out, 300), flush=True)
-    if n >= a.gate_rounds:
-        print(c("warn", f"│ ■ 停止ゲートが {a.gate_rounds} 回失敗。人間の判断が必要です。停止します。"), flush=True)
-        print("\a", end="", flush=True)
-        return False, None
-    return False, gate_message(a.gate, out, n, a.gate_rounds)
 
 
 def approval_took_effect(pane, confirm=None):
