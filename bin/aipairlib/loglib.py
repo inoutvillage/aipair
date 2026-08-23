@@ -3,22 +3,32 @@
 パーサ（parse_claude / parse_codex / _ts_key）だけを使う。aipair-relay が SourceFileLoader で
 読み込み、名前を自分の名前空間に束ねて使う。tests/relay-parsers.py で被覆されている。
 """
-from collections import deque
-
 from . import peerlog   # normal package import (was a SourceFileLoader-by-path)
 
 
 # --- schema feature-probe input --------------------------------------------- #
-def read_records(path, tail_lines=800):
-    """Decode the last `tail_lines` JSON objects from a jsonl/rollout transcript (skipping
-    unparseable lines), newest-biased and memory-bounded via a deque so the schema probe stays
-    cheap on a huge log. Returns a list of dicts; [] on a missing path or any OSError. Feeds
+def read_records(path, tail_lines=800, tail_bytes=1_000_000):
+    """Decode the last `tail_lines` JSON objects from the TAIL of a jsonl/rollout transcript
+    (skipping unparseable/empty lines). To stay cheap on a HUGE log, it seeks to at most the last
+    `tail_bytes` and reads only that window — the whole file is NOT scanned (a 40MB+ rollout was
+    re-read in full every few seconds otherwise). A possibly-partial first line of the window is
+    dropped. Returns a list of dicts; [] on a missing path or any OSError. Feeds
     corelib.schema_probe (the relay composes them in probe_log_schema)."""
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            lines = deque(fh, maxlen=tail_lines) if tail_lines else list(fh)
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            start = max(0, size - tail_bytes) if tail_bytes else 0
+            fh.seek(start)
+            data = fh.read()
     except OSError:
         return []
+    lines = data.decode("utf-8", errors="replace").split("\n")
+    if start > 0 and lines:
+        lines = lines[1:]                         # window began mid-line → drop the partial head
+    lines = [ln for ln in lines if ln.strip()]    # non-empty only …
+    if tail_lines:
+        lines = lines[-tail_lines:]               # … then the last N of those
     out = []
     for line in lines:
         try:
