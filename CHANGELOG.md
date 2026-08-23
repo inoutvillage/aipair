@@ -9,7 +9,9 @@ prepared (`aipairlib.__version__`); its **date is filled in in the release commi
 `v<version>` tag is pushed** (a fresh `## [Unreleased]` is then added above for the next cycle).
 `tests/doc-sync.py` enforces that this top version section equals `__version__`.
 
-## [0.1.0] — unreleased (prepared; published when the `v0.1.0` tag is pushed)
+## [Unreleased]
+
+## [0.1.0] - 2026-08-23
 
 The initial aipair release. aipair runs Claude Code and Codex CLI side by side in one tmux session with
 a live merged "bridge" pane, so each agent can read the other, and can drive an autonomous
@@ -41,4 +43,5 @@ mutual-review relay.
 - `SECURITY.md` threat model. Permission-bypass is opt-in (`--unsafe`) and required only for
   `aipair loop`; interactive `aipair` keeps each agent's normal permission prompts.
 
+[Unreleased]: https://github.com/inoutvillage/aipair/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/inoutvillage/aipair/releases/tag/v0.1.0
