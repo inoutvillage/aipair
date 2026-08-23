@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 REPO = os.path.dirname(HERE)
@@ -62,7 +63,13 @@ class Sentinels(unittest.TestCase):
              ("all_done", "AIPAIR_ALL_DONE"), ("plan_ok", "AIPAIR_PLAN_OK")]
 
     def setUp(self):
-        self.defaults = vars(cli.build_parser("x").parse_args([]))
+        # Test the BUILT-IN argparse defaults, not this shell's AIPAIR_* overrides — build the
+        # parser with every AIPAIR_* env var removed (else `AIPAIR_STOP=CUSTOM` makes the "default"
+        # CUSTOM and the sync check reads the environment instead of the code).
+        with mock.patch.dict(os.environ):
+            for _k in [k for k in os.environ if k.startswith("AIPAIR_")]:
+                del os.environ[_k]
+            self.defaults = vars(cli.build_parser("x").parse_args([]))
 
     def test_defaults_are_bracketed_sentinels(self):
         for attr, _env in self.CASES:
@@ -131,6 +138,52 @@ class SchemaProtocol(unittest.TestCase):
                       "--allow-untested-schema missing from build_parser")
         for doc, name in ((README, "README"), (SECURITY, "SECURITY")):
             self.assertIn("allow-untested-schema", doc, "%s must document --allow-untested-schema" % name)
+
+
+def _yaml_jobs(rel):
+    """Top-level job keys under a workflow's `jobs:` block (regex, no yaml dep)."""
+    lines = _read(rel).splitlines()
+    i = next((i for i, l in enumerate(lines) if l.rstrip() == "jobs:"), None)
+    if i is None:
+        return set()
+    jobs = set()
+    for l in lines[i + 1:]:
+        if re.match(r"^\S", l) and l.strip():
+            break
+        m = re.match(r"^  ([a-z][a-z0-9_-]+):\s*$", l)
+        if m:
+            jobs.add(m.group(1))
+    return jobs
+
+
+class TodoAndWorkflows(unittest.TestCase):
+    """P2-3 が対象に挙げた todo / CI 説明も、コード・workflow の実態に同期していることを固定する。"""
+    def test_todo_does_not_assert_manual_version_sync(self):
+        # tests/doc-sync.py が TESTED_VERSIONS↔README を強制するので、それを《手動同期》と断定する
+        # 古い注記（原文パターン「…表は手動同期」）が todo に残っていてはならない（貢献者を誤誘導する）。
+        # メタ記述（「手動同期」を引用して更新履歴に触れる等）は copula「は手動同期」を含まないので誤検知しない。
+        for i, ln in enumerate(_read("tasks/todo.md").splitlines(), 1):
+            if "TESTED_VERSIONS" in ln and "は手動同期" in ln:
+                self.fail("tasks/todo.md:%d が TESTED_VERSIONS を《手動同期》と断定している — doc-sync.py が"
+                          " 強制するので更新すること: %r" % (i, ln.strip()))
+
+    def test_nightly_jobs_are_defined_and_documented(self):
+        jobs = _yaml_jobs(".github/workflows/nightly.yml")
+        self.assertTrue(jobs, "could not parse nightly.yml jobs")
+        for want in ("upstream-latest-smoke", "authenticated-e2e"):
+            self.assertIn(want, jobs, "nightly.yml must define the job %s" % want)
+        for job in jobs:   # every nightly job must be written up in the README nightly 表
+            self.assertIn(job, README, "nightly job %s is undocumented in README" % job)
+
+    def test_ci_matrix_versions_match_readme(self):
+        ci = _read(".github/workflows/ci.yml")
+        # README「必要環境」/CI 説明: python floor 3.8 + current 3.13、tmux floor 3.1
+        for v in ("3.8", "3.13"):
+            self.assertIn("'%s'" % v, ci, "ci.yml matrix must include python %s" % v)
+        self.assertIn("'3.1'", ci, "ci.yml matrix must include the tmux 3.1 floor")
+        for v in ("3.8", "3.13", "3.1"):
+            self.assertIn(v, README, "README must document version %s used by CI" % v)
+
 
 
 if __name__ == "__main__":

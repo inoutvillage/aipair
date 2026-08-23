@@ -411,7 +411,7 @@ aipair-relay --allow-untested-dialogs      # 版が違っても自動操作を�
 aipair-relay --no-version-gate             # 版チェック自体をしない（AIPAIR_NO_VERSION_GATE=1）
 ```
 
-検証済み版を上げたら `bin/aipair-relay` の `TESTED_VERSIONS` と README の表を**両方**更新すること（テスト `VersionGate` が両者の一致を前提にしている）。
+検証済み版を上げたら `bin/aipairlib/corelib.py` の `TESTED_VERSIONS` と README「必要環境」表を**両方**更新すること（テスト `tests/doc-sync.py` が両者の一致を強制する）。
 
 #### schema ゲート（自動・ログの JSONL 形状）
 
@@ -536,7 +536,7 @@ GitHub Actions（`.github/workflows/ci.yml`）が push / PR ごとに ubuntu-lat
 | 現行 Python | 3.13 | distro |
 | 対応下限 tmux | 3.13 | **3.1**（`split-window -l 30%` の下限）を **release tarball からソースビルド**（SHA-256 pin・展開前に検証、`tmux -V` が厳密に `tmux 3.1` かも assertion） |
 
-`run-all.sh` は shebang で判別するので、relay・5 lib・peer-log・`.py` テスト（＝6 sibling module）、および shell テストが `python3` として起動する全経路がその lane の Python で走る。`session-name.sh` は実 tmux が < 3.2 なら `#{session_path}` 依存の採用/衝突ケースを skip（3.1 では安全な非採用に縮退。`[10]` の 3.1 シミュレーションが被覆）。shellcheck は全 lane で apt 導入。
+`run-all.sh` は shebang で判別するので、relay・`aipairlib` パッケージの各モジュール・peer-log・`.py` テスト、および shell テストが `python3` として起動する全経路がその lane の Python で走る。`session-name.sh` は実 tmux が < 3.2 なら `#{session_path}` 依存の採用/衝突ケースを skip（3.1 では安全な非採用に縮退。`[10]` の 3.1 シミュレーションが被覆）。shellcheck は全 lane で apt 導入。
 
 ### nightly（実 CLI・`.github/workflows/nightly.yml`）
 
