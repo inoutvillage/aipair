@@ -360,9 +360,9 @@ class Version(unittest.TestCase):
         self.assertTrue(self._section_is_dated("## [0.1.0] - 2026-08-23\nx\n", "0.1.0"))
         self.assertFalse(self._section_is_dated("## [0.1.0] — unreleased (prepared)\nx\n", "0.1.0"))
         self.assertTrue(self._section_is_dated("## [1.2.3+build.5] - 2026-01-01\nx\n", "1.2.3+build.5"))
-        # the current CHANGELOG top section is intentionally UNDATED (0.1.0 not released yet)
-        self.assertFalse(self._section_is_dated(_read("CHANGELOG.md"), aipairlib.__version__),
-                         "0.1.0 is prepared/unreleased, so its section must stay undated until the release commit")
+        # a released version's section is dated; a being-prepared one is『## [X.Y.Z] — unreleased』
+        # (undated). Both are valid per the release lifecycle, so we don't pin the current state here
+        # — the release.yml guard (checked above) is what refuses to PUBLISH an undated section.
 
     def test_security_release_policy_is_consistent(self):
         # SECURITY.md must not keep the old「タグ付きリリース運用は今のところありません」that now
