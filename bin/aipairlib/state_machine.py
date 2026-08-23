@@ -67,6 +67,25 @@ def decide_plan_action(texts, plan_ok, dialog):
     return PlanDecision("changes", text)
 
 
+QuestionDecision = collections.namedtuple("QuestionDecision", "action payload")
+
+
+def decide_question_action(texts, qdlg):
+    """Codex の質問回答 → 取るべきアクションを《純粋に》決める（副作用なし・tmux 非依存）。
+    plan_flow と同じ「判定/副作用」分離（P2-1・question_flow）。返す action:
+      no_text    回答本文を取得できず（ダイアログ検知からやり直し）
+      no_dialog  質問ダイアログが消えた（人間が操作した？ 通常待機へ）
+      deliver    回答（payload=本文）を『Chat about this』経由で配達
+    プランと違い承認 sentinel は無い — 質問回答はそのまま中継する（判定核は薄いが、no_text→
+    再検知 / no_dialog→人間操作 / else→配達 の不変条件を plan と対称にテスト可能にする）。"""
+    text = "\n".join(texts).strip()
+    if not text:
+        return QuestionDecision("no_text", None)
+    if qdlg is None:
+        return QuestionDecision("no_dialog", None)
+    return QuestionDecision("deliver", text)
+
+
 class ResponseGate:
     POKE_NOSHOW = 1800   # nonce がログに現れないまま諦めるまでの秒数（未配達＝停止）
 

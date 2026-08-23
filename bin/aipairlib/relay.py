@@ -96,7 +96,7 @@ import unicodedata
 # imports / a poke(busy_wait=...) argument, handled inside those modules — no injection here.
 from . import peerlog, corelib, loglib, tmuxlib, deliverylib, dialoglib, logs, review_protocol, gate, log_lock, cli
 from .schema_guard import SchemaGuard
-from .state_machine import ResponseGate, decide_plan_action
+from .state_machine import ResponseGate, decide_plan_action, decide_question_action
 from .gate import run_gate, gate_or_message
 from .cli import build_parser
 from .log_lock import (claude_glob, codex_all, codex_cwd_matches, claude_matches_pane, lock_claude,
@@ -743,13 +743,16 @@ def main():
                     qdlg = detect_question_dialog(panes["claude"])
                     if text:
                         dim(c("codex", "codex") + ": " + oneline(text))
-                    if not text:
+                    # 判定（no_text / no_dialog / deliver）は state_machine.decide_question_action の
+                    # 純粋関数へ切り出した（P2-1・question_flow）。ここは決定→副作用の実行のみ。
+                    decision = decide_question_action(texts, qdlg)
+                    if decision.action == "no_text":
                         log(c("warn", "◆ Codex の回答本文を取得できず。ダイアログ検知からやり直します。"))
-                    elif qdlg is None:
+                    elif decision.action == "no_dialog":
                         log(c("warn", "◆ 質問ダイアログが見当たりません（人間が操作した？）。通常の待機に戻ります。"))
-                    else:
+                    else:  # "deliver"
                         log("◆ " + c("ok", "Codex が回答") + " → 「Chat about this」経由で配達")
-                        if not send_question_answer(panes["claude"], qdlg, text,
+                        if not send_question_answer(panes["claude"], qdlg, decision.payload,
                                                     watch=claude_watch()):
                             # ダイアログは chat 押下で既に閉じており、未送信のまま state を
                             # 進めると永久停止する（Codex レビュー指摘）→ 明示停止
