@@ -961,6 +961,20 @@ class SchemaProbe(unittest.TestCase):
         # no boundary at all → the aspect does not fire (plain turn stays ok)
         self.assertEqual(relay.schema_probe("claude", [A])[0], "ok")
 
+    def test_claude_probe_judges_the_latest_assistant_after_resume(self):
+        # P1-4 (Codex): /resume appends a NEW version's records to the SAME JSONL. The probe must
+        # judge the LATEST assistant, so a later drift is not masked by an earlier good record.
+        good = self.CLA_OK[0]
+        bad = {"type": "assistant", "timestamp": "t", "uuid": {"x": 1}, "parentUuid": None,
+               "message": {"role": "assistant", "content": [], "stop_reason": "end_turn"}}  # uuid type drift
+        self.assertEqual(relay.schema_probe("claude", [bad, good])[0], "ok",
+                         "old malformed → new good (resume fixed the schema) → ok")
+        self.assertEqual(relay.schema_probe("claude", [good, bad])[0], "mismatch",
+                         "old good → new malformed (resume introduced drift) → mismatch")
+        # a later missing-key drift also wins over an earlier good record
+        partial = {"type": "assistant", "message": {"role": "assistant"}}
+        self.assertEqual(relay.schema_probe("claude", [good, partial])[0], "mismatch")
+
     def test_claude_attribution_keys_must_be_string_typed(self):
         # P1-4 (Codex): uuid / parentUuid / logicalParentUuid are used as DICT KEYS by
         # claude_response_attributed. A truthy but non-string value (object/list/number) would pass

@@ -204,9 +204,12 @@ def _claude_compaction_boundary(records):
 
 def _schema_probe_claude(records):
     # An "assistant-ish" record = top-level type=="assistant" OR inner message.role=="assistant"
-    # (the latter catches a renamed top-level type). One FULLY shaped assistant turn — the exact
-    # shape claude_done_ts + claude_response_attributed read — proves the schema in a single line.
-    drift = None
+    # (the latter catches a renamed top-level type). 判定は《最新の assistant-ish レコード》の形状で
+    # 行う: /resume は同一 JSONL に新バージョンのレコードを追記するため、最初の正常 assistant で即
+    # ok にすると後続（新バージョン）の型ドリフトを永久に見逃す（Codex 指摘）。実ログの assistant は
+    # 全て stop_reason を持つ（値は tool_use/end_turn）ので、stop_reason 欠落は真のドリフト＝
+    # streaming 途中の誤検知にはならない。
+    last = None   # 最新 assistant-ish レコードの (status, reason)
     for d in records:
         msg = d.get("message") if isinstance(d.get("message"), dict) else None
         inner_role = msg.get("role") if msg else None
@@ -214,28 +217,27 @@ def _schema_probe_claude(records):
             continue
         # claude_response_attributed は uuid / parentUuid を《辞書キー》に使うので、非空文字列
         # （parentUuid は文字列 or None）に限定する。truthy なだけの object/list を通すと
-        # unhashable で TypeError クラッシュする（Codex 指摘）。型ドリフトも mismatch にする。
+        # unhashable で TypeError クラッシュする。型ドリフトも mismatch にする。
         uid = d.get("uuid")
         uid_ok = isinstance(uid, str) and uid != ""
         pu = d.get("parentUuid")
         pu_ok = ("parentUuid" in d) and (pu is None or isinstance(pu, str))
         if (d.get("type") == "assistant" and msg is not None and "stop_reason" in msg
                 and d.get("timestamp") is not None and uid_ok and pu_ok):
-            return ("ok", "assistant+stop_reason+timestamp+uuid+parentUuid 確認")
-        # assistant-ish but not the shape the relay reads → remember the first concrete drift.
-        if d.get("type") != "assistant":
-            drift = drift or "assistant メッセージだが type!='assistant'（型名ドリフト）"
+            last = ("ok", "assistant+stop_reason+timestamp+uuid+parentUuid 確認")
+        elif d.get("type") != "assistant":
+            last = ("mismatch", "assistant メッセージだが type!='assistant'（型名ドリフト）")
         elif msg is None or "stop_reason" not in msg:
-            drift = drift or "assistant に message.stop_reason が無い（完了検知不能）"
+            last = ("mismatch", "assistant に message.stop_reason が無い（完了検知不能）")
         elif d.get("timestamp") is None:
-            drift = drift or "assistant に timestamp が無い"
+            last = ("mismatch", "assistant に timestamp が無い")
         elif not uid_ok:
-            drift = drift or "assistant の uuid が非空文字列でない（応答帰属チェーン不能/型ドリフト）"
+            last = ("mismatch", "assistant の uuid が非空文字列でない（応答帰属チェーン不能/型ドリフト）")
         elif "parentUuid" not in d:
-            drift = drift or "assistant に parentUuid が無い（応答帰属チェーン不能）"
+            last = ("mismatch", "assistant に parentUuid が無い（応答帰属チェーン不能）")
         else:
-            drift = drift or "assistant の parentUuid が文字列/None でない（型ドリフト）"
-    return ("mismatch", drift) if drift else ("unverified", "完了 assistant ターン未確認")
+            last = ("mismatch", "assistant の parentUuid が文字列/None でない（型ドリフト）")
+    return last if last is not None else ("unverified", "完了 assistant ターン未確認")
 
 
 def _combine_aspects(required, veto=()):
