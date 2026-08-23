@@ -104,7 +104,8 @@ def schema_probe(agent, records):
         # （その動作が起きた時だけ観測できるので未発生で ok を阻害しないが、ドリフトは mismatch）。
         return _combine_aspects(
             [_schema_probe_claude(records)],
-            veto=[_claude_delivery(records), _claude_dialog_resolution(records)])
+            veto=[_claude_delivery(records), _claude_dialog_resolution(records),
+                  _claude_compaction_boundary(records)])
     if agent == "codex":
         return _schema_probe_codex(records)
     return ("unverified", "")
@@ -172,6 +173,28 @@ def _claude_dialog_resolution(records):
     if drift:
         return ("mismatch", drift)
     return ("ok", "tool_result user 行 確認") if ok else ("unverified", "ダイアログ解決行 未出現")
+
+
+def _claude_compaction_boundary(records):
+    """compaction 境界の応答帰属スキーマ: `{type:system, subtype:compact_boundary}` が存在するなら
+    uuid ＋ 非空 logicalParentUuid を持つこと。claude_response_attributed は境界で parentUuid チェーン
+    を logicalParentUuid へ橋渡しして圧縮前の祖先へ辿るため、uuid（チェーン上で境界を特定）と
+    logicalParentUuid（橋渡し先）の双方が要る。どちらか欠落は帰属を永久に不成立にする positive
+    drift（Codex 指摘）。境界が無ければ unverified（veto-only：起きた時だけ観測できる）。"""
+    ok = False
+    drift = None
+    for d in records:
+        if not (d.get("type") == "system" and d.get("subtype") == "compact_boundary"):
+            continue
+        if d.get("uuid") and d.get("logicalParentUuid"):
+            ok = True
+        elif not d.get("uuid"):
+            drift = drift or "compact_boundary に uuid が無い（帰属チェーンで境界を辿れない）"
+        else:
+            drift = drift or "compact_boundary に logicalParentUuid が無い（圧縮境界を跨げない）"
+    if drift:
+        return ("mismatch", drift)
+    return ("ok", "compact_boundary uuid+logicalParentUuid 確認") if ok else ("unverified", "compact_boundary 未出現")
 
 
 def _schema_probe_claude(records):
