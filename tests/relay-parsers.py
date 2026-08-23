@@ -1749,6 +1749,22 @@ class LoglibStandalone(unittest.TestCase):
         a = relay.build_parser("x").parse_args([])
         self.assertEqual(a.stop, "[AIPAIR_REVIEW_OK]")
         self.assertEqual(a.plan_ok, "[AIPAIR_PLAN_APPROVED]")
+        # endless BLOCKED/HUMAN_REQUIRED sentinel (社長指示 2026-08-24 / _reference/new-task.md)
+        self.assertEqual(a.human_required, "[AIPAIR_HUMAN_REQUIRED]")
+
+    def test_human_required_sentinel_default_and_env_override(self):
+        # 既定は [AIPAIR_HUMAN_REQUIRED]、env AIPAIR_HUMAN_REQUIRED で上書きできる（他 sentinel と同経路）。
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AIPAIR_HUMAN_REQUIRED", None)
+            self.assertEqual(relay.build_parser("x").parse_args([]).human_required,
+                             "[AIPAIR_HUMAN_REQUIRED]")
+        with mock.patch.dict(os.environ, {"AIPAIR_HUMAN_REQUIRED": "[CUSTOM_HR]"}):
+            self.assertEqual(relay.build_parser("x").parse_args([]).human_required, "[CUSTOM_HR]")
+        # 明示フラグは env より優先
+        with mock.patch.dict(os.environ, {"AIPAIR_HUMAN_REQUIRED": "[CUSTOM_HR]"}):
+            self.assertEqual(
+                relay.build_parser("x").parse_args(["--human-required", "[FLAG_HR]"]).human_required,
+                "[FLAG_HR]")
 
     def test_log_lock_module_is_standalone(self):
         # P2-1 増分4: the log-locking cluster is a standalone module; relay re-exports the lock/
