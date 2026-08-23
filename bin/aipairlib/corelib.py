@@ -76,10 +76,17 @@ def version_gate(a, detected, tested=TESTED_VERSIONS):
 #                                internal_chat_message_metadata_passthrough (codex_response_complete
 #                                pairs by turn_id; drift there falls back to a time/position
 #                                heuristic that can misattribute a queued turn).
-# A CLI update can keep a "tested" version string yet move those keys, silently breaking turn
-# detection or attribution. schema_probe looks at REAL decoded records and reports whether the
-# keyed shape the relay depends on is present, aggregating aspects so the gate blocks only when a
-# positive drift appears (any aspect mismatch ⇒ mismatch; ok needs every aspect verified).
+#   delivery confirmation — claude: a user/queue-operation input row with string content (claude_input)
+#   dialog resolution     — claude: a type==user row whose content list carries a tool_result block
+#                                (claude_resolved). codex delivery is a raw text match (has_raw) with
+#                                no keyed shape, so it needs no probe.
+# turn-completion + attribution are REQUIRED (exercised every turn — if they drift the loop is
+# silently wrong). delivery + dialog resolution are VETO-ONLY: they surface only when that action
+# happens, so their absence never blocks "ok", but a positive drift in them still fails closed.
+# A CLI update can keep a "tested" version string yet move these keys, silently breaking turn
+# detection / attribution. schema_probe reads REAL decoded records and aggregates the aspects: any
+# aspect mismatch ⇒ mismatch; "ok" only once EVERY required aspect is positively verified (so a
+# task_started-only or user-metadata-less partial log stays "unverified", not a premature "ok").
 
 def schema_probe(agent, records):
     """Feature-probe decoded JSONL records for the schema markers the core relay reads.
@@ -93,10 +100,63 @@ def schema_probe(agent, records):
     fresh session never false-alarms. `records` is a list of decoded dicts (see loglib.read_records)."""
     records = [d for d in (records or []) if isinstance(d, dict)]
     if agent == "claude":
-        return _schema_probe_claude(records)
+        # required: ターン完了＋応答帰属（毎ターン行使）。veto-only: 配達確認・ダイアログ解決
+        # （その動作が起きた時だけ観測できるので未発生で ok を阻害しないが、ドリフトは mismatch）。
+        return _combine_aspects(
+            [_schema_probe_claude(records)],
+            veto=[_claude_delivery(records), _claude_dialog_resolution(records)])
     if agent == "codex":
         return _schema_probe_codex(records)
     return ("unverified", "")
+
+
+def _claude_delivery(records):
+    """配達確認スキーマ（LogWatch.claude_input）: Claude への入力として送信された行＝
+    type=='queue-operation'（operation enqueue/None・content が文字列）または type=='user'
+    （message.content が文字列）。queue-operation なのに文字列 content が無い等の形状ドリフトを
+    mismatch で捕捉する。まだ入力行が無ければ unverified（veto-only）。"""
+    ok = False
+    drift = None
+    for d in records:
+        t = d.get("type")
+        if t == "queue-operation":
+            if d.get("operation") not in (None, "enqueue"):
+                continue
+            if isinstance(d.get("content"), str):
+                ok = True
+            else:
+                drift = drift or "queue-operation に文字列 content が無い（配達確認不能）"
+        elif t == "user":
+            msg = d.get("message") if isinstance(d.get("message"), dict) else None
+            if isinstance(msg.get("content") if msg else None, str):
+                ok = True
+            # list content（tool_result）は dialog resolution 側で見るのでここでは数えない
+    if drift:
+        return ("mismatch", drift)
+    return ("ok", "claude 入力行（文字列 content）確認") if ok else ("unverified", "Claude 入力行 未出現")
+
+
+def _claude_dialog_resolution(records):
+    """ダイアログ解決スキーマ（LogWatch.claude_resolved）: type=='user' で message.content が list、
+    その中に type=='tool_result' ブロックを含む行（プラン承認/差し戻し/decline の成立証拠）。
+    tool_result を持つのに type!='user' 等のドリフトを mismatch で捕捉する。ダイアログが起きて
+    いなければ unverified（veto-only：通常のレビューループでは発生しないので ok を阻害しない）。"""
+    ok = False
+    drift = None
+    for d in records:
+        msg = d.get("message") if isinstance(d.get("message"), dict) else None
+        c = msg.get("content") if msg else None
+        has_tr = isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "tool_result"
+                                             for b in c)
+        if not has_tr:
+            continue
+        if d.get("type") == "user":
+            ok = True
+        else:
+            drift = drift or "tool_result を持つが type!='user'（ダイアログ解決の検出不能）"
+    if drift:
+        return ("mismatch", drift)
+    return ("ok", "tool_result user 行 確認") if ok else ("unverified", "ダイアログ解決行 未出現")
 
 
 def _schema_probe_claude(records):
@@ -128,22 +188,30 @@ def _schema_probe_claude(records):
     return ("mismatch", drift) if drift else ("unverified", "完了 assistant ターン未確認")
 
 
-def _combine_aspects(aspects):
-    """複数のスキーマ側面（ターン完了 / 応答帰属 / …）の probe 結果を安全側に集約する:
-    どれか一つでも mismatch なら mismatch、全側面が ok で初めて ok、それ以外は unverified。
-    「安全な自動レビューループに必要なスキーマが全て確認できて初めて compatible」（P1-2）。"""
-    for st, r in aspects:
+def _combine_aspects(required, veto=()):
+    """複数のスキーマ側面の probe 結果を安全側に集約する（P1-2）:
+      - required / veto のどれか一つでも mismatch なら mismatch（安全側）。
+      - required が全て ok で初めて ok（＝自律ループに必須のスキーマが全て確認できて compatible）。
+      - それ以外は unverified。
+    veto 側面（delivery confirmation / dialog resolution）は「その動作が実際に起きた時にだけ
+    観測できる」ため、未発生（unverified）で ok を阻害しない — ただし積極ドリフトは mismatch で
+    捕捉する。required は毎ターン必ず行使される側面（ターン完了・応答帰属）。"""
+    allsides = list(required) + list(veto)
+    for st, r in allsides:
         if st == "mismatch":
             return ("mismatch", r)
-    if aspects and all(st == "ok" for st, _ in aspects):
-        return ("ok", " / ".join(r for _, r in aspects if r))
-    return ("unverified", " / ".join(r for _, r in aspects if r))
+    if required and all(st == "ok" for st, _ in required):
+        return ("ok", " / ".join(r for _, r in allsides if r))
+    return ("unverified", " / ".join(r for _, r in allsides if r))
 
 
 def _codex_turn_completion(records):
-    """ターン完了スキーマ（codex_done_ts）: type=='event_msg' + payload.type in
-    {task_started, task_complete} + timestamp。task イベントが event_msg 外／timestamp 欠落は
+    """ターン完了スキーマ（codex_done_ts は task_complete を、codex_response_complete は
+    task_started を anchor に読む）: type=='event_msg' + payload.type in {task_started,
+    task_complete} + timestamp。**両方**が well-formed で観測できて初めて ok（片方だけの途中ログ
+    では latch せず unverified＝後続イベントの検証機会を残す）。event_msg 外／timestamp 欠落は
     positive drift。"""
+    started = complete = False
     drift = None
     for d in records:
         p = d.get("payload") if isinstance(d.get("payload"), dict) else None
@@ -151,19 +219,27 @@ def _codex_turn_completion(records):
         if ptype not in ("task_started", "task_complete"):
             continue
         if d.get("type") == "event_msg" and d.get("timestamp") is not None:
-            return ("ok", "event_msg/%s+timestamp 確認" % ptype)
-        drift = drift or ("%s だが type!='event_msg'（型名ドリフト）" % ptype
-                          if d.get("type") != "event_msg" else "%s に timestamp が無い" % ptype)
-    return ("mismatch", drift) if drift else ("unverified", "task_started/task_complete 未出現")
+            if ptype == "task_started":
+                started = True
+            else:
+                complete = True
+        else:
+            drift = drift or ("%s だが type!='event_msg'（型名ドリフト）" % ptype
+                              if d.get("type") != "event_msg" else "%s に timestamp が無い" % ptype)
+    if drift:
+        return ("mismatch", drift)
+    if started and complete:
+        return ("ok", "event_msg task_started+task_complete+timestamp 確認")
+    return ("unverified", "task_started/task_complete が揃っていない")
 
 
 def _codex_attribution(records):
     """応答帰属スキーマ（codex_response_complete の turn_id ペアリング）: task_started/task_complete
-    が turn_id を持ち、user の response_item が internal_chat_message_metadata_passthrough.turn_id を
-    持つこと。turn_id が消えると帰属が「時刻・位置」ヒューリスティックへ退行し先行タスクを誤帰属
-    し得る（実バグ既知）ため、その積極的ドリフトを検出して安全側へ倒す。task 側 turn_id が
-    在れば帰属の主キーは健在＝ok（user 側 metadata の欠如だけでは positive drift とはしない：旧
-    CLI 形状で passthrough キー自体が無いこともあるため unverified 寄り）。"""
+    が turn_id を持ち、**かつ** user の response_item が
+    internal_chat_message_metadata_passthrough.turn_id を持つこと。turn_id が消えると帰属が
+    「時刻・位置」ヒューリスティックへ退行し先行タスクを誤帰属し得る（実バグ既知）ため、その
+    積極的ドリフトを mismatch で捕捉する。ペアリングは task 側と user 側の turn_id 双方に依存する
+    ので、**両方**を観測できて初めて ok（片方だけでは latch せず unverified）。"""
     event_ok = user_ok = False
     drift = None
     for d in records:
@@ -184,13 +260,14 @@ def _codex_attribution(records):
                 drift = drift or "user response_item の metadata に turn_id が無い（帰属不能）"
     if drift:
         return ("mismatch", drift)
-    if event_ok:
-        return ("ok", "task_event.turn_id 確認" + ("+user.metadata.turn_id" if user_ok else ""))
-    return ("unverified", "turn_id を持つ task_event 未出現")
+    if event_ok and user_ok:
+        return ("ok", "task_event.turn_id + user.metadata.turn_id 確認")
+    return ("unverified", "turn_id の対応付け材料（task 側 / user 側）が揃っていない")
 
 
 def _schema_probe_codex(records):
-    # ターン完了 ＋ 応答帰属（turn_id）の両スキーマ側面を確認し、安全側に集約する（P1-2）。
+    # ターン完了 ＋ 応答帰属（turn_id）の両スキーマ側面が《揃って》初めて compatible（P1-2）。
+    # 部分証拠（task_started のみ・user metadata 欠如）では latch せず unverified のまま probe を続ける。
     return _combine_aspects([_codex_turn_completion(records), _codex_attribution(records)])
 
 
