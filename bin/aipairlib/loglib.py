@@ -260,16 +260,22 @@ def claude_response_attributed(path, probe):
             except ValueError:
                 continue
             u = d.get("uuid")
-            if u:
+            # 型ドリフト防御（Codex）: uuid / parent 値が文字列でない（dict/list/数値）と辞書キー
+            # や set 演算で TypeError になり relay がクラッシュする。schema probe が mismatch→exit 7
+            # で先に止めるが、万一到達しても例外にしないよう、ここでは文字列 uuid のみを map に入れ、
+            # 非文字列の親は None（＝そこで探索停止 = fail-closed）に落とす。
+            su = u if (isinstance(u, str) and u) else None
+            if su:
                 if d.get("type") == "system" and d.get("subtype") == "compact_boundary":
                     # 圧縮は parentUuid を None にする。logicalParentUuid が真の祖先。
-                    # 欠落時は None のまま＝この境界で探索が止まる（fail-closed）。
-                    parent[u] = d.get("logicalParentUuid")
+                    # 欠落／非文字列時は None のまま＝この境界で探索が止まる（fail-closed）。
+                    pu = d.get("logicalParentUuid")
                 else:
-                    parent[u] = d.get("parentUuid")
+                    pu = d.get("parentUuid")
+                parent[su] = pu if isinstance(pu, str) else None
             t = d.get("type")
             if t == "assistant":
-                last_assist_uuid = u
+                last_assist_uuid = su
             elif t == "user" and nonce_uuid is None:
                 content = ((d.get("message") or {}).get("content"))
                 if isinstance(content, str):
@@ -278,7 +284,7 @@ def claude_response_attributed(path, probe):
                     hit = any(probe in (b.get("text") or "")
                               for b in (content or []) if isinstance(b, dict))
                 if hit:
-                    nonce_uuid = u
+                    nonce_uuid = su
     except OSError:
         return False
     if not (last_assist_uuid and nonce_uuid):

@@ -181,17 +181,22 @@ def _claude_compaction_boundary(records):
     を logicalParentUuid へ橋渡しして圧縮前の祖先へ辿るため、uuid（チェーン上で境界を特定）と
     logicalParentUuid（橋渡し先）の双方が要る。どちらか欠落は帰属を永久に不成立にする positive
     drift（Codex 指摘）。境界が無ければ unverified（veto-only：起きた時だけ観測できる）。"""
+    def nonempty_str(v):
+        return isinstance(v, str) and v != ""
     ok = False
     drift = None
     for d in records:
         if not (d.get("type") == "system" and d.get("subtype") == "compact_boundary"):
             continue
-        if d.get("uuid") and d.get("logicalParentUuid"):
+        # uuid / logicalParentUuid は帰属チェーンで《辞書キー》に使う。非空文字列に限定する:
+        # truthy なだけの object/list を許すと claude_response_attributed が unhashable で
+        # TypeError クラッシュする（Codex 指摘）。型ドリフトも mismatch にして exit 7 で止める。
+        if nonempty_str(d.get("uuid")) and nonempty_str(d.get("logicalParentUuid")):
             ok = True
-        elif not d.get("uuid"):
-            drift = drift or "compact_boundary に uuid が無い（帰属チェーンで境界を辿れない）"
+        elif not nonempty_str(d.get("uuid")):
+            drift = drift or "compact_boundary の uuid が非空文字列でない（帰属チェーンで辿れない/型ドリフト）"
         else:
-            drift = drift or "compact_boundary に logicalParentUuid が無い（圧縮境界を跨げない）"
+            drift = drift or "compact_boundary の logicalParentUuid が非空文字列でない（圧縮境界を跨げない/型ドリフト）"
     if drift:
         return ("mismatch", drift)
     return ("ok", "compact_boundary uuid+logicalParentUuid 確認") if ok else ("unverified", "compact_boundary 未出現")
@@ -207,22 +212,29 @@ def _schema_probe_claude(records):
         inner_role = msg.get("role") if msg else None
         if d.get("type") != "assistant" and inner_role != "assistant":
             continue
+        # claude_response_attributed は uuid / parentUuid を《辞書キー》に使うので、非空文字列
+        # （parentUuid は文字列 or None）に限定する。truthy なだけの object/list を通すと
+        # unhashable で TypeError クラッシュする（Codex 指摘）。型ドリフトも mismatch にする。
+        uid = d.get("uuid")
+        uid_ok = isinstance(uid, str) and uid != ""
+        pu = d.get("parentUuid")
+        pu_ok = ("parentUuid" in d) and (pu is None or isinstance(pu, str))
         if (d.get("type") == "assistant" and msg is not None and "stop_reason" in msg
-                and d.get("timestamp") is not None and d.get("uuid") is not None
-                and "parentUuid" in d):
+                and d.get("timestamp") is not None and uid_ok and pu_ok):
             return ("ok", "assistant+stop_reason+timestamp+uuid+parentUuid 確認")
         # assistant-ish but not the shape the relay reads → remember the first concrete drift.
-        # claude_response_attributed walks BOTH uuid and parentUuid, so both are required.
         if d.get("type") != "assistant":
             drift = drift or "assistant メッセージだが type!='assistant'（型名ドリフト）"
         elif msg is None or "stop_reason" not in msg:
             drift = drift or "assistant に message.stop_reason が無い（完了検知不能）"
         elif d.get("timestamp") is None:
             drift = drift or "assistant に timestamp が無い"
-        elif d.get("uuid") is None:
-            drift = drift or "assistant に uuid が無い（応答帰属チェーン不能）"
-        else:
+        elif not uid_ok:
+            drift = drift or "assistant の uuid が非空文字列でない（応答帰属チェーン不能/型ドリフト）"
+        elif "parentUuid" not in d:
             drift = drift or "assistant に parentUuid が無い（応答帰属チェーン不能）"
+        else:
+            drift = drift or "assistant の parentUuid が文字列/None でない（型ドリフト）"
     return ("mismatch", drift) if drift else ("unverified", "完了 assistant ターン未確認")
 
 
