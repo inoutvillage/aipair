@@ -68,12 +68,18 @@ def version_gate(a, detected, tested=TESTED_VERSIONS):
 
 # --- JSONL schema feature-probe --------------------------------------------- #
 # version_gate above only compares --version strings, but the CORE relay reads the agents'
-# JSONL/rollout transcripts BY KEY: claude → type=="assistant" carrying message.stop_reason +
-# timestamp, and a uuid/parentUuid chain; codex → type=="event_msg" carrying
-# payload.type in {task_started, task_complete} + timestamp. A CLI update can keep a "tested"
-# version string yet move those keys, and then turn-detection silently breaks (the relay just
-# never sees a completed turn). schema_probe looks at REAL decoded records and reports whether
-# the keyed shape the relay depends on is actually present, so the gate can extend past the TUI.
+# JSONL/rollout transcripts BY KEY, probed as SEVERAL schema aspects (P1-2):
+#   turn completion   — claude: type=="assistant" + message.stop_reason + timestamp;
+#                        codex:  type=="event_msg" + payload.type in {task_started,task_complete} + timestamp
+#   response attribution — claude: assistant uuid + parentUuid chain;
+#                        codex:  turn_id on the task events AND on the user response_item's
+#                                internal_chat_message_metadata_passthrough (codex_response_complete
+#                                pairs by turn_id; drift there falls back to a time/position
+#                                heuristic that can misattribute a queued turn).
+# A CLI update can keep a "tested" version string yet move those keys, silently breaking turn
+# detection or attribution. schema_probe looks at REAL decoded records and reports whether the
+# keyed shape the relay depends on is present, aggregating aspects so the gate blocks only when a
+# positive drift appears (any aspect mismatch ⇒ mismatch; ok needs every aspect verified).
 
 def schema_probe(agent, records):
     """Feature-probe decoded JSONL records for the schema markers the core relay reads.
@@ -122,10 +128,22 @@ def _schema_probe_claude(records):
     return ("mismatch", drift) if drift else ("unverified", "完了 assistant ターン未確認")
 
 
-def _schema_probe_codex(records):
-    # codex_done_ts keys on type=="event_msg" + payload.type in {task_started, task_complete} +
-    # timestamp. A well-formed task event (started OR complete — same envelope) proves it; a
-    # task event NOT under event_msg, or without a timestamp, is positive drift.
+def _combine_aspects(aspects):
+    """複数のスキーマ側面（ターン完了 / 応答帰属 / …）の probe 結果を安全側に集約する:
+    どれか一つでも mismatch なら mismatch、全側面が ok で初めて ok、それ以外は unverified。
+    「安全な自動レビューループに必要なスキーマが全て確認できて初めて compatible」（P1-2）。"""
+    for st, r in aspects:
+        if st == "mismatch":
+            return ("mismatch", r)
+    if aspects and all(st == "ok" for st, _ in aspects):
+        return ("ok", " / ".join(r for _, r in aspects if r))
+    return ("unverified", " / ".join(r for _, r in aspects if r))
+
+
+def _codex_turn_completion(records):
+    """ターン完了スキーマ（codex_done_ts）: type=='event_msg' + payload.type in
+    {task_started, task_complete} + timestamp。task イベントが event_msg 外／timestamp 欠落は
+    positive drift。"""
     drift = None
     for d in records:
         p = d.get("payload") if isinstance(d.get("payload"), dict) else None
@@ -137,6 +155,43 @@ def _schema_probe_codex(records):
         drift = drift or ("%s だが type!='event_msg'（型名ドリフト）" % ptype
                           if d.get("type") != "event_msg" else "%s に timestamp が無い" % ptype)
     return ("mismatch", drift) if drift else ("unverified", "task_started/task_complete 未出現")
+
+
+def _codex_attribution(records):
+    """応答帰属スキーマ（codex_response_complete の turn_id ペアリング）: task_started/task_complete
+    が turn_id を持ち、user の response_item が internal_chat_message_metadata_passthrough.turn_id を
+    持つこと。turn_id が消えると帰属が「時刻・位置」ヒューリスティックへ退行し先行タスクを誤帰属
+    し得る（実バグ既知）ため、その積極的ドリフトを検出して安全側へ倒す。task 側 turn_id が
+    在れば帰属の主キーは健在＝ok（user 側 metadata の欠如だけでは positive drift とはしない：旧
+    CLI 形状で passthrough キー自体が無いこともあるため unverified 寄り）。"""
+    event_ok = user_ok = False
+    drift = None
+    for d in records:
+        p = d.get("payload") if isinstance(d.get("payload"), dict) else None
+        if not p:
+            continue
+        ptype = p.get("type")
+        if d.get("type") == "event_msg" and ptype in ("task_started", "task_complete"):
+            if p.get("turn_id") is not None:
+                event_ok = True
+            else:
+                drift = drift or "%s に turn_id が無い（応答帰属の対応付け不能）" % ptype
+        elif d.get("type") == "response_item" and ptype == "message" and p.get("role") == "user":
+            meta = p.get("internal_chat_message_metadata_passthrough")
+            if isinstance(meta, dict) and meta.get("turn_id") is not None:
+                user_ok = True
+            elif isinstance(meta, dict):
+                drift = drift or "user response_item の metadata に turn_id が無い（帰属不能）"
+    if drift:
+        return ("mismatch", drift)
+    if event_ok:
+        return ("ok", "task_event.turn_id 確認" + ("+user.metadata.turn_id" if user_ok else ""))
+    return ("unverified", "turn_id を持つ task_event 未出現")
+
+
+def _schema_probe_codex(records):
+    # ターン完了 ＋ 応答帰属（turn_id）の両スキーマ側面を確認し、安全側に集約する（P1-2）。
+    return _combine_aspects([_codex_turn_completion(records), _codex_attribution(records)])
 
 
 def schema_gate(a, probes):
