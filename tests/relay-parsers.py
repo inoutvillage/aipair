@@ -943,6 +943,36 @@ class SchemaProbe(unittest.TestCase):
         self.assertEqual(relay.read_records("/no/such/file.jsonl"), [])
 
 
+class SchemaGuardOrdering(unittest.TestCase):
+    """Regression (P1-a): in EVERY loop state, a freshly-locked transcript must be schema-probed
+    (schema_guard) BEFORE the relay treats it as a completed turn (*_done_ts) — otherwise a
+    schema-drifted log that *_done_ts still reads as 'done' fires one automated poke/dialog action
+    before exit 7. This is a source-structure check because the loop lives in a monolithic main();
+    it fails on the pre-fix code where codex_plan / codex_question locked then went straight to
+    codex_done_ts with no guard in between."""
+
+    def _main_loop_lines(self):
+        with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
+            src = fh.read().split("\n")
+        start = next(i for i, l in enumerate(src) if l.strip() == "while True:")
+        return src[start:]
+
+    def test_every_initial_lock_is_guarded_before_done_detection(self):
+        lines = self._main_loop_lines()
+        lock_idx = [i for i, l in enumerate(lines)
+                    if ("= lock_codex(" in l) or ("= lock_claude(" in l)]
+        self.assertGreaterEqual(len(lock_idx), 4, "expected the claude + 3 codex states to lock")
+        for i in lock_idx:
+            # scan forward to the next completion-detection call for the SAME agent
+            done_key = "codex_done_ts(" if "lock_codex(" in lines[i] else "claude_done_ts("
+            j = next((k for k in range(i + 1, len(lines)) if done_key in lines[k]), None)
+            self.assertIsNotNone(j, f"no {done_key} after the lock at loop-line {i}")
+            between = "\n".join(lines[i + 1:j])
+            self.assertIn("schema_guard()", between,
+                          f"lock at loop-line {i} reaches {done_key} with no schema_guard() before it "
+                          "— a drifted log could be acted on before exit 7")
+
+
 class PlanApproval(unittest.TestCase):
     OK = "[AIPAIR_PLAN_APPROVED]"
 
@@ -955,6 +985,17 @@ class PlanApproval(unittest.TestCase):
         self.assertEqual(relay.plan_extra_comment([], self.OK), "")
         # the sentinel itself is stripped; surrounding punctuation trimmed
         self.assertEqual(relay.plan_extra_comment([self.OK], self.OK), "")
+
+    def test_approve_feedback_delivers_extra_not_the_joined_turn(self):
+        # Regression (P1-c, delivery side): the feedback-approve path must DELIVER `extra` (the
+        # final-message comment), never the whole-turn joined `text` — otherwise a long preceding
+        # narration is sent to Claude. Source check: the branch lives in a monolithic main().
+        with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn('send_plan_feedback(panes["claude"], dialog, extra, approve=True', src,
+                      "approve-feedback must deliver the final-message comment (extra)")
+        self.assertNotIn('send_plan_feedback(panes["claude"], dialog, text, approve=True', src,
+                         "must not deliver the whole-turn joined text")
 
 
 class DialogSendScrape(unittest.TestCase):

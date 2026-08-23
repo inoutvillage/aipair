@@ -1231,6 +1231,10 @@ def main():
             elif state == "codex_plan":
                 if tracked["codex"] is None:
                     tracked["codex"] = lock_codex(cwd, codex_seen, panes["codex"])
+                # 🔴 ロック直後・完了判定前に probe（P1-a: 全 state 共通）
+                if tracked["codex"] and schema_guard():
+                    code = 7
+                    break
                 done = codex_done_ts(tracked["codex"], since) if tracked["codex"] else None
                 done = response_done("codex", tracked["codex"], done)
                 if done:
@@ -1260,7 +1264,7 @@ def main():
                         if len(extra) > 80 and dialog["tell"]:
                             log("◆ " + c("ok", "Codex がプラン承認（付帯コメントあり）")
                                 + " → feedback付きで承認（shift+tab）")
-                            if not send_plan_feedback(panes["claude"], dialog, text, approve=True,
+                            if not send_plan_feedback(panes["claude"], dialog, extra, approve=True,
                                                       watch=claude_watch()):
                                 print(c("warn", "│ ■ feedback付き承認（Shift+Tab）の成立を確認できず。"
                                                 "状態遷移せず停止します。"), flush=True)
@@ -1307,6 +1311,10 @@ def main():
             elif state == "codex_question":
                 if tracked["codex"] is None:
                     tracked["codex"] = lock_codex(cwd, codex_seen, panes["codex"])
+                # 🔴 ロック直後・完了判定前に probe（P1-a: 全 state 共通）
+                if tracked["codex"] and schema_guard():
+                    code = 7
+                    break
                 done = codex_done_ts(tracked["codex"], since) if tracked["codex"] else None
                 done = response_done("codex", tracked["codex"], done)
                 if done:
