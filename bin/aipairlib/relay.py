@@ -120,6 +120,7 @@ codex_done_ts = loglib.codex_done_ts
 turn_texts = loglib.turn_texts
 find_poke_ts = loglib.find_poke_ts
 codex_response_complete = loglib.codex_response_complete
+latest_compact_boundary = loglib.latest_compact_boundary
 claude_response_attributed = loglib.claude_response_attributed
 make_fragment = loglib.make_fragment
 read_records = loglib.read_records
@@ -1007,9 +1008,20 @@ def main():
             # inode 置換や truncate を見逃すため stat まで見る（Codex 指摘）。
             try:
                 st = os.stat(path)
-                ident = ((path, st.st_dev, st.st_ino), st.st_size)
+                gen, size = (path, st.st_dev, st.st_ino), st.st_size
             except OSError:
-                ident = ((path, None, None), None)
+                gen, size = (path, None, None), None
+            # Claude compaction は同一 path/inode に compact_boundary を追記する（gen/size 増加では
+            # 世代切替を捕まえられない）。size が変わった時だけ末尾を読み最新境界を marker に混ぜ、
+            # 変化が無ければ前回 marker を再利用（無駄読みを避ける）。codex は marker なし。
+            prev = schema_ident[agent]
+            prev_size = prev[1] if prev else None
+            prev_marker = prev[2] if prev else None
+            if agent == "claude" and size != prev_size:
+                marker = latest_compact_boundary(path)
+            else:
+                marker = prev_marker
+            ident = (gen, size, marker)
             # P1-4: 世代切替（別 path / inode 置換 / rotation / size 縮小=truncate）で latch を
             # 破棄して未確認から再 probe。同一世代の追記は再 probe、変化なし/終端 mismatch は skip。
             reset, skip = schema_should_reprobe(schema_latched[agent], schema_ident[agent], ident)

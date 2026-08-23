@@ -125,6 +125,18 @@ def make_fragment(text, n=48):
     return None
 
 
+def latest_compact_boundary(path, tail_bytes=1_000_000):
+    """Claude の context compaction は同じ JSONL に `{type:"system", subtype:"compact_boundary"}`
+    を追記する（path/inode 不変・size 増加）。その最新境界の uuid を返す（無ければ None）。
+    schema latch の世代 identity に混ぜて「同一ログでも compaction 後は未確認へ戻す」ために使う
+    （P1-4 / Codex）。末尾のみ読むので巨大ログでも安い。"""
+    uuid = None
+    for d in read_records(path, tail_lines=0, tail_bytes=tail_bytes):
+        if d.get("type") == "system" and d.get("subtype") == "compact_boundary":
+            uuid = d.get("uuid") or uuid or True   # uuid が無くても「境界あり」を示す真値
+    return uuid
+
+
 def codex_response_complete(path, probe, allow_position_fallback=False):
     """rollout から nonce の user メッセージを含むタスク（turn_id）を特定し、
     (そのタスクの task_started ts, 同 turn_id の task_complete ts or None) を返す。
