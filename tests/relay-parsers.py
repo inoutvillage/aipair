@@ -1266,9 +1266,10 @@ class SchemaLatchStep(unittest.TestCase):
         self.assertIn("schema_should_reprobe(self.latched[agent], self.ident[agent], ident)", sgsrc)
         self.assertIn("st.st_dev, st.st_ino", sgsrc, "identity must include inode (same-path rotation)")
         self.assertIn("_latest_compact_boundary(path)", sgsrc, "claude identity must fold in compaction")
-        with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
+        self.assertIn("self.watch()", sgsrc, "guard() must re-probe via watch()")
+        # the StateMachine (P2-1) drives the guard between iterations / after every fresh lock
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
             src = fh.read()
-        self.assertIn("sg.watch()", src)
         self.assertIn("sg.guard()", src)
 
     def test_latest_compact_boundary(self):
@@ -1332,7 +1333,7 @@ class SchemaLatchStep(unittest.TestCase):
         # P1-4 (Codex): the forced re-lock switches tracked["claude"] to a NEW log, then processes
         # its `done`. A schema_guard() must run on the switched log BEFORE response_done, so a
         # malformed new log fails closed (exit 7) instead of driving a review/stop.
-        with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
             src = fh.read()
         i_relock = src.index('tracked["claude"] = relocked')
         i_guard = src.index("sg.guard()", i_relock)
@@ -1350,7 +1351,7 @@ class SchemaGuardOrdering(unittest.TestCase):
     codex_done_ts with no guard in between."""
 
     def _main_loop_lines(self):
-        with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
             src = fh.read().split("\n")
         start = next(i for i, l in enumerate(src) if l.strip() == "while True:")
         return src[start:]
@@ -1399,7 +1400,7 @@ class PlanApproval(unittest.TestCase):
         self.assertEqual(d.payload, long_extra)
         self.assertNotIn("x", d.payload)                # 先行ナレーションは混入しない
         # relay は「決定した payload」を approve=True で配達する（text を再計算して送らない）
-        with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
             src = fh.read()
         self.assertIn('send_plan_feedback(panes["claude"], dialog, decision.payload, approve=True', src)
         self.assertNotIn('dialog, text, approve=True', src, "must not deliver the whole-turn joined text")
@@ -1432,6 +1433,38 @@ class PlanApproval(unittest.TestCase):
         self.assertEqual(relay.decide_plan_action([""], self.OK, dlg).action, "no_text")
         self.assertEqual(relay.decide_plan_action(["fix it"], self.OK, None).action, "no_dialog")
 
+
+class StateMachineWiring(unittest.TestCase):
+    """P2-1 完了: relay.main() は arg parse／依存構築／起動／exit のみを担い、ループ本体は
+    state_machine.StateMachine.run() へ移設。ここでは main() 由来の全依存を構築子が受け取り属性化
+    することと、run() が呼べることを配線レベルで確認する（ループ本体は tmux/画面と密結合な統合
+    レベルのため単体では回さない — 判定核 ResponseGate / decide_* は別途被覆済み）。"""
+    def test_constructs_and_stores_every_dependency(self):
+        import types
+        SM = relay.state_machine.StateMachine
+        a = types.SimpleNamespace(start_side="claude", settle=0, poll=0, max_rounds=20)
+        tracked = {"claude": None, "codex": None}
+        sm = SM(a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x", tracked=tracked,
+                claude_seen=set(), codex_seen=set(), baseline=123.0, sg=object(), rg=object(),
+                bw=60, poke_codex="pc", poke_codex_next="pcn", poke_claude="pcl",
+                poke_claude_pass="pcp", poke_claude_next="pcnx", stop_phrases=["[AIPAIR_REVIEW_OK]"],
+                next_ask_phrases=["[AIPAIR_NEXT]"], all_done_phrases=["[AIPAIR_ALL_DONE]"])
+        self.assertIs(sm.a, a)
+        self.assertIs(sm.tracked, tracked)                 # relay と共有する可変 dict
+        self.assertEqual((sm.own, sm.cwd, sm.baseline, sm.bw), ("%0", "/x", 123.0, 60))
+        self.assertEqual(sm.panes["codex"], "%2")
+        self.assertEqual((sm.poke_codex, sm.poke_claude_next), ("pc", "pcnx"))
+        self.assertEqual(sm.all_done_phrases, ["[AIPAIR_ALL_DONE]"])
+        self.assertTrue(callable(sm.run))
+
+    def test_relay_main_is_a_thin_launcher(self):
+        # main() ends by delegating to StateMachine(...).run(); the loop no longer lives in relay.py
+        with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
+            relay_src = fh.read()
+        self.assertIn("return StateMachine(", relay_src)
+        self.assertIn(").run()", relay_src)
+        for gone in ("while True:", "= lock_codex(", "codex_done_ts(", "class LogWatch:"):
+            self.assertNotIn(gone, relay_src, f"{gone!r} must have moved out of relay.py")
 
 class QuestionRelayDecision(unittest.TestCase):
     """P2-1 question_flow: Codex の質問回答をどうするかの判定は純粋関数 decide_question_action。
@@ -1561,8 +1594,20 @@ class ModuleLayout(unittest.TestCase):
         self.assertIs(relay.deliverylib.dialoglib, relay.dialoglib)
         self.assertIs(relay.dialoglib.deliverylib, relay.deliverylib)
         self.assertIs(relay.dim, relay.logs.dim)
-        # what stays in relay (the launcher core) is defined here, not in a lib
-        for core in ("main", "LogWatch", "lock_codex", "run_gate", "gate_or_message"):
+        # P2-1: the state machine (loop + LogWatch + approval_took_effect + done_banner) now lives
+        # in state_machine.py; relay imports it and wires StateMachine in main().
+        self.assertTrue(hasattr(relay, "state_machine"))
+        self.assertIs(relay.StateMachine, relay.state_machine.StateMachine)
+        self.assertIs(relay.decide_plan_action, relay.state_machine.decide_plan_action)
+        for moved in ("LogWatch", "approval_took_effect", "done_banner", "StateMachine"):
+            self.assertTrue(hasattr(relay.state_machine, moved), f"state_machine must own {moved}")
+        # plan_flow / question_flow は named module として独立（判定核の在処）。state_machine は
+        # そこから re-export する（`from .plan_flow import ...`）ので、実体との同一性で確認する。
+        from aipairlib import plan_flow, question_flow
+        self.assertIs(relay.state_machine.decide_plan_action, plan_flow.decide_plan_action)
+        self.assertIs(relay.state_machine.decide_question_action, question_flow.decide_question_action)
+        # what stays in relay (the launcher): main() + the re-exported helpers it wires
+        for core in ("main", "lock_codex", "run_gate", "gate_or_message"):
             self.assertTrue(hasattr(relay, core))
 
 
@@ -1764,10 +1809,17 @@ class ResponseGateBehavior(unittest.TestCase):
     def test_standalone_import_and_relay_reexport(self):
         self.assertTrue(_imports_without_relay("state_machine", "ResponseGate", "decide_plan_action",
                                                "decide_question_action"))
+        # P2-1: 判定核は plan_flow / question_flow の named module に在り、state_machine が再エクスポート
+        self.assertTrue(_imports_without_relay("plan_flow", "decide_plan_action"))
+        self.assertTrue(_imports_without_relay("question_flow", "decide_question_action"))
         from aipairlib.state_machine import ResponseGate, decide_plan_action, decide_question_action
+        from aipairlib.plan_flow import decide_plan_action as pf
+        from aipairlib.question_flow import decide_question_action as qf
+        self.assertIs(decide_plan_action, pf)          # state_machine は plan_flow から re-export
+        self.assertIs(decide_question_action, qf)
         self.assertIs(relay.ResponseGate, ResponseGate)
-        self.assertIs(relay.decide_plan_action, decide_plan_action)
-        self.assertIs(relay.decide_question_action, decide_question_action)
+        self.assertIs(relay.decide_plan_action, pf)
+        self.assertIs(relay.decide_question_action, qf)
 
     def test_arm_sets_lifecycle_and_clear_disables(self):
         g = self._gate(now=42.0)
