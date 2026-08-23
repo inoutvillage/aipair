@@ -1637,6 +1637,22 @@ class LoglibStandalone(unittest.TestCase):
         self.assertIs(relay.turn_texts, relay.loglib.turn_texts)
         self.assertIs(relay.read_records, relay.loglib.read_records)
 
+    def test_review_protocol_is_standalone_and_instructs_sentinel_at_head(self):
+        # P2-1 増分2: the poke templates are a standalone pure module (no relay dependency), and
+        # every stop/next/all-done/plan template instructs the sentinel ALONE on the first line.
+        self.assertTrue(_imports_without_relay("review_protocol", "default_poke_codex",
+                                               "endless_poke_codex_next", "plan_poke_codex",
+                                               "plan_extra_comment"))
+        rp = relay.review_protocol
+        self.assertIn("【1行目】", rp.default_poke_codex("[AIPAIR_REVIEW_OK]"))
+        self.assertIn("[AIPAIR_REVIEW_OK]", rp.default_poke_codex("[AIPAIR_REVIEW_OK]"))
+        self.assertIn("[AIPAIR_ALL_DONE]", rp.endless_poke_codex_next("tasks/todo.md", "[AIPAIR_ALL_DONE]"))
+        self.assertIn("[AIPAIR_NEXT]", rp.endless_poke_claude_pass("tasks/todo.md", "[AIPAIR_NEXT]"))
+        self.assertIn("[AIPAIR_PLAN_APPROVED]", rp.plan_poke_codex("p.md", "[AIPAIR_PLAN_APPROVED]"))
+        # relay re-exports the same objects (call sites unchanged)
+        self.assertIs(relay.default_poke_codex, rp.default_poke_codex)
+        self.assertIs(relay.plan_extra_comment, rp.plan_extra_comment)
+
 
 class ResponseAttribution(unittest.TestCase):
     """The loglib functions that decide whether a completed turn is the answer to OUR poke —

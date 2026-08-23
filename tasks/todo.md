@@ -16,6 +16,7 @@
 - [x] **P1-6 nightly を latest smoke（secrets 無）と authenticated-e2e（version pin + secrets 有）に分離**。上流 latest 破壊と aipair 既存版 E2E 破壊を切り分け。
 - [ ] **P2-1 relay state machine を state 単位で分割**（state_machine/review_protocol/schema_guard/plan_flow/question_flow）。relay.py は arg parse/依存構築/起動/exit に寄せる。
   - 増分1（着手済）: **schema_guard** を `bin/aipairlib/schema_guard.py` の `SchemaGuard` クラスへ抽出（latch/identity を所有・純関数と probe を注入）。従来 nested closure でテスト不能だった schema_watch/guard を**単体テスト可能**に（5 ケース追加）。installer FILES/import-verify にモジュール追加。残: review_protocol / plan_flow / question_flow / state_machine。
+  - 増分2（着手済）: **review_protocol** を `bin/aipairlib/review_protocol.py` へ抽出（poke 文面 7 本＋`plan_extra_comment`＝副作用無しの純関数群）。relay は `from .review_protocol import ...` で再エクスポート。standalone import＋sentinel-at-head 指示のテスト追加。残: plan_flow / question_flow / state_machine。
 - [ ] **P2-2 installer の transaction 性強化**（package + entrypoints + templates を staging→検証→一括切替、Phase2 途中失敗は entrypoint も自動 rollback）。
 - [ ] **P2-3 README/SECURITY/todo/TESTED_VERSIONS/CI 説明/schema・stop・plan protocol の同期をテスト化**（README の version==TESTED_VERSIONS、README の sentinel==コード定数）。
 - [ ] **P2-4 versioned release 運用開始**（`aipair --version` / git tag / CHANGELOG.md / GitHub Releases）。
