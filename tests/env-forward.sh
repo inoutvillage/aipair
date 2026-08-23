@@ -100,13 +100,15 @@ BR="$("$REAL_TMUX" -L "$SOCKET" split-window -t pair -P -F '#{pane_id}' -c "$W/p
 "$REAL_TMUX" -L "$SOCKET" select-pane -t "$BR" -T bridge
 P0="$("$REAL_TMUX" -L "$SOCKET" list-panes -t pair -F '#{pane_id}' | head -1)"
 "$REAL_TMUX" -L "$SOCKET" send-keys -t "$P0" \
-  "AIPAIR_RELAY_BIN='$STUB' AIPAIR_NO_VERSION_GATE=1 AIPAIR_GATE='pytest -q' aipair-relay-here --session pair --print > '$W/rh.out' 2>&1" Enter
+  "AIPAIR_RELAY_BIN='$STUB' AIPAIR_NO_VERSION_GATE=1 AIPAIR_GATE='pytest -q' AIPAIR_HUMAN_REQUIRED='[HR_TEST]' aipair-relay-here --session pair --print > '$W/rh.out' 2>&1" Enter
 if wait_file "$W/rh.out"; then
   line="$(grep -E '^launch' "$W/rh.out" || cat "$W/rh.out")"
   chk_has "$line" "--no-version-gate" "relay-here → --no-version-gate"
   chk_has "$line" "'--gate' 'pytest -q'" "relay-here → --gate 'pytest -q'"
+  chk_has "$line" "'--human-required' '[HR_TEST]'" "relay-here → --human-required (endless BLOCKED sentinel)"
   chk_has "$line" "AIPAIR_NO_VERSION_GATE=" "relay-here pins env (overrides the bridge pane)"
   chk_has "$line" "AIPAIR_GATE=" "relay-here pins AIPAIR_GATE on the command"
+  chk_has "$line" "AIPAIR_HUMAN_REQUIRED=" "relay-here pins AIPAIR_HUMAN_REQUIRED on the command"
 else n=$((n+1)); echo "FAIL relay-here produced no output"; sed 's/^/     /' "$W/rh.out" 2>/dev/null || true; fail=1; fi
 reset_server
 
