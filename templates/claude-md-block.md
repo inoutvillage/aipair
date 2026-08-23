@@ -15,7 +15,7 @@ Session control (each takes an optional `[dir]`, default `$PWD`):
 `aipair attach` attach only · `aipair stop` kill it · `aipair name` print the tmux session name.
 
 `aipair loop` runs `aipair-relay --max-rounds 20` and stops when **codex** emits the stop phrase
-`完了です` (defaults; override with `AIPAIR_MAX_ROUNDS` / `AIPAIR_STOP` / `AIPAIR_STOP_SIDE` —
+`[AIPAIR_REVIEW_OK]` (defaults; override with `AIPAIR_MAX_ROUNDS` / `AIPAIR_STOP` / `AIPAIR_STOP_SIDE` —
 precedence: CLI flag > env > built-in default; the relay itself and `aipair-relay-here` read the
 same env). By default each agent keeps its normal permission prompts; permission-bypass
 (`claude --dangerously-skip-permissions` / `codex --dangerously-bypass-approvals-and-sandbox`)
@@ -23,9 +23,9 @@ is opt-in via `--unsafe` / `AIPAIR_UNSAFE=1` and is required for `aipair loop`;
 for interactive launch, `AIPAIR_CLAUDE_FLAGS` / `AIPAIR_CODEX_FLAGS` set the flags entirely (empty = none, e.g. `AIPAIR_CODEX_FLAGS= aipair`), but under `aipair loop` the bypass flags are always present and cannot be removed — yours are appended.
 
 **Endless mode** (`AIPAIR_ENDLESS=1` / `--endless`): the stop phrase means "this task passed review,
-move on" instead of "stop". When Claude runs out of work it writes `次のタスクをください` at the start
+move on" instead of "stop". When Claude runs out of work it writes `[AIPAIR_NEXT]` at the start
 of its reply, and Codex assigns the next unchecked item from `tasks/todo.md` (`AIPAIR_TASK_LIST`).
-The loop ends **only** when Codex declares `全タスク完了` (`--max-rounds` is just a safety cap — set it
+The loop ends **only** when Codex declares `[AIPAIR_ALL_DONE]` (`--max-rounds` is just a safety cap — set it
 high).
 
 After a relay has ended and the back-and-forth has stopped, a new round can be started on demand

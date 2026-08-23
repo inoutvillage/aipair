@@ -682,6 +682,15 @@ DEFAULT_POKE_CLAUDE = ("【自動レビューループ】Codexがレビューし
                        "人間に伝言や共有を頼まないでください。修正したら何を直したか簡潔に述べ、ターンを終えてください。")
 
 
+def plan_extra_comment(texts, plan_ok):
+    """プラン承認の付帯コメント = 《最終メッセージ texts[-1]》から先頭の承認 sentinel を除いた残り。
+    連結全文ではなく最終メッセージだけを見るのは、先行する進捗ナレーションが長いだけで
+    「feedback 付き承認」へ誤分岐するのを防ぐため（Codex レビュー）。"""
+    if not texts:
+        return ""
+    return texts[-1].replace(plan_ok, "", 1).strip(" 。、！!\n\t「」")
+
+
 def default_poke_codex(stop):
     return (f"【自動レビューループ】Claudeが実装/修正を更新しました。`peer` でClaudeの最新の発言を読み、"
             f"コードをレビューしてください。あなたの返答は自動でClaudeに共有されます—人間に伝言を頼まないでください。"
@@ -774,8 +783,8 @@ def main():
                     help="起動時の claude/codex 版チェックをしない（env AIPAIR_NO_VERSION_GATE）")
     ap.add_argument("--allow-untested-schema", action="store_true",
                     default=_env_bool("AIPAIR_ALLOW_UNTESTED_SCHEMA"),
-                    help="ログ JSONL schema がコア relay の依存と不一致でもダイアログ自動操作を続行"
-                         "（既定: 不一致なら自動 OFF / env AIPAIR_ALLOW_UNTESTED_SCHEMA）")
+                    help="ログ JSONL schema がコア relay の依存と不一致でも継続（fail-open・ダイアログ自動操作は OFF）。"
+                         "既定は不一致なら fail-closed で停止（exit 7） / env AIPAIR_ALLOW_UNTESTED_SCHEMA")
     ap.add_argument("--no-schema-probe", action="store_true",
                     default=_env_bool("AIPAIR_NO_SCHEMA_PROBE"),
                     help="起動時/実行時の JSONL schema feature-probe をしない（env AIPAIR_NO_SCHEMA_PROBE）")
@@ -899,6 +908,7 @@ def main():
                             "ターン検出・応答帰属が誤動作し得るため、権限バイパス下の自律運転は中止します。"
                             "継続するなら --allow-untested-schema（AIPAIR_ALLOW_UNTESTED_SCHEMA=1）。"), flush=True)
             print("\a", end="", flush=True)
+            set_pane_title(own, "relay ■ 終了(schema不一致) / 0往復")   # 走行中タイトルのまま残さない
             return 7
         log(c("dim", "  → --allow-untested-schema: fail-open で継続（ダイアログ自動操作は OFF）"))
     if a.endless:
@@ -1006,6 +1016,17 @@ def main():
                     a.schema_stop = True          # fail-closed: stop the loop (exit 7)
             # "unverified" → leave unlatched, re-probe next iteration
 
+    def schema_guard():
+        """freshly (re)ロックしたログを《完了判定・poke の前に》probe し、override 無しの
+        schema mismatch なら fail-closed 停止を要求する（True を返す）。ロック直後に必ず呼ぶ
+        ことで「同一ループ内で probe 前に1回自動操作される」経路（parentUuid 欠落等でも
+        claude_done_ts が完了扱いし得るケース）を塞ぐ。"""
+        schema_watch()
+        if a.schema_stop:
+            print(c("warn", "│ ■ ログschema不一致を検出 → fail-closed で停止します（exit 7）。"), flush=True)
+            return True
+        return False
+
     def wait_heartbeat(who):
         # 待機フェーズごとに1回だけ表示（None = 表示済み。状態遷移時の time.time() 再セットで再アーム）
         nonlocal last_activity
@@ -1091,14 +1112,16 @@ def main():
     all_done_hit = False
     try:
         while True:
-            schema_watch()
-            if a.schema_stop:
-                print(c("warn", "│ ■ 実行時にログschema不一致を検出 → fail-closed で停止します（exit 7）。"), flush=True)
+            if schema_guard():          # between-iteration drift（latch 済みは安価な no-op）
                 code = 7
                 break
             if state == "claude":
                 if tracked["claude"] is None:
                     tracked["claude"] = lock_claude(cwd, claude_seen, panes["claude"], baseline)
+                # 🔴 ロック直後・完了判定前に probe（P1-a: probe 前に1回 poke される経路を塞ぐ）
+                if tracked["claude"] and schema_guard():
+                    code = 7
+                    break
                 done = claude_done_ts(tracked["claude"], since) if tracked["claude"] else None
                 if done and not claude_matches_pane(tracked["claude"], panes["claude"]):
                     # 誤ピン先の end_turn を「Claude 完了」と誤認しない（2026-07-21 Codex レビュー）:
@@ -1229,9 +1252,11 @@ def main():
                     elif dialog is None:
                         log(c("warn", "◆ プランダイアログが見当たりません（人間が操作した？）。通常の待機に戻ります。"))
                     elif plan_head == a.plan_ok:
-                        # 承認は成立。付帯コメント（先頭 sentinel 行を除いた残り）が十分あれば
-                        # feedback 付き承認（shift+tab）、無ければそのまま承認する。
-                        extra = text.replace(a.plan_ok, "", 1).strip(" 。、！!\n\t「」")
+                        # 承認は成立。付帯コメントは《最終メッセージ texts[-1] から先頭 sentinel を
+                        # 除いた残り》で測る（連結全文 text だと先行ナレーションが長いだけで
+                        # feedback 付き承認へ誤分岐する — Codex レビュー）。十分あれば shift+tab、
+                        # 無ければそのまま承認。
+                        extra = plan_extra_comment(texts, a.plan_ok)
                         if len(extra) > 80 and dialog["tell"]:
                             log("◆ " + c("ok", "Codex がプラン承認（付帯コメントあり）")
                                 + " → feedback付きで承認（shift+tab）")
@@ -1322,6 +1347,10 @@ def main():
             else:  # codex
                 if tracked["codex"] is None:
                     tracked["codex"] = lock_codex(cwd, codex_seen, panes["codex"])
+                # 🔴 ロック直後・完了判定前に probe（P1-a）
+                if tracked["codex"] and schema_guard():
+                    code = 7
+                    break
                 done = codex_done_ts(tracked["codex"], since) if tracked["codex"] else None
                 done = response_done("codex", tracked["codex"], done)
                 if done:

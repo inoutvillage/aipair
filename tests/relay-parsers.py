@@ -896,6 +896,24 @@ class SchemaProbe(unittest.TestCase):
         self.assertFalse(relay.schema_fail_closed(self.a(allow=False), []),
                          "no drift → no stop")
 
+    def test_a_done_but_mismatched_log_must_stop_before_action(self):
+        # Regression (P1-a): a log the relay would treat as a COMPLETED turn (stop_reason +
+        # timestamp + uuid present) but whose schema has drifted (parentUuid removed → attribution
+        # impossible). The relay must probe a freshly-locked log BEFORE completion detection, or it
+        # would fire one automated poke before exit 7. Here we prove BOTH facts hold on one record,
+        # which is exactly why the schema_guard is placed after the lock and before done-detection.
+        done_but_drifted = [{"type": "assistant", "timestamp": "2026-08-23T00:00:00Z", "uuid": "u1",
+                             "message": {"role": "assistant",
+                                         "content": [{"type": "text", "text": "ok"}],
+                                         "stop_reason": "end_turn"}}]   # NOTE: no parentUuid
+        self.assertEqual(relay.schema_probe("claude", done_but_drifted)[0], "mismatch",
+                         "attribution key missing → mismatch")
+        a = self.a(allow=False)
+        _rows, bad = relay.schema_gate(a, {"claude": ("mismatch", "x"), "codex": ("unverified", "")})
+        self.assertTrue(relay.schema_fail_closed(a, bad),
+                        "such a log must fail the relay closed (guard runs before the poke)")
+
+
     def test_probe_log_schema_reads_the_pinned_log(self):
         with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
             for d in self.CLA_OK:
@@ -923,6 +941,20 @@ class SchemaProbe(unittest.TestCase):
         finally:
             os.unlink(path)
         self.assertEqual(relay.read_records("/no/such/file.jsonl"), [])
+
+
+class PlanApproval(unittest.TestCase):
+    OK = "[AIPAIR_PLAN_APPROVED]"
+
+    def test_extra_comment_comes_from_the_final_message_only(self):
+        # Regression (P1-c): a long preceding narration must NOT be read as an approval comment —
+        # the comment is the FINAL message minus its leading sentinel, not the whole turn joined.
+        self.assertEqual(relay.plan_extra_comment(["x" * 300, self.OK], self.OK), "",
+                         "narration before a sentinel-only final message → no付帯コメント (plain approve)")
+        self.assertEqual(relay.plan_extra_comment([self.OK + "\n細かい補足がある"], self.OK), "細かい補足がある")
+        self.assertEqual(relay.plan_extra_comment([], self.OK), "")
+        # the sentinel itself is stripped; surrounding punctuation trimmed
+        self.assertEqual(relay.plan_extra_comment([self.OK], self.OK), "")
 
 
 class DialogSendScrape(unittest.TestCase):
