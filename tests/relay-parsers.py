@@ -793,9 +793,14 @@ class SchemaProbe(unittest.TestCase):
                "parentUuid": None,
                "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}],
                            "stop_reason": "end_turn"}}]
-    # a well-formed completed Codex turn
+    # a FULL Codex turn — the probe latches ok only when started + user-metadata + complete are ALL
+    # present (P1-2: no early ok on partial evidence)
     COD_OK = [{"type": "session_meta", "payload": {"cwd": "/x"}},
-              {"type": "event_msg", "timestamp": "t", "payload": {"type": "task_complete", "turn_id": "T1"}}]
+              {"type": "event_msg", "timestamp": "t1", "payload": {"type": "task_started", "turn_id": "T1"}},
+              {"type": "response_item",
+               "payload": {"type": "message", "role": "user", "content": [{"text": "relay-id:ab"}],
+                           "internal_chat_message_metadata_passthrough": {"turn_id": "T1"}}},
+              {"type": "event_msg", "timestamp": "t2", "payload": {"type": "task_complete", "turn_id": "T1"}}]
 
     def test_claude_ok_on_a_well_formed_turn(self):
         st, _r = relay.schema_probe("claude", self.CLA_OK)
@@ -838,10 +843,21 @@ class SchemaProbe(unittest.TestCase):
                  self.CLA_OK[0]]
         self.assertEqual(relay.schema_probe("claude", mixed)[0], "ok")
 
-    def test_codex_ok_on_complete_or_started(self):
+    def test_codex_ok_needs_started_complete_and_user_metadata(self):
+        # ok ONLY when the full picture is present (started + complete + user-metadata turn_id)
         self.assertEqual(relay.schema_probe("codex", self.COD_OK)[0], "ok")
+        # partial evidence must NOT latch ok (it would stop later re-probing) → unverified
         started = [{"type": "event_msg", "timestamp": "t", "payload": {"type": "task_started", "turn_id": "T1"}}]
-        self.assertEqual(relay.schema_probe("codex", started)[0], "ok")  # same envelope proves it
+        self.assertEqual(relay.schema_probe("codex", started)[0], "unverified",
+                         "task_started alone is a mid-turn log — not yet compatible")
+        complete = [{"type": "event_msg", "timestamp": "t", "payload": {"type": "task_complete", "turn_id": "T1"}}]
+        self.assertEqual(relay.schema_probe("codex", complete)[0], "unverified",
+                         "task_complete alone (no started, no user metadata) → unverified")
+        started_complete_no_meta = [
+            {"type": "event_msg", "timestamp": "t1", "payload": {"type": "task_started", "turn_id": "T1"}},
+            {"type": "event_msg", "timestamp": "t2", "payload": {"type": "task_complete", "turn_id": "T1"}}]
+        self.assertEqual(relay.schema_probe("codex", started_complete_no_meta)[0], "unverified",
+                         "no user-metadata turn_id yet → attribution unproven → unverified")
 
     def test_codex_nascent_is_unverified(self):
         self.assertEqual(relay.schema_probe("codex", [])[0], "unverified")
@@ -874,9 +890,8 @@ class SchemaProbe(unittest.TestCase):
         self.assertEqual(relay.schema_probe("codex", user_no_turn)[0], "mismatch")
 
     def test_codex_completion_and_attribution_both_required_for_ok(self):
-        # both aspects must be positively present → ok; a fully-shaped completed turn carries turn_id
-        ok = [{"type": "event_msg", "timestamp": "t", "payload": {"type": "task_complete", "turn_id": "T1"}}]
-        self.assertEqual(relay.schema_probe("codex", ok)[0], "ok")
+        # both aspects must be positively present AND complete → ok
+        self.assertEqual(relay.schema_probe("codex", self.COD_OK)[0], "ok")
         # an old-shaped user item WITHOUT the passthrough key at all is NOT positive drift (stays
         # unverified until a turn_id-bearing task event appears) — a nascent log must not false-alarm
         nascent_userish = [{"type": "response_item",
@@ -887,6 +902,28 @@ class SchemaProbe(unittest.TestCase):
         self.assertEqual(relay.schema_probe("other", self.CLA_OK)[0], "unverified")
         self.assertEqual(relay.schema_probe("claude", ["not a dict", 5, None])[0], "unverified")
         self.assertEqual(relay.schema_probe("claude", None)[0], "unverified")
+
+    def test_claude_delivery_and_dialog_aspects_are_veto_only(self):
+        # P1-2: delivery confirmation (claude_input) + dialog resolution (claude_resolved) are
+        # probed as their own aspects, but they are VETO-ONLY — a well-formed turn stays ok even
+        # though these haven't occurred yet (unverified), while a positive drift in them fails closed.
+        self.assertEqual(relay.schema_probe("claude", self.CLA_OK)[0], "ok",
+                         "core turn ok; delivery/dialog unverified must not block ok")
+        # delivery ok evidence: a user input row with string content
+        deliv = self.CLA_OK + [{"type": "user", "message": {"role": "user", "content": "a poke"}}]
+        self.assertEqual(relay.schema_probe("claude", deliv)[0], "ok")
+        # delivery drift: a queue-operation whose content is not a string → mismatch (veto fires)
+        deliv_drift = self.CLA_OK + [{"type": "queue-operation", "operation": "enqueue",
+                                      "content": {"not": "a string"}}]
+        self.assertEqual(relay.schema_probe("claude", deliv_drift)[0], "mismatch")
+        # dialog ok: a tool_result-bearing user row
+        dialog_ok = self.CLA_OK + [{"type": "user",
+                                    "message": {"role": "user", "content": [{"type": "tool_result"}]}}]
+        self.assertEqual(relay.schema_probe("claude", dialog_ok)[0], "ok")
+        # dialog drift: tool_result content NOT under type==user → mismatch (veto fires)
+        dialog_drift = self.CLA_OK + [{"type": "assistant",
+                                       "message": {"role": "assistant", "content": [{"type": "tool_result"}]}}]
+        self.assertEqual(relay.schema_probe("claude", dialog_drift)[0], "mismatch")
 
     def test_schema_gate_mismatch_fails_closed_by_default(self):
         # default = fail-closed: the gate flags the drift (schema_mismatch) so the relay stops
