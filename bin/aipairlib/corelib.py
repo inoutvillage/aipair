@@ -141,21 +141,34 @@ def _schema_probe_codex(records):
 
 def schema_gate(a, probes):
     """probes = {agent: (status, reason)}. Returns (rows, bad): rows = [(name, status, reason)],
-    bad = agents whose status is "mismatch". On any mismatch and not a.allow_untested_schema, the
-    SAME safe posture as the version gate is applied (dialog automation OFF) AND a.schema_mismatch
-    is set so the relay can warn loudly that the core turn-detection schema drifted. "unverified"
-    never trips the gate (a fresh log is normal)."""
+    bad = agents whose status is "mismatch". A mismatch means the JSONL/rollout that the core relay
+    parses for turn-completion / response-attribution has drifted from what the relay knows how to
+    read — continuing to drive permission-bypassed agents off a mis-parsed log is not safe, so the
+    default is FAIL-CLOSED: the relay stops (exit 7). Only an explicit --allow-untested-schema /
+    AIPAIR_ALLOW_UNTESTED_SCHEMA opts into FAIL-OPEN, and even then dialog automation (which most
+    depends on exact schema) is turned OFF. Either way a.schema_mismatch is set so the relay warns
+    loudly. "unverified" never trips the gate (a fresh log with no turns yet is normal)."""
     rows, bad = [], []
     for name in ("claude", "codex"):
         status, reason = probes.get(name, ("unverified", ""))
         rows.append((name, status, reason))
         if status == "mismatch":
             bad.append(name)
-    if bad and not getattr(a, "allow_untested_schema", False):
-        a.no_plan_review = True
-        a.no_question_relay = True
+    if bad:
         a.schema_mismatch = True
+        if getattr(a, "allow_untested_schema", False):
+            # fail-open override: keep running but degrade the schema-sensitive dialog automation.
+            a.no_plan_review = True
+            a.no_question_relay = True
+        # without the override the caller (relay) fails closed and exits 7 — it does NOT continue.
     return rows, bad
+
+
+def schema_fail_closed(a, bad):
+    """True when a schema mismatch must STOP the relay (exit 7): there is drift (`bad` non-empty)
+    and no --allow-untested-schema / AIPAIR_ALLOW_UNTESTED_SCHEMA override. This is the single
+    place the default-fail-closed / explicit-fail-open policy is decided."""
+    return bool(bad) and not getattr(a, "allow_untested_schema", False)
 
 
 def head_line(text):

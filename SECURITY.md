@@ -18,7 +18,7 @@ aipair は **Claude Code と Codex CLI を tmux 上で並走させ、相互レ�
 ## 対象バージョン
 
 - セキュリティ修正は **`main` の最新**に対してのみ提供します（タグ付きリリース運用は今のところありません）。
-- Claude Code / Codex CLI の**検証済みバージョン**は README「必要環境」を参照。未検証版では版ゲート／schema ゲートが自動で安全側（TUI 自動操作 OFF）に倒れます。
+- Claude Code / Codex CLI の**検証済みバージョン**は README「必要環境」を参照。未検証版では版ゲートが安全側（TUI 自動操作 OFF）に倒れ、**ログ schema が不一致なら既定で fail-closed 停止（exit 7）**します（`--allow-untested-schema` で継続可）。
 
 ---
 
@@ -63,7 +63,7 @@ relay はエージェントのペインへキー入力（poke）を送ってタ�
 - **境界／緩和:**
   - relay は自ペアの解決済みペイン（`@aipair-*-pane` / ヒューリスティック）だけを poke し、`TMUX_PANE` 除外で自ペインを対象にしません。
   - 停止ワードは**最終メッセージ冒頭 100 字のみ**で判定（文中の偶発一致で止まらない）。
-  - **版ゲート／schema ゲート**が UI 変更・ログ形状ドリフトを検知して TUI 自動操作を OFF に倒します。
+  - **版ゲート**が UI 変更を検知して TUI 自動操作を OFF に倒し、**schema ゲート**はログ形状ドリフトを検知すると既定で **fail-closed 停止（exit 7）**します（誤帰属したログでの自律運転を止めるため。`--allow-untested-schema` で fail-open 継続）。
   - **停止ゲート**（`--gate`）で「停止ワード検知後に機械的検査（例: テスト）を通った時だけ停止／次へ」を強制できます。
 
 ### 4. 自律的な git / ネットワーク
@@ -116,7 +116,7 @@ becomes the OTHER agent's tool result, which its CLI uploads to that provider's 
 Claude-side history can reach OpenAI and Codex-side history can reach Anthropic (a cross-provider
 data flow inherent to pairing; aipair's own process opens no network connection); (3) the relay
 reads transcript **content** for turn/stop detection, so crafted text can mislead it (mitigated
-by leading-100-char stop matching, version/schema gates, and the optional `--gate`);
+by head-line-exact sentinel matching for stop/approval, version/schema gates (schema drift fails closed), and the optional `--gate`);
 (4) autonomous git push (aipair's notice blocks do NOT gate it — use a `pre-push` hook);
 (5) marker-bounded edits to global `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` (opt-out via
 `--no-global-instructions`). Out of scope: sandboxing the agents, a malicious same-uid local

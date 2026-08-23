@@ -105,6 +105,7 @@ detect_version = corelib.detect_version
 version_gate = corelib.version_gate
 schema_probe = corelib.schema_probe
 schema_gate = corelib.schema_gate
+schema_fail_closed = corelib.schema_fail_closed
 hit_stop = corelib.hit_stop
 head_line = corelib.head_line
 scrub_output = corelib.scrub_output
@@ -793,6 +794,7 @@ def main():
     ap.add_argument("--no-color", action="store_true")
     a = ap.parse_args()
     a.schema_mismatch = False   # set by schema_gate / schema_watch when core JSONL schema drifts
+    a.schema_stop = False       # fail-closed: a runtime schema mismatch (no override) stops the loop (exit 7)
 
     # argparse の choices は「コマンドラインで渡された値」しか検証しない。
     # env 由来の既定値は素通りするので、ここで明示的に弾く（無言で codex 扱いにしない）。
@@ -892,10 +894,13 @@ def main():
     if not a.no_schema_probe and not any(st != "unverified" for _n, st, _r in srows):
         log(c("dim", "ログschema=実行時に検査（起動時はピン待ち）"))
     if sbad:
-        log((c("dim", "  → --allow-untested-schema によりダイアログ自動操作は継続")
-             if a.allow_untested_schema else
-             c("warn", "  → ログschema不一致のためダイアログ自動操作を OFF"
-                       "（ターン検出の信頼性低下に注意。--allow-untested-schema で無効化）")))
+        if schema_fail_closed(a, sbad):
+            print(c("warn", "│ ■ ログschema がコア relay の依存と不一致 → fail-closed で停止（exit 7）。"
+                            "ターン検出・応答帰属が誤動作し得るため、権限バイパス下の自律運転は中止します。"
+                            "継続するなら --allow-untested-schema（AIPAIR_ALLOW_UNTESTED_SCHEMA=1）。"), flush=True)
+            print("\a", end="", flush=True)
+            return 7
+        log(c("dim", "  → --allow-untested-schema: fail-open で継続（ダイアログ自動操作は OFF）"))
     if a.endless:
         log(c("ok", "連続モード=on") + f"（「{stop_phrases[0] if stop_phrases else '[AIPAIR_REVIEW_OK]'}」＝レビュー合格→次のタスクへ）")
         log(f"  タスクリスト={a.task_list}  次を要求={'/'.join(next_ask_phrases)}  "
@@ -993,10 +998,12 @@ def main():
                                 "ターン検出が誤動作する可能性があります。claude/codex の版と"
                                 " TESTED schema を確認してください。"), flush=True)
                 print("\a", end="", flush=True)
-                if not a.allow_untested_schema:
-                    a.no_plan_review = True
+                a.schema_mismatch = True
+                if a.allow_untested_schema:
+                    a.no_plan_review = True       # fail-open: continue, degrade dialog automation
                     a.no_question_relay = True
-                    a.schema_mismatch = True
+                else:
+                    a.schema_stop = True          # fail-closed: stop the loop (exit 7)
             # "unverified" → leave unlatched, re-probe next iteration
 
     def wait_heartbeat(who):
@@ -1079,12 +1086,16 @@ def main():
 
     # 終了理由を exit code で区別する（外部 orchestrator が成否を判別できるように）:
     #   0=停止ワード検知（正常完了） 3=最大往復キャップ 4=poke配達失敗
-    #   5=プラン/質問リレー上限・選択肢欠落
+    #   5=プラン/質問リレー上限・選択肢欠落 6=停止ゲート失敗 7=ログschema不一致(fail-closed)
     code = 0
     all_done_hit = False
     try:
         while True:
             schema_watch()
+            if a.schema_stop:
+                print(c("warn", "│ ■ 実行時にログschema不一致を検出 → fail-closed で停止します（exit 7）。"), flush=True)
+                code = 7
+                break
             if state == "claude":
                 if tracked["claude"] is None:
                     tracked["claude"] = lock_claude(cwd, claude_seen, panes["claude"], baseline)
@@ -1412,7 +1423,7 @@ def main():
     # 終了後もタイトルで結果が分かるようにする（走行中と区別がつかないと、
     # 何時間も前に終わった relay を「まだ回っている」と誤読する）
     reason = {0: "全タスク完了" if all_done_hit else "停止ワード", 3: "キャップ到達",
-              4: "配達失敗", 5: "上限到達", 6: "停止ゲート失敗"}.get(code, f"exit={code}")
+              4: "配達失敗", 5: "上限到達", 6: "停止ゲート失敗", 7: "schema不一致"}.get(code, f"exit={code}")
     set_pane_title(own, f"relay ■ 終了({reason}) / {rounds}往復")
     return code
 
