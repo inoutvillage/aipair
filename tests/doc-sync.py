@@ -308,6 +308,38 @@ class Version(unittest.TestCase):
         self.assertIn("gh release create", wf, "release.yml must create the GitHub Release")
         self.assertIn("tags:", wf)   # triggered by a tag push
 
+    @staticmethod
+    def _extract_changelog_section(text, version):
+        # mirror release.yml's awk: STRING-match the『## [version]』header (so a SemVer +build's `+`
+        # is not treated as a regex metachar), take lines until the next『## [』, skip link defs.
+        out, grab = [], False
+        for ln in text.splitlines():
+            if ln.startswith("## [" + version + "]"):
+                grab = True
+                continue
+            if grab and ln.startswith("## ["):
+                break
+            if grab and re.match(r"^\[[^\]]+\]:", ln):
+                continue
+            if grab:
+                out.append(ln)
+        return "\n".join(out).strip()
+
+    def test_release_notes_extraction_handles_build_metadata(self):
+        rl = _read(".github/workflows/release.yml")
+        # must STRING-match the header, not embed the version into an awk REGEX (where a SemVer
+        # +build's `+` would be a metachar → the section never matches → empty release notes).
+        self.assertIn('index($0, "## [" v "]")', rl,
+                      "release.yml must string-match the CHANGELOG header (index), not regex-match the version")
+        self.assertNotIn('$0 ~ "^## ', rl, "release.yml must not embed the version into an awk regex")
+        # functional (mirrors the awk): a +build section extracts non-empty
+        synthetic = ("# Changelog\n\n## [1.2.3+build.5] - 2026-01-01\n\nnotes body\n\n"
+                     "## [1.2.2] - 2025-12-31\nold\n")
+        self.assertEqual(self._extract_changelog_section(synthetic, "1.2.3+build.5"), "notes body")
+        # and the real CHANGELOG's current version extracts non-empty
+        self.assertTrue(self._extract_changelog_section(_read("CHANGELOG.md"), aipairlib.__version__),
+                        "the current CHANGELOG section for __version__ must extract non-empty")
+
     def test_security_release_policy_is_consistent(self):
         # SECURITY.md must not keep the old「タグ付きリリース運用は今のところありません」that now
         # contradicts RELEASING.md / CHANGELOG / the release workflow.

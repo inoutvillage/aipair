@@ -27,7 +27,7 @@ jobs:
           set -eu
           VER="${GITHUB_REF_NAME#v}"
           awk -v v="$VER" '
-            $0 ~ "^## \\[" v "\\]" { grab=1; next }
+            index($0, "## [" v "]") == 1 { grab=1; next }   # STRING match: a SemVer +build must not be a regex
             grab && /^## \[/ { exit }
             grab && /^\[[^]]+\]:/ { next }   # skip the compare-link definitions
             grab { print }
