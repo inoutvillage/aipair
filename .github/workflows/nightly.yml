@@ -1,21 +1,22 @@
 name: nightly-smoke
 # The push/PR CI (ci.yml) MOCKS claude/codex — fast and hermetic, but blind to the real CLIs
-# changing under aipair. This nightly job installs the ACTUAL claude + codex from npm and runs
-# aipair's own installer smoke against them (a real 3-pane pair started with `--version` flags,
-# then torn down), so a breaking change in either CLI's startup / version output surfaces here.
-#
-# NOTE: the AUTHENTICATED end-to-end round-trip (a real poke → agent reply → relay) additionally
-# needs ANTHROPIC + OPENAI credentials as repo secrets + API budget. The `e2e` step below SKIPS
-# unless BOTH secrets are set; when they are, it starts a real pair in a throw-away dir, injects a
-# unique-nonce prompt, and requires all three of: claude replied with EXACTLY the nonce, codex
-# genuinely responded (non-empty last_agent_message in the poked turn — so an invalid OpenAI key
-# fails), and the relay poked claude back. It tears the session down either way (fail-closed).
+# changing under aipair. This nightly is split into two independent jobs so a failure says WHICH
+# thing broke:
+#   upstream-latest-smoke — installs the LATEST claude + codex from npm (no secrets) and checks
+#     they still install / print --version / start a 3-pane aipair pair. A red here = "an upstream
+#     CLI changed today", independent of aipair.
+#   authenticated-e2e — pins the TESTED_VERSIONS claude + codex and runs the real authenticated
+#     round-trip (needs ANTHROPIC + OPENAI repo secrets + API budget; SKIPS without them). A red
+#     here on a KNOWN-GOOD pinned version = "aipair's own round-trip regressed", independent of
+#     whatever upstream shipped. The round-trip requires all three of: claude replied with EXACTLY
+#     the nonce, codex genuinely responded (non-empty last_agent_message in the poked turn), and
+#     the relay poked claude back — torn down either way (fail-closed).
 on:
   schedule:
     - cron: '37 18 * * *'   # daily ~03:37 JST
   workflow_dispatch:
 jobs:
-  real-cli-smoke:
+  upstream-latest-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -51,6 +52,32 @@ jobs:
           # The installer's own smoke starts a real pair (AIPAIR_*_FLAGS=--version so no TUI),
           # asserts 3 panes on a throw-away session, then tears it down. The CI runner's default
           # tmux server is ephemeral, so no private-socket shim is needed here.
+          bash aipair-install.sh
+  authenticated-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'   # current Claude Code needs node >= 22 (engines); lts/* satisfies it
+      - name: Install the PINNED tested claude + codex (from TESTED_VERSIONS, not latest)
+        run: |
+          set -eux
+          # Pin to the versions aipair is VERIFIED against so a red here means aipair's round-trip
+          # regressed — not that upstream shipped something new today. Read the pins from the single
+          # source of truth (corelib.TESTED_VERSIONS) so they never drift from the code / README.
+          CV="$(python3 -c 'import sys; sys.path.insert(0,"bin"); from aipairlib.corelib import TESTED_VERSIONS as T; print(T["claude"])')"
+          XV="$(python3 -c 'import sys; sys.path.insert(0,"bin"); from aipairlib.corelib import TESTED_VERSIONS as T; print(T["codex"])')"
+          echo "pinning claude=$CV codex=$XV"
+          npm install -g "@anthropic-ai/claude-code@$CV" "@openai/codex@$XV"
+          claude --version | grep -qF "$CV" || { echo "claude pin mismatch: wanted $CV, got $(claude --version)" >&2; exit 1; }
+          codex --version | grep -qF "$XV" || { echo "codex pin mismatch: wanted $XV, got $(codex --version)" >&2; exit 1; }
+      - name: Install tmux
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux
+      - name: aipair install (+ smoke) against the pinned CLIs
+        run: |
+          set -eux
           bash aipair-install.sh
       - name: Authenticated end-to-end (opt-in; needs BOTH secrets)
         env:
