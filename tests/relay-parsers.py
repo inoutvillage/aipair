@@ -941,14 +941,35 @@ class SchemaProbe(unittest.TestCase):
                                        "message": {"role": "assistant", "content": [{"type": "tool_result"}]}}]
         self.assertEqual(relay.schema_probe("claude", dialog_drift)[0], "mismatch")
 
-    def test_claude_delivery_text_block_input_is_drift(self):
-        # Regression: a user input row whose content became a TEXT-BLOCK ARRAY (not a string) is a
-        # delivery drift — claude_input() confirms delivery by matching a STRING content, so it
-        # can't see this shape. Must be mismatch, not a silent ok.
-        drift = self.CLA_OK + [{"type": "user",
+    def test_claude_delivery_drift_only_for_a_typed_input(self):
+        # A TYPED human input (promptSource / origin.kind==human) whose content became a text-block
+        # array is a delivery drift — claude_input() matches a STRING content, so it can't see it.
+        typed = self.CLA_OK + [{"type": "user", "promptSource": "typed",
                                 "message": {"role": "user",
                                             "content": [{"type": "text", "text": "relay-id:x"}]}}]
-        self.assertEqual(relay.schema_probe("claude", drift)[0], "mismatch")
+        self.assertEqual(relay.schema_probe("claude", typed)[0], "mismatch")
+        typed2 = self.CLA_OK + [{"type": "user", "origin": {"kind": "human"},
+                                 "message": {"role": "user", "content": [{"type": "text", "text": "x"}]}}]
+        self.assertEqual(relay.schema_probe("claude", typed2)[0], "mismatch")
+
+    def test_claude_delivery_does_not_false_stop_on_normal_text_block_rows(self):
+        # Regression (Codex): text-block user rows are NORMAL in real Claude JSONL — isMeta skill
+        # injections, `[Request interrupted by user]` (interruptedMessageId), image attachments, and
+        # rows without typed-input markers. None of these must become a delivery mismatch (they
+        # would false-stop the loop with exit 7 during normal operation).
+        def probe(row):
+            return relay.schema_probe("claude", self.CLA_OK + [row])[0]
+        text = [{"type": "text", "text": "hi"}]
+        self.assertEqual(probe({"type": "user", "isMeta": True, "promptSource": "typed",
+                                "message": {"role": "user", "content": text}}), "ok", "isMeta injection")
+        self.assertEqual(probe({"type": "user", "interruptedMessageId": "msg_1",
+                                "message": {"role": "user", "content": text}}), "ok", "interrupt row")
+        self.assertEqual(probe({"type": "user", "promptSource": "typed",
+                                "message": {"role": "user",
+                                            "content": [{"type": "text", "text": "see"},
+                                                        {"type": "image"}]}}), "ok", "image attachment")
+        self.assertEqual(probe({"type": "user",
+                                "message": {"role": "user", "content": text}}), "ok", "no typed markers")
 
     def test_schema_gate_mismatch_fails_closed_by_default(self):
         # default = fail-closed: the gate flags the drift (schema_mismatch) so the relay stops

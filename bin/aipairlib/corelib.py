@@ -132,13 +132,20 @@ def _claude_delivery(records):
             if isinstance(c, str):
                 ok = True
             elif isinstance(c, list):
-                # claude_input は user 行の content を《文字列》として配達確認する。tool_result を
-                # 持つ行は dialog resolution（別 aspect）なので対象外だが、text block 配列に変わった
-                # 通常の入力行は claude_input が読めない＝配達確認不能の positive drift（Codex 指摘）。
-                has_tr = any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c)
-                has_text = any(isinstance(b, dict) and b.get("type") == "text" for b in c)
-                if has_text and not has_tr:
-                    drift = drift or "user 入力行の content が文字列でなく text block 配列（claude_input が配達確認不能）"
+                # claude_input は user 行の content を《文字列》として配達確認する。text block 配列の
+                # user 行は正常ログにも多い（isMeta の skill 注入・`[Request interrupted by user]`
+                # 割り込み行・画像添付・tool_result）ので、これらを drift 扱いすると誤停止する（Codex
+                # 指摘・実ログで多数）。drift とみなすのは《実タイプ入力》— origin.kind=="human" or
+                # promptSource あり — が isMeta/割り込みでなく、content が text ブロックのみ（画像等
+                # 他種ブロックを含まない）に化けたケースだけ。これなら claude_input が読めず配達確認
+                # 不能＝真のドリフト。
+                origin = d.get("origin")
+                is_typed = (d.get("promptSource") is not None
+                            or (isinstance(origin, dict) and origin.get("kind") == "human"))
+                is_excluded = bool(d.get("isMeta")) or d.get("interruptedMessageId") is not None
+                block_types = {b.get("type") for b in c if isinstance(b, dict)}
+                if is_typed and not is_excluded and block_types == {"text"}:
+                    drift = drift or "typed 入力行の content が文字列でなく text ブロック（claude_input が配達確認不能）"
     if drift:
         return ("mismatch", drift)
     return ("ok", "claude 入力行（文字列 content）確認") if ok else ("unverified", "Claude 入力行 未出現")
