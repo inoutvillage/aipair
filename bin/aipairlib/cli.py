@@ -70,6 +70,11 @@ def build_parser(description=""):
                     help="endless: Claude 側の手持ちが尽きた合図 sentinel（default [AIPAIR_NEXT] / env AIPAIR_NEXT_ASK）")
     ap.add_argument("--all-done", default=_env_str("AIPAIR_ALL_DONE", "[AIPAIR_ALL_DONE]"),
                     help="endless: Codex 側が残タスク無しを宣言する終端 sentinel（default [AIPAIR_ALL_DONE] / env AIPAIR_ALL_DONE）")
+    ap.add_argument("--human-required",
+                    default=_env_str("AIPAIR_HUMAN_REQUIRED", "[AIPAIR_HUMAN_REQUIRED]"),
+                    help="endless: Codex 側が『残りは人間対応・外部依存の [!] のみ』を宣言する終端 sentinel。"
+                         "relay の task-list 分類が BLOCKED の時のみ honor し exit 8 で停止する"
+                         "（default [AIPAIR_HUMAN_REQUIRED] / env AIPAIR_HUMAN_REQUIRED）")
     ap.add_argument("--task-list", default=_env_str("AIPAIR_TASK_LIST", "tasks/todo.md"),
                     help="endless: 次タスクの唯一の根拠にするタスクリスト（default tasks/todo.md / env AIPAIR_TASK_LIST）")
     ap.add_argument("--gate", default=_env_str("AIPAIR_GATE", None),
