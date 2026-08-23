@@ -121,6 +121,7 @@ turn_texts = loglib.turn_texts
 find_poke_ts = loglib.find_poke_ts
 codex_response_complete = loglib.codex_response_complete
 latest_compact_boundary = loglib.latest_compact_boundary
+records_since_compaction = loglib.records_since_compaction
 claude_response_attributed = loglib.claude_response_attributed
 make_fragment = loglib.make_fragment
 read_records = loglib.read_records
@@ -131,7 +132,12 @@ def probe_log_schema(agent, path):
     ('unverified', 'ログ未特定') when no log is pinned yet. Bounded read (loglib.read_records)."""
     if not path:
         return ("unverified", "ログ未特定")
-    return schema_probe(agent, read_records(path))
+    records = read_records(path)
+    if agent == "claude":
+        # compaction 後の新世代は《最新 compact_boundary 以降》のみを検査する。さもないと境界前の
+        # malformed レコードを reset 後も拾い、即 terminal mismatch に戻る（P1-4/Codex）。
+        records = records_since_compaction(records)
+    return schema_probe(agent, records)
 
 
 # tmuxlib (tmux runner + pane helpers)
