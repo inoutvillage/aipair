@@ -107,6 +107,7 @@ schema_probe = corelib.schema_probe
 schema_gate = corelib.schema_gate
 schema_fail_closed = corelib.schema_fail_closed
 schema_latch_step = corelib.schema_latch_step
+schema_should_reprobe = corelib.schema_should_reprobe
 hit_stop = corelib.hit_stop
 head_line = corelib.head_line
 scrub_output = corelib.scrub_output
@@ -987,20 +988,29 @@ def main():
     last_rejected = None       # 帰属棄却した完了 ts（棄却ログを完了値ごと1回に抑制）
     schema_latched = {"claude": None, "codex": None}   # runtime JSONL schema latch: None→"ok-seen"（監視継続）／"mismatch"（終端）
     schema_sig = {"claude": None, "codex": None}       # 最後に probe した (path, size)。変化無ければ再読込しない（増分 probe）
+    schema_lpath = {"claude": None, "codex": None}     # latch/sig が対象とするログ path（P1-4: 切替で latch リセット）
 
     def schema_watch():
         """Once per agent, probe the tracked transcript for the core schema the relay reads
         (turn-completion keys). An `aipair loop` has no log at startup, so this — not the
         startup banner — is where real drift is caught, the first time a pinned log has turns.
-        Latches per agent (probe cost is paid only until each side resolves ok/mismatch); a
-        mismatch warns loudly + rings the bell and, unless --allow-untested-schema, falls to the
-        version gate's safe posture (dialogs off)."""
+        Latches per (agent, tracked log path): a terminal "mismatch" latch pertains to ONE log,
+        so when the tracked log switches (resume/clear/restart/rotation) the latch resets and the
+        NEW log is re-probed. A mismatch warns loudly + rings the bell and, unless
+        --allow-untested-schema, falls to the version gate's safe posture (dialogs off)."""
         if a.no_schema_probe:
             return
         for agent in ("claude", "codex"):
-            # "mismatch" は終端。"ok-seen"/None は監視継続（veto-only の delivery/dialog が後から
-            # ドリフトするのを捕捉するため ok でも latch しない — P1-b）。
-            if schema_latched[agent] == "mismatch" or not tracked[agent]:
+            if not tracked[agent]:
+                continue
+            # P1-4: 追跡ログ path が切り替わった（resume/clear/再起動/rotation）ら latch/sig を
+            # 破棄して新ログを未確認から再 probe。"mismatch" は同一ログ内では終端（skip）。
+            reset, skip = schema_should_reprobe(schema_latched[agent], schema_lpath[agent], tracked[agent])
+            if reset:
+                schema_latched[agent] = None
+                schema_sig[agent] = None
+                schema_lpath[agent] = tracked[agent]
+            if skip:
                 continue
             # 増分 probe: 追跡ログの (path, size) が前回と同じ＝新規追記が無い → 巨大ログの
             # 全再読込を避けて skip（path 変化＝resume/rotation は size も変わるので再 probe される）。

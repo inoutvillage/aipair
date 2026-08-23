@@ -1096,13 +1096,24 @@ class SchemaLatchStep(unittest.TestCase):
         self.assertEqual(relay.schema_latch_step(None, "unverified", False), (None, "none"))
         self.assertEqual(relay.schema_latch_step("ok-seen", "unverified", False), ("ok-seen", "none"))
 
-    def test_schema_watch_does_not_go_terminal_on_ok(self):
-        # source guard: schema_watch must only `continue` (skip) an agent whose latch is "mismatch"
-        # — never on "ok"/"ok-seen" — so late veto-aspect drift is still probed.
+    def test_schema_reprobe_resets_a_terminal_mismatch_when_the_log_switches(self):
+        # P1-4: the latch is per (agent, tracked log path). A terminal "mismatch" pertains to ONE
+        # log; when the tracked log switches (resume/clear/restart/rotation) the latch must reset so
+        # the NEW log is re-probed — otherwise a fresh, healthy log is never looked at again.
+        self.assertEqual(relay.schema_should_reprobe("mismatch", "A.jsonl", "A.jsonl"), (False, True),
+                         "same log + terminal mismatch → skip")
+        self.assertEqual(relay.schema_should_reprobe("mismatch", "A.jsonl", "B.jsonl"), (True, False),
+                         "NEW log → reset the mismatch latch and re-probe")
+        self.assertEqual(relay.schema_should_reprobe("ok-seen", "A.jsonl", "A.jsonl"), (False, False),
+                         "same log, ok-seen → keep probing (veto aspects)")
+        self.assertEqual(relay.schema_should_reprobe("ok-seen", "A.jsonl", "B.jsonl"), (True, False),
+                         "NEW log → reset and re-probe from scratch")
+        self.assertEqual(relay.schema_should_reprobe(None, None, "A.jsonl"), (True, False),
+                         "first path pinned → treat as a switch (probe it)")
+        # wiring guard: schema_watch actually consults the per-path reset (not bypassed)
         with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
             src = fh.read()
-        self.assertIn('if schema_latched[agent] == "mismatch" or not tracked[agent]:', src,
-                      "schema_watch must keep probing after ok (only mismatch is terminal)")
+        self.assertIn("schema_should_reprobe(schema_latched[agent], schema_lpath[agent], tracked[agent])", src)
 
 
 class SchemaGuardOrdering(unittest.TestCase):
