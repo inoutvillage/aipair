@@ -941,6 +941,15 @@ class SchemaProbe(unittest.TestCase):
                                        "message": {"role": "assistant", "content": [{"type": "tool_result"}]}}]
         self.assertEqual(relay.schema_probe("claude", dialog_drift)[0], "mismatch")
 
+    def test_claude_delivery_text_block_input_is_drift(self):
+        # Regression: a user input row whose content became a TEXT-BLOCK ARRAY (not a string) is a
+        # delivery drift — claude_input() confirms delivery by matching a STRING content, so it
+        # can't see this shape. Must be mismatch, not a silent ok.
+        drift = self.CLA_OK + [{"type": "user",
+                                "message": {"role": "user",
+                                            "content": [{"type": "text", "text": "relay-id:x"}]}}]
+        self.assertEqual(relay.schema_probe("claude", drift)[0], "mismatch")
+
     def test_schema_gate_mismatch_fails_closed_by_default(self):
         # default = fail-closed: the gate flags the drift (schema_mismatch) so the relay stops
         # (exit 7). It does NOT silently degrade-and-continue, so it must not force dialogs off here.
@@ -1021,6 +1030,24 @@ class SchemaProbe(unittest.TestCase):
         finally:
             os.unlink(path)
         self.assertEqual(relay.read_records("/no/such/file.jsonl"), [])
+
+    def test_read_records_seeks_the_tail_not_the_whole_file(self):
+        # Perf regression: read_records must read only the TAIL window, not scan a huge file from
+        # the start every probe. Write a large log and read with a small tail_bytes; only the last
+        # records in that window come back, and the partial leading line is dropped cleanly.
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            for i in range(20000):
+                fh.write(json.dumps({"type": "event_msg", "i": i}) + "\n")
+            path = fh.name
+        try:
+            recs = relay.read_records(path, tail_lines=5)
+            self.assertEqual([d.get("i") for d in recs], [19995, 19996, 19997, 19998, 19999])
+            # a tiny byte window still yields valid records (no half-line JSON errors leaking out)
+            tail = relay.read_records(path, tail_lines=800, tail_bytes=2000)
+            self.assertTrue(tail and all(isinstance(d, dict) and "i" in d for d in tail))
+            self.assertLess(len(tail), 800, "the 2000-byte window holds far fewer than 800 lines")
+        finally:
+            os.unlink(path)
 
 
 class SchemaLatchStep(unittest.TestCase):

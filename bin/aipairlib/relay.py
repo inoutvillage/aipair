@@ -986,6 +986,7 @@ def main():
     POKE_NOSHOW = 1800         # nonce がログに現れないまま諦めるまでの秒数
     last_rejected = None       # 帰属棄却した完了 ts（棄却ログを完了値ごと1回に抑制）
     schema_latched = {"claude": None, "codex": None}   # runtime JSONL schema latch: None→"ok-seen"（監視継続）／"mismatch"（終端）
+    schema_sig = {"claude": None, "codex": None}       # 最後に probe した (path, size)。変化無ければ再読込しない（増分 probe）
 
     def schema_watch():
         """Once per agent, probe the tracked transcript for the core schema the relay reads
@@ -1001,6 +1002,15 @@ def main():
             # ドリフトするのを捕捉するため ok でも latch しない — P1-b）。
             if schema_latched[agent] == "mismatch" or not tracked[agent]:
                 continue
+            # 増分 probe: 追跡ログの (path, size) が前回と同じ＝新規追記が無い → 巨大ログの
+            # 全再読込を避けて skip（path 変化＝resume/rotation は size も変わるので再 probe される）。
+            try:
+                sig = (tracked[agent], os.path.getsize(tracked[agent]))
+            except OSError:
+                sig = None
+            if sig is not None and schema_sig[agent] == sig:
+                continue
+            schema_sig[agent] = sig
             status, reason = probe_log_schema(agent, tracked[agent])
             schema_latched[agent], action = schema_latch_step(
                 schema_latched[agent], status, a.allow_untested_schema)

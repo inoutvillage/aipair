@@ -128,9 +128,17 @@ def _claude_delivery(records):
                 drift = drift or "queue-operation に文字列 content が無い（配達確認不能）"
         elif t == "user":
             msg = d.get("message") if isinstance(d.get("message"), dict) else None
-            if isinstance(msg.get("content") if msg else None, str):
+            c = msg.get("content") if msg else None
+            if isinstance(c, str):
                 ok = True
-            # list content（tool_result）は dialog resolution 側で見るのでここでは数えない
+            elif isinstance(c, list):
+                # claude_input は user 行の content を《文字列》として配達確認する。tool_result を
+                # 持つ行は dialog resolution（別 aspect）なので対象外だが、text block 配列に変わった
+                # 通常の入力行は claude_input が読めない＝配達確認不能の positive drift（Codex 指摘）。
+                has_tr = any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c)
+                has_text = any(isinstance(b, dict) and b.get("type") == "text" for b in c)
+                if has_text and not has_tr:
+                    drift = drift or "user 入力行の content が文字列でなく text block 配列（claude_input が配達確認不能）"
     if drift:
         return ("mismatch", drift)
     return ("ok", "claude 入力行（文字列 content）確認") if ok else ("unverified", "Claude 入力行 未出現")
