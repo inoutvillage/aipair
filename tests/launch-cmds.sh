@@ -105,8 +105,8 @@ chk "$(run loop bridge 'AIPAIR_STOP=' | sed -n '5p')" "[[AIPAIR_REVIEW_OK]]" "em
 chk "$(run loop bridge 'AIPAIR_MAX_ROUNDS=100' 'AIPAIR_STOP_SIDE=both' | sed -n '3p;7p' | paste -sd' ')" "[100] [both]" "max-rounds / stop-side pass through"
 
 echo "# [3] endless mode"
-chk "$(run loop bridge AIPAIR_ENDLESS=1 'AIPAIR_TASK_LIST=my tasks/todo list.md' 'AIPAIR_ALL_DONE=all done!' | sed -n '8,14p')" \
-    "[--endless]${J}[--task-list]${J}[my tasks/todo list.md]${J}[--next-ask]${J}[[AIPAIR_NEXT]]${J}[--all-done]${J}[all done!]" "endless args, spaces and ! intact"
+chk "$(run loop bridge AIPAIR_ENDLESS=1 'AIPAIR_TASK_LIST=my tasks/todo list.md' 'AIPAIR_ALL_DONE=all done!' | sed -n '8,16p')" \
+    "[--endless]${J}[--task-list]${J}[my tasks/todo list.md]${J}[--next-ask]${J}[[AIPAIR_NEXT]]${J}[--all-done]${J}[all done!]${J}[--human-required]${J}[[AIPAIR_HUMAN_REQUIRED]]" "endless args (incl. --human-required), spaces and ! intact"
 for off in 0 false no off; do
   chk "$(run loop bridge "AIPAIR_ENDLESS=$off" | grep -c -- '--endless' || true)" "0" "AIPAIR_ENDLESS=$off means off (as README promises)"
 done

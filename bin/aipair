@@ -282,7 +282,8 @@ if [ "$cmd" = loop ]; then
   if env_on "${AIPAIR_ENDLESS:-}"; then
     bridge+=(--endless --task-list "${AIPAIR_TASK_LIST:-tasks/todo.md}"
              --next-ask "${AIPAIR_NEXT_ASK:-[AIPAIR_NEXT]}"
-             --all-done "${AIPAIR_ALL_DONE:-[AIPAIR_ALL_DONE]}")
+             --all-done "${AIPAIR_ALL_DONE:-[AIPAIR_ALL_DONE]}"
+             --human-required "${AIPAIR_HUMAN_REQUIRED:-[AIPAIR_HUMAN_REQUIRED]}")
     BRIDGE_TITLE="relay ● endless / max ${AIPAIR_MAX_ROUNDS:-20} / 終端 ${AIPAIR_ALL_DONE:-[AIPAIR_ALL_DONE]} / Ctrl-C で停止"
   fi
   # A pre-existing tmux server does NOT pass this process's env to the new session, so
@@ -332,7 +333,7 @@ CODEX_LINE="clear; env AI_SELF=codex AI_PEER=claude $PAIR_PINS codex $CODEX_FLAG
 # earlier run; without pinning, `AIPAIR_GATE= aipair loop` could still run yesterday's
 # gate, and a stale invalid int would make the relay exit 2 before argparse even ran.
 RELAY_ENV_VARS=(AIPAIR_STOP AIPAIR_STOP_SIDE AIPAIR_MAX_ROUNDS AIPAIR_ENDLESS
-                AIPAIR_TASK_LIST AIPAIR_NEXT_ASK AIPAIR_ALL_DONE
+                AIPAIR_TASK_LIST AIPAIR_NEXT_ASK AIPAIR_ALL_DONE AIPAIR_HUMAN_REQUIRED
                 AIPAIR_GATE AIPAIR_GATE_TIMEOUT AIPAIR_GATE_ROUNDS
                 AIPAIR_ALLOW_UNTESTED_DIALOGS AIPAIR_NO_VERSION_GATE
                 AIPAIR_ALLOW_UNTESTED_SCHEMA AIPAIR_NO_SCHEMA_PROBE)

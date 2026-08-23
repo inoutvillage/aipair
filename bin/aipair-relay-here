@@ -20,6 +20,7 @@
 # env が bridge に届かないため、ここでフラグへ展開して渡す。--print で結果を確認できる:
 #   AIPAIR_MAX_ROUNDS  最大往復数        AIPAIR_STOP / AIPAIR_STOP_SIDE  停止ワードと判定側
 #   AIPAIR_ENDLESS     連続モード(1でon)  AIPAIR_TASK_LIST / AIPAIR_NEXT_ASK / AIPAIR_ALL_DONE
+#   AIPAIR_HUMAN_REQUIRED  人間対応待ち終端 sentinel（分類 BLOCKED 時のみ honor）
 #   AIPAIR_GATE / AIPAIR_GATE_TIMEOUT / AIPAIR_GATE_ROUNDS  停止ゲート
 #   AIPAIR_ALLOW_UNTESTED_DIALOGS / AIPAIR_NO_VERSION_GATE  版ゲート
 #   AIPAIR_ALLOW_UNTESTED_SCHEMA / AIPAIR_NO_SCHEMA_PROBE  JSONL schema ゲート
@@ -193,6 +194,9 @@ fi
 if [ -n "${AIPAIR_ALL_DONE:-}" ] && ! has_extra --all-done; then
   ENV_ARGS+=(--all-done "$AIPAIR_ALL_DONE")
 fi
+if [ -n "${AIPAIR_HUMAN_REQUIRED:-}" ] && ! has_extra --human-required; then
+  ENV_ARGS+=(--human-required "$AIPAIR_HUMAN_REQUIRED")
+fi
 # gate / version-gate env (same reason as endless above: send-keys drops the caller's env)
 # Trim only leading/trailing whitespace (like relay's _env_bool and aipair's env_on) — NOT
 # all inner spaces, or "f alse" would read as false while the relay reads it as true.
@@ -215,7 +219,7 @@ if [ -n "${AIPAIR_GATE_ROUNDS:-}" ]  && ! has_extra --gate-rounds;  then ENV_ARG
 # bin/aipair; see there). Then append the flag translations and any explicit EXTRA flags.
 RELAY_ENV=()
 for v in AIPAIR_STOP AIPAIR_STOP_SIDE AIPAIR_MAX_ROUNDS AIPAIR_ENDLESS \
-         AIPAIR_TASK_LIST AIPAIR_NEXT_ASK AIPAIR_ALL_DONE \
+         AIPAIR_TASK_LIST AIPAIR_NEXT_ASK AIPAIR_ALL_DONE AIPAIR_HUMAN_REQUIRED \
          AIPAIR_GATE AIPAIR_GATE_TIMEOUT AIPAIR_GATE_ROUNDS \
          AIPAIR_ALLOW_UNTESTED_DIALOGS AIPAIR_NO_VERSION_GATE \
          AIPAIR_ALLOW_UNTESTED_SCHEMA AIPAIR_NO_SCHEMA_PROBE; do
