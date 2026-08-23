@@ -4,9 +4,10 @@ All notable changes to aipair are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and aipair uses
 [Semantic Versioning](https://semver.org/). The version below is the single source of truth
 `aipairlib.__version__`; a release is the git tag `v<version>` and its GitHub Release (see
-[RELEASING.md](RELEASING.md)). The top version section is whatever `__version__` currently is — it
-gets a date **when its `v<version>` tag is pushed**; until then it is the release being prepared.
-`tests/doc-sync.py` enforces that this section matches `__version__`.
+[RELEASING.md](RELEASING.md)). The top `## [X.Y.Z] — unreleased` section is the release being
+prepared (`aipairlib.__version__`); its **date is filled in in the release commit, right before the
+`v<version>` tag is pushed** (a fresh `## [Unreleased]` is then added above for the next cycle).
+`tests/doc-sync.py` enforces that this top version section equals `__version__`.
 
 ## [0.1.0] — unreleased (prepared; published when the `v0.1.0` tag is pushed)
 

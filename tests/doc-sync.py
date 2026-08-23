@@ -312,8 +312,11 @@ class Version(unittest.TestCase):
         # contradicts RELEASING.md / CHANGELOG / the release workflow.
         self.assertNotIn("タグ付きリリース運用は今のところありません", SECURITY,
                          "SECURITY.md still says there is no tagged-release operation — update the 対象バージョン policy")
-        self.assertIn("RELEASING.md", SECURITY,
-                      "SECURITY.md 対象バージョン policy must point at the release process (RELEASING.md)")
+        # link to the release process, and with the CORRECT relative path (both files are at repo
+        # root, so ../RELEASING.md would be broken).
+        self.assertIn("(RELEASING.md)", SECURITY,
+                      "SECURITY.md must link the release process as (RELEASING.md) — same-dir relative path")
+        self.assertNotIn("(../RELEASING.md)", SECURITY, "broken link: SECURITY.md and RELEASING.md are both at repo root")
 
 
 if __name__ == "__main__":
