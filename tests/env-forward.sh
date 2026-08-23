@@ -20,10 +20,10 @@ printf '#!/usr/bin/env bash\nexit 0\n' > "$W/bin/claude"; cp "$W/bin/claude" "$W
 cat > "$W/bin/aipair-relay" <<SHIM
 #!/usr/bin/env bash
 { printf 'ARGV: %s\\n' "\$*"
-  printf 'GATE=[%s] NVG=[%s] AUD=[%s] TIMEOUT=[%s] ROUNDS=[%s] AUS=[%s] NSP=[%s]\\n' \\
+  printf 'GATE=[%s] NVG=[%s] AUD=[%s] TIMEOUT=[%s] ROUNDS=[%s] AUS=[%s] NSP=[%s] HR=[%s]\\n' \\
     "\${AIPAIR_GATE:-}" "\${AIPAIR_NO_VERSION_GATE:-}" "\${AIPAIR_ALLOW_UNTESTED_DIALOGS:-}" \\
     "\${AIPAIR_GATE_TIMEOUT:-}" "\${AIPAIR_GATE_ROUNDS:-}" \\
-    "\${AIPAIR_ALLOW_UNTESTED_SCHEMA:-}" "\${AIPAIR_NO_SCHEMA_PROBE:-}"
+    "\${AIPAIR_ALLOW_UNTESTED_SCHEMA:-}" "\${AIPAIR_NO_SCHEMA_PROBE:-}" "\${AIPAIR_HUMAN_REQUIRED:-}"
 } > $W/relay-argv
 SHIM
 chmod +x "$W"/bin/*
@@ -105,6 +105,9 @@ if wait_file "$W/relay-argv"; then
   argv="$(cat "$W/relay-argv")"
   n=$((n+1)); if printf '%s' "$argv" | grep -qF -- "[STALE_HR]"; then echo "FAIL stale AIPAIR_HUMAN_REQUIRED leaked into argv: $argv"; fail=1; else echo "ok   stale AIPAIR_HUMAN_REQUIRED did not leak into --human-required"; fi
   chk_has "$argv" "--human-required [AIPAIR_HUMAN_REQUIRED]" "empty caller → default HR sentinel (not the server's stale value)"
+  # the relay's ENV for AIPAIR_HUMAN_REQUIRED must be neutralized by RELAY_ENV_VARS — HR=[] proves
+  # the env pin (not just the flag default) overrode the server's stale value.
+  chk_has "$argv" "HR=[]" "relay env AIPAIR_HUMAN_REQUIRED neutralized (server held '[STALE_HR]')"
 else n=$((n+1)); echo "FAIL aipair loop (endless stale HR): relay never launched"; fail=1; fi
 reset_server
 # a CUSTOM value on the aipair loop path reaches argv (proves bin/aipair's bridge wiring, not only relay-here)
@@ -113,7 +116,9 @@ rm -f "$W/relay-argv"
 AIPAIR_ENDLESS=1 AIPAIR_HUMAN_REQUIRED='[CUSTOM_HR]' AIPAIR_CLAUDE_FLAGS='' AIPAIR_CODEX_FLAGS='' \
   AIPAIR_UNSAFE=1 timeout 8 script -qec "aipair loop '$W/proj'" /dev/null >/dev/null 2>&1 || true
 if wait_file "$W/relay-argv"; then
-  chk_has "$(cat "$W/relay-argv")" "--human-required [CUSTOM_HR]" "aipair loop forwards a custom AIPAIR_HUMAN_REQUIRED to argv"
+  argv="$(cat "$W/relay-argv")"
+  chk_has "$argv" "--human-required [CUSTOM_HR]" "aipair loop forwards a custom AIPAIR_HUMAN_REQUIRED to argv"
+  chk_has "$argv" "HR=[[CUSTOM_HR]]" "relay env AIPAIR_HUMAN_REQUIRED pinned to the custom value"
 else n=$((n+1)); echo "FAIL aipair loop (endless custom HR): relay never launched"; fail=1; fi
 reset_server
 
