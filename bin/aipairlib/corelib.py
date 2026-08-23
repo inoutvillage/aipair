@@ -253,11 +253,22 @@ def _codex_attribution(records):
             else:
                 drift = drift or "%s に turn_id が無い（応答帰属の対応付け不能）" % ptype
         elif d.get("type") == "response_item" and ptype == "message" and p.get("role") == "user":
+            # codex_response_complete は「nonce を含む TEXT の user response_item」から turn_id を
+            # 読む。テキストを持つ実 user メッセージ（＝relay の poke が着地した行）が
+            # metadata.turn_id を欠くのは帰属不能の積極ドリフト（passthrough キー自体の有無に
+            # かかわらず mismatch）。Codex 指摘: 完全ターンで metadata 欠落を unverified にすると
+            # ブロックされず帰属不能スキーマで走り続けてしまう。
+            content = p.get("content")
+            has_text = isinstance(content, list) and any(
+                isinstance(b, dict) and isinstance(b.get("text"), str) for b in content)
+            if not has_text:
+                continue
             meta = p.get("internal_chat_message_metadata_passthrough")
-            if isinstance(meta, dict) and meta.get("turn_id") is not None:
+            tid = meta.get("turn_id") if isinstance(meta, dict) else None
+            if tid is not None:
                 user_ok = True
-            elif isinstance(meta, dict):
-                drift = drift or "user response_item の metadata に turn_id が無い（帰属不能）"
+            else:
+                drift = drift or "text の user response_item に metadata.turn_id が無い（帰属不能）"
     if drift:
         return ("mismatch", drift)
     if event_ok and user_ok:
@@ -301,6 +312,25 @@ def schema_fail_closed(a, bad):
     and no --allow-untested-schema / AIPAIR_ALLOW_UNTESTED_SCHEMA override. This is the single
     place the default-fail-closed / explicit-fail-open policy is decided."""
     return bool(bad) and not getattr(a, "allow_untested_schema", False)
+
+
+def schema_latch_step(current, status, allow_untested):
+    """一エージェントの runtime schema 監視を進める1ステップ。`current` は latch 状態
+    (None=未確認 / 'ok-seen'=ok を観測済みだが監視継続 / 'mismatch'=確定・終端)、`status` は
+    今回の集約 probe 結果。戻り値は (new_latch, action) で action ∈ {'stop','degrade','ok','none'}。
+
+    🔴 P1-b の要点: 'ok' は**終端ではない**。delivery/dialog は veto-only で「その動作が起きた時
+    だけ観測できる」ため、ok 到達後も **latch せず probe を続ける**（'ok-seen' は再 probe を許す
+    状態）。こうして後から dialog が発生してスキーマがドリフトした時にも mismatch を捕捉できる。
+    終端は 'mismatch' のみ（fail-closed なら stop、override なら degrade して継続）。"""
+    if current == "mismatch":
+        return ("mismatch", "none")
+    if status == "mismatch":
+        return ("mismatch", "degrade" if allow_untested else "stop")
+    if status == "ok":
+        # ok を初めて観測した時だけログを出す（'ok'）。以降も監視は続ける（latch しない）。
+        return ("ok-seen", "ok" if current != "ok-seen" else "none")
+    return (current, "none")   # unverified → 監視継続
 
 
 def head_line(text):
