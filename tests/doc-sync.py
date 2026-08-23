@@ -29,6 +29,16 @@ SECURITY = _read("SECURITY.md")
 VER_RE = re.compile(r"\d+\.\d+\.\d+")
 
 
+def _builtin_defaults():
+    """argparse defaults with ALL AIPAIR_* env vars removed — the code's BUILT-IN values, not this
+    shell's overrides. Without this, `AIPAIR_STOP=X` fakes a sentinel default and `AIPAIR_MAX_ROUNDS=bad`
+    makes build_parser sys.exit(2), so every doc↔default check must go through here."""
+    with mock.patch.dict(os.environ):
+        for _k in [k for k in os.environ if k.startswith("AIPAIR_")]:
+            del os.environ[_k]
+        return vars(cli.build_parser("x").parse_args([]))
+
+
 def _rows_with_first_cell(text, first_cell):
     """Markdown table rows (| a | b | …) whose FIRST cell trims to first_cell."""
     out = []
@@ -63,13 +73,7 @@ class Sentinels(unittest.TestCase):
              ("all_done", "AIPAIR_ALL_DONE"), ("plan_ok", "AIPAIR_PLAN_OK")]
 
     def setUp(self):
-        # Test the BUILT-IN argparse defaults, not this shell's AIPAIR_* overrides — build the
-        # parser with every AIPAIR_* env var removed (else `AIPAIR_STOP=CUSTOM` makes the "default"
-        # CUSTOM and the sync check reads the environment instead of the code).
-        with mock.patch.dict(os.environ):
-            for _k in [k for k in os.environ if k.startswith("AIPAIR_")]:
-                del os.environ[_k]
-            self.defaults = vars(cli.build_parser("x").parse_args([]))
+        self.defaults = _builtin_defaults()
 
     def test_defaults_are_bracketed_sentinels(self):
         for attr, _env in self.CASES:
@@ -134,7 +138,7 @@ class SchemaProtocol(unittest.TestCase):
             self.assertIn("fail-closed", doc, "%s must describe the fail-closed schema stop" % name)
 
     def test_allow_untested_schema_flag_exists_and_is_documented(self):
-        self.assertIn("allow_untested_schema", vars(cli.build_parser("x").parse_args([])),
+        self.assertIn("allow_untested_schema", _builtin_defaults(),
                       "--allow-untested-schema missing from build_parser")
         for doc, name in ((README, "README"), (SECURITY, "SECURITY")):
             self.assertIn("allow-untested-schema", doc, "%s must document --allow-untested-schema" % name)
@@ -175,14 +179,24 @@ class TodoAndWorkflows(unittest.TestCase):
         for job in jobs:   # every nightly job must be written up in the README nightly 表
             self.assertIn(job, README, "nightly job %s is undocumented in README" % job)
 
-    def test_ci_matrix_versions_match_readme(self):
+    def test_ci_matrix_rows_match_readme(self):
+        # verify the ACTUAL matrix ROWS (per row), not just that a version string exists somewhere.
         ci = _read(".github/workflows/ci.yml")
-        # README「必要環境」/CI 説明: python floor 3.8 + current 3.13、tmux floor 3.1
-        for v in ("3.8", "3.13"):
-            self.assertIn("'%s'" % v, ci, "ci.yml matrix must include python %s" % v)
-        self.assertIn("'3.1'", ci, "ci.yml matrix must include the tmux 3.1 floor")
-        for v in ("3.8", "3.13", "3.1"):
+        rows = set(re.findall(r"\{\s*python:\s*'([^']+)',\s*tmux:\s*'?([^',}\s]+)'?\s*\}", ci))
+        self.assertEqual(rows, {("3.8", "distro"), ("3.13", "distro"), ("3.13", "3.1")},
+                         "ci.yml matrix rows drifted from README「必要環境」（floor 3.8 / current 3.13 / tmux 3.1）: %s"
+                         % sorted(rows))
+        for v in ("3.8", "3.13", "3.1"):   # README must document each version the matrix pins
             self.assertIn(v, README, "README must document version %s used by CI" % v)
+
+    def test_current_behaviour_docs_avoid_the_stale_module_count(self):
+        # the aipairlib package grew past the old「5 libs / 6 sibling modules」count (P2-1), so the
+        # CURRENT-behaviour docs (ci.yml comment, README) must describe it count-free. (todo.md keeps
+        # historical PR notes that legitimately record the old count, so it is not scanned here.)
+        for text, name in ((_read(".github/workflows/ci.yml"), "ci.yml"), (README, "README")):
+            for stale in ("5 lib", "6 sibling module", "6 module"):
+                self.assertNotIn(stale, text, "%s still uses the stale module count %r — describe the "
+                                 "aipairlib package count-free" % (name, stale))
 
 
 
