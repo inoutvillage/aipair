@@ -45,6 +45,13 @@ from .review_protocol import plan_poke_codex, question_poke_codex
 from .plan_flow import decide_plan_action
 from .question_flow import decide_question_action
 
+# endless BLOCKED/HUMAN_REQUIRED（社長指示 2026-08-24 / _reference/new-task.md）: max-rounds(3) と
+# 区別する固有 exit code。同じ 8 でも 2 つの内部理由を reason 文字列で区別する（Phase 2/4 が設定）:
+#   HUMAN_REQUIRED   = 実行可能な [ ] が尽き、人間対応の [!] のみ残存（task-list 分類==BLOCKED）
+#   BLOCKED (no-progress) = 同一タスクが snapshot 不変のまま 3 回連続再選択（relay 内部検出）
+EXIT_BLOCKED = 8
+BLOCKED_HR_REASON = "人間対応待ち（HUMAN_REQUIRED）"
+BLOCKED_NOPROGRESS_REASON = "進捗なし（BLOCKED / no-progress）"
 
 
 class ResponseGate:
@@ -336,8 +343,10 @@ class StateMachine:
         # 終了理由を exit code で区別する（外部 orchestrator が成否を判別できるように）:
         #   0=停止ワード検知（正常完了） 3=最大往復キャップ 4=poke配達失敗
         #   5=プラン/質問リレー上限・選択肢欠落 6=停止ゲート失敗 7=ログschema不一致(fail-closed)
+        #   8=人間対応待ち/進捗なし（HUMAN_REQUIRED / no-progress。max-rounds とは別。Phase 2/4 が設定）
         code = 0
         all_done_hit = False
+        blocked_reason = None          # code==8 のサブ理由（BLOCKED_HR_REASON / BLOCKED_NOPROGRESS_REASON）
         try:
             while True:
                 if sg.guard():          # between-iteration drift（latch 済みは安価な no-op）
@@ -694,6 +703,7 @@ class StateMachine:
         # 終了後もタイトルで結果が分かるようにする（走行中と区別がつかないと、
         # 何時間も前に終わった relay を「まだ回っている」と誤読する）
         reason = {0: "全タスク完了" if all_done_hit else "停止ワード", 3: "キャップ到達",
-                  4: "配達失敗", 5: "上限到達", 6: "停止ゲート失敗", 7: "schema不一致"}.get(code, f"exit={code}")
+                  4: "配達失敗", 5: "上限到達", 6: "停止ゲート失敗", 7: "schema不一致",
+                  8: blocked_reason or BLOCKED_HR_REASON}.get(code, f"exit={code}")
         set_pane_title(own, f"relay ■ 終了({reason}) / {rounds}往復")
         return code

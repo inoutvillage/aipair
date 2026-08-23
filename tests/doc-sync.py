@@ -99,7 +99,7 @@ class Sentinels(unittest.TestCase):
 
 class ExitCodes(unittest.TestCase):
     """README の exit code 表 == 正準集合、かつ state_machine の reason dict のコードは全て記載済み。"""
-    CANON = {0, 2, 3, 4, 5, 6, 7, 130}
+    CANON = {0, 2, 3, 4, 5, 6, 7, 8, 130}
 
     def _readme_exit_codes(self):
         # README has TWO『| code |』tables — the installer\'s (0/1/2/3) and the relay\'s. Anchor on

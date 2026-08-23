@@ -1457,6 +1457,19 @@ class StateMachineWiring(unittest.TestCase):
         self.assertEqual(sm.all_done_phrases, ["[AIPAIR_ALL_DONE]"])
         self.assertTrue(callable(sm.run))
 
+    def test_exit_blocked_code_and_two_distinct_reasons(self):
+        # endless BLOCKED/HUMAN_REQUIRED (社長指示 2026-08-24): exit 8 は max-rounds(3) と別コードで、
+        # 2 つの内部理由（HUMAN_REQUIRED / no-progress）を区別する文字列を Phase 2/4 が使う。
+        sm = relay.state_machine
+        self.assertEqual(sm.EXIT_BLOCKED, 8)
+        self.assertNotIn(sm.EXIT_BLOCKED, (0, 3))          # max-rounds(3)・正常(0) と衝突しない
+        self.assertTrue(sm.BLOCKED_HR_REASON and sm.BLOCKED_NOPROGRESS_REASON)
+        self.assertNotEqual(sm.BLOCKED_HR_REASON, sm.BLOCKED_NOPROGRESS_REASON)
+        # reason dict は literal『8:』を持つ（doc-sync が README との同期を検証する）
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertRegex(src, r"reason = \{[^}]*\b8:\s")
+
     def test_relay_main_is_a_thin_launcher(self):
         # main() ends by delegating to StateMachine(...).run(); the loop no longer lives in relay.py
         with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
