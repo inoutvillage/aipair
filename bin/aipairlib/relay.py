@@ -106,6 +106,7 @@ version_gate = corelib.version_gate
 schema_probe = corelib.schema_probe
 schema_gate = corelib.schema_gate
 schema_fail_closed = corelib.schema_fail_closed
+schema_latch_step = corelib.schema_latch_step
 hit_stop = corelib.hit_stop
 head_line = corelib.head_line
 scrub_output = corelib.scrub_output
@@ -984,7 +985,7 @@ def main():
     probe_sent_at = 0.0        # poke 送出時刻（no-show 監視用）
     POKE_NOSHOW = 1800         # nonce がログに現れないまま諦めるまでの秒数
     last_rejected = None       # 帰属棄却した完了 ts（棄却ログを完了値ごと1回に抑制）
-    schema_latched = {"claude": None, "codex": None}   # runtime JSONL schema probe: latch once per agent
+    schema_latched = {"claude": None, "codex": None}   # runtime JSONL schema latch: None→"ok-seen"（監視継続）／"mismatch"（終端）
 
     def schema_watch():
         """Once per agent, probe the tracked transcript for the core schema the relay reads
@@ -996,25 +997,27 @@ def main():
         if a.no_schema_probe:
             return
         for agent in ("claude", "codex"):
-            if schema_latched[agent] is not None or not tracked[agent]:
+            # "mismatch" は終端。"ok-seen"/None は監視継続（veto-only の delivery/dialog が後から
+            # ドリフトするのを捕捉するため ok でも latch しない — P1-b）。
+            if schema_latched[agent] == "mismatch" or not tracked[agent]:
                 continue
             status, reason = probe_log_schema(agent, tracked[agent])
-            if status == "ok":
-                schema_latched[agent] = "ok"
-                dim(f"{agent} ログschema OK（{reason}）")
-            elif status == "mismatch":
-                schema_latched[agent] = "mismatch"
+            schema_latched[agent], action = schema_latch_step(
+                schema_latched[agent], status, a.allow_untested_schema)
+            if action == "ok":
+                dim(f"{agent} ログschema OK（{reason}）")   # 一度だけ通知。以降も監視は続ける
+            elif action in ("stop", "degrade"):
                 print(c("warn", f"│ ■ {agent} のログ JSONL schema がコア relay の依存と不一致（{reason}）。"
-                                "ターン検出が誤動作する可能性があります。claude/codex の版と"
+                                "ターン検出／応答帰属が誤動作する可能性があります。claude/codex の版と"
                                 " TESTED schema を確認してください。"), flush=True)
                 print("\a", end="", flush=True)
                 a.schema_mismatch = True
-                if a.allow_untested_schema:
+                if action == "degrade":
                     a.no_plan_review = True       # fail-open: continue, degrade dialog automation
                     a.no_question_relay = True
                 else:
                     a.schema_stop = True          # fail-closed: stop the loop (exit 7)
-            # "unverified" → leave unlatched, re-probe next iteration
+            # "unverified" → 監視継続
 
     def schema_guard():
         """freshly (re)ロックしたログを《完了判定・poke の前に》probe し、override 無しの

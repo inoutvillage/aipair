@@ -861,10 +861,13 @@ class SchemaProbe(unittest.TestCase):
 
     def test_codex_nascent_is_unverified(self):
         self.assertEqual(relay.schema_probe("codex", [])[0], "unverified")
-        only_meta_and_user = [{"type": "session_meta", "payload": {"cwd": "/x"}},
-                              {"type": "response_item", "payload": {"type": "message", "role": "user",
-                                                                    "content": [{"text": "hi"}]}}]
-        self.assertEqual(relay.schema_probe("codex", only_meta_and_user)[0], "unverified")
+        # session_meta alone, and session_meta + a not-yet-complete task_started → still nascent
+        self.assertEqual(relay.schema_probe("codex", [{"type": "session_meta", "payload": {"cwd": "/x"}}])[0],
+                         "unverified")
+        meta_and_started = [{"type": "session_meta", "payload": {"cwd": "/x"}},
+                            {"type": "event_msg", "timestamp": "t",
+                             "payload": {"type": "task_started", "turn_id": "T1"}}]
+        self.assertEqual(relay.schema_probe("codex", meta_and_started)[0], "unverified")
 
     def test_codex_mismatch_positive_drift_only(self):
         renamed = [{"type": "turn", "timestamp": "t", "payload": {"type": "task_complete", "turn_id": "T1"}}]
@@ -892,11 +895,24 @@ class SchemaProbe(unittest.TestCase):
     def test_codex_completion_and_attribution_both_required_for_ok(self):
         # both aspects must be positively present AND complete → ok
         self.assertEqual(relay.schema_probe("codex", self.COD_OK)[0], "ok")
-        # an old-shaped user item WITHOUT the passthrough key at all is NOT positive drift (stays
-        # unverified until a turn_id-bearing task event appears) — a nascent log must not false-alarm
-        nascent_userish = [{"type": "response_item",
-                            "payload": {"type": "message", "role": "user", "content": [{"text": "hi"}]}}]
-        self.assertEqual(relay.schema_probe("codex", nascent_userish)[0], "unverified")
+
+    def test_codex_full_turn_without_user_metadata_is_mismatch(self):
+        # Regression (P1-2, tightened): started + a REAL text user response_item + complete, but the
+        # user item has no metadata.turn_id → the turn happened yet can't be attributed by turn_id.
+        # This must be mismatch (fail-closed), NOT unverified — otherwise it doesn't block and the
+        # relay keeps running on an unattributable schema.
+        full_no_meta = [
+            {"type": "event_msg", "timestamp": "t1", "payload": {"type": "task_started", "turn_id": "T1"}},
+            {"type": "response_item",
+             "payload": {"type": "message", "role": "user", "content": [{"text": "relay-id:ab"}]}},
+            {"type": "event_msg", "timestamp": "t2", "payload": {"type": "task_complete", "turn_id": "T1"}}]
+        st, reason = relay.schema_probe("codex", full_no_meta)
+        self.assertEqual(st, "mismatch")
+        self.assertIn("turn_id", reason)
+        # a NON-text user item (no text blocks) is not one the relay attributes → not drift
+        nontext = [{"type": "response_item",
+                    "payload": {"type": "message", "role": "user", "content": [{"image": "x"}]}}]
+        self.assertEqual(relay.schema_probe("codex", nontext)[0], "unverified")
 
     def test_unknown_agent_and_non_dicts_are_unverified(self):
         self.assertEqual(relay.schema_probe("other", self.CLA_OK)[0], "unverified")
@@ -1005,6 +1021,40 @@ class SchemaProbe(unittest.TestCase):
         finally:
             os.unlink(path)
         self.assertEqual(relay.read_records("/no/such/file.jsonl"), [])
+
+
+class SchemaLatchStep(unittest.TestCase):
+    """Regression (P1-b): the runtime schema latch must NOT go terminal on 'ok'. delivery/dialog
+    are veto-only aspects that surface only when that action happens, so after 'ok' the relay must
+    KEEP probing — a dialog that only occurs later and drifts must still become a mismatch (exit 7).
+    Only 'mismatch' is terminal."""
+
+    def test_ok_is_not_terminal_and_a_late_mismatch_stops(self):
+        # first ok → log once, but stay in a re-probing state ('ok-seen', not terminal)
+        self.assertEqual(relay.schema_latch_step(None, "ok", False), ("ok-seen", "ok"))
+        # subsequent ok → no re-log, still probing
+        self.assertEqual(relay.schema_latch_step("ok-seen", "ok", False), ("ok-seen", "none"))
+        # a mismatch that only appears AFTER ok (e.g. a dialog that finally happens and has drifted)
+        # → stop (exit 7). This is the crux Codex asked for.
+        self.assertEqual(relay.schema_latch_step("ok-seen", "mismatch", False), ("mismatch", "stop"))
+
+    def test_override_degrades_instead_of_stopping(self):
+        self.assertEqual(relay.schema_latch_step("ok-seen", "mismatch", True), ("mismatch", "degrade"))
+        self.assertEqual(relay.schema_latch_step(None, "mismatch", True), ("mismatch", "degrade"))
+
+    def test_mismatch_is_terminal_and_unverified_keeps_probing(self):
+        self.assertEqual(relay.schema_latch_step("mismatch", "ok", False), ("mismatch", "none"))
+        self.assertEqual(relay.schema_latch_step("mismatch", "mismatch", False), ("mismatch", "none"))
+        self.assertEqual(relay.schema_latch_step(None, "unverified", False), (None, "none"))
+        self.assertEqual(relay.schema_latch_step("ok-seen", "unverified", False), ("ok-seen", "none"))
+
+    def test_schema_watch_does_not_go_terminal_on_ok(self):
+        # source guard: schema_watch must only `continue` (skip) an agent whose latch is "mismatch"
+        # — never on "ok"/"ok-seen" — so late veto-aspect drift is still probed.
+        with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn('if schema_latched[agent] == "mismatch" or not tracked[agent]:', src,
+                      "schema_watch must keep probing after ok (only mismatch is terminal)")
 
 
 class SchemaGuardOrdering(unittest.TestCase):
