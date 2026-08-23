@@ -21,7 +21,7 @@
 - [x] **sentinel 追加（cli.py）**〔`--human-required` / `AIPAIR_HUMAN_REQUIRED`〕: `--human-required`（既定 `[AIPAIR_HUMAN_REQUIRED]`）＋ env のみ。既存 `hit_stop`（先頭行完全一致）準拠。**`[AIPAIR_BLOCKED]` は agent sentinel にしない**（no-progress は relay 内部検出＝下記 Phase 4）。
 - [x] **新 env の配線を完全化**〔`bin/aipair`(bridge+RELAY_ENV_VARS)・`bin/aipair-relay-here`(forward+pin+doc)・env-forward/launch-cmds 被覆〕: `AIPAIR_HUMAN_REQUIRED` を `cli.py` だけでなく `bin/aipair`・`bin/aipair-relay-here`（stale-env 打ち消し＋argv 転送）に追加し、`tests/env-forward.sh`・`tests/launch-cmds.sh` の被覆に含める（既存 sentinel/env と同じ経路）。
 - [x] **exit code 8**〔`EXIT_BLOCKED`＋2理由定数・reason dict・README表・doc-sync CANON〕を reason map（`state_machine.py`）と全終了経路に追加。2つの内部理由を持つ: (a) `HUMAN_REQUIRED`（分類==`BLOCKED`）(b) `BLOCKED (no-progress)`（relay 内部検出）。どちらも exit 8・reason 文字列で区別。max-rounds(3) と明確に区別。〔設定は Phase 2/4〕
-- [ ] `[!]` の意味を既存「チェックボックスの意味」節（endless relay が読む厳密定義）・README・SECURITY に記載。
+- [x] `[!]` の意味を既存「チェックボックスの意味」節（endless relay が読む厳密定義）・README・SECURITY に記載。〔3箇所記載済。定義行はインライン code で分類器に誤カウントされないことを実 todo.md で検証〕
 
 ### Phase 2 — endless 終端の3状態化（§2/§10）
 - [ ] **起動直後・各 terminal sentinel 受信時に relay が task-list を再分類**し、分類結果を**唯一の権威**とする。`READY`=継続 / `BLOCKED`=HUMAN_REQUIRED で exit 8 停止 / `ALL_DONE`=exit 0。
@@ -99,9 +99,10 @@ Phase 1（基盤）→ Phase 2（終端判定）→ Phase 3（プロンプト）
 # aipair — 外部コードレビュー（2026-08-21 受領）対応
 
 ## チェックボックスの意味（endless relay が読むファイルなので厳密に）
-- `- [ ]` = **着手可**（承認済み・依存解消済み）。endless モードの Codex はここからだけ次を選ぶ
+- `- [ ]` = **着手可**（承認済み・依存解消済み）。endless モードの Codex はここからだけ次を選ぶ（READY）
 - `- [x]` = 完了（検証済み）
-- **判断待ちはこのファイルに置かない** → `tasks/decisions.md`（`[?]` D1〜D3）。決まったら具体タスクに落としてここへ移す
+- `- [!]` = **保留（BLOCKED / HUMAN_REQUIRED）**: 未完了だが AI pair だけでは進行不能（人間承認・認証・管理者操作・外部反映・実機確認等）。**直下に `blocker:` 理由を併記**（無いと解析エラー exit 2）。endless relay は `[!]` を**着手可に数えず**、`[ ]` が尽きて `[!]` だけ残ると HUMAN_REQUIRED として **exit 8** で正常停止する（max-rounds ではない）
+- **純粋な判断待ち（まだ具体タスクでない）はこのファイルに置かない** → `tasks/decisions.md`（`[?]` D1〜D3）。決まったら具体タスクに落としてここへ移す。ただし**作業途中で判明した blocker は `[!]` でこのファイルに表現**してよい（`_reference/new-task.md` §10）
 
 ## 事実確認（確定）— レビュー 10 件、事実誤認ゼロ
 
