@@ -13,7 +13,7 @@
 - [x] **P1-3 Codex の turn_id 欠落時 fallback 見直し**（`codex_response_complete`）— 通常モードは turn_id 無し→帰属不能→fail-closed。残す場合は compatibility mode 明示＋警告＋自律判定には使わない。
 - [x] **P1-4 schema latch を agent 単位→agent+tracked log identity（path）単位へ**。log 切替（/resume・/clear・再起動・compaction・rotation）で未確認へ戻し再 probe。
 - [ ] **P1-5 認証付き round-trip E2E を実走**（外部依存: repo secrets + API 予算）。3シグナル成功を最低1回 workflow_dispatch で確認。README は「harness 実装済/未検証」と「E2E 検証済」を混同しない。
-- [ ] **P1-6 nightly を latest smoke（secrets 無）と authenticated-e2e（version pin + secrets 有）に分離**。上流 latest 破壊と aipair 既存版 E2E 破壊を切り分け。
+- [x] **P1-6 nightly を latest smoke（secrets 無）と authenticated-e2e（version pin + secrets 有）に分離**。上流 latest 破壊と aipair 既存版 E2E 破壊を切り分け。
 - [ ] **P2-1 relay state machine を state 単位で分割**（state_machine/review_protocol/schema_guard/plan_flow/question_flow）。relay.py は arg parse/依存構築/起動/exit に寄せる。
 - [ ] **P2-2 installer の transaction 性強化**（package + entrypoints + templates を staging→検証→一括切替、Phase2 途中失敗は entrypoint も自動 rollback）。
 - [ ] **P2-3 README/SECURITY/todo/TESTED_VERSIONS/CI 説明/schema・stop・plan protocol の同期をテスト化**（README の version==TESTED_VERSIONS、README の sentinel==コード定数）。

@@ -536,7 +536,18 @@ GitHub Actions（`.github/workflows/ci.yml`）が push / PR ごとに ubuntu-lat
 | 現行 Python | 3.13 | distro |
 | 対応下限 tmux | 3.13 | **3.1**（`split-window -l 30%` の下限）を **release tarball からソースビルド**（SHA-256 pin・展開前に検証、`tmux -V` が厳密に `tmux 3.1` かも assertion） |
 
-`run-all.sh` は shebang で判別するので、relay・5 lib・peer-log・`.py` テスト（＝6 sibling module）、および shell テストが `python3` として起動する全経路がその lane の Python で走る。`session-name.sh` は実 tmux が < 3.2 なら `#{session_path}` 依存の採用/衝突ケースを skip（3.1 では安全な非採用に縮退。`[10]` の 3.1 シミュレーションが被覆）。shellcheck は全 lane で apt 導入。実 claude/codex を要する E2E は CI では動かせない（→ 「制約・既知の限界」）。
+`run-all.sh` は shebang で判別するので、relay・5 lib・peer-log・`.py` テスト（＝6 sibling module）、および shell テストが `python3` として起動する全経路がその lane の Python で走る。`session-name.sh` は実 tmux が < 3.2 なら `#{session_path}` 依存の採用/衝突ケースを skip（3.1 では安全な非採用に縮退。`[10]` の 3.1 シミュレーションが被覆）。shellcheck は全 lane で apt 導入。
+
+### nightly（実 CLI・`.github/workflows/nightly.yml`）
+
+ci.yml は claude/codex を**モック**する（速く hermetic だが実 CLI の変化に盲目）。そこで nightly は**実 claude/codex を npm 導入**して 2 つの独立 job で回す（どちらが壊れたか切り分けるため）:
+
+| job | 版 | secrets | 目的 |
+|---|---|---|---|
+| `upstream-latest-smoke` | **最新** claude/codex | 不要 | 上流 CLI が今日壊れていないか（install・`--version`・aipair の実起動形・3 pane 起動）。赤 = 上流の変化 |
+| `authenticated-e2e` | **`TESTED_VERSIONS` に pin** | ANTHROPIC/OPENAI（無ければ E2E は self-skip） | aipair 自身の round-trip 回帰。既知良好版で赤 = aipair の退行。3シグナル（claude が nonce を完全一致で返す／codex が実応答＝poke turn の非空 last_agent_message／relay が claude へ poke 返し）で fail-closed |
+
+pin 版は `corelib.TESTED_VERSIONS` を実行時に読むのでコード/README とドリフトしない。**「harness 実装済/未検証」と「認証付き E2E 検証済（secret 付き実走成功）」は別物**で、後者は repo secrets ＋ API 予算が要る（`tasks/todo.md` 参照）。
 TUI 本体（Claude Code / Codex CLI の実画面）は CI では動かせないため、ダイアログ検出などは**画面キャプチャの fixture** で固定している。実 UI が変わった時は fixture ごと更新すること。
 
 ## 制約・既知の限界
