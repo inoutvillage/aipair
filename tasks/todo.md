@@ -1,3 +1,58 @@
+# endless モード BLOCKED / HUMAN_REQUIRED 対応（社長指示 2026-08-24）— `_reference/new-task.md`
+
+> **問題**: endless モードのタスク状態が実質「未完了/完了」の2値しかなく、人間対応・外部依存で
+> AI が完了できないタスクが残ると、未チェック項目ありのまま `全タスク完了` にできず max-rounds まで
+> 無駄に往復する（P1-5/#8-9 の secrets 待ちで**実際に発生**）。
+> **方針**: 「未完了=続行」をやめ、**READY / DONE / BLOCKED を state machine で区別**する。
+> 「全タスクは未完了だが AI が今できるタスクは0件」を正式な状態にし、進行不能を検出した時点で
+> 即座に人間待ちとして停止する（max-rounds は安全網であって正常終了制御ではない）。
+> **現状の実態**: relay は task-list を一切読まず、ALL_DONE は Codex の `[AIPAIR_ALL_DONE]` sentinel のみで決まる
+> （`state_machine.py:621`）。exit は 0/3/4/5/6/7/130 のみで **exit 8 未定義**。→ 本改修で relay 自身が task-list を分類する。
+
+## チェックボックスの意味（拡張・endless relay が厳密に読む / Phase 1 で既存「チェックボックスの意味」節へ統合）
+- `- [ ]` = 実行可能な未完了（**READY** 対象）
+- `- [x]` = 完了
+- `- [!]` = 保留（**BLOCKED/HUMAN_REQUIRED**）: 未完了だが AI pair だけでは進行不能、人間/外部条件の解消が必要。直下に `blocker:` を併記。
+  （記法 `[!]` は実装上の既定。**GFM では `[!]` はチェックボックスとして描画されず、`[!]` を含むただのリスト文字列として表示される**〈未チェック `[ ]` 扱いではない〉。endless relay は `[!]` を BLOCKED として厳密に区別する）
+
+### Phase 1 — 基盤: `[!]` 状態 + task-list 分類器 + exit 8 + sentinel
+- [x] **task-list 分類器（純関数・単体テスト）**〔`bin/aipairlib/tasklist.py`＋`tests/tasklist.py` 17件・run-all 緑〕: **本文テキストを受け取り**（ファイル I/O は分離）**構造体**を返す: `{state, ready:[行テキスト...], blocked:[{item:行テキスト, blocker}...], hash}`。`state`=`READY`(≥1 `[ ]`) / `BLOCKED`(0 `[ ]`・≥1 `[!]`) / `ALL_DONE`(0 `[ ]`・0 `[!]`)。ネストした `  - [ ]/[!]` も対象。**認識する記法は厳密に `[ ]`・`[x]`/`[X]`・`[!]` のみ**。**未知の checkbox 風記法（`[?]`・`[-]` 等）は無視して `ALL_DONE` にせず、解析エラー exit 2**（fail-closed）。**`[!]` に直下の `blocker:` 行が無ければ解析エラー exit 2**（全 blocked は理由必須）。**任意長のバッククォート／チルダ・コードフェンス（```/~~~）内の疑似 checkbox は無視**。
+- [ ] **task-list ローダ（I/O・fail-closed）**: 相対パスは **`--dir` 基準**で解決。欠損・読取不能・解析不能は **`ALL_DONE` にせず起動エラー exit 2**（fail-closed。「読めない＝完了」で誤停止させない）。
+- [ ] **sentinel 追加（cli.py）**: `--human-required`（既定 `[AIPAIR_HUMAN_REQUIRED]`）＋ env のみ。既存 `hit_stop`（先頭行完全一致）準拠。**`[AIPAIR_BLOCKED]` は agent sentinel にしない**（no-progress は relay 内部検出＝下記 Phase 4）。
+- [ ] **新 env の配線を完全化**: `AIPAIR_HUMAN_REQUIRED` を `cli.py` だけでなく `bin/aipair`・`bin/aipair-relay-here`（stale-env 打ち消し＋argv 転送）に追加し、`tests/env-forward.sh`・`tests/launch-cmds.sh` の被覆に含める（既存 sentinel/env と同じ経路）。
+- [ ] **exit code 8** を reason map（`state_machine.py:696`）と全終了経路に追加。2つの内部理由を持つ: (a) `HUMAN_REQUIRED`（分類==`BLOCKED`）(b) `BLOCKED (no-progress)`（relay 内部検出）。どちらも exit 8・reason 文字列で区別。max-rounds(3) と明確に区別。
+- [ ] `[!]` の意味を既存「チェックボックスの意味」節（endless relay が読む厳密定義）・README・SECURITY に記載。
+
+### Phase 2 — endless 終端の3状態化（§2/§10）
+- [ ] **起動直後・各 terminal sentinel 受信時に relay が task-list を再分類**し、分類結果を**唯一の権威**とする。`READY`=継続 / `BLOCKED`=HUMAN_REQUIRED で exit 8 停止 / `ALL_DONE`=exit 0。
+- [ ] **sentinel は分類が一致する時のみ honor**: `[AIPAIR_ALL_DONE]` は分類==`ALL_DONE` の時だけ終了、`[AIPAIR_HUMAN_REQUIRED]` は分類==`BLOCKED` の時だけ終了。**分類に `READY` が残る場合は sentinel を拒否して継続**（Case 6 に必須。誤 sentinel で未処理の `[ ]` を残して止めない）。no-progress による停止（exit 8）は分類とは独立の relay 内部経路であり error/max-rounds と同一扱いにしない。
+
+### Phase 3 — Codex/Claude の選択ロジック・プロンプト（§4/§5/§9）
+- [ ] **Codex 次タスク選択プロンプト**: `[ ]`優先→1件指示 / `[ ]`無→`[!]`確認→`[!]`あれば `[AIPAIR_HUMAN_REQUIRED]` / どちらも無→`[AIPAIR_ALL_DONE]`。**`[!]` を再指示しない**。
+- [ ] **Claude プロンプト**: 実行不能（承認/認証/管理者/外部反映/実機/環境）を検出したら `[ ]`→`[!]`＋`blocker:` 理由に更新してから、他の `[ ]` を続行 or 手詰まり宣言。
+- [ ] **§9 修正**: 「人間に伝言を頼むな」は通常レビュー往復のみ維持。**HUMAN_REQUIRED まで人間へのエスカレーションを禁止しない**（「安易に人間へ投げるな」と「人間しか解けない時も止まるな」を混同しない）。
+- [ ] **配布済みドキュメントの旧契約を更新**（新契約と矛盾するため必須）: `bin/aipairlib/relay.py` の help（`:58-73`「終端は Codex の --all-done 宣言のみ」）、`bin/aipair` のコメント・初期 title（`:278-286`）、`templates/claude-md-block.md`、`.claude/skills/aipair-relay/SKILL.md`、`.claude/skills/aipair-setup/SKILL.md` から**「終端は ALL_DONE のみ」を削除**し、**task-list 分類（READY/BLOCKED/ALL_DONE）＋ HUMAN_REQUIRED 終端＋ exit 8** を記載。
+
+### Phase 4 — no-progress guard（§8）
+- [ ] **タスク同一性の契約を確定**: 識別子は **task-list 上の完全一致行テキスト（verbatim `- [ ]` 行）** に固定（安定 ID 方式は採らない）。Codex は次タスク指示時にその行を逐語エコー（プロンプトで指定）。relay は現 task-list 内で**厳密一致が丁度1件**である事を検証。**fail-closed**: 抽出失敗 or 一致 0/≥2 件は識別子=`UNRESOLVED` とし、警告ログ＋ no-progress ストリークを進める（同一性を判定できないまま無限往復させない）。
+- [ ] no-progress 判定は**簡易版に固定**（`git diff` 条件は採らない — 無関係な dirty/untracked で常にリセットされ判定不能になるため）。**意味的 task-list snapshot hash**（生バイトでなく、パースした checkbox 項目＋状態の正規化スナップショット。装飾的編集ではリセットしない）を用い、**(同一識別子の再選択 OR `UNRESOLVED`) AND snapshot hash 不変**が **3 回連続（初版は定数で固定。env 調整は導入しない — 全配線が未計画のため）** で **relay 内部 reason `BLOCKED (no-progress)` として直接 exit 8**（agent sentinel は介さない）。ストリークは「新しい識別子の解決」または「snapshot hash 変化」でリセット。snapshot hash は**順序付きの正規化タプル列 `(indent, state, item, blocker)` から生成**（行順を保持・状態と本文とインデントのみを織り込む）。
+
+### Phase 5 — 人間待ち終了 UX（§6/§7）
+- [ ] 2種類の exit 8 を**別々の banner** で即終了（無駄往復なし）。pane title 反映。
+  - **HUMAN_REQUIRED（分類==BLOCKED）**: 「■ 自動処理を停止しました／理由: 人間対応が必要なタスクのみ残っています／残: `[!]` 項目名＋blocker 理由」を一覧表示。
+  - **BLOCKED (no-progress)**: 「■ 自動処理を停止しました／理由: 進捗がないまま同じタスクが再選択／繰り返された READY 項目（or `UNRESOLVED`）／ストリーク数／task-list snapshot hash」を表示。**no-progress 時は `[!]` が存在しない場合があり**、`[!]` 一覧に依存しない。
+
+### Phase 6 — 回帰テスト（§11）
+- [ ] Case1（`[ ]`+`[x]`→A選択・継続）/ Case2（全`[x]`→ALL_DONE・exit0）/ Case3（`[!]`+`[x]`→HUMAN_REQUIRED・exit8・再指示なし）/ Case4（`[ ]`+`[!]`→A先行→後にHUMAN_REQUIRED）/ Case5（同一`[ ]`を **2回目までは継続・3回目で exit 8**／snapshot hash 不変→no-progress）/ Case6（`[!]`あるが別`[ ]`あり→継続・まだHUMAN_REQUIREDにしない）を自動テスト化。
+- [ ] **負テスト**: (a) `[!]` に `blocker:` 無し→exit 2 / (b) **任意長のバッククォート／チルダ・コードフェンス**内の疑似 checkbox を分類が無視 / (c) task-list 欠損・解析不能→exit 2 / (d) 識別子 0/≥2 一致→`UNRESOLVED` 経路 / (e) **未知 checkbox 風記法（`[?]` 等）→exit 2**（`ALL_DONE` にしない）。**正**テスト: `[X]`（大文字）を完了として扱う。
+- [ ] **旧説明の再発防止**: `tests/broadcast-blocks.sh` と doc-sync で、上記配布ドキュメントに「終端は ALL_DONE のみ」等の旧契約が**再発しないこと**＋新契約（HUMAN_REQUIRED / task-list 分類 / exit 8）が**存在すること**を assert。
+- [ ] doc-sync に新 sentinel（`[AIPAIR_HUMAN_REQUIRED]`）・exit 8・`[!]` 意味を pin（README と実装の同期）。
+
+### 依存順
+Phase 1（基盤）→ Phase 2（終端判定）→ Phase 3（プロンプト）は 2 と並行可 → Phase 4（guard）→ Phase 5（UX）→ Phase 6（テストは各 Phase と並行、最後に統合）。
+
+---
+
 # aipair 改修（社長指示 2026-08-23）— 外部レビュー指摘の優先対応
 
 > 方針: **「推測して動き続ける」より「判定できない場合は止まる（fail-closed）」を優先**。
