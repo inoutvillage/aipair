@@ -4,14 +4,13 @@ All notable changes to aipair are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and aipair uses
 [Semantic Versioning](https://semver.org/). The version below is the single source of truth
 `aipairlib.__version__`; a release is the git tag `v<version>` and its GitHub Release (see
-[RELEASING.md](RELEASING.md)). `tests/doc-sync.py` enforces that the top released version here
-equals `__version__`.
+[RELEASING.md](RELEASING.md)). The top version section is whatever `__version__` currently is — it
+gets a date **when its `v<version>` tag is pushed**; until then it is the release being prepared.
+`tests/doc-sync.py` enforces that this section matches `__version__`.
 
-## [Unreleased]
+## [0.1.0] — unreleased (prepared; published when the `v0.1.0` tag is pushed)
 
-## [0.1.0] - 2026-08-23
-
-First tagged release. aipair runs Claude Code and Codex CLI side by side in one tmux session with
+The initial aipair release. aipair runs Claude Code and Codex CLI side by side in one tmux session with
 a live merged "bridge" pane, so each agent can read the other, and can drive an autonomous
 mutual-review relay.
 
@@ -41,5 +40,4 @@ mutual-review relay.
 - `SECURITY.md` threat model. Permission-bypass is opt-in (`--unsafe`) and required only for
   `aipair loop`; interactive `aipair` keeps each agent's normal permission prompts.
 
-[Unreleased]: https://github.com/inoutvillage/aipair/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/inoutvillage/aipair/releases/tag/v0.1.0
