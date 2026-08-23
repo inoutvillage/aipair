@@ -547,7 +547,7 @@ ci.yml は claude/codex を**モック**する（速く hermetic だが実 CLI �
 | `upstream-latest-smoke` | **最新** claude/codex | 不要 | 上流 CLI が今日壊れていないか（install・`--version`・aipair の実起動形・3 pane 起動）。赤 = 上流の変化 |
 | `authenticated-e2e` | **`TESTED_VERSIONS` に pin** | ANTHROPIC/OPENAI（無ければ E2E は self-skip） | aipair 自身の round-trip 回帰。既知良好版で赤 = aipair の退行。3シグナル（claude が nonce を完全一致で返す／codex が実応答＝poke turn の非空 last_agent_message／relay が claude へ poke 返し）で fail-closed |
 
-pin 版は `corelib.TESTED_VERSIONS` を実行時に読むのでコード/README とドリフトしない。**「harness 実装済/未検証」と「認証付き E2E 検証済（secret 付き実走成功）」は別物**で、後者は repo secrets ＋ API 予算が要る（`tasks/todo.md` 参照）。
+pin 版は `corelib.TESTED_VERSIONS` を実行時に読むのでコード/README とドリフトしない。**round-trip（poke→返信→relay 返し）は aipair の実運用そのもの（サブスク認証の Claude Code × Codex CLI を実機で並走）で実証される**。`authenticated-e2e` は **API キー認証で headless に回す opt-in の回帰 job**（secrets があれば走る／無ければ self-skip）であって**リリースの必須ゲートではない**（サブスク認証＝実利用経路とは別経路のため）。
 TUI 本体（Claude Code / Codex CLI の実画面）は CI では動かせないため、ダイアログ検出などは**画面キャプチャの fixture** で固定している。実 UI が変わった時は fixture ごと更新すること。
 
 ## 制約・既知の限界
@@ -578,7 +578,7 @@ aipair は `aipair loop` で **権限バイパスした2つの AI CLI を tmux �
 現在の版は `aipair --version`（`aipair-relay --version` も同じ）で確認できる。版の source of truth は
 `bin/aipairlib/__version__`、リリースは git タグ `v<version>` とその GitHub Release（`v*` タグの push で
 `.github/workflows/release.yml` が tag==`__version__` を検証して発行）。変更履歴は [CHANGELOG.md](CHANGELOG.md)、
-手順は [RELEASING.md](RELEASING.md)。`tests/doc-sync.py` が `__version__`・CHANGELOG の prepared 版セクション（tag push 前の release commit で日付付与）・
+手順は [RELEASING.md](RELEASING.md)。`tests/doc-sync.py` が `__version__`・CHANGELOG の最上位の版セクション（発行前は `## [X.Y.Z] — unreleased`／発行後は `## [Unreleased]` の下の dated 版。日付は tag push 前の release commit で付与）・
 `--version` 出力の一致を強制する（版ゲートの `TESTED_VERSIONS`＝検証済み claude/codex 版とは別物）。
 
 ## ライセンス
