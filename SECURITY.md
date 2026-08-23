@@ -17,7 +17,7 @@ aipair は **Claude Code と Codex CLI を tmux 上で並走させ、相互レ�
 
 ## 対象バージョン
 
-- セキュリティ修正は **`main` の最新**に対してのみ提供します（タグ付きリリース運用は今のところありません）。
+- セキュリティ修正は **`main` の最新**に対して提供します。リリースは `v<version>` タグ運用で、発行後は最新リリースも対象（手順は [RELEASING.md](../RELEASING.md)、現在の版は `aipair --version`）。
 - Claude Code / Codex CLI の**検証済みバージョン**は README「必要環境」を参照。未検証版では版ゲートが安全側（TUI 自動操作 OFF）に倒れ、**ログ schema が不一致なら既定で fail-closed 停止（exit 7）**します（`--allow-untested-schema` で継続可）。
 
 ---

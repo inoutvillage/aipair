@@ -29,6 +29,12 @@ def _read(name):
 README = _read("README.md")
 SECURITY = _read("SECURITY.md")
 VER_RE = re.compile(r"\d+\.\d+\.\d+")
+# Official SemVer 2.0.0 grammar (semver.org): rejects 1.2.3.foo / 1.2.3-.. / leading zeros,
+# accepts optional -prerelease and +build. Used to validate aipairlib.__version__.
+SEMVER = re.compile(
+    r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?"
+    r"(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$")
 
 
 def _builtin_defaults():
@@ -269,16 +275,19 @@ class Version(unittest.TestCase):
     """P2-4: aipairlib.__version__ が唯一の source of truth で、CHANGELOG の最新リリース版・
     `aipair --version` / `aipair-relay --version` の出力・release workflow の tag 検査が一致する。"""
     def test_version_is_semver(self):
-        self.assertRegex(aipairlib.__version__, r"^\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$",
-                         "__version__ %r is not SemVer" % aipairlib.__version__)
+        self.assertRegex(aipairlib.__version__, SEMVER,
+                         "__version__ %r is not SemVer 2.0.0" % aipairlib.__version__)
 
-    def test_changelog_top_release_matches_version(self):
-        rel = [m for m in re.findall(r"^## \[([^\]]+)\]", _read("CHANGELOG.md"), re.M)
-               if m.lower() != "unreleased"]
-        self.assertTrue(rel, "CHANGELOG.md has no released『## [X.Y.Z]』section")
-        self.assertEqual(rel[0], aipairlib.__version__,
-                         "CHANGELOG.md top release %s != __version__ %s (bump them together)"
-                         % (rel[0], aipairlib.__version__))
+    def test_changelog_top_version_section_matches_version(self):
+        # the TOP『## [X.Y.Z]』section (released with a date, or being prepared) must equal __version__,
+        # so bumping the version without a CHANGELOG entry (or vice versa) fails here. It may be
+        # undated while unreleased (a date is added when the vX.Y.Z tag is pushed — see RELEASING.md).
+        vers = [m for m in re.findall(r"^## \[([^\]]+)\]", _read("CHANGELOG.md"), re.M)
+                if m.lower() != "unreleased"]
+        self.assertTrue(vers, "CHANGELOG.md has no『## [X.Y.Z]』version section")
+        self.assertEqual(vers[0], aipairlib.__version__,
+                         "CHANGELOG.md top version section %s != __version__ %s (bump them together)"
+                         % (vers[0], aipairlib.__version__))
 
     def test_aipair_version_reports_the_source_of_truth(self):
         r = subprocess.run([os.path.join(REPO, "bin", "aipair"), "--version"],
@@ -297,6 +306,14 @@ class Version(unittest.TestCase):
         self.assertIn("aipairlib.__version__", wf, "release.yml must verify the tag against __version__")
         self.assertIn("gh release create", wf, "release.yml must create the GitHub Release")
         self.assertIn("tags:", wf)   # triggered by a tag push
+
+    def test_security_release_policy_is_consistent(self):
+        # SECURITY.md must not keep the old「タグ付きリリース運用は今のところありません」that now
+        # contradicts RELEASING.md / CHANGELOG / the release workflow.
+        self.assertNotIn("タグ付きリリース運用は今のところありません", SECURITY,
+                         "SECURITY.md still says there is no tagged-release operation — update the 対象バージョン policy")
+        self.assertIn("RELEASING.md", SECURITY,
+                      "SECURITY.md 対象バージョン policy must point at the release process (RELEASING.md)")
 
 
 if __name__ == "__main__":
