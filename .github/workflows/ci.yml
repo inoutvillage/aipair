@@ -15,8 +15,9 @@ jobs:
         #     source since the distro ships 3.4. session-name.sh auto-detects tmux < 3.2 and skips
         #     the `#{session_path}`-based legacy/collision cases (that path is a safe non-adopt,
         #     covered by its [10] simulation); everything else runs on the real 3.1 binary.
-        # run-all.sh classifies by shebang, so the python files (relay + 5 libs + peer-log + the
-        # .py tests) and everything the shell tests invoke as `python3` run on the matrix python.
+        # run-all.sh classifies by shebang, so the python files (the aipairlib package modules +
+        # the thin entrypoints + the .py tests) and everything the shell tests invoke as `python3`
+        # run on the matrix python.
         include:
           - { python: '3.8',  tmux: distro }   # python floor, distro tmux (3.4)
           - { python: '3.13', tmux: distro }   # current python, distro tmux
