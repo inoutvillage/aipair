@@ -6,7 +6,7 @@ Watches both agents' session logs for turn completion, and relays a short
     (you type the first task into Claude)
     Claude implements ──end_turn──▶ poke Codex: "read with `peer`, review"
     Codex reviews   ──task_complete──▶ poke Claude: "read with `peer`, fix"
-    … repeat until Codex's review contains the stop phrase (default 完了です),
+    … repeat until Codex's review leads with the stop sentinel (default [AIPAIR_REVIEW_OK]),
       or the max-round safety cap is hit.
 
 Plan mode (auto plan review):
@@ -47,17 +47,17 @@ Question dialogs (auto AskUserQuestion relay):
   turn; disable with --no-question-relay.
 
 Endless mode (--endless, opt-in; 既定は従来どおり停止ワードで終了):
-  停止ワード（既定 完了です）を「このタスクのレビュー合格」の合図として扱い、
+  停止 sentinel（既定 [AIPAIR_REVIEW_OK]）を「このタスクのレビュー合格」の合図として扱い、
   ループを止めずに Claude へ「次のタスクへ進め」と伝える。Claude 側の手持ちが
-  尽きたら Claude が --next-ask（既定「次のタスクをください」）を冒頭に書き、
+  尽きたら Claude が --next-ask（既定 [AIPAIR_NEXT]）を先頭行に単独で書き、
   relay は Codex に「タスクリストから次の1件を指示せよ」と依頼する。Codex が
-  --all-done（既定「全タスク完了」）を冒頭に書いた時点でループ終了（exit 0）。
+  --all-done（既定 [AIPAIR_ALL_DONE]）を先頭行に単独で書いた時点でループ終了（exit 0）。
 
       Claude 実装 ──▶ Codex レビュー
         ├ 指摘あり      → Claude が修正（従来どおり）
-        └「完了です」    → Claude「次のタスクへ」
-                            └ 手持ちなし →「次のタスクをください」
-                                 └─▶ Codex「次はこれ」/「全タスク完了」→ 終了
+        └[AIPAIR_REVIEW_OK] → Claude「次のタスクへ」
+                            └ 手持ちなし → [AIPAIR_NEXT]
+                                 └─▶ Codex「次はこれ」/ [AIPAIR_ALL_DONE] → 終了
 
   次タスクの根拠は --task-list（既定 tasks/todo.md）の未チェック項目に限定し、
   リスト外の新規提案を禁じる文面を Codex へ送る（スコープ膨張の防止）。
@@ -106,6 +106,7 @@ version_gate = corelib.version_gate
 schema_probe = corelib.schema_probe
 schema_gate = corelib.schema_gate
 hit_stop = corelib.hit_stop
+head_line = corelib.head_line
 scrub_output = corelib.scrub_output
 gate_tail = corelib.gate_tail
 gate_message = corelib.gate_message
@@ -657,8 +658,10 @@ def plan_poke_codex(plan_path, ok):
     where = f"`{plan_path}`" if plan_path else "`~/.claude/plans/` にある最新の .md"
     return (f"【自動プランレビュー】Claudeが実装プランを作成し、承認待ちで停止しています。"
             f"プランファイル {where} を読んでレビューしてください。修正すべき点があれば具体的かつ簡潔に"
-            f"列挙してください（あなたの返答はそのままClaudeのプラン承認ダイアログに送信されます—"
-            f"人間に伝言を頼まないでください）。修正が不要なら本文の冒頭に「{ok}」と明記してください。")
+            f"列挙してください（その場合は下記の承認シグナルを書かないこと。あなたの返答はそのまま"
+            f"Claudeのプラン承認ダイアログに送信されます—人間に伝言を頼まないでください）。"
+            f"問題がなく承認する場合のみ、最終回答の【1行目】に {ok} を単独で"
+            f"（同じ行に他の文字を書かず）出力してください。否定文・説明の中に書いても承認にはなりません。")
 
 
 def question_poke_codex(blocks, limit=3000):
@@ -681,7 +684,9 @@ DEFAULT_POKE_CLAUDE = ("【自動レビューループ】Codexがレビューし
 def default_poke_codex(stop):
     return (f"【自動レビューループ】Claudeが実装/修正を更新しました。`peer` でClaudeの最新の発言を読み、"
             f"コードをレビューしてください。あなたの返答は自動でClaudeに共有されます—人間に伝言を頼まないでください。"
-            f"修正が必要なら具体的に指摘し、これ以上直す点が無ければ本文の冒頭に「{stop}」と明記してください。")
+            f"修正が必要なら具体的に指摘してください（その場合は下記の合格シグナルを書かないこと）。"
+            f"これ以上直す点が無い場合のみ、最終回答の【1行目】に {stop} を単独で"
+            f"（同じ行に他の文字を書かず）出力してください。否定文・引用・説明の中に書いても合格にはなりません。")
 
 
 # --- endless mode の poke 文面 ---------------------------------------------- #
@@ -693,8 +698,9 @@ def endless_poke_claude_pass(task_list, next_ask):
             "収束しません）。次に、未チェック項目から**次の1件**に着手してください。着手する項目名を"
             "明示してから実装し、終わったら何をしたか簡潔に述べてターンを終えてください。"
             "あなたの返答は自動でCodexに共有されます—人間に伝言を頼まないでください。"
-            f"未チェック項目が無く、あなたの側でやることが尽きている場合のみ、本文の冒頭に「{next_ask}」と"
-            "明記してターンを終えてください（Codexが次の指示を出します）。")
+            f"未チェック項目が無く、あなたの側でやることが尽きている場合のみ、最終回答の【1行目】に "
+            f"{next_ask} を単独で（同じ行に他の文字を書かず）出力してターンを終えてください"
+            "（Codexが次の指示を出します）。それ以外の場合はこのシグナルを書かないこと。")
 
 
 def endless_poke_codex_next(task_list, all_done):
@@ -703,8 +709,9 @@ def endless_poke_codex_next(task_list, all_done):
             f"`{task_list}` の**未チェック項目**から次に着手すべきものを**1件だけ**指示してください。"
             "指示は「どのファイルで何をするか」が分かる具体性で書いてください。"
             "あなたの返答は自動でClaudeに共有されます—人間に伝言を頼まないでください。"
-            f"⚠ リストに無い作業を新規に提案しないこと。未チェック項目が残っていない場合は、本文の冒頭に"
-            f"「{all_done}」と明記してください（それでループを終了します）。")
+            f"⚠ リストに無い作業を新規に提案しないこと。未チェック項目が残っていない場合のみ、最終回答の"
+            f"【1行目】に {all_done} を単独で（同じ行に他の文字を書かず）出力してください"
+            "（それでループを終了します）。まだ残っている場合はこのシグナルを書かないこと。")
 
 
 def endless_poke_claude_next(task_list):
@@ -720,8 +727,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--session", help="tmux session (default: current)")
     ap.add_argument("--dir", default=os.getcwd(), help="working directory (default: cwd)")
-    ap.add_argument("--stop", default=_env_str("AIPAIR_STOP", "完了です"),
-                    help="stop phrase(s), '||'-separated (default 完了です / env AIPAIR_STOP)")
+    ap.add_argument("--stop", default=_env_str("AIPAIR_STOP", "[AIPAIR_REVIEW_OK]"),
+                    help="制御 sentinel（'||'-separated）。最終メッセージの先頭行が完全一致で成立。"
+                         "default [AIPAIR_REVIEW_OK] / env AIPAIR_STOP")
     ap.add_argument("--stop-side", default=_env_str("AIPAIR_STOP_SIDE", "codex"),
                     choices=["codex", "claude", "both"],
                     help="whose message ends the loop (default codex / env AIPAIR_STOP_SIDE)")
@@ -732,10 +740,10 @@ def main():
                          "終端は Codex の --all-done 宣言のみ（env AIPAIR_ENDLESS）")
     ap.add_argument("--no-endless", action="store_true",
                     help="AIPAIR_ENDLESS が効いている環境で、この1本だけ連続モードを切る")
-    ap.add_argument("--next-ask", default=_env_str("AIPAIR_NEXT_ASK", "次のタスクをください"),
-                    help="endless: Claude 側の手持ちが尽きた合図（default 次のタスクをください / env AIPAIR_NEXT_ASK）")
-    ap.add_argument("--all-done", default=_env_str("AIPAIR_ALL_DONE", "全タスク完了"),
-                    help="endless: Codex 側が残タスク無しを宣言する終端ワード（default 全タスク完了 / env AIPAIR_ALL_DONE）")
+    ap.add_argument("--next-ask", default=_env_str("AIPAIR_NEXT_ASK", "[AIPAIR_NEXT]"),
+                    help="endless: Claude 側の手持ちが尽きた合図 sentinel（default [AIPAIR_NEXT] / env AIPAIR_NEXT_ASK）")
+    ap.add_argument("--all-done", default=_env_str("AIPAIR_ALL_DONE", "[AIPAIR_ALL_DONE]"),
+                    help="endless: Codex 側が残タスク無しを宣言する終端 sentinel（default [AIPAIR_ALL_DONE] / env AIPAIR_ALL_DONE）")
     ap.add_argument("--task-list", default=_env_str("AIPAIR_TASK_LIST", "tasks/todo.md"),
                     help="endless: 次タスクの唯一の根拠にするタスクリスト（default tasks/todo.md / env AIPAIR_TASK_LIST）")
     ap.add_argument("--gate", default=_env_str("AIPAIR_GATE", None),
@@ -755,8 +763,8 @@ def main():
     ap.add_argument("--poke-codex", default=None, help="default references the stop phrase")
     ap.add_argument("--plan-rounds", type=int, default=5,
                     help="max plan-review rounds per plan (default 5)")
-    ap.add_argument("--plan-ok", default="プラン承認",
-                    help="Codex's plan-approval phrase (default プラン承認)")
+    ap.add_argument("--plan-ok", default=_env_str("AIPAIR_PLAN_OK", "[AIPAIR_PLAN_APPROVED]"),
+                    help="Codex のプラン承認 sentinel。先頭行完全一致でのみ承認（default [AIPAIR_PLAN_APPROVED] / env AIPAIR_PLAN_OK）")
     ap.add_argument("--allow-untested-dialogs", action="store_true",
                     default=_env_bool("AIPAIR_ALLOW_UNTESTED_DIALOGS"),
                     help="claude/codex の版が検証済みと違ってもプラン承認・質問リレーの自動操作を続ける"
@@ -808,14 +816,14 @@ def main():
     cwd = os.path.realpath(os.path.expanduser(a.dir))
     stop_phrases = [s for s in a.stop.split("||") if s]
 
-    poke_codex = a.poke_codex or default_poke_codex(stop_phrases[0] if stop_phrases else "完了です")
+    poke_codex = a.poke_codex or default_poke_codex(stop_phrases[0] if stop_phrases else "[AIPAIR_REVIEW_OK]")
     poke_claude = a.poke_claude
     next_ask_phrases = [s for s in a.next_ask.split("||") if s]
     all_done_phrases = [s for s in a.all_done.split("||") if s]
     poke_claude_pass = endless_poke_claude_pass(a.task_list, next_ask_phrases[0] if next_ask_phrases
-                                                else "次のタスクをください")
+                                                else "[AIPAIR_NEXT]")
     poke_codex_next = endless_poke_codex_next(a.task_list, all_done_phrases[0] if all_done_phrases
-                                              else "全タスク完了")
+                                              else "[AIPAIR_ALL_DONE]")
     poke_claude_next = endless_poke_claude_next(a.task_list)
     if a.endless and not all_done_phrases:
         print(c("warn", "aipair-relay: --endless では --all-done が終端の唯一の手段です（空にできません）"),
@@ -889,7 +897,7 @@ def main():
              c("warn", "  → ログschema不一致のためダイアログ自動操作を OFF"
                        "（ターン検出の信頼性低下に注意。--allow-untested-schema で無効化）")))
     if a.endless:
-        log(c("ok", "連続モード=on") + f"（「{stop_phrases[0] if stop_phrases else '完了です'}」＝レビュー合格→次のタスクへ）")
+        log(c("ok", "連続モード=on") + f"（「{stop_phrases[0] if stop_phrases else '[AIPAIR_REVIEW_OK]'}」＝レビュー合格→次のタスクへ）")
         log(f"  タスクリスト={a.task_list}  次を要求={'/'.join(next_ask_phrases)}  "
             f"終端={'/'.join(all_done_phrases)}（codex側）")
         if a.stop_side != "codex":
@@ -1198,8 +1206,10 @@ def main():
                     tstart = max(since, probe_ts_cache) if probe else since
                     texts = turn_texts("codex", tracked["codex"], tstart, done)
                     text = "\n".join(texts).strip()
-                    # 承認判定も停止ワードと同じ理由で最終メッセージ（=本文）の冒頭で行う
-                    final = " ".join(texts[-1].split()) if texts else ""
+                    # 承認判定は停止ワードと同じく sentinel の先頭行完全一致で行う。プランの
+                    # 自動承認は不可逆な自動操作なので、否定文・引用・指示文中の言及
+                    # （「[AIPAIR_PLAN_APPROVED]とは判断できません」等）を絶対に承認にしない。
+                    plan_head = head_line(texts[-1]) if texts else ""
                     dialog = detect_plan_dialog(panes["claude"]) or plan_dialog
                     if text:
                         dim(c("codex", "codex") + ": " + oneline(text))
@@ -1207,8 +1217,10 @@ def main():
                         log(c("warn", "◆ Codex のレビュー本文を取得できず。ダイアログ検知からやり直します。"))
                     elif dialog is None:
                         log(c("warn", "◆ プランダイアログが見当たりません（人間が操作した？）。通常の待機に戻ります。"))
-                    elif a.plan_ok in final[:80]:
-                        extra = final.replace(a.plan_ok, "", 1).strip(" 。、！!\n\t「」")
+                    elif plan_head == a.plan_ok:
+                        # 承認は成立。付帯コメント（先頭 sentinel 行を除いた残り）が十分あれば
+                        # feedback 付き承認（shift+tab）、無ければそのまま承認する。
+                        extra = text.replace(a.plan_ok, "", 1).strip(" 。、！!\n\t「」")
                         if len(extra) > 80 and dialog["tell"]:
                             log("◆ " + c("ok", "Codex がプラン承認（付帯コメントあり）")
                                 + " → feedback付きで承認（shift+tab）")

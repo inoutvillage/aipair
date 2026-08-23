@@ -41,22 +41,65 @@ def epoch(iso):
 
 
 class HitStop(unittest.TestCase):
-    def test_only_the_head_of_the_last_message_counts(self):
-        self.assertTrue(relay.hit_stop(["確認します", "完了です。修正点はありません"], ["完了です"]))
-        self.assertFalse(relay.hit_stop(["完了です", "まだ直す点があります"], ["完了です"]),
-                         "an earlier narration message must not stop the loop")
+    # 制御信号は自然言語から分離した専用 sentinel。最終メッセージの《先頭の非空行が
+    # sentinel と完全一致》した時だけ成立する（否定文・引用・文中言及・同一行の後続テキストは不成立）。
+    OK = "[AIPAIR_REVIEW_OK]"
+    DONE = "[AIPAIR_ALL_DONE]"
 
-    def test_mid_message_mention_beyond_100_chars_does_not_stop(self):
-        text = "x" * 120 + " 完了です"
-        self.assertFalse(relay.hit_stop([text], ["完了です"]))
+    def test_sentinel_alone_or_with_following_lines(self):
+        self.assertTrue(relay.hit_stop([self.OK], [self.OK]), "sentinel 単独 → true")
+        self.assertTrue(relay.hit_stop([self.OK + "\n問題ありません。"], [self.OK]),
+                        "sentinel + 後続説明(2行目) → true")
+        self.assertTrue(relay.hit_stop(["\n\n" + self.OK], [self.OK]),
+                        "先頭の空行は許容")
 
-    def test_any_of_several_phrases_and_markdown_noise(self):
-        self.assertTrue(relay.hit_stop(["**LGTM** — ship it"], ["完了です", "LGTM"]))
-        self.assertTrue(relay.hit_stop(["  完了です\n\n詳細…"], ["完了です"]), "whitespace is collapsed")
+    def test_sentinel_not_at_head_does_not_stop(self):
+        self.assertFalse(relay.hit_stop(["レビュー結果:\n" + self.OK], [self.OK]),
+                         "sentinel が2行目 → false")
+        self.assertFalse(relay.hit_stop(["まだ " + self.OK + " とは言えません。"], [self.OK]),
+                         "「まだ sentinel ではない」→ false")
+        self.assertFalse(relay.hit_stop([self.DONE + "ではありません。あと2件残っています。"], [self.DONE]),
+                         "「sentinelではありません」→ false")
+        self.assertFalse(relay.hit_stop(["この後 " + self.OK + " と回答してください。"], [self.OK]),
+                         "「sentinel と回答してください」→ false")
+
+    def test_same_line_trailing_text_does_not_stop(self):
+        self.assertFalse(relay.hit_stop([self.OK + " 問題ありません"], [self.OK]),
+                         "sentinel は先頭行に単独で置かれた時のみ成立（同一行の後続テキストは不成立）")
+
+    def test_mid_message_mention_does_not_stop(self):
+        self.assertFalse(relay.hit_stop(["ツールの修正が " + self.OK + " 。ただし本題は残っています。"], [self.OK]),
+                         "100字以内の文中一致 → false")
+        self.assertFalse(relay.hit_stop(["x" * 120 + " " + self.OK], [self.OK]),
+                         "100字以降の一致 → false")
+
+    def test_only_the_last_message_head_counts(self):
+        self.assertFalse(relay.hit_stop([self.OK, "まだ直す点があります"], [self.OK]),
+                         "先行ナレーションが sentinel でも、最終メッセージが別なら停止しない")
+
+    def test_several_candidates_only_the_leading_one(self):
+        self.assertTrue(relay.hit_stop([self.OK], [self.OK, self.DONE]),
+                        "複数候補のうち先頭行に一致する sentinel のみ true")
+        self.assertFalse(relay.hit_stop([self.OK], [self.DONE]),
+                         "先頭が OK の時に DONE 単独では成立しない")
+
+    def test_custom_phrase_also_head_exact(self):
+        # カスタム停止ワードも先頭行完全一致（substring ではない）
+        self.assertTrue(relay.hit_stop(["LGTM\nship it"], ["LGTM"]))
+        self.assertFalse(relay.hit_stop(["**LGTM** — ship it"], ["LGTM"]),
+                         "markdown で囲んだ言及は制御信号ではない")
 
     def test_empty(self):
-        self.assertFalse(relay.hit_stop([], ["完了です"]))
-        self.assertFalse(relay.hit_stop(["完了です"], []))
+        self.assertFalse(relay.hit_stop([], [self.OK]))
+        self.assertFalse(relay.hit_stop([self.OK], []))
+
+
+class HeadLine(unittest.TestCase):
+    def test_first_non_empty_line_stripped(self):
+        self.assertEqual(relay.head_line("  [AIPAIR_NEXT]  \n次の行"), "[AIPAIR_NEXT]")
+        self.assertEqual(relay.head_line("\n\n  hello \nworld"), "hello")
+        self.assertEqual(relay.head_line(""), "")
+        self.assertEqual(relay.head_line("   \n\t\n"), "")
 
 
 class EnvHelpers(unittest.TestCase):
@@ -1083,7 +1126,8 @@ class CorelibStandalone(unittest.TestCase):
         core = importlib.util.module_from_spec(importlib.util.spec_from_loader("corelib_standalone", loader))
         loader.exec_module(core)   # would raise if it referenced relay-only globals
         self.assertEqual(core.parse_version("2.1.238 (Claude Code)"), "2.1.238")
-        self.assertTrue(core.hit_stop(["完了です。"], ["完了です"]))
+        self.assertTrue(core.hit_stop(["[AIPAIR_REVIEW_OK]"], ["[AIPAIR_REVIEW_OK]"]))   # head-exact
+        self.assertFalse(core.hit_stop(["まだ [AIPAIR_REVIEW_OK] ではない"], ["[AIPAIR_REVIEW_OK]"]))
         self.assertEqual(core.scrub_output("a\x00b"), "a b")
         self.assertEqual(core.schema_probe("claude", [])[0], "unverified")   # pure, no relay needed
         self.assertEqual(core.TESTED_VERSIONS, relay.TESTED_VERSIONS)

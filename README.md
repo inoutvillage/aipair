@@ -196,7 +196,7 @@ aipair name   [dir]    # tmux セッション名を表示
 | タスク | 動作 |
 |---|---|
 | 🤝 起動 / 再アタッチ | `aipair`（claude ┃ codex ／ 下段 bridge） |
-| 🔁 相互レビュー・ループ | `aipair loop`（自走。Codex が「完了です」で停止） |
+| 🔁 相互レビュー・ループ | `aipair loop`（自走。Codex が `[AIPAIR_REVIEW_OK]` で停止） |
 | 📜 統合ログ（bridge）だけ表示 | `peer-log both --watch`（アタッチせず会話を俯瞰） |
 | 🛑 停止 | `aipair stop` |
 | 🤖 claude 単体 / 🤖 codex 単体 | tmux 無しで片方だけ（`peer` 参照可） |
@@ -237,23 +237,23 @@ peer-log codex --full      # セッション全体
 1. 起動後、**Claude ペインに最初の依頼を入力**（例「○○を実装して」）
 2. Claude が実装完了（`end_turn`）→ relay が Codex に自動ポーク「`peer` で読んでレビューして」
 3. Codex がレビュー完了（`task_complete`）→ relay が Claude に自動ポーク「`peer` で読んで修正して」
-4. 2–3 を繰り返し、**Codex の発言に停止ワード「完了です」が出たら自動停止**（最大 20 往復で打ち切り）
+4. 2–3 を繰り返し、**Codex の最終回答が先頭行に停止 sentinel `[AIPAIR_REVIEW_OK]` を単独で出したら自動停止**（最大 20 往復で打ち切り）
    - 判定はターンの**最終メッセージの冒頭 100 字**（ターン途中の進捗ナレーションは見ない。
-     文中の偶発的な「〜が完了です」での誤停止を防ぐため冒頭のみ）
+     制御信号は専用 sentinel に分離し、否定文・引用・文中言及での誤停止を防ぐ）
 
 ### 日本語の既定値と変更方法
 
-停止ワード・合図は日本語が既定。英語などに変えるには env（または relay のフラグ）で上書きする（**優先順位: CLI フラグ > 環境変数 > 既定値**）:
+停止・状態遷移の合図は自然言語から分離した専用 **sentinel**（`[AIPAIR_REVIEW_OK]` / `[AIPAIR_NEXT]` / `[AIPAIR_ALL_DONE]` / `[AIPAIR_PLAN_APPROVED]`）で、**最終回答の先頭行に単独で置かれた時だけ**成立する。変えるには env（または relay のフラグ）で上書きする（**優先順位: CLI フラグ > 環境変数 > 既定値**）:
 
 | 環境変数 | 既定 | 意味 |
 |---|---|---|
-| `AIPAIR_STOP` | `完了です` | 停止ワード（`\|\|` 区切りで複数可）。例: `AIPAIR_STOP="LGTM\|\|完了です"` |
+| `AIPAIR_STOP` | `[AIPAIR_REVIEW_OK]` | 停止 sentinel（`\|\|` 区切りで複数可）。**最終回答の先頭行に単独で置かれた時のみ成立**（否定文・引用・文中言及では不成立）。例: `AIPAIR_STOP="LGTM\|\|[AIPAIR_REVIEW_OK]"` |
 | `AIPAIR_STOP_SIDE` | `codex` | どちらの発言で止めるか（`codex` / `claude` / `both`） |
 | `AIPAIR_MAX_ROUNDS` | `20` | 最大往復数（暴走防止） |
 | `AIPAIR_ENDLESS` | （未設定＝off） | `1` で連続モード（→ 次節） |
 | `AIPAIR_TASK_LIST` | `tasks/todo.md` | 連続モードの次タスクの根拠ファイル |
-| `AIPAIR_NEXT_ASK` | `次のタスクをください` | 連続モード: Claude の手持ちが尽きた合図 |
-| `AIPAIR_ALL_DONE` | `全タスク完了` | 連続モード: Codex の終端宣言 |
+| `AIPAIR_NEXT_ASK` | `[AIPAIR_NEXT]` | 連続モード: Claude の手持ちが尽きた合図 sentinel（先頭行に単独で） |
+| `AIPAIR_ALL_DONE` | `[AIPAIR_ALL_DONE]` | 連続モード: Codex の終端 sentinel（先頭行に単独で） |
 | `AIPAIR_UNSAFE` | （未設定＝安全） | `1`/`--unsafe` で権限バイパス起動（`aipair loop` は必須）。既定は通常の許可プロンプト |
 | `AIPAIR_CLAUDE_FLAGS` / `AIPAIR_CODEX_FLAGS` | （安全＝無し／`--unsafe`＝`--dangerously-…`） | 起動フラグ。明示指定は最優先。**ペイン内のシェルが解釈するシェル断片**（`"--model opus"` は 2 引数、`'--append-system-prompt "a b"'` の引用符も有効）。空文字でフラグ無し。**ただし `aipair loop` では危険フラグが必ず付与される**（空/カスタム指定にも追記。relay が許可プロンプトに答えられないため） |
 | `AIPAIR_DRY_RUN` | （未設定＝off） | `1` で各ペインに打ち込む起動行を表示するだけで何も起動しない（設定確認・テスト用）。真偽値の読み方は `AIPAIR_ENDLESS` と同じ |
@@ -288,40 +288,40 @@ peer-log codex --full      # セッション全体
 
   | 状態 | タイトル |
   |---|---|
-  | 通常モード | `relay ● 1タスク / max 20 / 停止「完了です」/ Ctrl-C で停止` |
-  | 連続モード | `relay ● endless / max 100 / 終端「全タスク完了」/ Ctrl-C で停止` |
+  | 通常モード | `relay ● 1タスク / max 20 / 停止 [AIPAIR_REVIEW_OK] / Ctrl-C で停止` |
+  | 連続モード | `relay ● endless / max 100 / 終端 [AIPAIR_ALL_DONE] / Ctrl-C で停止` |
   | 終了後 | `relay ■ 終了(全タスク完了) / 3往復` ／ `■ 終了(キャップ到達)` ／ `■ 終了(配達失敗)` ／ `■ 終了(停止ゲート失敗)` ／ `■ 中断` |
 
 ### 連続モード（endless）— 全タスクが尽きるまで止めない
 
-既定は「1 タスク＝1 ループ」で、Codex の「完了です」で終わります。
+既定は「1 タスク＝1 ループ」で、Codex が `[AIPAIR_REVIEW_OK]` を先頭行に出したら終わります。
 **`AIPAIR_ENDLESS=1 aipair loop`**（または `aipair-relay --endless`）にすると、
 停止ワードを**「このタスクのレビュー合格」**として扱い、ループを止めずに次のタスクへ進みます。
 
 ```
 Claude 実装 ──▶ Codex レビュー
   ├ 指摘あり      → Claude が修正（従来どおり）
-  └「完了です」    → Claude へ「合格。tasks/todo.md の次の1件へ」
-                      └ 未チェック項目なし → Claude「次のタスクをください」
+  └ [AIPAIR_REVIEW_OK] → Claude へ「合格。tasks/todo.md の次の1件へ」
+                      └ 未チェック項目なし → Claude [AIPAIR_NEXT]
                            └─▶ Codex へ「リストから次を1件指示して」
                                  ├ 次タスク提示 → Claude 実装へ戻る
-                                 └「全タスク完了」→ ■ ループ終了（exit 0）
+                                 └ [AIPAIR_ALL_DONE] → ■ ループ終了（exit 0）
 ```
 
-- **終端は Codex の「全タスク完了」宣言だけ**です。`--max-rounds` は暴走防止のキャップとして残るので、
+- **終端は Codex の `[AIPAIR_ALL_DONE]` 宣言だけ**です。`--max-rounds` は暴走防止のキャップとして残るので、
   連続モードでは大きめ（例 `AIPAIR_MAX_ROUNDS=100`）にしてください。
 - **次タスクの根拠は `tasks/todo.md` の未チェック項目に限定**され、リスト外の新規提案を禁じる文面を
   Codex に送ります（放っておくと「改善案」が無限に湧いてスコープが膨らむため）。パスは `AIPAIR_TASK_LIST` で変更可。
 - 合図の判定は既定モードと同じ **最終メッセージの冒頭 100 字**です。3 つの合図
-  （完了です／次のタスクをください／全タスク完了）はいずれもこの窓に入った時だけ効きます。
+  （`[AIPAIR_REVIEW_OK]` ／ `[AIPAIR_NEXT]` ／ `[AIPAIR_ALL_DONE]`）はいずれも先頭行に単独で置かれた時だけ効きます。
   窓内に偶発的に書かれると誤検知しますが、いずれも**早く止まる/次に進む方向**に倒れます。
 
 ### relay の再点火（`aipair-relay-here`）
 
 relay が終了して往復が止まった後、新しい仕事があれば **`aipair-relay-here`**（ペア内の claude / codex / bridge
 どのペインからでも）で relay を 1 本だけ再点火できる（`--adopt` で既存ペアに乗る。bridge が busy なら二重起動を避けて exit 2）。
-Claude からは `aipair-relay` スキルでも同じことができる。**オンデマンド専用＝自動再起動はしない**（「完了です」の直後に
-無条件で再点火すると、Codex がまた即「完了です」→ 延々ループになるため）。
+Claude からは `aipair-relay` スキルでも同じことができる。**オンデマンド専用＝自動再起動はしない**（`[AIPAIR_REVIEW_OK]` の直後に
+無条件で再点火すると、Codex がまた即 `[AIPAIR_REVIEW_OK]` → 延々ループになるため）。
 
 ```bash
 aipair-relay-here --print [rounds N] [stop "フレーズ"] [stop-side codex|claude|both]   # ドライラン（組み立てたコマンドを表示）
@@ -337,7 +337,7 @@ Claude がプランモードで **「Would you like to proceed?」の承認待�
 1. ダイアログからプランファイルのパス（`~/.claude/plans/*.md`）を読み取り、**Codex にレビュー依頼**
 2. Codex の返答で分岐:
    - **修正要求** → 「Tell Claude what to change」を選択し、レビュー本文をペーストして **Enter**（Claude がプラン修正 → 再度ダイアログ → 繰り返し）
-   - **承認**（冒頭に「プラン承認」）→ 「Yes, and bypass permissions」を選択して実装開始
+   - **承認**（先頭行に `[AIPAIR_PLAN_APPROVED]` を単独で）→ 「Yes, and bypass permissions」を選択して実装開始
    - **承認＋付帯コメント** → feedback をペーストして **shift+tab**（feedback 付き承認）
 3. プランレビューは 1 プランにつき最大 5 回（`--plan-rounds`）。超過時はベルを鳴らして人間に委ねる
 
@@ -360,7 +360,7 @@ Codex のレビュー配達時（通常ループ）も、Claude が質問ダイ�
 | relay オプション | 既定 | 意味 |
 |---|---|---|
 | `--plan-rounds N` | `5` | プランレビューの上限回数 |
-| `--plan-ok WORD` | `プラン承認` | Codex の承認ワード |
+| `--plan-ok WORD` | `[AIPAIR_PLAN_APPROVED]` | Codex のプラン承認 sentinel（先頭行完全一致でのみ承認 / env `AIPAIR_PLAN_OK`） |
 | `--no-plan-review` | — | プランダイアログ処理を無効化（従来動作） |
 | `--question-rounds N` | `5` | 質問リレーの連続上限（ターン完了でリセット） |
 | `--no-question-relay` | — | 質問ダイアログ処理を無効化（従来動作） |
@@ -384,7 +384,7 @@ Codex のレビュー配達時（通常ループ）も、Claude が質問ダイ�
 
 | code | 意味 |
 |---|---|
-| 0 | 停止ワード検知（正常完了）。連続モードでは Codex の「全タスク完了」宣言 |
+| 0 | 停止 sentinel 検知（正常完了）。連続モードでは Codex の `[AIPAIR_ALL_DONE]` 宣言 |
 | 2 | 起動エラー（session/pane 不明等）・env の不正値 |
 | 3 | 最大往復キャップ到達 |
 | 4 | poke 配達失敗 |

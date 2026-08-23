@@ -51,7 +51,7 @@ run() { bash -c "$(line "$@")"; }
 J=$'\n'
 
 echo "# [1] loop defaults"
-chk "$(run loop bridge)" "cmd=aipair-relay self=bridge peer=${J}[--max-rounds]${J}[20]${J}[--stop]${J}[完了です]${J}[--stop-side]${J}[codex]" "bridge: relay with default args"
+chk "$(run loop bridge)" "cmd=aipair-relay self=bridge peer=${J}[--max-rounds]${J}[20]${J}[--stop]${J}[[AIPAIR_REVIEW_OK]]${J}[--stop-side]${J}[codex]" "bridge: relay with default args"
 chk "$(run loop claude)" "cmd=claude self=claude peer=codex${J}[--session-id]${J}[$S]${J}[--dangerously-skip-permissions]" "claude: --session-id pin + bypass under --unsafe, AI_SELF/AI_PEER exported"
 chk "$(run loop codex)"  "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]" "codex: bypass flag under --unsafe, AI_SELF/AI_PEER exported"
 chk "$(line loop session)" "$(aipair name "$W/proj")" "session line = aipair name"
@@ -101,16 +101,16 @@ echo "# [2] values with shell metacharacters arrive as ONE argument each"
 chk "$(run loop bridge "AIPAIR_STOP=it's done" | sed -n '5p')" "[it's done]" "apostrophe in AIPAIR_STOP"
 chk "$(run loop bridge 'AIPAIR_STOP=say "ok" $HOME; rm -rf /' | sed -n '5p')" '[say "ok" $HOME; rm -rf /]' "double quotes, \$VAR and ; are literal (no expansion, no injection)"
 chk "$(run loop bridge 'AIPAIR_STOP=LGTM||完了です' | sed -n '5p')" "[LGTM||完了です]" "README example with || separator"
-chk "$(run loop bridge 'AIPAIR_STOP=' | sed -n '5p')" "[完了です]" "empty AIPAIR_STOP falls back to the default"
+chk "$(run loop bridge 'AIPAIR_STOP=' | sed -n '5p')" "[[AIPAIR_REVIEW_OK]]" "empty AIPAIR_STOP falls back to the default sentinel"
 chk "$(run loop bridge 'AIPAIR_MAX_ROUNDS=100' 'AIPAIR_STOP_SIDE=both' | sed -n '3p;7p' | paste -sd' ')" "[100] [both]" "max-rounds / stop-side pass through"
 
 echo "# [3] endless mode"
 chk "$(run loop bridge AIPAIR_ENDLESS=1 'AIPAIR_TASK_LIST=my tasks/todo list.md' 'AIPAIR_ALL_DONE=all done!' | sed -n '8,14p')" \
-    "[--endless]${J}[--task-list]${J}[my tasks/todo list.md]${J}[--next-ask]${J}[次のタスクをください]${J}[--all-done]${J}[all done!]" "endless args, spaces and ! intact"
+    "[--endless]${J}[--task-list]${J}[my tasks/todo list.md]${J}[--next-ask]${J}[[AIPAIR_NEXT]]${J}[--all-done]${J}[all done!]" "endless args, spaces and ! intact"
 for off in 0 false no off; do
   chk "$(run loop bridge "AIPAIR_ENDLESS=$off" | grep -c -- '--endless' || true)" "0" "AIPAIR_ENDLESS=$off means off (as README promises)"
 done
-chk "$(line loop title AIPAIR_ENDLESS=1 'AIPAIR_ALL_DONE=fin')" "relay ● endless / max 20 / 終端「fin」/ Ctrl-C で停止" "endless title"
+chk "$(line loop title AIPAIR_ENDLESS=1 'AIPAIR_ALL_DONE=fin')" "relay ● endless / max 20 / 終端 fin / Ctrl-C で停止" "endless title"
 
 echo "# [4] agent flags are shell fragments (documented, backwards compatible)"
 # `start` (interactive) mode: loop always appends the bypass flag, so test the fragment
