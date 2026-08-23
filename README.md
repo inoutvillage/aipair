@@ -238,7 +238,7 @@ peer-log codex --full      # セッション全体
 2. Claude が実装完了（`end_turn`）→ relay が Codex に自動ポーク「`peer` で読んでレビューして」
 3. Codex がレビュー完了（`task_complete`）→ relay が Claude に自動ポーク「`peer` で読んで修正して」
 4. 2–3 を繰り返し、**Codex の最終回答が先頭行に停止 sentinel `[AIPAIR_REVIEW_OK]` を単独で出したら自動停止**（最大 20 往復で打ち切り）
-   - 判定はターンの**最終メッセージの冒頭 100 字**（ターン途中の進捗ナレーションは見ない。
+   - 判定はターンの**最終メッセージの先頭行が sentinel と完全一致**した時のみ（ターン途中の進捗ナレーションは見ない。
      制御信号は専用 sentinel に分離し、否定文・引用・文中言及での誤停止を防ぐ）
 
 ### 日本語の既定値と変更方法
@@ -312,7 +312,7 @@ Claude 実装 ──▶ Codex レビュー
   連続モードでは大きめ（例 `AIPAIR_MAX_ROUNDS=100`）にしてください。
 - **次タスクの根拠は `tasks/todo.md` の未チェック項目に限定**され、リスト外の新規提案を禁じる文面を
   Codex に送ります（放っておくと「改善案」が無限に湧いてスコープが膨らむため）。パスは `AIPAIR_TASK_LIST` で変更可。
-- 合図の判定は既定モードと同じ **最終メッセージの冒頭 100 字**です。3 つの合図
+- 合図の判定は既定モードと同じ **最終メッセージの先頭行の sentinel 完全一致**です。3 つの合図
   （`[AIPAIR_REVIEW_OK]` ／ `[AIPAIR_NEXT]` ／ `[AIPAIR_ALL_DONE]`）はいずれも先頭行に単独で置かれた時だけ効きます。
   窓内に偶発的に書かれると誤検知しますが、いずれも**早く止まる/次に進む方向**に倒れます。
 
@@ -435,7 +435,7 @@ aipair-relay --no-version-gate             # 版チェック自体をしない�
 判断が変わったら:
 
 ```bash
-aipair-relay --allow-untested-schema       # schema が食い違っても自動操作を続ける（AIPAIR_ALLOW_UNTESTED_SCHEMA=1）
+aipair-relay --allow-untested-schema       # schema 不一致でも継続=fail-open（既定は fail-closed で exit 7・AIPAIR_ALLOW_UNTESTED_SCHEMA=1）
 aipair-relay --no-schema-probe             # schema probe 自体をしない（AIPAIR_NO_SCHEMA_PROBE=1）
 ```
 
