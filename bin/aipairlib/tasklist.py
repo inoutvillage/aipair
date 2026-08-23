@@ -1,8 +1,8 @@
-"""aipair endless-mode task-list classifier (pure, no I/O).
+"""aipair endless-mode task-list classifier + loader.
 
-endless モードの task-list 本文を READY / BLOCKED / ALL_DONE に分類する純関数。
-ファイル I/O・path 解決・exit コード写像は loader 側（別項目）に分離する。ここは
-「本文テキスト → 構造化された分類結果 or TaskListError」だけを担う。
+endless モードの task-list を READY / BLOCKED / ALL_DONE に分類する。
+`classify()` は純関数（本文テキスト → 分類結果 or TaskListError）。ファイル I/O・
+相対パス解決・exit 2 写像は `resolve_path()` / `load()` / `load_or_exit()` に分離する。
 
 state（社長指示 2026-08-24 / `_reference/new-task.md` §2）:
   READY    = 実行可能な `[ ]` が1件以上 → endless 継続
@@ -18,7 +18,9 @@ state（社長指示 2026-08-24 / `_reference/new-task.md` §2）:
 - `hash` は順序付き正規化タプル列 `(indent, state, text, blocker)` から生成（装飾的編集では変わらない）。
 """
 import hashlib
+import os
 import re
+import sys
 
 READY = "READY"
 BLOCKED = "BLOCKED"
@@ -121,3 +123,44 @@ def classify(text):
     blocked = [{"item": it[2], "blocker": it[4]} for it in items if it[1] == "blocked"]
     state = READY if ready else (BLOCKED if blocked else ALL_DONE)
     return {"state": state, "ready": ready, "blocked": blocked, "hash": _snapshot_hash(items)}
+
+
+# ── loader（I/O・fail-closed）: 相対パスは --dir 基準で解決し、欠損・読取不能・解析不能は
+#    ALL_DONE にせず TaskListError（呼び出し側は exit 2）。 ────────────────────────────────
+def resolve_path(task_list, base_dir):
+    """相対 task-list パスを base_dir（--dir）基準で解決した絶対/連結パスを返す（純粋）。"""
+    if os.path.isabs(task_list):
+        return task_list
+    return os.path.join(base_dir, task_list)
+
+
+def load(task_list, base_dir):
+    """task-list を読み込み classify した結果を返す。失敗は全て TaskListError（fail-closed）。
+
+    欠損・ディレクトリ・読取不能・decode 不能・解析不能を **ALL_DONE にせず** 例外にする
+    （「読めない＝完了」で endless を誤停止させない）。呼び出し側は exit 2 に写像する。
+    """
+    path = resolve_path(task_list, base_dir)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        raise TaskListError("task-list not found: %s (resolved from --dir=%s)" % (path, base_dir))
+    except IsADirectoryError:
+        raise TaskListError("task-list is a directory, not a file: %s" % path)
+    except (OSError, UnicodeDecodeError) as e:
+        raise TaskListError("task-list unreadable: %s (%s)" % (path, e))
+    return classify(text)          # 解析不能なら classify が TaskListError を投げる
+
+
+def load_or_exit(task_list, base_dir, emit=None):
+    """load() し、失敗時は理由を出して sys.exit(2)（fail-closed の起動エラー）。成功時は分類結果。
+
+    emit は 1 引数の出力関数（既定は stderr）。exit 2 は cli.py の引数エラーと同じ「設定不備で
+    黙って進めない」姿勢。"""
+    try:
+        return load(task_list, base_dir)
+    except TaskListError as e:
+        (emit or (lambda m: print(m, file=sys.stderr)))(
+            "aipair-relay: task-list を読めません（fail-closed・exit 2）: %s" % e)
+        sys.exit(2)

@@ -17,7 +17,7 @@
 
 ### Phase 1 — 基盤: `[!]` 状態 + task-list 分類器 + exit 8 + sentinel
 - [x] **task-list 分類器（純関数・単体テスト）**〔`bin/aipairlib/tasklist.py`＋`tests/tasklist.py`・run-all 緑〕: **本文テキストを受け取り**（ファイル I/O は分離）**構造体**を返す: `{state, ready:[行テキスト...], blocked:[{item:行テキスト, blocker}...], hash}`。`state`=`READY`(≥1 `[ ]`) / `BLOCKED`(0 `[ ]`・≥1 `[!]`) / `ALL_DONE`(0 `[ ]`・0 `[!]`)。ネストした `  - [ ]/[!]` も対象。**認識する記法は厳密に `[ ]`・`[x]`/`[X]`・`[!]` のみ**。**未知の checkbox 風記法（`[?]`・`[-]` 等）は無視して `ALL_DONE` にせず、解析エラー exit 2**（fail-closed）。**`[!]` に直下の `blocker:` 行が無ければ解析エラー exit 2**（全 blocked は理由必須）。**任意長のバッククォート／チルダ・コードフェンス（```/~~~）内の疑似 checkbox は無視**。
-- [ ] **task-list ローダ（I/O・fail-closed）**: 相対パスは **`--dir` 基準**で解決。欠損・読取不能・解析不能は **`ALL_DONE` にせず起動エラー exit 2**（fail-closed。「読めない＝完了」で誤停止させない）。
+- [x] **task-list ローダ（I/O・fail-closed）**〔`tasklist.py` `resolve_path`/`load`/`load_or_exit`〕: 相対パスは **`--dir` 基準**で解決。欠損・読取不能・解析不能は **`ALL_DONE` にせず起動エラー exit 2**（fail-closed。「読めない＝完了」で誤停止させない）。
 - [ ] **sentinel 追加（cli.py）**: `--human-required`（既定 `[AIPAIR_HUMAN_REQUIRED]`）＋ env のみ。既存 `hit_stop`（先頭行完全一致）準拠。**`[AIPAIR_BLOCKED]` は agent sentinel にしない**（no-progress は relay 内部検出＝下記 Phase 4）。
 - [ ] **新 env の配線を完全化**: `AIPAIR_HUMAN_REQUIRED` を `cli.py` だけでなく `bin/aipair`・`bin/aipair-relay-here`（stale-env 打ち消し＋argv 転送）に追加し、`tests/env-forward.sh`・`tests/launch-cmds.sh` の被覆に含める（既存 sentinel/env と同じ経路）。
 - [ ] **exit code 8** を reason map（`state_machine.py:696`）と全終了経路に追加。2つの内部理由を持つ: (a) `HUMAN_REQUIRED`（分類==`BLOCKED`）(b) `BLOCKED (no-progress)`（relay 内部検出）。どちらも exit 8・reason 文字列で区別。max-rounds(3) と明確に区別。

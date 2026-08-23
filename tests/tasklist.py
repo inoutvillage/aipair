@@ -8,6 +8,7 @@
 """
 import os
 import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.realpath(__file__))
@@ -122,6 +123,62 @@ class SnapshotHash(unittest.TestCase):
         a = tl.classify("- [ ] task A\n")["hash"]
         b = tl.classify("# new heading\n\n- [ ] task A\n\nmore prose\n")["hash"]
         self.assertEqual(a, b)      # 非 checkbox の装飾編集では snapshot が変わらない
+
+
+class Loader(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        for root, _dirs, files in os.walk(self.dir, topdown=False):
+            for f in files:
+                os.remove(os.path.join(root, f))
+            os.rmdir(root)
+
+    def _write(self, name, text):
+        path = os.path.join(self.dir, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def test_resolve_relative_against_base_dir(self):
+        self.assertEqual(tl.resolve_path("tasks/todo.md", "/base"),
+                         os.path.join("/base", "tasks/todo.md"))
+
+    def test_resolve_absolute_is_unchanged(self):
+        self.assertEqual(tl.resolve_path("/abs/todo.md", "/base"), "/abs/todo.md")
+
+    def test_load_classifies_a_relative_path(self):
+        self._write("todo.md", "- [ ] task A\n- [x] task B\n")
+        r = tl.load("todo.md", self.dir)          # relative, resolved against base_dir
+        self.assertEqual(r["state"], tl.READY)
+        self.assertEqual(r["ready"], ["- [ ] task A"])
+
+    def test_missing_file_is_fail_closed_not_all_done(self):
+        with self.assertRaises(tl.TaskListError):
+            tl.load("does-not-exist.md", self.dir)
+
+    def test_directory_is_fail_closed(self):
+        os.mkdir(os.path.join(self.dir, "adir"))
+        with self.assertRaises(tl.TaskListError):
+            tl.load("adir", self.dir)
+
+    def test_unparseable_content_propagates_fail_closed(self):
+        self._write("bad.md", "- [?] unknown marker\n")
+        with self.assertRaises(tl.TaskListError):
+            tl.load("bad.md", self.dir)
+
+    def test_load_or_exit_returns_result_on_success(self):
+        self._write("todo.md", "- [x] done\n")
+        self.assertEqual(tl.load_or_exit("todo.md", self.dir)["state"], tl.ALL_DONE)
+
+    def test_load_or_exit_exits_2_and_emits_on_failure(self):
+        emitted = []
+        with self.assertRaises(SystemExit) as cm:
+            tl.load_or_exit("missing.md", self.dir, emit=emitted.append)
+        self.assertEqual(cm.exception.code, 2)     # fail-closed startup error
+        self.assertTrue(emitted and "fail-closed" in emitted[0])
 
 
 if __name__ == "__main__":
