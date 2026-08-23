@@ -861,12 +861,15 @@ class SchemaProbe(unittest.TestCase):
         self.assertEqual(relay.schema_probe("claude", ["not a dict", 5, None])[0], "unverified")
         self.assertEqual(relay.schema_probe("claude", None)[0], "unverified")
 
-    def test_schema_gate_mismatch_degrades_like_version_gate(self):
+    def test_schema_gate_mismatch_fails_closed_by_default(self):
+        # default = fail-closed: the gate flags the drift (schema_mismatch) so the relay stops
+        # (exit 7). It does NOT silently degrade-and-continue, so it must not force dialogs off here.
         a = self.a()
         rows, bad = relay.schema_gate(a, {"claude": ("mismatch", "x"), "codex": ("ok", "y")})
         self.assertEqual(bad, ["claude"])
-        self.assertTrue(a.no_plan_review and a.no_question_relay, "dialogs off on schema drift")
-        self.assertTrue(a.schema_mismatch)
+        self.assertTrue(a.schema_mismatch, "drift is flagged so the relay can fail closed")
+        self.assertFalse(a.no_plan_review or a.no_question_relay,
+                         "no silent degrade-and-continue without the override (the relay exits 7)")
         self.assertEqual([st for _n, st, _r in rows], ["mismatch", "ok"])
 
     def test_schema_gate_unverified_never_trips(self):
@@ -875,12 +878,23 @@ class SchemaProbe(unittest.TestCase):
         self.assertEqual(bad, [])
         self.assertFalse(a.no_plan_review or a.no_question_relay or a.schema_mismatch)
 
-    def test_schema_gate_allow_untested_keeps_dialogs_on(self):
+    def test_schema_gate_allow_untested_continues_with_dialogs_off(self):
+        # explicit override = fail-open: keep running, but still degrade the schema-sensitive
+        # dialog automation (and flag the drift). It must NOT exit.
         a = self.a(allow=True)
         rows, bad = relay.schema_gate(a, {"claude": ("mismatch", "x"), "codex": ("mismatch", "y")})
         self.assertEqual(bad, ["claude", "codex"])
-        self.assertFalse(a.no_plan_review or a.no_question_relay or a.schema_mismatch,
-                         "opt-in acknowledges the drift and keeps automation on")
+        self.assertTrue(a.schema_mismatch, "the drift is acknowledged")
+        self.assertTrue(a.no_plan_review and a.no_question_relay,
+                        "fail-open still turns off the schema-sensitive dialog automation")
+
+    def test_schema_fail_closed_policy(self):
+        # the single decision point: drift + no override → stop (exit 7); override or no drift → run
+        self.assertTrue(relay.schema_fail_closed(self.a(allow=False), ["claude"]))
+        self.assertFalse(relay.schema_fail_closed(self.a(allow=True), ["claude"]),
+                         "explicit override opts into fail-open")
+        self.assertFalse(relay.schema_fail_closed(self.a(allow=False), []),
+                         "no drift → no stop")
 
     def test_probe_log_schema_reads_the_pinned_log(self):
         with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
