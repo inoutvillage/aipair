@@ -391,6 +391,7 @@ Codex のレビュー配達時（通常ループ）も、Claude が質問ダイ�
 | 5 | プランレビュー/質問リレーの上限到達・選択肢欠落 |
 | 6 | 停止ゲート（`--gate`）が `--gate-rounds` 回失敗 |
 | 7 | ログ JSONL schema がコア relay の依存キーと不一致（**fail-closed**。`--allow-untested-schema` で継続） |
+| 8 | 連続モードで**実行可能タスクが尽き、人間対応の `[!]` のみ残存（HUMAN_REQUIRED）／または同一タスクで進捗停止（no-progress）**。max-rounds とは別扱い。人間対応後に再開 |
 | 130 | Ctrl-C 中断 |
 
 ---
