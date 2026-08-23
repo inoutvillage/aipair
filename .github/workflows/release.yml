@@ -22,6 +22,19 @@ jobs:
           VER="$(python3 -c 'import sys; sys.path.insert(0, "bin"); import aipairlib; print(aipairlib.__version__)')"
           echo "tag=$GITHUB_REF_NAME  __version__=$VER"
           [ "$TAG" = "$VER" ] || { echo "::error::tag $GITHUB_REF_NAME does not match __version__ $VER"; exit 1; }
+      - name: Require the CHANGELOG section to be DATED (not still 'unreleased'/prepared)
+        run: |
+          set -eu
+          VER="${GITHUB_REF_NAME#v}"
+          # the header must be exactly『## [VER] - YYYY-MM-DD』(dated in the release commit before
+          # tagging — see RELEASING.md); a『## [VER] — unreleased (prepared)』heading must NOT publish.
+          dated="$(awk -v v="$VER" '
+            index($0, "## [" v "]") == 1 {
+              rest = substr($0, length("## [" v "]") + 1)
+              print (rest ~ /^ - [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][[:space:]]*$/) ? "yes" : "no"
+              exit
+            }' CHANGELOG.md)"
+          [ "$dated" = yes ] || { echo "::error::CHANGELOG.md『## [$VER]』is not dated as '## [$VER] - YYYY-MM-DD' (still prepared/unreleased?) — date it in the release commit before tagging (see RELEASING.md)"; exit 1; }
       - name: Extract this version's CHANGELOG section as the release notes
         run: |
           set -eu

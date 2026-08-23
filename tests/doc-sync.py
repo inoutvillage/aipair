@@ -340,6 +340,30 @@ class Version(unittest.TestCase):
         self.assertTrue(self._extract_changelog_section(_read("CHANGELOG.md"), aipairlib.__version__),
                         "the current CHANGELOG section for __version__ must extract non-empty")
 
+    @staticmethod
+    def _section_is_dated(text, version):
+        # mirror release.yml's date guard: the header must be『## [version] - YYYY-MM-DD』(dated),
+        # not『## [version] — unreleased (prepared)』.
+        for ln in text.splitlines():
+            if ln.startswith("## [" + version + "]"):
+                return bool(re.match(r"^ - \d{4}-\d{2}-\d{2}\s*$", ln[len("## [" + version + "]"):]))
+        return False
+
+    def test_release_refuses_to_publish_an_undated_section(self):
+        rl = _read(".github/workflows/release.yml")
+        # release.yml must reject an undated (still 'unreleased'/prepared) heading before publishing,
+        # so pushing a tag before dating the CHANGELOG in the release commit fails loudly.
+        self.assertIn("is not dated as", rl, "release.yml must verify the section is dated before publishing")
+        self.assertIn("[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]", rl,
+                      "release.yml must check the YYYY-MM-DD date format of the section header")
+        # functional (mirrors the awk): dated passes, prepared/undated fails — including +build versions.
+        self.assertTrue(self._section_is_dated("## [0.1.0] - 2026-08-23\nx\n", "0.1.0"))
+        self.assertFalse(self._section_is_dated("## [0.1.0] — unreleased (prepared)\nx\n", "0.1.0"))
+        self.assertTrue(self._section_is_dated("## [1.2.3+build.5] - 2026-01-01\nx\n", "1.2.3+build.5"))
+        # the current CHANGELOG top section is intentionally UNDATED (0.1.0 not released yet)
+        self.assertFalse(self._section_is_dated(_read("CHANGELOG.md"), aipairlib.__version__),
+                         "0.1.0 is prepared/unreleased, so its section must stay undated until the release commit")
+
     def test_security_release_policy_is_consistent(self):
         # SECURITY.md must not keep the old「タグ付きリリース運用は今のところありません」that now
         # contradicts RELEASING.md / CHANGELOG / the release workflow.
