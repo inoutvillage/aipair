@@ -140,10 +140,12 @@ def codex_response_complete(path, probe, allow_position_fallback=False):
       task_complete を対応付ける。キュー投入時に「時刻上の直前 start」が先行タスク
       を指す誤帰属は、位置推定ではなく ID 対応でそもそも起こらない。
     turn_id メタデータが欠落した nonce では帰属が確定できない。既定は fail-closed で
-    (None, None) を返す（位置推定は queue 投入時に先行タスクを誤帰属し得るため、自律運転の
-    停止/承認判定に使ってはならない — P1-3）。allow_position_fallback=True（compatibility
-    mode: 呼び出し側が --allow-untested-schema / --no-schema-probe を明示した時だけ）に限り、
-    従来どおり「直前の task_started」への位置フォールバックを行う。"""
+    (None, None) を返す（位置推定は queue 投入時に先行タスクを誤帰属し得る）。
+    allow_position_fallback=True に限り従来の「直前の task_started」への位置フォールバックを
+    行うが、これは **診断/表示用途専用**（P1-3）。自律運転の応答帰属ゲート response_done は
+    このフォールバックを《一切使わない》— 誤帰属した応答で停止 sentinel 判定・レビュー転送・
+    プラン自動承認へ進むのは危険なため、turn_id で確定できなければ compat mode でも帰属不能の
+    まま fail-closed（待機＝人間判断）にする。"""
     starts, completes = [], []
     nonce_ts = None
     nonce_turn = None

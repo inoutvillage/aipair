@@ -912,9 +912,6 @@ def main():
             set_pane_title(own, "relay ■ 終了(schema不一致) / 0往復")   # 走行中タイトルのまま残さない
             return 7
         log(c("dim", "  → --allow-untested-schema: fail-open で継続（ダイアログ自動操作は OFF）"))
-    if a.allow_untested_schema or a.no_schema_probe:
-        log(c("warn", "⚠ compatibility mode: codex 応答帰属で turn_id 欠落時に位置フォールバックを許可"
-                      "（誤帰属の可能性。schema 安全機構を明示的に外した時のみ）"))
     if a.endless:
         log(c("ok", "連続モード=on") + f"（「{stop_phrases[0] if stop_phrases else '[AIPAIR_REVIEW_OK]'}」＝レビュー合格→次のタスクへ）")
         log(f"  タスクリスト={a.task_list}  次を要求={'/'.join(next_ask_phrases)}  "
@@ -1074,12 +1071,13 @@ def main():
         if probe_ts_cache is None:
             return None  # nonce 未着（未配達）— poke_noshow が期限を監視
         if agent == "codex":
-            # turn_id 欠落時の位置フォールバックは compatibility mode（schema 安全機構を明示的に
-            # 外した時）だけ許可。既定は帰属不能→(None,None) で fail-closed（下の reject で待機）。
-            anchor, comp = codex_response_complete(
-                path, probe, allow_position_fallback=(a.allow_untested_schema or a.no_schema_probe))
+            # 応答帰属ゲートでは turn_id 欠落時の位置フォールバックを《一切使わない》（P1-3 /
+            # Codex レビュー）。位置推定は queue 投入で先行タスクを誤帰属し得るので、それで
+            # 停止 sentinel 判定・レビュー転送・質問回答・プラン自動承認へ進むのは危険。
+            # turn_id で確定できなければ compat mode でも帰属不能→reject（＝人間判断待ちで待機）。
+            anchor, comp = codex_response_complete(path, probe)
             if anchor is None:
-                return reject("nonce の user アイテム未発見")
+                return reject("応答帰属不能（turn_id 欠落 or nonce の user アイテム未発見）→ 自律判定に使わず待機")
             if comp is None:
                 return reject("応答タスク（同 turn_id）が未完了")
             # texts 窓のアンカーを応答タスク開始時刻へ進める（先行タスク末尾の混入防止）
