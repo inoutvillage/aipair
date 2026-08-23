@@ -49,7 +49,7 @@ PY_MIN="3.8";   PY_MIN_MAJOR=3;   PY_MIN_MINOR=8
 FILES=(aipair aipair-relay aipair-relay-here peer peer-log
        aipairlib/__init__.py aipairlib/logs.py aipairlib/peerlog.py aipairlib/corelib.py
        aipairlib/loglib.py aipairlib/tmuxlib.py aipairlib/deliverylib.py aipairlib/dialoglib.py
-       aipairlib/schema_guard.py aipairlib/review_protocol.py aipairlib/relay.py)
+       aipairlib/schema_guard.py aipairlib/review_protocol.py aipairlib/gate.py aipairlib/relay.py)
 SKILLS=(aipair-setup aipair-relay)
 MARK_START='<!-- aipair:start -->'
 MARK_END='<!-- aipair:end -->'
@@ -106,7 +106,7 @@ done
 _missing=""
 for _f in bin/aipair bin/aipair-relay bin/aipair-relay-here bin/peer bin/peer-log \
           bin/aipairlib/__init__.py bin/aipairlib/relay.py bin/aipairlib/peerlog.py bin/aipairlib/logs.py \
-          bin/aipairlib/corelib.py bin/aipairlib/loglib.py bin/aipairlib/tmuxlib.py bin/aipairlib/deliverylib.py bin/aipairlib/dialoglib.py bin/aipairlib/schema_guard.py bin/aipairlib/review_protocol.py \
+          bin/aipairlib/corelib.py bin/aipairlib/loglib.py bin/aipairlib/tmuxlib.py bin/aipairlib/deliverylib.py bin/aipairlib/dialoglib.py bin/aipairlib/schema_guard.py bin/aipairlib/review_protocol.py bin/aipairlib/gate.py \
           templates/vscode-tasks.json templates/claude-md-block.md templates/codex-agents-block.md \
           .claude/skills/aipair-setup/SKILL.md .claude/skills/aipair-relay/SKILL.md; do
   [ -f "$REPO_DIR/$_f" ] || _missing="$_missing $_f"
