@@ -390,69 +390,98 @@ for f in "${RETIRED[@]}"; do
     fi
   fi
 done
-install_one() {  # $1 = repo-relative bin path (e.g. aipair-relay or aipairlib/relay.py). backup + copy.
-  local f="$1" src="$REPO_DIR/bin/$1" dst="$BIN_DIR/$1" X
-  mkdir -p "$(dirname "$dst")" || { fail "cannot create $(dirname "$dst")"; return 1; }
-  case "$f" in */*) X=false ;; *) X=true ;; esac   # only top-level entrypoints/launchers are executable
-  if [ -f "$dst" ] && same_file "$src" "$dst"; then
-    if $X && [ ! -x "$dst" ]; then chmod +x "$dst" || { fail "cannot chmod +x $dst"; return 1; }; fi
-    skip "$dst is up to date"; return 0
-  fi
-  if [ -e "$dst" ]; then
-    cp -p "$dst" "$dst.bak-$TS" || { fail "cannot back up $dst"; return 1; }
-    cp "$src" "$dst" || { fail "cannot install $dst"; return 1; }
-    if $X; then chmod +x "$dst" || { fail "cannot chmod +x $dst"; return 1; }; fi
-    ok "$dst updated (previous copy: $dst.bak-$TS)"
-  else
-    cp "$src" "$dst" || { fail "cannot install $dst"; return 1; }
-    if $X; then chmod +x "$dst" || { fail "cannot chmod +x $dst"; return 1; }; fi
-    ok "$dst installed"
-  fi
+# ---- transactional install: aipairlib package + top-level entrypoints as ONE staged batch (P2-2)
+# The package (Phase 1) was already staged→verified→atomically-swapped, but the entrypoints (Phase
+# 2) used to be copied one-by-one, so a failure partway through left a MIXED set (new package /
+# new `aipair` beside an old `aipair-relay`). Now both are staged together in a temp dir, the
+# staged thin entrypoints are run against the STAGED package (the thin entrypoints add their own
+# dir to sys.path, so a co-located stage exercises exactly the new combination), and only then are
+# the changed paths switched as one batch guarded by a SINGLE rollback. Any failure — a bad import,
+# a mid-switch mv, or the post-switch --help — restores every backed-up path, so an upgrade is
+# all-or-nothing: never a new package beside old/half-switched entrypoints.
+ENTRYPOINTS=(); for f in "${FILES[@]}"; do case "$f" in aipairlib/*) : ;; *) ENTRYPOINTS+=("$f") ;; esac; done
+
+_pkg_current() {  # every aipairlib/* file installed == repo copy
+  local g; for g in "${FILES[@]}"; do case "$g" in aipairlib/*) same_file "$REPO_DIR/bin/$g" "$BIN_DIR/$g" || return 1 ;; esac; done; return 0
 }
-# Two-phase install so a broken NEW package never leaves the install unusable — neither the flat
-# libs (pre-#7) NOR an already-installed #7 package. Phase 1: stage the aipairlib package in a
-# TEMP dir on the same filesystem as BIN_DIR, verify it imports THERE, and only then atomically
-# swap it into place. The live $BIN_DIR/aipairlib is never overwritten until the new one verifies.
-pkg_up_to_date() {
-  local g
-  for g in "${FILES[@]}"; do case "$g" in aipairlib/*) same_file "$REPO_DIR/bin/$g" "$BIN_DIR/$g" || return 1 ;; esac; done
-  return 0
-}
-if [ -d "$BIN_DIR/aipairlib" ] && pkg_up_to_date; then
-  skip "$BIN_DIR/aipairlib is up to date"
+
+EP_CHANGED=()   # only the entrypoints that differ from the repo get backed up + switched
+for f in "${ENTRYPOINTS[@]}"; do same_file "$REPO_DIR/bin/$f" "$BIN_DIR/$f" || EP_CHANGED+=("$f"); done
+PKG_NEEDS=1; { [ -d "$BIN_DIR/aipairlib" ] && _pkg_current; } && PKG_NEEDS=0
+
+if [ "$PKG_NEEDS" -eq 0 ] && [ "${#EP_CHANGED[@]}" -eq 0 ]; then
+  for f in "${ENTRYPOINTS[@]}"; do [ -x "$BIN_DIR/$f" ] || chmod +x "$BIN_DIR/$f" 2>/dev/null || true; done
+  # nothing to switch, but still confirm the existing thin entrypoints import the existing package
+  for f in aipair-relay peer-log; do
+    "$BIN_DIR/$f" --help >/dev/null 2>&1 || { fail "$BIN_DIR/$f --help failed (existing install broken?) — re-run after fixing $BIN_DIR/aipairlib"; exit 1; }
+  done
+  skip "$BIN_DIR aipairlib package + entrypoints are up to date"
 else
-  STAGE="$BIN_DIR/.aipairlib-stage-$TS"; rm -rf "$STAGE"
+  STAGE="$BIN_DIR/.aipair-stage-$TS"; rm -rf "$STAGE"
   mkdir -p "$STAGE/aipairlib" || { fail "cannot create staging dir $STAGE"; exit 1; }
-  for f in "${FILES[@]}"; do case "$f" in aipairlib/*)
-    cp "$REPO_DIR/bin/$f" "$STAGE/$f" || { fail "cannot stage $f"; rm -rf "$STAGE"; exit 1; } ;; esac; done
-  # verify the STAGED package imports (from the temp dir) before touching the live one
+  for f in "${FILES[@]}"; do
+    cp "$REPO_DIR/bin/$f" "$STAGE/$f" || { fail "cannot stage $f"; rm -rf "$STAGE"; exit 1; }
+  done
+  for f in "${ENTRYPOINTS[@]}"; do
+    chmod +x "$STAGE/$f" || { fail "cannot chmod staged $f"; rm -rf "$STAGE"; exit 1; }
+  done
+  # verify the NEW combination in the stage, before touching anything live:
+  #   (1) the staged package imports; (2) the staged shell launchers parse;
+  #   (3) the staged thin entrypoints import the staged package end-to-end (co-located --help).
   if ! AIPAIR_STAGE="$STAGE" python3 -c "import os, sys; sys.path.insert(0, os.environ['AIPAIR_STAGE']); import aipairlib.relay, aipairlib.peerlog" 2>/dev/null; then
-    rm -rf "$STAGE"
-    fail "the new aipairlib package failed to import — kept the previous install unchanged"
-    exit 1
+    rm -rf "$STAGE"; fail "the new aipairlib package failed to import — kept the previous install unchanged"; exit 1
   fi
-  # swap into place (mv is atomic on the same filesystem); back up the old package dir first
-  if [ -e "$BIN_DIR/aipairlib" ]; then
-    rm -rf "$BIN_DIR/aipairlib.bak-$TS"
-    mv "$BIN_DIR/aipairlib" "$BIN_DIR/aipairlib.bak-$TS" || { fail "cannot back up $BIN_DIR/aipairlib"; rm -rf "$STAGE"; exit 1; }
+  for f in aipair aipair-relay-here peer; do
+    bash -n "$STAGE/$f" 2>/dev/null || { rm -rf "$STAGE"; fail "staged $f has a shell syntax error — kept the previous install unchanged"; exit 1; }
+  done
+  for f in aipair-relay peer-log; do
+    "$STAGE/$f" --help >/dev/null 2>&1 || { rm -rf "$STAGE"; fail "staged $f could not import the staged package (--help) — kept the previous install unchanged"; exit 1; }
+  done
+
+  # switch changed paths as one batch; SWITCHED records every path to undo on ANY later failure.
+  SWITCHED=()
+  _rollback_install() {
+    local d
+    [ "${#SWITCHED[@]}" -gt 0 ] || return 0
+    for d in "${SWITCHED[@]}"; do
+      if [ "$d" = "aipairlib" ]; then
+        rm -rf "$BIN_DIR/aipairlib"; [ -e "$BIN_DIR/aipairlib.bak-$TS" ] && mv "$BIN_DIR/aipairlib.bak-$TS" "$BIN_DIR/aipairlib"
+      else
+        rm -f "$BIN_DIR/$d"; [ -e "$BIN_DIR/$d.bak-$TS" ] && mv "$BIN_DIR/$d.bak-$TS" "$BIN_DIR/$d"
+      fi
+    done
+  }
+  if [ "$PKG_NEEDS" -eq 1 ]; then
+    if [ -e "$BIN_DIR/aipairlib" ]; then
+      rm -rf "$BIN_DIR/aipairlib.bak-$TS"
+      mv "$BIN_DIR/aipairlib" "$BIN_DIR/aipairlib.bak-$TS" || { fail "cannot back up $BIN_DIR/aipairlib"; rm -rf "$STAGE"; exit 1; }
+    fi
+    if ! mv "$STAGE/aipairlib" "$BIN_DIR/aipairlib"; then
+      fail "cannot install $BIN_DIR/aipairlib — rolling back"; SWITCHED+=("aipairlib"); _rollback_install; rm -rf "$STAGE"; exit 1
+    fi
+    SWITCHED+=("aipairlib")
   fi
-  if ! mv "$STAGE/aipairlib" "$BIN_DIR/aipairlib"; then
-    fail "cannot install $BIN_DIR/aipairlib"
-    [ -e "$BIN_DIR/aipairlib.bak-$TS" ] && mv "$BIN_DIR/aipairlib.bak-$TS" "$BIN_DIR/aipairlib"   # restore the old one
-    rm -rf "$STAGE"; exit 1
+  if [ "${#EP_CHANGED[@]}" -gt 0 ]; then
+    for f in "${EP_CHANGED[@]}"; do
+      if [ -e "$BIN_DIR/$f" ]; then
+        cp -p "$BIN_DIR/$f" "$BIN_DIR/$f.bak-$TS" || { fail "cannot back up $BIN_DIR/$f — rolling back this upgrade"; _rollback_install; rm -rf "$STAGE"; exit 1; }
+      fi
+      if ! mv "$STAGE/$f" "$BIN_DIR/$f"; then
+        fail "cannot install $BIN_DIR/$f — rolling back this upgrade"; _rollback_install; rm -rf "$STAGE"; exit 1
+      fi
+      SWITCHED+=("$f")
+    done
   fi
   rm -rf "$STAGE"
-  ok "$BIN_DIR/aipairlib package installed (verified its import before swapping in)"
+  # post-switch verification: the INSTALLED entrypoints import the INSTALLED package end-to-end.
+  # A failure here rolls the whole batch back (package + every switched entrypoint).
+  for f in aipair-relay peer-log; do
+    if ! "$BIN_DIR/$f" --help >/dev/null 2>&1; then
+      fail "$BIN_DIR/$f --help failed after install — rolled back package + entrypoints"; _rollback_install; exit 1
+    fi
+  done
+  ok "$BIN_DIR aipairlib package + entrypoints installed (verified the new combo before + after switching)"
 fi
-# Phase 2: now switch the top-level executables (thin entrypoints + bash launchers).
-for f in "${FILES[@]}"; do case "$f" in aipairlib/*) : ;; *) install_one "$f" || exit 1 ;; esac; done
-# Final check: the installed thin entrypoints run and import the package end-to-end.
-for f in aipair-relay peer-log; do
-  if ! "$BIN_DIR/$f" --help >/dev/null 2>&1; then
-    fail "$BIN_DIR/$f --help failed — the aipairlib package must sit next to the entrypoints in $BIN_DIR"
-    exit 1
-  fi
-done
 ok "aipair-relay / peer-log start from $BIN_DIR (--help exits 0)"
 
 # Now that the aipairlib package is installed AND the entrypoints import it, retire the old flat

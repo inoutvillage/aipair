@@ -119,5 +119,28 @@ else
   chmod u+w "$TH2/.local/bin" 2>/dev/null || true; rm -rf "$TH2"
 fi
 
+# --- Phase 2 (entrypoint) transactional rollback (P2-2): a mid-switch failure that cannot complete
+# must restore EVERY entrypoint already switched, so an upgrade never ends half-old/half-new ------
+TH5="$(mktemp -d "${TMPDIR:-/tmp}/aipair-upg5.XXXXXX")"
+mkdir -p "$TH5/.local/bin"
+env -u TMUX PATH="$SHIMD:$PATH" HOME="$TH5" bash "$REPO/aipair-install.sh" >/dev/null 2>&1
+if [ -x "$TH5/.local/bin/aipair-relay" ]; then
+  # make the installed entrypoints "stale" (differ from repo → they WILL be switched) and tag them
+  # so we can prove a failed upgrade rolled them back to THIS content, not the new repo copy.
+  for f in aipair aipair-relay aipair-relay-here peer-log; do printf '\n# STALE-P2-%s\n' "$$" >> "$TH5/.local/bin/$f"; done
+  # sabotage `peer` (4th of 5): replace it with a directory so its backup `cp -p` fails mid-switch,
+  # AFTER aipair / aipair-relay / aipair-relay-here have already been switched.
+  rm -f "$TH5/.local/bin/peer"; mkdir "$TH5/.local/bin/peer"; : > "$TH5/.local/bin/peer/keep"
+  rc5=0; env -u TMUX PATH="$SHIMD:$PATH" HOME="$TH5" bash "$REPO/aipair-install.sh" >/dev/null 2>&1 || rc5=$?
+  chk "[ $rc5 -ne 0 ]" "entrypoint switch that cannot complete → installer exits non-zero (got $rc5)"
+  for f in aipair aipair-relay aipair-relay-here; do
+    chk "grep -q 'STALE-P2-$$' '$TH5/.local/bin/$f'" "$f rolled back to pre-upgrade content (Phase 2 all-or-nothing)"
+  done
+  chk "! ls -d '$TH5/.local/bin/.aipair-stage-'* >/dev/null 2>&1" "staging dir cleaned up after the failed upgrade"
+else
+  echo "skip Phase 2 rollback check (initial install did not complete — no tmux/py?)"
+fi
+rm -rf "$TH5"
+
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED)"
 exit $fail
