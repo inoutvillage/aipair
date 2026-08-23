@@ -21,6 +21,26 @@
 #   └───────────────────────────────┘
 set -euo pipefail
 
+# --- aipair --version -----------------------------------------------------------
+# Read the single source of truth (aipairlib.__version__) sitting next to this script, whether run
+# from the repo (bin/) or installed (~/.local/bin/). Handled before any tmux/dir setup.
+for _va in "$@"; do
+  case "$_va" in
+    --version|-V)
+      exec python3 - "$0" <<'PY'
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(sys.argv[1])))
+try:
+    import aipairlib
+    print("aipair " + aipairlib.__version__)
+except Exception as e:  # noqa: BLE001 — any import failure means the package is missing
+    print("aipair: could not read version (%s)" % e, file=sys.stderr)
+    sys.exit(1)
+PY
+      ;;
+  esac
+done
+
 # --- safety: --unsafe / AIPAIR_UNSAFE opt-in to permission-bypass -------------
 # Without it, agents run with their normal permission prompts. `aipair loop` (the
 # unattended relay) REQUIRES it, since the relay cannot answer those prompts.

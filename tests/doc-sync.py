@@ -8,6 +8,7 @@ the docs) is a real hazard. Each test pins one doc claim to the constant it must
 """
 import os
 import re
+import subprocess
 import sys
 import unittest
 from unittest import mock
@@ -15,6 +16,7 @@ from unittest import mock
 HERE = os.path.dirname(os.path.realpath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, os.path.join(REPO, "bin"))
+import aipairlib                       # noqa: E402  (for __version__)
 import aipairlib.corelib as corelib   # noqa: E402
 import aipairlib.cli as cli           # noqa: E402
 
@@ -261,6 +263,40 @@ class TodoAndWorkflows(unittest.TestCase):
                 self.assertNotIn(stale, text, "%s still uses the stale module count %r — describe the "
                                  "aipairlib package count-free" % (name, stale))
 
+
+
+class Version(unittest.TestCase):
+    """P2-4: aipairlib.__version__ が唯一の source of truth で、CHANGELOG の最新リリース版・
+    `aipair --version` / `aipair-relay --version` の出力・release workflow の tag 検査が一致する。"""
+    def test_version_is_semver(self):
+        self.assertRegex(aipairlib.__version__, r"^\d+\.\d+\.\d+([.-][0-9A-Za-z.-]+)?$",
+                         "__version__ %r is not SemVer" % aipairlib.__version__)
+
+    def test_changelog_top_release_matches_version(self):
+        rel = [m for m in re.findall(r"^## \[([^\]]+)\]", _read("CHANGELOG.md"), re.M)
+               if m.lower() != "unreleased"]
+        self.assertTrue(rel, "CHANGELOG.md has no released『## [X.Y.Z]』section")
+        self.assertEqual(rel[0], aipairlib.__version__,
+                         "CHANGELOG.md top release %s != __version__ %s (bump them together)"
+                         % (rel[0], aipairlib.__version__))
+
+    def test_aipair_version_reports_the_source_of_truth(self):
+        r = subprocess.run([os.path.join(REPO, "bin", "aipair"), "--version"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "aipair " + aipairlib.__version__)
+
+    def test_aipair_relay_version_reports_the_source_of_truth(self):
+        r = subprocess.run([sys.executable, os.path.join(REPO, "bin", "aipair-relay"), "--version"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "aipair-relay " + aipairlib.__version__)
+
+    def test_release_workflow_pins_the_tag_to_version(self):
+        wf = _read(".github/workflows/release.yml")
+        self.assertIn("aipairlib.__version__", wf, "release.yml must verify the tag against __version__")
+        self.assertIn("gh release create", wf, "release.yml must create the GitHub Release")
+        self.assertIn("tags:", wf)   # triggered by a tag push
 
 
 if __name__ == "__main__":

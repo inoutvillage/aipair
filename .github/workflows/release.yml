@@ -1,0 +1,40 @@
+name: release
+# Cutting a release = pushing a `vX.Y.Z` tag (see RELEASING.md). This re-checks the tag against
+# aipairlib.__version__ (the single source of truth), turns the matching CHANGELOG.md section into
+# the release notes, and publishes the GitHub Release. Nothing runs until a `v*` tag is pushed.
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write            # create the GitHub Release
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Verify the tag matches aipairlib.__version__
+        run: |
+          set -eu
+          TAG="${GITHUB_REF_NAME#v}"
+          VER="$(python3 -c 'import sys; sys.path.insert(0, "bin"); import aipairlib; print(aipairlib.__version__)')"
+          echo "tag=$GITHUB_REF_NAME  __version__=$VER"
+          [ "$TAG" = "$VER" ] || { echo "::error::tag $GITHUB_REF_NAME does not match __version__ $VER"; exit 1; }
+      - name: Extract this version's CHANGELOG section as the release notes
+        run: |
+          set -eu
+          VER="${GITHUB_REF_NAME#v}"
+          awk -v v="$VER" '
+            $0 ~ "^## \\[" v "\\]" { grab=1; next }
+            grab && /^## \[/ { exit }
+            grab && /^\[[^]]+\]:/ { next }   # skip the compare-link definitions
+            grab { print }
+          ' CHANGELOG.md > release-notes.md
+          [ -s release-notes.md ] || { echo "::error::no CHANGELOG.md section for $VER"; exit 1; }
+          echo "=== release notes ==="; cat release-notes.md
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --title "aipair $GITHUB_REF_NAME" --notes-file release-notes.md
