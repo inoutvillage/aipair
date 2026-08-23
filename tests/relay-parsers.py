@@ -941,6 +941,26 @@ class SchemaProbe(unittest.TestCase):
                                        "message": {"role": "assistant", "content": [{"type": "tool_result"}]}}]
         self.assertEqual(relay.schema_probe("claude", dialog_drift)[0], "mismatch")
 
+    def test_claude_compaction_boundary_needs_uuid_and_logical_parent(self):
+        # P1-4 (Codex): claude_response_attributed bridges a compaction via the boundary's uuid +
+        # logicalParentUuid. A boundary missing either can't be walked → attribution never
+        # succeeds, so the schema probe must flag it as mismatch (it is a required-when-present
+        # aspect: no boundary → doesn't block ok; a malformed boundary → mismatch).
+        A = self.CLA_OK[0]
+        valid = {"type": "system", "subtype": "compact_boundary", "uuid": "B1", "logicalParentUuid": "L1"}
+        self.assertEqual(relay.schema_probe("claude", [valid, A])[0], "ok")
+        no_uuid = {"type": "system", "subtype": "compact_boundary", "logicalParentUuid": "L1"}
+        self.assertEqual(relay.schema_probe("claude", [no_uuid, A])[0], "mismatch")
+        no_lpu = {"type": "system", "subtype": "compact_boundary", "uuid": "B1"}
+        st, reason = relay.schema_probe("claude", [no_lpu, A])
+        self.assertEqual(st, "mismatch")
+        self.assertIn("logicalParentUuid", reason)
+        # an empty logicalParentUuid is also drift (non-empty required)
+        empty_lpu = {"type": "system", "subtype": "compact_boundary", "uuid": "B1", "logicalParentUuid": ""}
+        self.assertEqual(relay.schema_probe("claude", [empty_lpu, A])[0], "mismatch")
+        # no boundary at all → the aspect does not fire (plain turn stays ok)
+        self.assertEqual(relay.schema_probe("claude", [A])[0], "ok")
+
     def test_claude_delivery_drift_only_for_a_typed_input(self):
         # A TYPED human input (promptSource / origin.kind==human) whose content became a text-block
         # array is a delivery drift — claude_input() matches a STRING content, so it can't see it.
@@ -1174,7 +1194,7 @@ class SchemaLatchStep(unittest.TestCase):
         recs = [
             {"type": "user", "promptSource": "typed",   # pre-boundary delivery drift (typed text-block)
              "message": {"role": "user", "content": [{"type": "text", "text": "x"}]}},
-            {"type": "system", "subtype": "compact_boundary", "uuid": "B1"},
+            {"type": "system", "subtype": "compact_boundary", "uuid": "B1", "logicalParentUuid": "L1"},
             {"type": "assistant", "timestamp": "t", "uuid": "u1", "parentUuid": None,   # post-boundary OK
              "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}],
                          "stop_reason": "end_turn"}},
