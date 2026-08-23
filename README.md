@@ -308,16 +308,20 @@ Claude 実装 ──▶ Codex レビュー
                                  └ [AIPAIR_ALL_DONE] → ■ ループ終了（exit 0）
 ```
 
-- **終端は Codex の `[AIPAIR_ALL_DONE]` 宣言だけ**です。`--max-rounds` は暴走防止のキャップとして残るので、
-  連続モードでは大きめ（例 `AIPAIR_MAX_ROUNDS=100`）にしてください。
+- **終端は2つ**: 全タスク完了（Codex の `[AIPAIR_ALL_DONE]`・exit 0）と、実行可能タスクが尽き人間対応の `[!]` だけ
+  残る **HUMAN_REQUIRED**（`[AIPAIR_HUMAN_REQUIRED]`・exit 8）。いずれも **relay の `tasks/todo.md` 分類が一致した時のみ
+  成立**します（分類が READY のまま＝着手可 `- [ ]` が残るなら、sentinel を無視して継続）。`--max-rounds` は暴走防止の
+  キャップとして残るので、連続モードでは大きめ（例 `AIPAIR_MAX_ROUNDS=100`）にしてください。
 - **次タスクの根拠は `tasks/todo.md` の未チェック項目に限定**され、リスト外の新規提案を禁じる文面を
   Codex に送ります（放っておくと「改善案」が無限に湧いてスコープが膨らむため）。パスは `AIPAIR_TASK_LIST` で変更可。
 - **タスクリストの記法（endless relay が厳密に読む）**: `- [ ]`=着手可、`- [x]`=完了、`- [!]`=**保留（人間対応・外部依存で
   AI だけでは進められない。直下に `blocker:` 理由）**。`[!]` は着手可に数えず、着手可 `- [ ]` が尽きて `- [!]` だけ残ると
   **HUMAN_REQUIRED として停止（exit 8）**し人間の対応を待ちます（無限往復させない）。認識記法は `[ ]`/`[x]`/`[X]`/`[!]` のみ
   で、未知記法や `blocker:` 欠落は fail-closed（exit 2）。
-- 合図の判定は既定モードと同じ **最終メッセージの先頭行の sentinel 完全一致**です。3 つの合図
-  （`[AIPAIR_REVIEW_OK]` ／ `[AIPAIR_NEXT]` ／ `[AIPAIR_ALL_DONE]`）はいずれも先頭行に単独で置かれた時だけ効きます。
+- 合図の判定は既定モードと同じ **最終メッセージの先頭行の sentinel 完全一致**です。4 つの合図
+  （`[AIPAIR_REVIEW_OK]` ／ `[AIPAIR_NEXT]` ／ `[AIPAIR_ALL_DONE]` ／ `[AIPAIR_HUMAN_REQUIRED]`）はいずれも先頭行に
+  単独で置かれた時だけ効きます。`[AIPAIR_ALL_DONE]` / `[AIPAIR_HUMAN_REQUIRED]` は **relay の task-list 分類が
+  それぞれ ALL_DONE / BLOCKED に一致した時のみ**成立します（不一致＝着手可が残るなら無視して継続）。
   窓内に偶発的に書かれると誤検知しますが、いずれも**早く止まる/次に進む方向**に倒れます。
 
 ### relay の再点火（`aipair-relay-here`）
