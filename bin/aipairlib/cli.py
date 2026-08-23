@@ -7,6 +7,7 @@ import argparse
 import os
 import sys
 
+from . import __version__
 from .review_protocol import DEFAULT_POKE_CLAUDE
 
 ENV_USED = []          # 起動ログで「env 由来」を可視化する（無言で効かせない）
@@ -49,6 +50,7 @@ def _env_bool(name, default=False):
 def build_parser(description=""):
     ap = argparse.ArgumentParser(description=description,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version="aipair-relay " + __version__)
     ap.add_argument("--session", help="tmux session (default: current)")
     ap.add_argument("--dir", default=os.getcwd(), help="working directory (default: cwd)")
     ap.add_argument("--stop", default=_env_str("AIPAIR_STOP", "[AIPAIR_REVIEW_OK]"),
