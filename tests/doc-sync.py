@@ -272,7 +272,7 @@ class TodoAndWorkflows(unittest.TestCase):
 
 
 class Version(unittest.TestCase):
-    """P2-4: aipairlib.__version__ が唯一の source of truth で、CHANGELOG の最新リリース版・
+    """P2-4: aipairlib.__version__ が唯一の source of truth で、CHANGELOG の prepared 版セクション・
     `aipair --version` / `aipair-relay --version` の出力・release workflow の tag 検査が一致する。"""
     def test_version_is_semver(self):
         self.assertRegex(aipairlib.__version__, SEMVER,
@@ -281,7 +281,8 @@ class Version(unittest.TestCase):
     def test_changelog_top_version_section_matches_version(self):
         # the TOP『## [X.Y.Z]』section (released with a date, or being prepared) must equal __version__,
         # so bumping the version without a CHANGELOG entry (or vice versa) fails here. It may be
-        # undated while unreleased (a date is added when the vX.Y.Z tag is pushed — see RELEASING.md).
+        # undated while unreleased (its date is added in the release commit just before the vX.Y.Z
+        # tag is pushed — see RELEASING.md).
         vers = [m for m in re.findall(r"^## \[([^\]]+)\]", _read("CHANGELOG.md"), re.M)
                 if m.lower() != "unreleased"]
         self.assertTrue(vers, "CHANGELOG.md has no『## [X.Y.Z]』version section")
