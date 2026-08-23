@@ -1140,6 +1140,67 @@ class SchemaProbe(unittest.TestCase):
             os.unlink(path)
 
 
+class SchemaGuardClass(unittest.TestCase):
+    """P2-1: the runtime schema monitor is now the SchemaGuard class (extracted from the monolithic
+    relay loop), so it is unit-testable in isolation — previously it was a nested closure."""
+    def _sg(self, probe_status, allow=False, no_probe=False):
+        import types
+        from aipairlib.schema_guard import SchemaGuard
+        a = types.SimpleNamespace(no_schema_probe=no_probe, allow_untested_schema=allow,
+                                  schema_stop=False, schema_mismatch=False,
+                                  no_plan_review=False, no_question_relay=False)
+        tracked = {"claude": "/log/claude.jsonl", "codex": None}
+        self.dims, self.warns = [], []
+        # a fresh stat-like identity: monkeypatch os.stat via the probe returning a fixed value is
+        # hard, so drive the generation by patching the instance's _identity to a stable tuple.
+        sg = SchemaGuard(a, tracked,
+                         probe_log_schema=lambda agent, path: (probe_status, "r"),
+                         latest_compact_boundary=lambda path: None,
+                         dim=lambda m: self.dims.append(m),
+                         warn=lambda m, bell=False: self.warns.append((m, bell)))
+        sg._identity = lambda agent, path: (("gen", 1, 1), 100, None)  # stable ident per call
+        return a, sg
+
+    def test_mismatch_fails_closed_by_default(self):
+        a, sg = self._sg("mismatch")
+        sg.watch()
+        self.assertTrue(a.schema_stop and a.schema_mismatch)
+        self.assertTrue(any(bell for _m, bell in self.warns), "mismatch warns with a bell")
+        # guard() re-runs watch() and reports the stop
+        a2, sg2 = self._sg("mismatch")
+        self.assertTrue(sg2.guard())
+        self.assertTrue(a2.schema_stop)
+
+    def test_mismatch_with_override_degrades_not_stops(self):
+        a, sg = self._sg("mismatch", allow=True)
+        sg.watch()
+        self.assertFalse(a.schema_stop)
+        self.assertTrue(a.no_plan_review and a.no_question_relay and a.schema_mismatch)
+
+    def test_ok_logs_once_and_never_stops(self):
+        a, sg = self._sg("ok")
+        sg.watch()
+        self.assertFalse(a.schema_stop)
+        self.assertEqual(len(self.dims), 1, "ok logged once")
+        sg.watch()   # same identity → skip (no re-log)
+        self.assertEqual(len(self.dims), 1)
+
+    def test_no_schema_probe_is_a_noop(self):
+        a, sg = self._sg("mismatch", no_probe=True)
+        sg.watch()
+        self.assertFalse(a.schema_stop or a.schema_mismatch)
+
+    def test_a_new_generation_reprobes_a_terminal_mismatch(self):
+        a, sg = self._sg("mismatch")
+        sg.watch()
+        self.assertEqual(sg.latched["claude"], "mismatch")
+        # the log switches to a NEW generation → latch resets and it is re-probed (still mismatch here)
+        sg._identity = lambda agent, path: (("gen2", 2, 2), 50, None)
+        a.schema_stop = False
+        sg.watch()
+        self.assertTrue(a.schema_stop, "a new generation must be re-probed, not skipped by the old latch")
+
+
 class SchemaLatchStep(unittest.TestCase):
     """Regression (P1-b): the runtime schema latch must NOT go terminal on 'ok'. delivery/dialog
     are veto-only aspects that surface only when that action happens, so after 'ok' the relay must
@@ -1198,12 +1259,17 @@ class SchemaLatchStep(unittest.TestCase):
         self.assertEqual(relay.schema_should_reprobe("mismatch", ident("A", 10, 150, marker="B1"),
                                                      ident("A", 10, 200)), (False, True),
                          "boundary scrolled out → no spurious reset")
-        # wiring guard: schema_watch consults the generation reset (stat + compaction marker)
+        # wiring guard: the SchemaGuard (P2-1 extraction) consults the generation reset
+        # (stat + compaction marker), and relay drives it via sg.watch()/sg.guard().
+        with open(os.path.join(BIN, "aipairlib", "schema_guard.py"), encoding="utf-8") as fh:
+            sgsrc = fh.read()
+        self.assertIn("schema_should_reprobe(self.latched[agent], self.ident[agent], ident)", sgsrc)
+        self.assertIn("st.st_dev, st.st_ino", sgsrc, "identity must include inode (same-path rotation)")
+        self.assertIn("_latest_compact_boundary(path)", sgsrc, "claude identity must fold in compaction")
         with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
             src = fh.read()
-        self.assertIn("schema_should_reprobe(schema_latched[agent], schema_ident[agent], ident)", src)
-        self.assertIn("st.st_dev, st.st_ino", src, "identity must include inode (same-path rotation)")
-        self.assertIn("latest_compact_boundary(path)", src, "claude identity must fold in compaction")
+        self.assertIn("sg.watch()", src)
+        self.assertIn("sg.guard()", src)
 
     def test_latest_compact_boundary(self):
         with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
@@ -1269,10 +1335,10 @@ class SchemaLatchStep(unittest.TestCase):
         with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
             src = fh.read()
         i_relock = src.index('tracked["claude"] = relocked')
-        i_guard = src.index("schema_guard()", i_relock)
+        i_guard = src.index("sg.guard()", i_relock)
         i_respond = src.index('response_done("claude", tracked["claude"], done)', i_relock)
         self.assertLess(i_guard, i_respond,
-                        "schema_guard() must run after the forced re-lock and BEFORE response_done")
+                        "sg.guard() must run after the forced re-lock and BEFORE response_done")
 
 
 class SchemaGuardOrdering(unittest.TestCase):
@@ -1300,8 +1366,8 @@ class SchemaGuardOrdering(unittest.TestCase):
             j = next((k for k in range(i + 1, len(lines)) if done_key in lines[k]), None)
             self.assertIsNotNone(j, f"no {done_key} after the lock at loop-line {i}")
             between = "\n".join(lines[i + 1:j])
-            self.assertIn("schema_guard()", between,
-                          f"lock at loop-line {i} reaches {done_key} with no schema_guard() before it "
+            self.assertIn("sg.guard()", between,
+                          f"lock at loop-line {i} reaches {done_key} with no sg.guard() before it "
                           "— a drifted log could be acted on before exit 7")
 
 
