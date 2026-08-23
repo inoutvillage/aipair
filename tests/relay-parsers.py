@@ -1467,6 +1467,18 @@ class ResponseAttribution(unittest.TestCase):
         p = self.w("cx.jsonl", [self._ev("2026-08-21T00:00:01Z", "task_started", "T1")])
         self.assertEqual(relay.codex_response_complete(p, "relay-id:zzz"), (None, None))
 
+    def test_response_done_gate_never_uses_the_position_fallback(self):
+        # P1-3 (integration guard): the AUTONOMOUS attribution gate (response_done) must call
+        # codex_response_complete WITHOUT the position fallback — so a turn_id-less, unattributable
+        # codex turn can never be accepted as a completion and drive an auto stop / review-forward /
+        # question-answer / plan auto-approval. The fallback stays opt-in for diagnostics only.
+        with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("anchor, comp = codex_response_complete(path, probe)", src,
+                      "the gate must call it plainly (no fallback)")
+        self.assertNotIn("allow_position_fallback=True", src, "relay must never enable the fallback")
+        self.assertNotIn("allow_position_fallback=(", src, "relay must never enable the fallback")
+
     # ---- Claude: parentUuid ancestry -------------------------------------------
     def _cl_user(self, uuid, parent, text, ts="2026-08-21T00:00:05Z"):
         return {"type": "user", "uuid": uuid, "parentUuid": parent, "timestamp": ts, "message": {"content": text}}
