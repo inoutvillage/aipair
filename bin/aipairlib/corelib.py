@@ -329,16 +329,29 @@ def schema_fail_closed(a, bad):
     return bool(bad) and not getattr(a, "allow_untested_schema", False)
 
 
-def schema_should_reprobe(latch, latched_path, new_path):
-    """一エージェントの runtime schema 監視について、追跡ログ path が変わったかを見て
-    (reset, skip) を返す（P1-4）。終端 'mismatch' latch は《ひとつのログ》に対するものなので、
-    path が切り替わったら（resume/clear/再起動/rotation）latch をリセットして新ログを未確認から
-    再 probe しなければ、新ログを一生見ない。
-      reset=True … latch/sig を破棄して latched_path を new_path へ更新すべき
-      skip=True  … （path 変化を反映した後の）latch が終端 'mismatch' なので今回の probe は skip"""
-    reset = new_path != latched_path
-    latch_after = None if reset else latch
-    return (reset, latch_after == "mismatch")
+def schema_should_reprobe(latch, last_ident, ident):
+    """一エージェントの runtime schema 監視を、追跡ログの《世代 identity》で進める（P1-4）。
+    ident = (generation, size)、generation = (path, st_dev, st_ino)。戻り値 (reset, skip):
+
+      - 世代の切替（generation が変わる＝別 path / inode 置換 / rotation、または size が《減る》＝
+        truncate/再作成/compaction による書き直し）→ (reset=True, skip=False): latch を破棄して
+        新ログを未確認から再 probe。pathname だけでは同一 path の inode 置換や truncate を
+        取りこぼすため、dev/ino とサイズ減少まで見る（Codex 指摘）。
+      - 同一世代で size が《増える》＝追記 → (False, False): 再 probe（latch は保持）。
+      - 変化なし → (False, True): 増分 skip（size-memo）。
+      - 世代切替でない 'mismatch' はその世代の終端 → (False, True): skip。
+
+    呼び出し側は reset で latch を None にし、常に last_ident を ident へ更新する。"""
+    last_gen, last_size = last_ident if last_ident else (None, None)
+    gen, size = ident
+    shrank = (size is not None and last_size is not None and size < last_size)
+    if gen != last_gen or shrank:
+        return (True, False)                 # 新世代 → reset + reprobe
+    if latch == "mismatch":
+        return (False, True)                 # 同一世代の終端 mismatch → skip
+    if ident == last_ident:
+        return (False, True)                 # 変化なし → skip
+    return (False, False)                    # 追記で成長 → reprobe（reset せず）
 
 
 def schema_latch_step(current, status, allow_untested):
