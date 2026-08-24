@@ -317,11 +317,14 @@ class StateMachine:
             """endless: task-list を分類（唯一の権威）。読めない/解析不能は exit 2 で fail-closed。"""
             return tasklist.load_or_exit(a.task_list, cwd, emit=lambda m: log(c("warn", m)))
 
+        _startup_state = None
         if a.endless:
-            # 起動直後に一度分類して fail-closed 検証＋初期状態をログ（「読めない＝完了」で誤停止させない）
+            # 起動直後に一度分類して fail-closed 検証＋初期状態をログ（「読めない＝完了」で誤停止させない）。
+            # 分類結果は下（code 初期化後）で状態遷移まで反映する（単なる検証ログに留めない）。
             _init_cls = classify_tasklist()
-            log(dim("task-list 初期分類: %s（ready=%d blocked=%d）"
-                    % (_init_cls["state"], len(_init_cls["ready"]), len(_init_cls["blocked"]))))
+            _startup_state = _init_cls["state"]
+            dim("task-list 初期分類: %s（ready=%d blocked=%d）"
+                % (_init_cls["state"], len(_init_cls["ready"]), len(_init_cls["blocked"])))
 
         state = a.start_side
         gate_state = {"fails": 0}
@@ -362,8 +365,22 @@ class StateMachine:
         code = 0
         all_done_hit = False
         blocked_reason = None          # code==8 のサブ理由（BLOCKED_HR_REASON / BLOCKED_NOPROGRESS_REASON）
+        # 起動時分類が権威（社長指示 §2）: 既に ALL_DONE なら 1 度も poke せず即 exit 0、BLOCKED（[!] のみ）
+        # なら即 exit 8。READY の時だけループを開始する。
+        if _startup_state == tasklist.ALL_DONE:
+            all_done_hit = True
+            log(c("ok", "起動時点で全タスク完了（着手可 [ ] なし）→ 駆動せず exit 0"))
+        elif _startup_state == tasklist.BLOCKED:
+            blocked_reason = BLOCKED_HR_REASON
+            code = EXIT_BLOCKED
+            print("\n" + c("warn", "│ ■ 人間対応待ち（HUMAN_REQUIRED）: 起動時点で実行可能な [ ] が無く "
+                  "[!] のみ残存。駆動せず exit %d で停止します。" % EXIT_BLOCKED), flush=True)
+            print("\a", end="", flush=True)
+        _skip_loop = _startup_state in (tasklist.ALL_DONE, tasklist.BLOCKED)
         try:
             while True:
+                if _skip_loop:          # 起動時点で ALL_DONE/BLOCKED → 1 度も駆動せず抜ける（poke しない）
+                    break
                 if sg.guard():          # between-iteration drift（latch 済みは安価な no-op）
                     code = 7
                     break

@@ -1477,6 +1477,64 @@ class StateMachineWiring(unittest.TestCase):
         self.assertIn("human_required_phrases = [s for s in a.human_required.split", src)
         self.assertIn("human_required_phrases=human_required_phrases", src)
 
+    def _run_startup(self, state):
+        # 起動時分類が state の StateMachine.run() を、tmux/poke を mock して回す。
+        # 戻り値 code と「poke が呼ばれたか」を返す（起動時終端では 1 度も poke しないのが要件）。
+        import types
+        sm_mod = relay.state_machine
+        a = types.SimpleNamespace(start_side="claude", settle=0, poll=0, max_rounds=20,
+                                  endless=True, task_list="tasks/todo.md")
+        tracked = {"claude": "a.jsonl", "codex": "b.jsonl"}
+        sm = sm_mod.StateMachine(
+            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x", tracked=tracked,
+            claude_seen=set(), codex_seen=set(), baseline=0.0, sg=object(), rg=object(),
+            bw=60, poke_codex="pc", poke_codex_next="pcn", poke_claude="pcl",
+            poke_claude_pass="pcp", poke_claude_next="pcnx", stop_phrases=["[AIPAIR_REVIEW_OK]"],
+            next_ask_phrases=["[AIPAIR_NEXT]"], all_done_phrases=["[AIPAIR_ALL_DONE]"],
+            human_required_phrases=["[AIPAIR_HUMAN_REQUIRED]"])
+        cls = {"state": state, "ready": [], "blocked": [], "hash": "h"}
+        with mock.patch.object(sm_mod.tasklist, "load_or_exit", return_value=cls), \
+             mock.patch.object(sm_mod, "set_pane_title"), \
+             mock.patch.object(sm_mod, "poke") as poke_mock:
+            code = sm.run()
+        return code, poke_mock.called
+
+    def test_startup_all_done_exits_0_without_poking(self):
+        code, poked = self._run_startup(relay.state_machine.tasklist.ALL_DONE)
+        self.assertEqual(code, 0)         # 起動時点で完了 → exit 0
+        self.assertFalse(poked)           # 1 度も poke せず（エージェントを駆動しない）
+
+    def test_startup_blocked_exits_8_without_poking(self):
+        code, poked = self._run_startup(relay.state_machine.tasklist.BLOCKED)
+        self.assertEqual(code, relay.state_machine.EXIT_BLOCKED)   # [!] のみ → exit 8
+        self.assertFalse(poked)
+
+    def test_startup_ready_enters_the_loop(self):
+        # READY のときは _skip_loop=False でループへ入る。ループ先頭の sg.guard() を marker で捕捉して、
+        # 起動時に skip して即 return していないことを証明する。
+        import types
+        sm_mod = relay.state_machine
+        a = types.SimpleNamespace(start_side="claude", settle=0, poll=0, max_rounds=20,
+                                  endless=True, task_list="tasks/todo.md")
+
+        class _Guard:
+            def guard(self):
+                raise RuntimeError("LOOP-ENTERED")
+
+        sm = sm_mod.StateMachine(
+            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x",
+            tracked={"claude": "a", "codex": "b"}, claude_seen=set(), codex_seen=set(),
+            baseline=0.0, sg=_Guard(), rg=object(), bw=60, poke_codex="pc", poke_codex_next="pcn",
+            poke_claude="pcl", poke_claude_pass="pcp", poke_claude_next="pcnx",
+            stop_phrases=["[AIPAIR_REVIEW_OK]"], next_ask_phrases=["[AIPAIR_NEXT]"],
+            all_done_phrases=["[AIPAIR_ALL_DONE]"], human_required_phrases=["[AIPAIR_HUMAN_REQUIRED]"])
+        cls = {"state": sm_mod.tasklist.READY, "ready": ["- [ ] a"], "blocked": [], "hash": "h"}
+        with mock.patch.object(sm_mod.tasklist, "load_or_exit", return_value=cls), \
+             mock.patch.object(sm_mod, "set_pane_title"), \
+             mock.patch.object(sm_mod, "poke"):
+            with self.assertRaisesRegex(RuntimeError, "LOOP-ENTERED"):
+                sm.run()
+
     def test_exit_blocked_code_and_two_distinct_reasons(self):
         # endless BLOCKED/HUMAN_REQUIRED (社長指示 2026-08-24): exit 8 は max-rounds(3) と別コードで、
         # 2 つの内部理由（HUMAN_REQUIRED / no-progress）を区別する文字列を Phase 2/4 が使う。
