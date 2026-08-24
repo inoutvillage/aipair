@@ -20,11 +20,6 @@ tasks left, Codex declares `[AIPAIR_HUMAN_REQUIRED]`, a question is too large to
 task makes no progress across rounds) instead of guessing or spinning.
 
 ### Added
-- **Task-list classification is the termination authority** — in `--endless`, the relay reads the
-  task-list and classifies it (`READY` / `BLOCKED` / `ALL_DONE`); an all-done / human-required
-  sentinel is honored only when the classification agrees, so a misfired sentinel can neither end
-  nor wrongly continue the loop. Startup classification acts immediately (`ALL_DONE` → exit 0,
-  `BLOCKED` → exit 8, `READY` → run).
 - **`[!]` blocked-task notation** — a `- [!]` item with a required `blocker: <reason>` child line
   marks work that needs a human or an external dependency; the agents move a task there instead of
   leaving it `- [ ]` or guessing past it.
@@ -39,6 +34,13 @@ task makes no progress across rounds) instead of guessing or spinning.
   (exit 8) without answering and leaves the dialog for a human. The task-list is untouched.
 - **Distinct exit-8 banners** — the human-wait and no-progress stops each print their own banner
   (naming the blocking item or the question) so it is clear why the loop stopped and what to do.
+
+### Changed
+- **Endless termination is decided by the task-list classification, not by the agent's sentinel
+  alone** — the relay reads and classifies the task-list (`READY` / `BLOCKED` / `ALL_DONE`), and a
+  terminal sentinel (`[AIPAIR_ALL_DONE]` / `[AIPAIR_HUMAN_REQUIRED]`) ends the run only when the
+  classification agrees; a sentinel the classification does not support does not terminate the loop.
+  Startup classification acts immediately (`ALL_DONE` → exit 0, `BLOCKED` → exit 8, `READY` → run).
 
 ### Fixed
 - **Endless mode no longer marks a task done before review** — the `- [x]` is written only on the
