@@ -32,5 +32,12 @@ chk "! grep -q 'claude --dangerously-skip-permissions' templates/vscode-tasks.js
 chk "! grep -q 'codex --dangerously-bypass-approvals-and-sandbox' templates/vscode-tasks.json" "vscode: codex single-launch is not bypass-by-default"
 chk "grep -q 'aipair loop --unsafe' templates/vscode-tasks.json" "vscode: the loop task opts into --unsafe explicitly"
 
+# endless 新契約（社長指示 2026-08-24 §11 Phase 6）: 旧契約「終端は ALL_DONE のみ」を配布ドキュメントへ
+# 再発させない＋新契約（HUMAN_REQUIRED）が存在すること。ドキュメントが実装から drift しないよう固定する。
+for f in templates/claude-md-block.md .claude/skills/aipair-relay/SKILL.md .claude/skills/aipair-setup/SKILL.md; do
+  chk "! grep -qE '終端は Codex の.*宣言(のみ|だけ)|ends \*\*only\*\* when|終端 \[AIPAIR_ALL_DONE\]|全タスク完了」宣言のみ' '$f'" "$f: 旧契約「ALL_DONE のみ」が再発していない"
+  chk "grep -qF 'HUMAN_REQUIRED' '$f'" "$f: 新契約 HUMAN_REQUIRED を記載している"
+done
+
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED)"
 exit $fail

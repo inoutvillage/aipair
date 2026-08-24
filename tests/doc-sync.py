@@ -438,5 +438,26 @@ class Version(unittest.TestCase):
         self.assertNotIn("(../RELEASING.md)", SECURITY, "broken link: SECURITY.md and RELEASING.md are both at repo root")
 
 
+class EndlessContract(unittest.TestCase):
+    """P6（社長指示 2026-08-24 §11）: endless の**新契約**（task-list 分類 / HUMAN_REQUIRED / exit 8）が
+    README・relay.py に存在し、**旧契約「終端は ALL_DONE のみ」が再発しない**こと。配布物・help が実装から
+    drift しないよう固定する（broadcast-blocks はテンプレ／skills 側を固定）。"""
+    STALE = [r"終端は Codex の.*宣言(のみ|だけ)", r"ends \*\*only\*\* when",
+             r"終端 \[AIPAIR_ALL_DONE\]", r"全タスク完了」宣言のみ"]
+
+    def _check(self, text, name):
+        for pat in self.STALE:
+            self.assertNotRegex(text, pat, "%s に旧契約が再発している: %r" % (name, pat))
+        self.assertIn("HUMAN_REQUIRED", text, "%s に新契約 HUMAN_REQUIRED が無い" % name)
+
+    def test_readme_has_new_contract_and_no_stale(self):
+        self._check(README, "README")
+        self.assertIn("AIPAIR_HUMAN_REQUIRED", README)   # env 表／sentinel 一覧に載っている
+        self.assertRegex(README, r"exit 8|・exit 8")     # exit 8 を README が記載
+
+    def test_relay_help_has_new_contract_and_no_stale(self):
+        self._check(_read("bin/aipairlib/relay.py"), "bin/aipairlib/relay.py")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
