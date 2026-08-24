@@ -36,7 +36,11 @@ chk "grep -q 'aipair loop --unsafe' templates/vscode-tasks.json" "vscode: the lo
 # 再発させない＋新契約（HUMAN_REQUIRED）が存在すること。ドキュメントが実装から drift しないよう固定する。
 for f in templates/claude-md-block.md .claude/skills/aipair-relay/SKILL.md .claude/skills/aipair-setup/SKILL.md; do
   chk "! grep -qE '終端は Codex の.*宣言(のみ|だけ)|ends \*\*only\*\* when|終端 \[AIPAIR_ALL_DONE\]|全タスク完了」宣言のみ' '$f'" "$f: 旧契約「ALL_DONE のみ」が再発していない"
-  chk "grep -qF 'HUMAN_REQUIRED' '$f'" "$f: 新契約 HUMAN_REQUIRED を記載している"
+  # 新契約の要素を全て固定（1 語 HUMAN_REQUIRED だけでは、分類/[!]/exit 8 の欠落を検出できない）
+  chk "grep -qF 'HUMAN_REQUIRED' '$f'"                          "$f: HUMAN_REQUIRED を記載"
+  chk "grep -qF 'exit 8' '$f'"                                 "$f: exit 8 を記載"
+  chk "grep -qF '[!]' '$f'"                                    "$f: 保留記法 [!] を記載"
+  chk "grep -qE 'READY.*BLOCKED.*ALL_DONE|分類' '$f'"          "$f: task-list 分類（READY/BLOCKED/ALL_DONE）を記載"
 done
 
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED)"
