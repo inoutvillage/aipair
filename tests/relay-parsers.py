@@ -1547,7 +1547,8 @@ class StateMachineWiring(unittest.TestCase):
         # ストリークを進める前に警告ログを出す。resolve→(UNRESOLVED 警告)→advance の順序を固定。
         with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
             src = fh.read()
-        seg = src[src.index("ident = resolve_task_identity("):src.index("np_state, np_stop = advance_no_progress")]
+        i = src.index("ident = resolve_task_identity(")   # pending_kind ブロックの resolve
+        seg = src[i:src.index("np_state, np_stop = advance_no_progress", i)]   # その後の advance まで
         self.assertIn("if ident == UNRESOLVED:", seg)
         self.assertIn('log(c("warn"', seg)          # UNRESOLVED 分岐で警告を出す
 
@@ -2474,19 +2475,22 @@ class EndlessScenarios(unittest.TestCase):
                                  self.TO_CODEX_NEXT, self.TO_CLAUDE_NEXT,
                                  self.TO_CODEX_NEXT])
 
-    def test_case6_ready_rejects_human_required_then_continues(self):
+    def test_case6_ready_rejects_human_required_then_reselects(self):
         # [!] があっても着手可 [ ] があれば READY: Codex が [AIPAIR_HUMAN_REQUIRED] を出しても分類 READY が
-        # 支持せず reject → 継続（Claude へ POKE_CLAUDE_NEXT）。次ラウンド ALL_DONE → exit 0（exit 8 にしない）。
+        # 支持せず reject。**Claude へは送らず Codex に選択を再要求**し、Codex が `- [ ] A` を選択して初めて
+        # Claude へ配達する。誤 sentinel で exit 8 にしない。
         ready = self._cls("- [ ] A\n- [!] human\n  - blocker: x\n")
-        alldone = self._cls("- [x] A\n- [x] human\n")
+        alldone = self._cls("- [x] A\n- [x] done\n")
         code, pokes = self._drive("claude", ready, [
             ("claude", ["[AIPAIR_NEXT]"], None),
-            ("codex", ["[AIPAIR_HUMAN_REQUIRED]"], ready),   # READY → reject → 継続
+            ("codex", ["[AIPAIR_HUMAN_REQUIRED]"], ready),   # READY → reject → Codex へ再要求（Claude へ送らない）
+            ("codex", ["- [ ] A"], ready),                   # Codex が着手可 A を選択 → Claude へ配達
             ("claude", ["[AIPAIR_NEXT]"], None),
             ("codex", ["[AIPAIR_ALL_DONE]"], alldone),       # → exit 0
         ])
         self.assertEqual(code, 0)                    # 誤 HUMAN_REQUIRED では exit 8 にしない
-        self.assertEqual(pokes, [self.TO_CODEX_NEXT, self.TO_CLAUDE_NEXT, self.TO_CODEX_NEXT])
+        # reject は Codex へ再要求（TO_CODEX_NEXT）、選択後に初めて Claude へ配達（TO_CLAUDE_NEXT）
+        self.assertEqual(pokes, [self.TO_CODEX_NEXT, self.TO_CODEX_NEXT, self.TO_CLAUDE_NEXT, self.TO_CODEX_NEXT])
 
 
 if __name__ == "__main__":
