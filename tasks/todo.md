@@ -30,9 +30,8 @@
       ログ「質問内容が自動中継上限を超えたため人間確認待ちで停止」。回帰テスト追加。
 
 ## P2-1 — no-progress task identity の安定化（不可視空白に依存しない）
-- [ ] インデント・末尾空白・hard-break スペースに依存しない identity へ。**要 CEO 判断**: 案A（stable task ID
-      `- [ ] [T001] …`）か案B（内部 canonical key: 先頭 indent 除去・trailing 除去・checkbox 記法正規化・NFC）。
-      同一本文複数は `UNRESOLVED`（fail-closed）維持。3回連続で exit 8 は不変。
+- [!] no-progress identity を不可視空白（インデント/末尾空白/hard-break）に依存させない改善（案A: stable task ID `[T001]` 記法追加／案B: 内部 canonical key＝先頭 indent・trailing 除去＋checkbox 記法正規化＋NFC。同一本文複数は UNRESOLVED 維持・3回連続 exit 8 は不変）
+  - blocker: 案A（task-list 記法に ID 導入）か案B（記法据え置き・内部正規化）かは記法変更の是非を伴う CEO 判断待ち。決定後に具体 `- [ ]` タスクへ落とす。
 
 ## P2-2 — main と release の version を区別
 - [ ] release 直後の main を dev version（`0.2.0.dev0`）に。可能なら `+g<commit>` を付す。
