@@ -1,12 +1,21 @@
-"""endless モードの終端判定（純関数・I/O なし）。
+"""endless モードの応答判定 / controller（判定は純粋。分類 I/O だけ注入 callback 経由）。
 
-社長指示 2026-08-24（`_reference/new-task.md`）§2/§4: endless の終端は「未完了/完了」の 2 値でなく
+社長指示 2026-08-24（`_reference/new-task.md`）§2/§4/§8: endless の終端は「未完了/完了」の 2 値でなく
 READY / BLOCKED / ALL_DONE の 3 状態で制御する。**relay が読む task-list の分類が唯一の権威**であり、
 agent が出した終端 sentinel（`[AIPAIR_ALL_DONE]` / `[AIPAIR_HUMAN_REQUIRED]`）は、分類が一致した
 時だけ honor する。分類に READY が残る（着手可 `[ ]` がある）なら、sentinel が出ても拒否して継続する
 （誤 sentinel で未処理の `[ ]` を残して止めない — §11 Case 6）。
 
-no-progress（同一タスクの停滞）は分類とは独立の relay 内部経路（Phase 4）であり、ここでは扱わない。
+このモジュールが所有するもの（P2-5 で state_machine から集約）:
+- 終端判定 `decide_endless_terminal`（sentinel × 分類 → all_done / human_required / reject）
+- no-progress guard（§8）: 停滞ストリーク `advance_no_progress` ／ 逐語識別子の同定 `resolve_task_identity`
+- 停止 banner の文言ビルダ `human_required_banner_lines` / `no_progress_banner_lines`（(level,text) 行データ）
+- Codex 応答 → run() が適用する `EndlessOutcome` を生成する `handle_endless_response`
+
+判定は純粋（同じ入力 → 同じ outcome）。ただし task-list 分類だけは副作用なので、
+`handle_endless_response` は `classify` を **注入 callback** で受け取り、元の実装と同じ条件でのみ呼ぶ
+（終端 sentinel 検出時／`pending_kind == "next"` 時。レビュー継続時は呼ばない）。print / poke /
+state 遷移・exit code などの副作用は run()（state_machine）側で outcome を適用して行う。
 """
 import collections
 import re
