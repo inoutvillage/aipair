@@ -25,8 +25,10 @@ for interactive launch, `AIPAIR_CLAUDE_FLAGS` / `AIPAIR_CODEX_FLAGS` set the fla
 **Endless mode** (`AIPAIR_ENDLESS=1` / `--endless`): the stop phrase means "this task passed review,
 move on" instead of "stop". When Claude runs out of work it writes `[AIPAIR_NEXT]` at the start
 of its reply, and Codex assigns the next unchecked item from `tasks/todo.md` (`AIPAIR_TASK_LIST`).
-The loop ends **only** when Codex declares `[AIPAIR_ALL_DONE]` (`--max-rounds` is just a safety cap — set it
-high).
+The loop's terminal is decided by relay's classification of `tasks/todo.md` (READY/BLOCKED/ALL_DONE):
+it ends when Codex declares `[AIPAIR_ALL_DONE]` and nothing is left (exit 0), **or** `[AIPAIR_HUMAN_REQUIRED]`
+when only human-blocked `- [!]` items remain (exit 8 — waiting for you). Mark a task only a human can
+unblock as `- [!]` with a `blocker:` reason under it. `--max-rounds` is just a safety cap — set it high.
 
 After a relay has ended and the back-and-forth has stopped, a new round can be started on demand
 with **`aipair-relay-here`** (from the claude or codex pane; it adopts the running pair with

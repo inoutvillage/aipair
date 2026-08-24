@@ -110,7 +110,7 @@ chk "$(run loop bridge AIPAIR_ENDLESS=1 'AIPAIR_TASK_LIST=my tasks/todo list.md'
 for off in 0 false no off; do
   chk "$(run loop bridge "AIPAIR_ENDLESS=$off" | grep -c -- '--endless' || true)" "0" "AIPAIR_ENDLESS=$off means off (as README promises)"
 done
-chk "$(line loop title AIPAIR_ENDLESS=1 'AIPAIR_ALL_DONE=fin')" "relay ● endless / max 20 / 終端 fin / Ctrl-C で停止" "endless title"
+chk "$(line loop title AIPAIR_ENDLESS=1 'AIPAIR_ALL_DONE=fin')" "relay ● endless / max 20 / 終端 DONE/HUMAN / Ctrl-C で停止" "endless title (2 終端: ALL_DONE / HUMAN_REQUIRED)"
 
 echo "# [4] agent flags are shell fragments (documented, backwards compatible)"
 # `start` (interactive) mode: loop always appends the bypass flag, so test the fragment

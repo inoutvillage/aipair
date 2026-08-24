@@ -166,7 +166,7 @@ echo "exit=$?"
 
 ▼ 自走ループの既定値（日本語）
   停止ワード「完了です」（AIPAIR_STOP）／ 判定側 codex（AIPAIR_STOP_SIDE）／ 最大 20 往復（AIPAIR_MAX_ROUNDS）
-  連続モードの合図「次のタスクをください」「全タスク完了」（AIPAIR_NEXT_ASK / AIPAIR_ALL_DONE）
+  連続モードの合図「次のタスクをください」／終端「全タスク完了」「人間対応待ち」（AIPAIR_NEXT_ASK / AIPAIR_ALL_DONE / AIPAIR_HUMAN_REQUIRED）
 
 ▼ 次にやること
   1. 新しいシェルを開く（PATH 反映）→ cd <project> → aipair

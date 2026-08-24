@@ -56,7 +56,7 @@ aipair-relay-here -- --endless --max-rounds 100
 - 「完了です」は**終了ではなく「レビュー合格→次のタスクへ」**の合図になる。
 - Claude 側の手持ちが尽きたら本文冒頭に「**次のタスクをください**」と書く → relay が Codex に
   `tasks/todo.md` の未チェック項目から次の1件を指示させる。
-- **終端は Codex の「全タスク完了」宣言のみ**（+ `--max-rounds` の安全キャップ）。
+- **終端は relay の task-list 分類（READY/BLOCKED/ALL_DONE）が権威で 2 つ**: 全完了（`[AIPAIR_ALL_DONE]`・exit 0）と、人間対応の `- [!]`（直下に `blocker:` 理由）だけが残る HUMAN_REQUIRED（`[AIPAIR_HUMAN_REQUIRED]`・exit 8・人間対応待ち）。着手可 `- [ ]` が残る間は終端 sentinel を無視して継続（+ `--max-rounds` の安全キャップ）。
   既定の 20 往復ではすぐキャップに当たるので `--max-rounds` を大きめに。
 - 上の 🚫（無限ループにしない）は**既定モードの話**。連続モードはユーザーが明示的に選んだ時だけで、
   こちらから勝手に `--endless` を付けない。
