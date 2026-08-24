@@ -12,10 +12,12 @@ agent が出した終端 sentinel（`[AIPAIR_ALL_DONE]` / `[AIPAIR_HUMAN_REQUIRE
 - 停止 banner の文言ビルダ `human_required_banner_lines` / `no_progress_banner_lines`（(level,text) 行データ）
 - Codex 応答 → run() が適用する `EndlessOutcome` を生成する `handle_endless_response`
 
-判定は純粋（同じ入力 → 同じ outcome）。ただし task-list 分類だけは副作用なので、
-`handle_endless_response` は `classify` を **注入 callback** で受け取り、元の実装と同じ条件でのみ呼ぶ
-（終端 sentinel 検出時／`pending_kind == "next"` 時。レビュー継続時は呼ばない）。print / poke /
-state 遷移・exit code などの副作用は run()（state_machine）側で outcome を適用して行う。
+**個々の判定 helper は純粋**（`decide_endless_terminal` / `advance_no_progress` / `resolve_task_identity` /
+banner ビルダは同じ入力 → 同じ出力）。**controller `handle_endless_response` 自体は直接 I/O を持たない**が、
+task-list 分類だけは**可変な外部状態**を読む副作用なので **注入 callback `classify` 経由**で行う
+（＝同じ引数・同じ callback オブジェクトでも、その時点の task-list 次第で outcome は変わり得る＝参照透過ではない）。
+classify は元の実装と同じ条件でのみ呼ぶ（終端 sentinel 検出時／`pending_kind == "next"` 時。レビュー継続時は
+呼ばない）。print / poke / state 遷移・exit code などの副作用は run()（state_machine）側で outcome を適用して行う。
 """
 import collections
 import re

@@ -45,7 +45,7 @@
 - [x] README: stable（`--branch v0.1.0`）/ development（main）を分け、**main = development version** を冒頭に明示。
 
 ## P2-5 — state_machine 再肥大化の抑制（今回追加分を別 module へ）
-- [ ] 今回追加する question HUMAN_REQUIRED / question payload guard / task completion 系を、`state_machine.py`
+- [x] 今回追加する question HUMAN_REQUIRED / question payload guard / task completion 系を、`state_machine.py`
       に直接分岐を足さず別 module（例 `question_controller` / `endless_controller`）へ切り出す。run() は state 判定＋
       handler 呼び出し＋next state＋exit code に寄せる。**P1-2/P1-3 実装時からこの原則で追加する**。
 
