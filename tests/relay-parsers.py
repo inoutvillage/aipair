@@ -1477,6 +1477,22 @@ class StateMachineWiring(unittest.TestCase):
         self.assertIn("human_required_phrases = [s for s in a.human_required.split", src)
         self.assertIn("human_required_phrases=human_required_phrases", src)
 
+    def test_endless_rejects_empty_terminal_sentinels(self):
+        # fail-closed（Codex relay-id:c24c2593）: endless で終端 sentinel が空だと、Codex への文面は
+        # 既定 sentinel を出すのに検出リストが空で認識できず、その終端へ遷移しても max-rounds まで続く。
+        # → 起動時に exit 2 で拒否する。--all-done / --human-required の両方、"" と "||" の両方を固定。
+        relay_bin = os.path.join(BIN, "aipair-relay")
+        base = ["--endless", "--dir", "/tmp"]
+        for empty in ("", "||"):
+            r = subprocess.run([sys.executable, relay_bin, "--all-done", "[X]",
+                                "--human-required", empty] + base, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("--human-required", r.stderr)
+            r = subprocess.run([sys.executable, relay_bin, "--all-done", empty,
+                                "--human-required", "[Y]"] + base, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("--all-done", r.stderr)
+
     def _run_startup(self, state):
         # 起動時分類が state の StateMachine.run() を、tmux/poke を mock して回す。
         # 戻り値 code と「poke が呼ばれたか」を返す（起動時終端では 1 度も poke しないのが要件）。

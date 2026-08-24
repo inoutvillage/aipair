@@ -238,9 +238,17 @@ def main():
                                               human_required_phrases[0] if human_required_phrases
                                               else "[AIPAIR_HUMAN_REQUIRED]")
     poke_claude_next = endless_poke_claude_next(a.task_list)
+    # endless の 2 終端（ALL_DONE / HUMAN_REQUIRED）はどちらも sentinel が必須。空だとプロンプトは既定
+    # sentinel を出すのに検出リストが空になり、その終端へ遷移しても認識できず max-rounds まで続く
+    # （prompt と検出の食い違い）→ fail-closed で拒否する。
     if a.endless and not all_done_phrases:
-        print(c("warn", "aipair-relay: --endless では --all-done が終端の唯一の手段です（空にできません）"),
-              file=sys.stderr)
+        print(c("warn", "aipair-relay: --endless の終端 sentinel --all-done を空にできません"
+                        "（分類 ALL_DONE 時の正常終了に必要）"), file=sys.stderr)
+        return 2
+    if a.endless and not human_required_phrases:
+        print(c("warn", "aipair-relay: --endless の終端 sentinel --human-required を空にできません"
+                        "（分類 BLOCKED 時の HUMAN_REQUIRED 停止に必要。空だと Codex への文面は既定 "
+                        "sentinel を出すのに検出できず max-rounds まで続く）"), file=sys.stderr)
         return 2
 
     session = a.session or current_session()
