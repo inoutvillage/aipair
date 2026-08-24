@@ -43,7 +43,7 @@
   - **BLOCKED (no-progress)**: 「■ 自動処理を停止しました／理由: 進捗がないまま同じタスクが再選択／繰り返された READY 項目（or `UNRESOLVED`）／ストリーク数／task-list snapshot hash」を表示。**no-progress 時は `[!]` が存在しない場合があり**、`[!]` 一覧に依存しない。
 
 ### Phase 6 — 回帰テスト（§11）
-- [ ] Case1（`[ ]`+`[x]`→A選択・継続）/ Case2（全`[x]`→ALL_DONE・exit0）/ Case3（`[!]`+`[x]`→HUMAN_REQUIRED・exit8・再指示なし）/ Case4（`[ ]`+`[!]`→A先行→後にHUMAN_REQUIRED）/ Case5（同一`[ ]`を **2回目までは継続・3回目で exit 8**／snapshot hash 不変→no-progress）/ Case6（`[!]`あるが別`[ ]`あり→継続・まだHUMAN_REQUIREDにしない）を自動テスト化。
+- [x] Case1〜6 を自動テスト化〔relay-parsers `EndlessScenarios`＝classify＋decide_endless_terminal＋advance_no_progress の合成〕: Case1（`[ ]`+`[x]`→A選択・継続）/ Case2（全`[x]`→ALL_DONE・exit0）/ Case3（`[!]`+`[x]`→HUMAN_REQUIRED・exit8・再指示なし）/ Case4（`[ ]`+`[!]`→A先行→後にHUMAN_REQUIRED）/ Case5（同一`[ ]`を **2回目までは継続・3回目で exit 8**／snapshot hash 不変→no-progress）/ Case6（`[!]`あるが別`[ ]`あり→継続・まだHUMAN_REQUIREDにしない）。
 - [ ] **負テスト**: (a) `[!]` に `blocker:` 無し→exit 2 / (b) **任意長のバッククォート／チルダ・コードフェンス**内の疑似 checkbox を分類が無視 / (c) task-list 欠損・解析不能→exit 2 / (d) 識別子 0/≥2 一致→`UNRESOLVED` 経路 / (e) **未知 checkbox 風記法（`[?]` 等）→exit 2**（`ALL_DONE` にしない）。**正**テスト: `[X]`（大文字）を完了として扱う。
 - [ ] **旧説明の再発防止**: `tests/broadcast-blocks.sh` と doc-sync で、上記配布ドキュメントに「終端は ALL_DONE のみ」等の旧契約が**再発しないこと**＋新契約（HUMAN_REQUIRED / task-list 分類 / exit 8）が**存在すること**を assert。
 - [ ] doc-sync に新 sentinel（`[AIPAIR_HUMAN_REQUIRED]`）・exit 8・`[!]` 意味を pin（README と実装の同期）。

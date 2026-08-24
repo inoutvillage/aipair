@@ -2362,5 +2362,58 @@ class ResponseAttribution(unittest.TestCase):
         self.assertIn("in window", relay.turn_texts("codex", p, since, epoch("2026-08-21T00:00:08Z")))
 
 
+class EndlessScenarios(unittest.TestCase):
+    """§11 Case1-6: task-list 分類（tasklist.classify）＋終端判定（decide_endless_terminal）＋
+    no-progress（advance_no_progress）を合成し、endless の各シナリオを end-to-end で固定する
+    （社長指示 2026-08-24 / `_reference/new-task.md` §11）。"""
+    def setUp(self):
+        self.tl = relay.state_machine.tasklist
+        self.term = relay.state_machine.decide_endless_terminal
+        self.np = relay.state_machine.advance_no_progress
+
+    def test_case1_ready_continues(self):
+        # [ ]+[x] → 分類 READY → 着手可を選んで継続。ALL_DONE/HUMAN_REQUIRED 誤宣言は分類が支持せず reject。
+        cls = self.tl.classify("- [ ] task A\n- [x] task B\n")
+        self.assertEqual(cls["state"], self.tl.READY)
+        self.assertEqual(cls["ready"], ["- [ ] task A"])
+        self.assertEqual(self.term(True, False, cls["state"]), "reject")
+        self.assertEqual(self.term(False, True, cls["state"]), "reject")
+
+    def test_case2_all_done_exit0(self):
+        cls = self.tl.classify("- [x] a\n- [x] b\n")
+        self.assertEqual(cls["state"], self.tl.ALL_DONE)
+        self.assertEqual(self.term(True, False, cls["state"]), "all_done")     # → exit 0
+
+    def test_case3_human_required_exit8(self):
+        cls = self.tl.classify("- [x] done\n- [!] set secrets\n  - blocker: repo admin\n")
+        self.assertEqual(cls["state"], self.tl.BLOCKED)
+        self.assertEqual(self.term(False, True, cls["state"]), "human_required")   # → exit 8
+        # [!] は再指示しない＝Codex プロンプトが指定（②→HUMAN_REQUIRED）
+        prompt = relay.review_protocol.endless_poke_codex_next("t.md", "[AIPAIR_ALL_DONE]", "[AIPAIR_HUMAN_REQUIRED]")
+        self.assertIn("再指示しない", prompt)
+
+    def test_case4_ready_then_human_required(self):
+        # [ ]+[!] → 最初は READY（A 先行）。A 完了後は BLOCKED → HUMAN_REQUIRED。
+        before = self.tl.classify("- [ ] A\n- [!] human\n  - blocker: needs approval\n")
+        self.assertEqual(before["state"], self.tl.READY)
+        after = self.tl.classify("- [x] A\n- [!] human\n  - blocker: needs approval\n")
+        self.assertEqual(after["state"], self.tl.BLOCKED)
+        self.assertEqual(self.term(False, True, after["state"]), "human_required")
+
+    def test_case5_no_progress_stops_on_third(self):
+        h = self.tl.classify("- [ ] A\n- [x] b\n")["hash"]
+        s, stop = self.np(None, "- [ ] A", h); self.assertFalse(stop)
+        s, stop = self.np(s, "- [ ] A", h);    self.assertFalse(stop)    # 2回目まで継続
+        s, stop = self.np(s, "- [ ] A", h);    self.assertTrue(stop)     # 3回目で exit 8
+        self.assertEqual(s[2], 3)
+
+    def test_case6_blocked_present_but_ready_exists(self):
+        # [!] があっても別の [ ] があれば READY → まだ HUMAN_REQUIRED にしない（誤 sentinel は reject）。
+        cls = self.tl.classify("- [ ] A\n- [!] human\n  - blocker: x\n")
+        self.assertEqual(cls["state"], self.tl.READY)
+        self.assertEqual(len(cls["blocked"]), 1)
+        self.assertEqual(self.term(False, True, cls["state"]), "reject")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
