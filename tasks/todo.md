@@ -26,7 +26,7 @@
 - [x] task-list の `[!]` とは**別経路**（質問停止で todo を勝手に `[!]` にしない）。回帰テスト追加。
 
 ## P1-3 — 質問 truncate を fail-closed 化
-- [ ] 質問 payload が自動中継上限（現 3000 字）を超えたら **truncate せず HUMAN_REQUIRED（exit 8）**。
+- [x] 質問 payload が自動中継上限（現 3000 字）を超えたら **truncate せず HUMAN_REQUIRED（exit 8）**。
       ログ「質問内容が自動中継上限を超えたため人間確認待ちで停止」。回帰テスト追加。
 
 ## P2-1 — no-progress task identity の安定化（不可視空白に依存しない）
