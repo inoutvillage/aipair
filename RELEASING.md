@@ -19,7 +19,11 @@ A release is a git tag **`v<version>`** plus its GitHub Release; the tag must eq
    cycle, and fix the bottom link definitions: `[X.Y.Z]` → the **tag/release URL**
    (`…/releases/tag/vX.Y.Z`) and add `[Unreleased]` → the **compare URL** (`…/compare/vX.Y.Z...HEAD`).
    This dated section is what the tag publishes (`release.yml` refuses to publish an undated section).
-3. Commit both in one commit: `release: vX.Y.Z`.
+   Also update the **README stable install line(s)** — the `git clone --branch vX.Y.Z …` in the Quick
+   Start and the install section — to the new tag (doc-sync's
+   `test_readme_stable_branch_tracks_the_latest_release` fails until the README tag matches the newest
+   dated CHANGELOG release).
+3. Commit these in one commit: `release: vX.Y.Z`.
 4. Open a PR and let CI pass (doc-sync checks `__version__` == the CHANGELOG top version section and
    that `aipair --version` / `aipair-relay --version` report it). Merge — this is the release commit.
 5. **Tag the merge commit and push the tag**:
