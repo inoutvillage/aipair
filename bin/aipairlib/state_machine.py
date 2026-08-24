@@ -45,7 +45,7 @@ from .review_protocol import plan_poke_codex, question_poke_codex
 from .plan_flow import decide_plan_action
 from .question_flow import decide_question_action, handle_question_answer, decide_question_relay
 from .endless_flow import (decide_endless_terminal, resolve_task_identity, advance_no_progress,  # noqa: F401
-                           UNRESOLVED)
+                           human_required_banner_lines, no_progress_banner_lines, UNRESOLVED)
 from . import tasklist
 
 # endless BLOCKED/HUMAN_REQUIRED（社長指示 2026-08-24 / _reference/new-task.md）: max-rounds(3) と
@@ -267,35 +267,6 @@ def done_banner(rounds, who, all_done=False):
     print("\a", end="", flush=True)
 
 
-def human_required_banner(cls, rounds):
-    """HUMAN_REQUIRED（分類 BLOCKED）の終了 banner（§6）: 残 `[!]` 項目名＋blocker 理由を一覧表示。"""
-    print("", flush=True)
-    print(c("warn", "│ ■ 自動処理を停止しました"), flush=True)
-    print(c("warn", "│   理由: 人間対応が必要なタスク（`[!]`）のみ残っています"
-                    f"（HUMAN_REQUIRED・exit {EXIT_BLOCKED}・{rounds} 往復）"), flush=True)
-    print(c("warn", "│   残タスク:"), flush=True)
-    for b in cls.get("blocked", []):
-        print(c("warn", f"│     {b['item']}"), flush=True)
-        print(c("dim", f"│       blocker: {b['blocker']}"), flush=True)
-    print(c("warn", "│   人間対応後、再度 endless を開始してください。"), flush=True)
-    print("\a", end="", flush=True)
-
-
-def no_progress_banner(np_state, rounds):
-    """no-progress（同一タスク停滞）の終了 banner（§6）: 繰り返された項目・ストリーク数・snapshot hash を
-    表示する。no-progress では `[!]` が存在しない場合があるので `[!]` 一覧に依存しない。"""
-    ident, hashv, streak = np_state
-    what = "UNRESOLVED（識別子を task-list 内で一意に同定できず）" if ident == UNRESOLVED else ident
-    print("", flush=True)
-    print(c("warn", "│ ■ 自動処理を停止しました"), flush=True)
-    print(c("warn", "│   理由: 進捗がないまま同じタスクが再選択されています"
-                    f"（no-progress・exit {EXIT_BLOCKED}・{rounds} 往復）"), flush=True)
-    print(c("warn", f"│   繰り返された項目: {what}"), flush=True)
-    print(c("dim", f"│   連続回数: {streak} / task-list snapshot hash: {hashv}"), flush=True)
-    print(c("warn", "│   人間確認が必要な可能性があります。"), flush=True)
-    print("\a", end="", flush=True)
-
-
 def print_banner(lines):
     """(level|None, text) 行列を着色して出力し、最後にベルを鳴らす（level=None は無着色）。
     banner の《文言》は question_flow 等の純 module 側で構築し、ここは表示だけ（P2-5）。"""
@@ -418,7 +389,7 @@ class StateMachine:
         elif _startup_state == tasklist.BLOCKED:
             blocked_reason = BLOCKED_HR_REASON
             code = EXIT_BLOCKED
-            human_required_banner(_init_cls, rounds)      # 起動時点で [!] のみ → 駆動せず即終了
+            print_banner(human_required_banner_lines(_init_cls, rounds, EXIT_BLOCKED))      # 起動時点で [!] のみ → 駆動せず即終了
         _skip_loop = _startup_state in (tasklist.ALL_DONE, tasklist.BLOCKED)
         try:
             while True:
@@ -729,7 +700,7 @@ class StateMachine:
                             if term == "human_required":
                                 blocked_reason = BLOCKED_HR_REASON
                                 code = EXIT_BLOCKED
-                                human_required_banner(term_cls, rounds); break
+                                print_banner(human_required_banner_lines(term_cls, rounds, EXIT_BLOCKED)); break
                             if term == "reject":
                                 # 誤 sentinel（分類は READY＝着手可 [ ] が残る）: Codex はタスクを選択して
                                 # いないので、Claude へ「次タスク指示」を送らず（未選択のタスクを着手させない）、
@@ -741,7 +712,7 @@ class StateMachine:
                                 if np_stop:
                                     blocked_reason = BLOCKED_NOPROGRESS_REASON
                                     code = EXIT_BLOCKED
-                                    no_progress_banner(np_state, rounds); break
+                                    print_banner(no_progress_banner_lines(np_state, rounds, EXIT_BLOCKED)); break
                                 sent = poke(panes["codex"], poke_codex_next,
                                             confirm=codex_poke_confirm(), busy_wait=bw)
                                 if not sent:
@@ -768,7 +739,7 @@ class StateMachine:
                                 if np_stop:
                                     blocked_reason = BLOCKED_NOPROGRESS_REASON
                                     code = EXIT_BLOCKED
-                                    no_progress_banner(np_state, rounds); break
+                                    print_banner(no_progress_banner_lines(np_state, rounds, EXIT_BLOCKED)); break
                                 msg_claude = poke_claude_next
                             elif a.stop_side in ("codex", "both") and hit_stop(texts, stop_phrases):
                                 ok_gate, gate_msg = gate_or_message(a, gate_state, cwd)
