@@ -2384,7 +2384,8 @@ class EndlessScenarios(unittest.TestCase):
         sm = relay.state_machine
         a = types.SimpleNamespace(start_side=start_side, settle=0, poll=0, max_rounds=20, endless=True,
                                   task_list="tasks/todo.md", stop_side="codex", no_plan_review=True,
-                                  no_question_relay=True, plan_rounds=5, question_rounds=5, plan_ok="[P]")
+                                  no_question_relay=True, plan_rounds=5, question_rounds=5, plan_ok="[P]",
+                                  gate=None, gate_timeout=600, gate_rounds=3)
         rg = types.SimpleNamespace(response_done=lambda who, path, done: done, noshow=lambda who: False,
                                    arm=lambda nonce: None, probe=None, probe_ts_cache=0.0)
         sg = types.SimpleNamespace(guard=lambda: False)
@@ -2478,6 +2479,30 @@ class EndlessScenarios(unittest.TestCase):
         self.assertEqual(pokes, [self.TO_CODEX_NEXT, self.TO_CLAUDE_NEXT,
                                  self.TO_CODEX_NEXT, self.TO_CLAUDE_NEXT,
                                  self.TO_CODEX_NEXT])
+
+    def test_p0_1_case_b_review_ng_sends_normal_poke_not_pass(self):
+        # P0-1 Case B（Codex relay-id:806af357）: レビュー NG（[AIPAIR_REVIEW_OK] 無し）は通常の
+        # poke_claude を Claude へ送り、poke_claude_pass（= [x] 化を促す文面）は送らない。run() 実駆動で固定。
+        ready = self._cls("- [ ] A\n")
+        code, pokes = self._drive("codex", ready, [
+            ("codex", ["修正が必要です: X を直して"], None),      # NG レビュー（pending_kind=review）
+            ("claude", ["[AIPAIR_NEXT]"], None),
+            ("codex", ["[AIPAIR_ALL_DONE]"], self._cls("- [x] A\n")),
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(pokes, [("%1", "POKE_CLAUDE"), ("%2", "POKE_CODEX_NEXT")])
+        self.assertNotIn(("%1", "POKE_CLAUDE_PASS"), pokes)   # NG では pass（[x] 化）を送らない
+
+    def test_p0_1_case_c_review_ok_sends_pass(self):
+        # P0-1 Case C: レビュー合格（[AIPAIR_REVIEW_OK]）で初めて poke_claude_pass（[x] 化を促す）を送る。
+        ready = self._cls("- [ ] A\n")
+        code, pokes = self._drive("codex", ready, [
+            ("codex", ["[AIPAIR_REVIEW_OK]"], None),           # OK レビュー
+            ("claude", ["[AIPAIR_NEXT]"], None),
+            ("codex", ["[AIPAIR_ALL_DONE]"], self._cls("- [x] A\n")),
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(pokes, [("%1", "POKE_CLAUDE_PASS"), ("%2", "POKE_CODEX_NEXT")])
 
     def test_p0_1_case_d_unreviewed_task_stays_ready_on_restart(self):
         # P0-1 Case D（社長指示 2026-08-24）: 実装後・レビュー前は task が [ ] のまま（next 文面は [x] 化を
