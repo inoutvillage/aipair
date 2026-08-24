@@ -1478,6 +1478,20 @@ class StateMachineWiring(unittest.TestCase):
         # ready が空 → UNRESOLVED
         self.assertEqual(R("- [ ] task A", []), U)
 
+    def test_resolve_task_identity_is_verbatim_indent_and_trailing_ws(self):
+        # Codex relay-id:91e37007: verbatim 完全一致。同本文でインデント違いの 2 項目を、正しく
+        # エコーされた行だけに一意同定する（前後空白を除去して両方一致＝UNRESOLVED にしない）。
+        R = relay.state_machine.resolve_task_identity
+        U = relay.state_machine.UNRESOLVED
+        two = ["- [ ] task", "  - [ ] task"]                    # 同本文・インデント違い
+        self.assertEqual(R("- [ ] task", two), "- [ ] task")    # 親を逐語 → 親
+        self.assertEqual(R("  - [ ] task", two), "  - [ ] task")  # 子を逐語 → 子
+        self.assertEqual(R("`  - [ ] task`", two), "  - [ ] task")  # 子をバッククォート囲み → 子
+        # 末尾空白: 逐語一致は成立、非逐語（末尾空白の付け外し）は UNRESOLVED
+        self.assertEqual(R("- [ ] t  ", ["- [ ] t  "]), "- [ ] t  ")   # 末尾空白まで一致
+        self.assertEqual(R("- [ ] t  ", ["- [ ] t"]), U)               # ready に無い末尾空白
+        self.assertEqual(R("- [ ] t", ["- [ ] t  "]), U)               # ready の末尾空白を欠落
+
     def test_codex_next_prompt_asks_to_echo_the_task_line(self):
         # §8 の識別子契約: Codex は指示するタスク行を逐語エコーする（プロンプトで指定）。
         txt = relay.review_protocol.endless_poke_codex_next("t.md", "[AIPAIR_ALL_DONE]", "[AIPAIR_HUMAN_REQUIRED]")
