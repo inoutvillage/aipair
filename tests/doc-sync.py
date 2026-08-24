@@ -78,7 +78,8 @@ class Sentinels(unittest.TestCase):
     """停止・状態遷移 sentinel の《既定値》== build_parser の argparse 既定（README がドキュメント）。"""
     # argparse dest → the env var README documents it under
     CASES = [("stop", "AIPAIR_STOP"), ("next_ask", "AIPAIR_NEXT_ASK"),
-             ("all_done", "AIPAIR_ALL_DONE"), ("plan_ok", "AIPAIR_PLAN_OK")]
+             ("all_done", "AIPAIR_ALL_DONE"), ("human_required", "AIPAIR_HUMAN_REQUIRED"),
+             ("plan_ok", "AIPAIR_PLAN_OK")]
 
     def setUp(self):
         self.defaults = _builtin_defaults()
@@ -457,6 +458,14 @@ class EndlessContract(unittest.TestCase):
         self.assertRegex(README, r"READY/BLOCKED/ALL_DONE",  # 3 状態を明示（削除を検知する）
                          "README に task-list 分類 READY/BLOCKED/ALL_DONE の明示が無い")
         self.assertIn("[!]", README)                     # 保留記法
+
+    def test_readme_pins_the_blocked_notation_meaning(self):
+        # `[!]` の意味（保留＝人間対応・外部依存で AI 単独では進められない、直下に blocker: 理由）を
+        # README が説明していること（記号だけでなく意味を pin する）。
+        self.assertTrue([ln for ln in README.splitlines() if "- [!]" in ln and "保留" in ln],
+                        "README に `- [!]`=保留 の意味説明が無い")
+        self.assertIn("blocker:", README)                # 直下に blocker: 理由
+        self.assertRegex(README, r"人間対応|外部依存")     # 人間対応・外部依存の含意
 
     def test_relay_help_docstring_has_new_contract_and_no_stale(self):
         # relay.py 全体でなく **module docstring（= --help 文面）** だけを AST で抽出して検証する。

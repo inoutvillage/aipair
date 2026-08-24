@@ -46,7 +46,7 @@
 - [x] Case1〜6 を自動テスト化〔relay-parsers `EndlessScenarios`＝classify＋decide_endless_terminal＋advance_no_progress の合成〕: Case1（`[ ]`+`[x]`→A選択・継続）/ Case2（全`[x]`→ALL_DONE・exit0）/ Case3（`[!]`+`[x]`→HUMAN_REQUIRED・exit8・再指示なし）/ Case4（`[ ]`+`[!]`→A先行→後にHUMAN_REQUIRED）/ Case5（同一`[ ]`を **2回目までは継続・3回目で exit 8**／snapshot hash 不変→no-progress）/ Case6（`[!]`あるが別`[ ]`あり→継続・まだHUMAN_REQUIREDにしない）。
 - [x] **負テスト**〔tasklist `Section11Negatives`（load_or_exit→exit 2 経路）＋(d) は relay-parsers `resolve_task_identity`〕: (a) `[!]` に `blocker:` 無し→exit 2 / (b) **任意長のバッククォート／チルダ・コードフェンス**内の疑似 checkbox を分類が無視 / (c) task-list 欠損・解析不能→exit 2 / (d) 識別子 0/≥2 一致→`UNRESOLVED` 経路 / (e) **未知 checkbox 風記法（`[?]` 等）→exit 2**（`ALL_DONE` にしない）。**正**テスト: `[X]`（大文字）を完了として扱う。
 - [x] **旧説明の再発防止**〔broadcast-blocks に3ファイル×2 assert・doc-sync `EndlessContract`（README/relay.py help）〕: `tests/broadcast-blocks.sh` と doc-sync で、上記配布ドキュメントに「終端は ALL_DONE のみ」等の旧契約が**再発しないこと**＋新契約（HUMAN_REQUIRED / task-list 分類 / exit 8）が**存在すること**を assert。
-- [ ] doc-sync に新 sentinel（`[AIPAIR_HUMAN_REQUIRED]`）・exit 8・`[!]` 意味を pin（README と実装の同期）。
+- [x] doc-sync に新 sentinel（`[AIPAIR_HUMAN_REQUIRED]`）・exit 8・`[!]` 意味を pin（README と実装の同期）。〔Sentinels CASES に human_required／ExitCodes CANON に 8／EndlessContract で `[!]` 意味を pin〕
 
 ### 依存順
 Phase 1（基盤）→ Phase 2（終端判定）→ Phase 3（プロンプト）は 2 と並行可 → Phase 4（guard）→ Phase 5（UX）→ Phase 6（テストは各 Phase と並行、最後に統合）。
