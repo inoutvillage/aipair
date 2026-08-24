@@ -1556,25 +1556,33 @@ class StateMachineWiring(unittest.TestCase):
         self.assertIn("UNRESOLVED", flat2)
 
     def test_no_progress_warns_on_unresolved_identity(self):
-        # 契約（§8 / Codex relay-id:7292a881）: 識別子が UNRESOLVED（抽出失敗・0/≥2 一致）の時は、
-        # ストリークを進める前に警告ログを出す。resolve→(UNRESOLVED 警告)→advance の順序を固定。
-        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
-            src = fh.read()
-        i = src.index("ident = resolve_task_identity(")   # pending_kind ブロックの resolve
-        seg = src[i:src.index("np_state, np_stop = advance_no_progress", i)]   # その後の advance まで
-        self.assertIn("if ident == UNRESOLVED:", seg)
-        self.assertIn('log(c("warn"', seg)          # UNRESOLVED 分岐で警告を出す
+        # 契約（§8 / Codex relay-id:7292a881）: 識別子が UNRESOLVED（抽出失敗・0/≥2 一致）の時、
+        # controller（endless_flow.handle_endless_response）は警告 log を outcome に載せストリークを進める。
+        # P2-5 で判定核が state_machine から endless_flow へ移ったので controller を直接駆動して固定する。
+        from aipairlib import endless_flow as ef
+        cls = {"state": "READY", "ready": ["- [ ] A"], "blocked": [], "hash": "h1"}
+        eo = ef.handle_endless_response(
+            ["逐語エコーの無い指示"], ["[AIPAIR_ALL_DONE]"], ["[AIPAIR_HUMAN_REQUIRED]"],
+            "next", None, 1, 8, "HR", "NOPROG", lambda: cls)          # 0 一致 → UNRESOLVED
+        self.assertEqual(eo.kind, "advance_next")        # 1 回目は継続
+        self.assertEqual(eo.log, ef.UNRESOLVED_LOG)      # UNRESOLVED 警告を outcome に載せる
+        self.assertEqual(eo.np_state[0], ef.UNRESOLVED)  # ストリークを進めた
 
     def test_no_progress_guard_wired_at_codex_next(self):
-        # Codex 次タスク指示（pending_kind == "next"）の直後で識別子＋hash から no-progress を判定し、
-        # 停止時は relay 内部理由 BLOCKED_NOPROGRESS_REASON ＋ EXIT_BLOCKED で break する配線を固定。
-        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
-            src = fh.read()
-        block = src[src.index('if pending_kind == "next":'):][:1300]
-        self.assertIn("resolve_task_identity(", block)
-        self.assertIn("advance_no_progress(np_state", block)
-        self.assertIn("BLOCKED_NOPROGRESS_REASON", block)
-        self.assertIn("code = EXIT_BLOCKED", block)
+        # §8: pending_kind=="next" で同一識別子＋hash が limit(3) 連続なら no_progress で停止
+        # （reason=BLOCKED_NOPROGRESS ＋ banner）。判定は endless_flow.handle_endless_response（P2-5）。
+        from aipairlib import endless_flow as ef
+        cls = {"state": "READY", "ready": ["- [ ] A"], "blocked": [], "hash": "H"}
+        base = (["- [ ] A"], ["[AIPAIR_ALL_DONE]"], ["[AIPAIR_HUMAN_REQUIRED]"], "next")
+        np = None
+        for expect in ("advance_next", "advance_next", "no_progress"):   # 3 連続で停止
+            eo = ef.handle_endless_response(*base, np, 1, 8, "HR", "NOPROG", lambda: cls)
+            self.assertEqual(eo.kind, expect)
+            np = eo.np_state
+        self.assertEqual(eo.reason, "NOPROG")            # relay 内部理由
+        self.assertTrue(eo.banner)                       # no-progress banner を outcome に載せる
+        # 逐語一致で識別子が解決されていること（ストリークが進む前提）
+        self.assertEqual(np[0], "- [ ] A")
 
     def test_codex_next_prompt_asks_to_echo_the_task_line(self):
         # §8 の識別子契約: Codex は指示するタスク行を逐語エコーする（プロンプトで指定）。
@@ -1722,33 +1730,37 @@ class StateMachineWiring(unittest.TestCase):
         for name in ("decide_question_action", "handle_question_answer", "decide_question_relay",
                      "human_required_banner_lines", "question_oversize_banner_lines"):
             self.assertTrue(hasattr(question_flow, name), f"question_flow must own {name}")
-        # endless の終端判定 + 停止 banner 文言（HUMAN_REQUIRED / no-progress）も endless_flow が所有する
+        # endless の終端判定・no-progress・停止 banner・応答 outcome 生成はすべて endless_flow が所有する
         for name in ("decide_endless_terminal", "resolve_task_identity", "advance_no_progress",
-                     "human_required_banner_lines", "no_progress_banner_lines"):
+                     "human_required_banner_lines", "no_progress_banner_lines",
+                     "handle_endless_response", "EndlessOutcome"):
             self.assertTrue(hasattr(endless_flow, name), f"endless_flow must own {name}")
         # state_machine は import して同一オブジェクトを使う（再実装しない）
         self.assertIs(sm.handle_question_answer, question_flow.handle_question_answer)
         self.assertIs(sm.decide_question_relay, question_flow.decide_question_relay)
-        self.assertIs(sm.decide_endless_terminal, endless_flow.decide_endless_terminal)
-        self.assertIs(sm.advance_no_progress, endless_flow.advance_no_progress)
-        # endless 停止 banner は endless_flow の実装を使う（state_machine 内 print 関数ではない）
+        self.assertIs(sm.handle_endless_response, endless_flow.handle_endless_response)
         self.assertIs(sm.human_required_banner_lines, endless_flow.human_required_banner_lines)
         self.assertIs(sm.no_progress_banner_lines, endless_flow.no_progress_banner_lines)
         with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
             sm_src = fh.read()
-        # run() は handler / banner ビルダを呼ぶだけ（P1-2/P1-3/P2-5）— 判定分岐も banner 文言も直書きしない
+        # run() は handler / controller を呼び、outcome を適用するだけ（P1-2/P1-3/P2-5）
         self.assertIn("handle_question_answer(", sm_src)
         self.assertIn("decide_question_relay(", sm_src)
-        self.assertIn("print_banner(human_required_banner_lines(", sm_src)   # endless HR は endless_flow の行を print
-        self.assertIn("print_banner(no_progress_banner_lines(", sm_src)
+        self.assertIn("handle_endless_response(", sm_src)   # endless 応答は endless_flow の controller が判定
+        self.assertIn("print_banner(eo.banner)", sm_src)    # 停止 banner は outcome から print（run() で組まない）
         self.assertNotIn('decision.action == "human_required"', sm_src,
                          "質問の分岐判定は question_flow.handle_question_answer 内へ")
-        for gone in ("def question_human_required_banner",
-                     "def human_required_banner",   # 旧 endless HR print 関数 / _lines とも state_machine に置かない
-                     "def no_progress_banner",      # 旧 endless no-progress print 関数 / _lines も同様
-                     "def question_oversize_banner_lines", "def decide_question_relay",
-                     "def handle_question_answer", "def decide_endless_terminal"):
-            self.assertNotIn(gone, sm_src, f"{gone} は flow module 側に置く（state_machine で再定義しない）")
+        # Codex 応答の判定分岐・no-progress 更新・banner 生成が state_machine 直書きに戻らないことを固定。
+        # （起動時 BLOCKED の print_banner(human_required_banner_lines(...)) は endless_flow のビルダを
+        #  print するだけの適用側なので許容 — これは判定ではなく outcome の表示）。
+        for gone in ('term == "reject"', 'term == "human_required"', 'if pending_kind == "next":',
+                     "advance_no_progress(np_state", "resolve_task_identity(",
+                     "print_banner(no_progress_banner_lines(",
+                     "def question_human_required_banner", "def human_required_banner",
+                     "def no_progress_banner", "def question_oversize_banner_lines",
+                     "def decide_question_relay", "def handle_question_answer",
+                     "def decide_endless_terminal", "def handle_endless_response"):
+            self.assertNotIn(gone, sm_src, f"{gone!r} は flow module 側に置く（state_machine で再定義/直書きしない）")
 
 class QuestionRelayDecision(unittest.TestCase):
     """P2-1 question_flow: Codex の質問回答をどうするかの判定は純粋関数 decide_question_action。
