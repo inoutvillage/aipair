@@ -1477,21 +1477,22 @@ class StateMachineWiring(unittest.TestCase):
         self.assertIn("human_required_phrases = [s for s in a.human_required.split", src)
         self.assertIn("human_required_phrases=human_required_phrases", src)
 
-    def test_endless_rejects_empty_terminal_sentinels(self):
-        # fail-closed（Codex relay-id:c24c2593）: endless で終端 sentinel が空だと、Codex への文面は
-        # 既定 sentinel を出すのに検出リストが空で認識できず、その終端へ遷移しても max-rounds まで続く。
-        # → 起動時に exit 2 で拒否する。--all-done / --human-required の両方、"" と "||" の両方を固定。
+    def test_endless_rejects_empty_sentinels(self):
+        # fail-closed（Codex relay-id:c24c2593 / 3a1abe3b）: endless の sentinel（終端 --all-done /
+        # --human-required、合図 --next-ask）が空だと、文面は既定 sentinel を出すのに検出リストが空で
+        # 認識できず、その遷移が起きても max-rounds まで続く。→ 起動時に exit 2 で拒否する。
+        # 3 つの sentinel すべて、"" と "||" の両方を固定する。
         relay_bin = os.path.join(BIN, "aipair-relay")
         base = ["--endless", "--dir", "/tmp"]
+        ok = {"--all-done": "[X]", "--human-required": "[Y]", "--next-ask": "[Z]"}
         for empty in ("", "||"):
-            r = subprocess.run([sys.executable, relay_bin, "--all-done", "[X]",
-                                "--human-required", empty] + base, capture_output=True, text=True)
-            self.assertEqual(r.returncode, 2, r.stderr)
-            self.assertIn("--human-required", r.stderr)
-            r = subprocess.run([sys.executable, relay_bin, "--all-done", empty,
-                                "--human-required", "[Y]"] + base, capture_output=True, text=True)
-            self.assertEqual(r.returncode, 2, r.stderr)
-            self.assertIn("--all-done", r.stderr)
+            for flag in ("--all-done", "--human-required", "--next-ask"):
+                argv = [sys.executable, relay_bin]
+                for f, v in ok.items():
+                    argv += [f, empty if f == flag else v]      # 対象 flag だけ空、他は有効値
+                r = subprocess.run(argv + base, capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2, "%s=%r should exit 2: %s" % (flag, empty, r.stderr))
+                self.assertIn(flag, r.stderr)
 
     def _run_startup(self, state):
         # 起動時分類が state の StateMachine.run() を、tmux/poke を mock して回す。

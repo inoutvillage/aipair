@@ -251,6 +251,11 @@ def main():
                         "（分類 BLOCKED 時の HUMAN_REQUIRED 停止に必要。空だと Codex への文面は既定 "
                         "sentinel を出すのに検出できず max-rounds まで続く）"), file=sys.stderr)
         return 2
+    if a.endless and not next_ask_phrases:
+        print(c("warn", "aipair-relay: --endless の合図 sentinel --next-ask を空にできません"
+                        "（Claude の手詰まり合図＝次タスク選択への遷移に必要。空だと Claude への文面は既定 "
+                        "sentinel を出すのに検出できず遷移できない）"), file=sys.stderr)
+        return 2
 
     session = a.session or current_session()
     if not session:
