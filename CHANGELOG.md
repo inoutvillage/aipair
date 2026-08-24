@@ -13,9 +13,11 @@ version match and verifies both states.
 
 ## [Unreleased]
 
-Correctness and safety of the autonomous `aipair loop --endless` relay: the loop now stops for a
-human (rather than guessing or spinning) whenever it cannot decide, and a task-list classification —
-not an agent's say-so — is the authority on when the run is finished.
+Correctness and safety of the autonomous `aipair loop --endless` relay: a task-list classification —
+not an agent's say-so — is the authority on when a run is finished, and the loop stops for a human on
+specific detectable conditions (the task-list classifies as `BLOCKED` with only human-dependent `[!]`
+tasks left, Codex declares `[AIPAIR_HUMAN_REQUIRED]`, a question is too large to relay intact, or a
+task makes no progress across rounds) instead of guessing or spinning.
 
 ### Added
 - **Task-list classification is the termination authority** — in `--endless`, the relay reads the
@@ -38,18 +40,19 @@ not an agent's say-so — is the authority on when the run is finished.
 - **Distinct exit-8 banners** — the human-wait and no-progress stops each print their own banner
   (naming the blocking item or the question) so it is clear why the loop stopped and what to do.
 
-### Changed
-- **A task is checked off `- [x]` only after review passes** — in endless mode the implementer no
-  longer marks a task done at implementation time; the `- [x]` is written on the next turn once
-  Codex's review passes, so a restart mid-review cannot misread the task-list as `ALL_DONE`.
-- **Task-list loading is fail-closed** — a missing, unreadable, or zero-checkbox task-list now exits
-  2 (configuration error) instead of being read as "all done"; endless mode requires at least one
-  recognized checkbox (`- [ ]` / `- [x]` / `- [!]`).
-- **Oversized questions fail closed** — a question whose text exceeds the auto-relay size limit now
-  stops for a human (exit 8) instead of being truncated and proxy-answered from an incomplete prompt.
-- **A classification-rejected sentinel re-asks Codex** — if Codex emits a terminal sentinel the
-  classification does not support, the relay re-asks Codex to pick the next task instead of
-  forwarding to Claude.
+### Fixed
+- **Endless mode no longer marks a task done before review** — the `- [x]` is written only on the
+  next turn after Codex's review passes, not at implementation time, so a relay restart mid-review
+  can no longer misread the task-list as `ALL_DONE` and stop early.
+- **A missing / unreadable / zero-checkbox task-list no longer reads as "all done"** — it now exits
+  2 (configuration error) instead of terminating the loop as complete; endless mode requires at
+  least one recognized checkbox (`- [ ]` / `- [x]` / `- [!]`).
+- **An oversized question is no longer truncated and proxy-answered** — a question whose text
+  exceeds the auto-relay size limit stops for a human (exit 8) instead of being cut down and
+  answered from an incomplete prompt.
+- **A classification-rejected sentinel is no longer forwarded to Claude** — if Codex emits a
+  terminal sentinel the task-list classification does not support, the relay re-asks Codex to pick
+  the next task instead of sending the rejected turn on to Claude.
 
 ## [0.1.0] - 2026-08-23
 
