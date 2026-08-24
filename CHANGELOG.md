@@ -11,13 +11,7 @@ both, the topmost VERSION-numbered section is `aipairlib.__version__`; its date 
 release commit, just before the `v<version>` tag is pushed. `tests/doc-sync.py` enforces the
 version match and verifies both states.
 
-## [0.2.0-dev.0] — unreleased (main; developing toward 0.2.0)
-
-### Changed
-- **Versioning** — between releases, `main` now carries a development pre-release `X.Y.Z-dev.N`
-  instead of the last shipped version, so `aipair --version` / `aipair-relay --version` on a checkout
-  is distinct from a released build. `RELEASING.md` documents dropping the `-dev.N` pre-release to the
-  final `X.Y.Z` at release time.
+## [Unreleased]
 
 ## [0.1.0] - 2026-08-23
 
@@ -51,5 +45,5 @@ mutual-review relay.
 - `SECURITY.md` threat model. Permission-bypass is opt-in (`--unsafe`) and required only for
   `aipair loop`; interactive `aipair` keeps each agent's normal permission prompts.
 
-[0.2.0-dev.0]: https://github.com/inoutvillage/aipair/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/inoutvillage/aipair/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/inoutvillage/aipair/releases/tag/v0.1.0
