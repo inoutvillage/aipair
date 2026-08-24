@@ -59,18 +59,26 @@ Endless mode (--endless, opt-in; 既定は従来どおり停止ワードで終�
   停止 sentinel（既定 [AIPAIR_REVIEW_OK]）を「このタスクのレビュー合格」の合図として扱い、
   ループを止めずに Claude へ「次のタスクへ進め」と伝える。Claude 側の手持ちが
   尽きたら Claude が --next-ask（既定 [AIPAIR_NEXT]）を先頭行に単独で書き、
-  relay は Codex に「タスクリストから次の1件を指示せよ」と依頼する。Codex が
-  --all-done（既定 [AIPAIR_ALL_DONE]）を先頭行に単独で書いた時点でループ終了（exit 0）。
+  relay は Codex に「タスクリストから次の1件を指示せよ」と依頼する。
+  終端は relay の task-list 分類が権威（READY/BLOCKED/ALL_DONE）。Codex の終端 sentinel
+  --all-done（[AIPAIR_ALL_DONE]）/ --human-required（[AIPAIR_HUMAN_REQUIRED]）は分類が一致した
+  時だけ honor する:
+    ・ALL_DONE（[ ] も [!] も無い）＋ [AIPAIR_ALL_DONE]            → 全完了・exit 0
+    ・BLOCKED（[ ] が無く人間対応の [!] のみ）＋ [AIPAIR_HUMAN_REQUIRED] → 人間対応待ち・exit 8
+    ・READY（着手可 [ ] が残る）→ sentinel を無視して継続（誤 sentinel で止めない）
 
       Claude 実装 ──▶ Codex レビュー
         ├ 指摘あり      → Claude が修正（従来どおり）
         └[AIPAIR_REVIEW_OK] → Claude「次のタスクへ」
                             └ 手持ちなし → [AIPAIR_NEXT]
-                                 └─▶ Codex「次はこれ」/ [AIPAIR_ALL_DONE] → 終了
+                                 └─▶ Codex「次はこれ」
+                                      / 分類 ALL_DONE + [AIPAIR_ALL_DONE]       → exit 0
+                                      / 分類 BLOCKED  + [AIPAIR_HUMAN_REQUIRED]  → exit 8（人間対応待ち）
 
   次タスクの根拠は --task-list（既定 tasks/todo.md）の未チェック項目に限定し、
   リスト外の新規提案を禁じる文面を Codex へ送る（スコープ膨張の防止）。
-  終端は Codex の --all-done 宣言のみ。--max-rounds は安全キャップとして残る。
+  task-list の記法: [ ]=着手可 / [x]=完了 / [!]=人間対応・外部依存の保留（直下に blocker: 理由）。
+  終端は上記2つ（ALL_DONE=exit 0 / HUMAN_REQUIRED=exit 8）。--max-rounds は安全キャップとして残る。
   --gate CMD（env AIPAIR_GATE）: 停止ワード検知後に CMD を --dir で実行し、exit 0 の時だけ停止／次タスクへ。
   失敗は出力の末尾を添えて Claude に差し戻す（--gate-rounds 回（既定 3）で exit 6）。未指定なら従来どおり。
 
@@ -329,11 +337,12 @@ def main():
         log(c("dim", "  → --allow-untested-schema: fail-open で継続（ダイアログ自動操作は OFF）"))
     if a.endless:
         log(c("ok", "連続モード=on") + f"（「{stop_phrases[0] if stop_phrases else '[AIPAIR_REVIEW_OK]'}」＝レビュー合格→次のタスクへ）")
-        log(f"  タスクリスト={a.task_list}  次を要求={'/'.join(next_ask_phrases)}  "
-            f"終端={'/'.join(all_done_phrases)}（codex側）")
+        log(f"  タスクリスト={a.task_list}  次を要求={'/'.join(next_ask_phrases)}")
+        log(f"  終端（task-list 分類で判定・codex側）= ALL_DONE:{'/'.join(all_done_phrases)}"
+            f" / HUMAN_REQUIRED:{'/'.join(human_required_phrases)}")
         if a.stop_side != "codex":
             log(c("warn", f"  ⚠ --stop-side {a.stop_side} は連続モードでは終了になりません"
-                          "（終端は Codex の終端ワードのみ）"))
+                          "（連続モードの終端 sentinel ALL_DONE/HUMAN_REQUIRED は Codex 側）"))
         if a.max_rounds == 20:
             log(c("dim", "  ヒント: 連続モードは往復が伸びます。--max-rounds を大きめに（例 100）"))
     log("プランレビュー=" + ("off" if a.no_plan_review
