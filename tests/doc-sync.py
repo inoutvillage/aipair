@@ -453,7 +453,10 @@ class EndlessContract(unittest.TestCase):
     def test_readme_has_new_contract_and_no_stale(self):
         self._check(README, "README")
         self.assertIn("AIPAIR_HUMAN_REQUIRED", README)   # env 表／sentinel 一覧に載っている
-        self.assertRegex(README, r"exit 8|・exit 8")     # exit 8 を README が記載
+        self.assertIn("exit 8", README)                  # exit 8 を README が記載
+        self.assertRegex(README, r"READY/BLOCKED/ALL_DONE",  # 3 状態を明示（削除を検知する）
+                         "README に task-list 分類 READY/BLOCKED/ALL_DONE の明示が無い")
+        self.assertIn("[!]", README)                     # 保留記法
 
     def test_relay_help_docstring_has_new_contract_and_no_stale(self):
         # relay.py 全体でなく **module docstring（= --help 文面）** だけを AST で抽出して検証する。
