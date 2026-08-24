@@ -7,20 +7,27 @@ Claude が AskUserQuestion の選択ダイアログで停止したとき、relay
 """
 import collections
 
+from .corelib import hit_stop
+
 QuestionDecision = collections.namedtuple("QuestionDecision", "action payload")
 
 
-def decide_question_action(texts, qdlg):
+def decide_question_action(texts, qdlg, human_required_phrases=()):
     """Codex の質問回答 → 取るべきアクションを《純粋に》決める（副作用なし・tmux 非依存）。
     plan_flow と同じ「判定/副作用」分離（P2-1・question_flow）。返す action:
-      no_text    回答本文を取得できず（ダイアログ検知からやり直し）
-      no_dialog  質問ダイアログが消えた（人間が操作した？ 通常待機へ）
-      deliver    回答（payload=本文）を『Chat about this』経由で配達
-    プランと違い承認 sentinel は無い — 質問回答はそのまま中継する（判定核は薄いが、no_text→
-    再検知 / no_dialog→人間操作 / else→配達 の不変条件を plan と対称にテスト可能にする）。"""
+      no_text        回答本文を取得できず（ダイアログ検知からやり直し）
+      human_required 人間判断が必要（承認/権限/課金/不可逆等）→ Claude へ送らず exit 8 で停止（P1-2）
+      no_dialog      質問ダイアログが消えた（人間が操作した？ 通常待機へ）
+      deliver        回答（payload=本文）を『Chat about this』経由で配達
+
+    P1-2（社長指示 2026-08-24）: Codex が最終回答の先頭行に `[AIPAIR_HUMAN_REQUIRED]` を単独で出したら、
+    その質問は AI が代理判断すべきでない（承認・権限・意思決定・秘密・課金・不可逆・本番操作）。
+    Claude へ回答を送らず HUMAN_REQUIRED で停止する。task-list の `[!]` とは別経路（todo は変更しない）。"""
     text = "\n".join(texts).strip()
     if not text:
         return QuestionDecision("no_text", None)
+    if human_required_phrases and hit_stop(texts, human_required_phrases):
+        return QuestionDecision("human_required", None)
     if qdlg is None:
         return QuestionDecision("no_dialog", None)
     return QuestionDecision("deliver", text)

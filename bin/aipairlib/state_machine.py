@@ -55,6 +55,7 @@ from . import tasklist
 EXIT_BLOCKED = 8
 BLOCKED_HR_REASON = "人間対応待ち（HUMAN_REQUIRED）"
 BLOCKED_NOPROGRESS_REASON = "進捗なし（BLOCKED / no-progress）"
+QUESTION_HR_REASON = "質問に人間判断が必要（HUMAN_REQUIRED）"    # P1-2: AskUserQuestion 経路の exit 8
 
 
 class ResponseGate:
@@ -294,6 +295,20 @@ def no_progress_banner(np_state, rounds):
     print("\a", end="", flush=True)
 
 
+def question_human_required_banner(qs_blocks, rounds):
+    """P1-2: AskUserQuestion に人間判断が必要（Codex が [AIPAIR_HUMAN_REQUIRED] を宣言）時の終了 banner。
+    質問内容を表示する。task-list の `[!]` とは別経路（todo は変更しない）。"""
+    print("", flush=True)
+    print(c("warn", "│ ■ 自動処理を停止しました"), flush=True)
+    print(c("warn", "│   理由: Claude の質問に人間の判断が必要です"
+                    f"（HUMAN_REQUIRED・exit {EXIT_BLOCKED}・{rounds} 往復）"), flush=True)
+    print(c("warn", "│   質問:"), flush=True)
+    for b in (qs_blocks or []):
+        print(c("dim", f"│     {b}"), flush=True)
+    print(c("warn", "│   人間が Claude 側で回答した後、relay を再開してください。"), flush=True)
+    print("\a", end="", flush=True)
+
+
 class StateMachine:
     """aipair relay の状態機械本体（P2-1: relay.main() から切り出し）。claude / codex /
     codex_plan / codex_question の 4 state を回し、ターン完了検知→相手ペインへの poke／ダイアログ
@@ -342,6 +357,9 @@ class StateMachine:
         stop_phrases, next_ask_phrases, all_done_phrases = (self.stop_phrases, self.next_ask_phrases,
                                                             self.all_done_phrases)
         human_required_phrases = self.human_required_phrases
+        # P1-2: 質問リレーで Codex に HUMAN_REQUIRED を宣言させる際に表示する sentinel トークン。
+        # 通常モードで --human-required を空にした場合は None（質問 HR 経路を案内しない）。
+        hr_token = human_required_phrases[0] if human_required_phrases else None
 
         def classify_tasklist():
             """endless: task-list を分類（唯一の権威）。読めない/解析不能は exit 2 で fail-closed。"""
@@ -366,6 +384,7 @@ class StateMachine:
         plan_rounds = 0
         plan_dialog = None
         question_rounds = 0        # 連続質問リレー回数（Claude のターン完了でリセット）
+        qs_blocks = []             # 直近に検知した質問ブロック（HUMAN_REQUIRED banner 表示用・P1-2）
         q_unconfirmed_warned = False  # 「画面は質問ダイアログだがログ照合できず」の警告を1回に抑制
         last_activity = time.time()
 
@@ -514,7 +533,7 @@ class StateMachine:
                             question_rounds += 1
                             log("◆ " + c("claude", "質問ダイアログ検知")
                                 + f"（{question_rounds}/{a.question_rounds}回目・{len(qs_blocks)}問）→ Codex に回答依頼")
-                            sent = poke(panes["codex"], question_poke_codex(qs_blocks),
+                            sent = poke(panes["codex"], question_poke_codex(qs_blocks, hr_token),
                                         confirm=codex_poke_confirm(), busy_wait=bw)
                             if not sent:
                                 print(c("warn", "│ ■ Codex への回答依頼を配達できず（poke失敗）。"
@@ -631,9 +650,18 @@ class StateMachine:
                             dim(c("codex", "codex") + ": " + oneline(text))
                         # 判定（no_text / no_dialog / deliver）は state_machine.decide_question_action の
                         # 純粋関数へ切り出した（P2-1・question_flow）。ここは決定→副作用の実行のみ。
-                        decision = decide_question_action(texts, qdlg)
+                        decision = decide_question_action(texts, qdlg, human_required_phrases)
                         if decision.action == "no_text":
                             log(c("warn", "◆ Codex の回答本文を取得できず。ダイアログ検知からやり直します。"))
+                        elif decision.action == "human_required":
+                            # P1-2: Codex が「この質問は人間判断が必要」と宣言 → Claude へ回答を送らず
+                            # exit 8（HUMAN_REQUIRED）で停止。ダイアログは開いたまま残し、人間が Claude 側で
+                            # 回答する。task-list の [!] とは別経路（todo は一切変更しない）。
+                            log(c("warn", "◆ Codex が回答を保留（HUMAN_REQUIRED）→ 人間判断が必要として停止します。"))
+                            blocked_reason = QUESTION_HR_REASON
+                            code = EXIT_BLOCKED
+                            question_human_required_banner(qs_blocks, question_rounds)
+                            break
                         elif decision.action == "no_dialog":
                             log(c("warn", "◆ 質問ダイアログが見当たりません（人間が操作した？）。通常の待機に戻ります。"))
                         else:  # "deliver"

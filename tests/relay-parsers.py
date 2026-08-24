@@ -534,9 +534,22 @@ class QuestionDialog(unittest.TestCase):
         self.assertIsNone(relay.dialoglib._question_block("no footer here\n1. a\n2. b\n"))
 
     def test_poke_text_is_capped(self):
-        text = relay.question_poke_codex(["q" * 5000], limit=300)
-        self.assertLess(len(text), 700)
+        text = relay.question_poke_codex(["q" * 5000], "[AIPAIR_HUMAN_REQUIRED]", limit=300)
+        self.assertLess(len(text), 900)
         self.assertIn("…", text)
+
+    def test_poke_offers_human_required_when_token_given(self):
+        # P1-2: sentinel トークンが与えられたら HUMAN_REQUIRED 経路（1行目に単独出力）を案内する。
+        text = relay.question_poke_codex(["Pick a database"], "[AIPAIR_HUMAN_REQUIRED]")
+        self.assertIn("[AIPAIR_HUMAN_REQUIRED]", text)
+        self.assertIn("1行目", text)
+        self.assertIn("人間", text)
+
+    def test_poke_omits_human_required_when_token_empty(self):
+        # 通常モードで --human-required を空にした場合（None）は HR 経路を案内しない。
+        text = relay.question_poke_codex(["Pick a database"], None)
+        self.assertNotIn("HUMAN_REQUIRED", text)
+        self.assertIn("Pick a database", text)
 
 
 class StopGate(unittest.TestCase):
@@ -1692,6 +1705,35 @@ class StateMachineWiring(unittest.TestCase):
         for gone in ("while True:", "= lock_codex(", "codex_done_ts(", "class LogWatch:"):
             self.assertNotIn(gone, relay_src, f"{gone!r} must have moved out of relay.py")
 
+    def test_question_human_required_wiring_stops_at_exit_8(self):
+        # P1-2: codex_question state で Codex が HUMAN_REQUIRED を宣言したら、Claude へ回答を送らず
+        # exit 8 で停止する。ループ本体は monolithic なので SchemaGuardOrdering と同じ source-structure
+        # 検査で配線を固定する（判定核 decide_question_action の human_required は QuestionRelayDecision
+        # で純粋被覆済み）。
+        sm = relay.state_machine
+        # (a) reason 定数が存在し、他の exit-8 理由と区別される
+        self.assertTrue(sm.QUESTION_HR_REASON)
+        self.assertNotIn(sm.QUESTION_HR_REASON, (sm.BLOCKED_HR_REASON, sm.BLOCKED_NOPROGRESS_REASON))
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
+            src = fh.read().split("\n")
+        # (b) 判定核へ human_required_phrases を渡している（sentinel 照合の材料）
+        self.assertIn("decision = decide_question_action(texts, qdlg, human_required_phrases)",
+                      "\n".join(src))
+        # (c) human_required 分岐: EXIT_BLOCKED + QUESTION_HR_REASON + break、かつ回答は送らない
+        i = next(k for k, l in enumerate(src) if 'decision.action == "human_required"' in l)
+        branch_indent = len(src[i]) - len(src[i].lstrip())
+        body = []
+        for l in src[i + 1:]:
+            if l.strip() and (len(l) - len(l.lstrip())) <= branch_indent:
+                break                      # 次の elif/else（同 or 浅インデント）で分岐終了
+            body.append(l)
+        body = "\n".join(body)
+        self.assertIn("code = EXIT_BLOCKED", body)
+        self.assertIn("QUESTION_HR_REASON", body)
+        self.assertIn("break", body)
+        self.assertNotIn("send_question_answer", body,
+                         "HUMAN_REQUIRED 分岐は Claude へ回答を送らない（人間判断待ちで停止）")
+
 class QuestionRelayDecision(unittest.TestCase):
     """P2-1 question_flow: Codex の質問回答をどうするかの判定は純粋関数 decide_question_action。
     plan と対称に「no_text→再検知 / no_dialog→人間操作 / else→配達」を副作用抜きで被覆する。"""
@@ -1706,6 +1748,30 @@ class QuestionRelayDecision(unittest.TestCase):
         self.assertEqual(relay.decide_question_action([], qdlg).action, "no_text")
         # 回答中に人間がダイアログを操作 → 消えていれば no_dialog（通常待機へ戻す）
         self.assertEqual(relay.decide_question_action(["answer"], None).action, "no_dialog")
+
+    def test_human_required_branch(self):
+        # P1-2: Codex が最終メッセージ1行目に [AIPAIR_HUMAN_REQUIRED] を単独出力 → human_required。
+        # Claude へ回答を送らず exit 8 で停止する経路（state_machine 側）。
+        qdlg = {"chat": "1", "footer": "Chat about this"}
+        HR = ["[AIPAIR_HUMAN_REQUIRED]"]
+        # 単独 1 行目 → human_required（ダイアログ有無に依らない）
+        self.assertEqual(relay.decide_question_action(["[AIPAIR_HUMAN_REQUIRED]"], qdlg, HR).action,
+                         "human_required")
+        self.assertEqual(relay.decide_question_action(["[AIPAIR_HUMAN_REQUIRED]"], None, HR).action,
+                         "human_required")
+        # 最終メッセージの 1 行目に単独 → human_required（先行の進捗ナレーションは無視）
+        self.assertEqual(
+            relay.decide_question_action(["調べます", "[AIPAIR_HUMAN_REQUIRED]"], qdlg, HR).action,
+            "human_required")
+        # sentinel が最終メッセージでない → deliver（契約は「最終回答の1行目」）
+        self.assertEqual(
+            relay.decide_question_action(["[AIPAIR_HUMAN_REQUIRED]", "本番DBの可否"], qdlg, HR).action,
+            "deliver")
+        # phrases 未指定（通常モードで --human-required 空）→ HR 判定しない
+        self.assertEqual(relay.decide_question_action(["[AIPAIR_HUMAN_REQUIRED]"], qdlg, ()).action,
+                         "deliver")
+        # 空本文は HR より優先（no_text）
+        self.assertEqual(relay.decide_question_action([""], qdlg, HR).action, "no_text")
 
 
 class DialogSendScrape(unittest.TestCase):
