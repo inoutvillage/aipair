@@ -1494,6 +1494,14 @@ class StateMachineWiring(unittest.TestCase):
                 self.assertEqual(r.returncode, 2, "%s=%r should exit 2: %s" % (flag, empty, r.stderr))
                 self.assertIn(flag, r.stderr)
 
+    def test_relay_endless_pane_title_shows_both_terminals(self):
+        # Codex relay-id:09d4bcf5: relay 本体のタイトルが launcher の 2 終端表示を ALL_DONE のみへ
+        # 上書きしていたのを是正。endless タイトルは両終端（DONE/HUMAN）を示し、旧『終端「{a.all_done}」』は使わない。
+        with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("relay ● endless / max {a.max_rounds} / 終端 DONE/HUMAN", src)
+        self.assertNotIn('終端「{a.all_done}」', src)
+
     def _run_startup(self, state):
         # 起動時分類が state の StateMachine.run() を、tmux/poke を mock して回す。
         # 戻り値 code と「poke が呼ばれたか」を返す（起動時終端では 1 度も poke しないのが要件）。

@@ -293,7 +293,7 @@ def main():
 
     # ペインタイトルで「今どのモードで・何往復まで」が一目で分かるようにする
     own = own_pane(session)
-    set_pane_title(own, (f"relay ● endless / max {a.max_rounds} / 終端「{a.all_done}」/ Ctrl-C で停止"
+    set_pane_title(own, (f"relay ● endless / max {a.max_rounds} / 終端 DONE/HUMAN / Ctrl-C で停止"
                          if a.endless else
                          f"relay ● 1タスク / max {a.max_rounds} / 停止「{a.stop}」/ Ctrl-C で停止"))
 
