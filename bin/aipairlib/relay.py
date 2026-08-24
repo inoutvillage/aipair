@@ -237,7 +237,8 @@ def main():
                                               all_done_phrases[0] if all_done_phrases else "[AIPAIR_ALL_DONE]",
                                               human_required_phrases[0] if human_required_phrases
                                               else "[AIPAIR_HUMAN_REQUIRED]")
-    poke_claude_next = endless_poke_claude_next(a.task_list)
+    poke_claude_next = endless_poke_claude_next(a.task_list,
+                                                next_ask_phrases[0] if next_ask_phrases else "[AIPAIR_NEXT]")
     # endless の 2 終端（ALL_DONE / HUMAN_REQUIRED）はどちらも sentinel が必須。空だとプロンプトは既定
     # sentinel を出すのに検出リストが空になり、その終端へ遷移しても認識できず max-rounds まで続く
     # （prompt と検出の食い違い）→ fail-closed で拒否する。
