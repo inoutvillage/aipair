@@ -54,6 +54,27 @@ def resolve_task_identity(codex_text, ready_lines):
     return matched[0] if len(matched) == 1 else UNRESOLVED
 
 
+NO_PROGRESS_LIMIT = 3        # 同一 signature を連続 N 回選択で停止（初版は定数固定・env 調整は導入しない）
+
+
+def advance_no_progress(prev, cur_id, cur_hash, limit=NO_PROGRESS_LIMIT):
+    """no-progress ストリークを 1 手進める純関数（§8・簡易版）。
+
+    prev = (prev_id, prev_hash, streak) or None（初回）。今回の (cur_id, cur_hash) が「進捗なし」
+    ——**(同一識別子の再選択 OR `UNRESOLVED`) AND snapshot hash 不変**——なら streak を増やし、そうで
+    なければ 1 に戻す（新しい識別子の解決・snapshot hash 変化でリセット）。streak が limit に達したら停止。
+
+    戻り値: ((cur_id, cur_hash, streak), should_stop)。Case 5: 同一タスクを 2回目までは継続・3回目で停止
+    （streak: 1→2→3、limit=3 で 3回目に stop）。
+    """
+    if prev is None:
+        return ((cur_id, cur_hash, 1), False)
+    prev_id, prev_hash, streak = prev
+    stalled = (cur_hash == prev_hash) and (cur_id == UNRESOLVED or cur_id == prev_id)
+    streak = streak + 1 if stalled else 1
+    return ((cur_id, cur_hash, streak), streak >= limit)
+
+
 def decide_endless_terminal(saw_all_done, saw_human_required, state):
     """終端 sentinel フラグ＋task-list 分類 state から終端の可否を決める（純関数）。
 
