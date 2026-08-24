@@ -459,6 +459,15 @@ class EndlessContract(unittest.TestCase):
                          "README に task-list 分類 READY/BLOCKED/ALL_DONE の明示が無い")
         self.assertIn("[!]", README)                     # 保留記法
 
+    def test_readme_and_help_pin_empty_tasklist_exits_2(self):
+        # P1-1（社長指示 2026-08-24）: 認識 checkbox が 0 件のファイルは ALL_DONE でなく exit 2（設定不備）。
+        # 「ALL_DONE＝残ゼロ」だけだと空ファイルも正常完了に読めるため、README と --help に明記して pin する。
+        import ast
+        doc = ast.get_docstring(ast.parse(_read("bin/aipairlib/relay.py")))
+        for text, name in ((README, "README"), (doc, "relay --help docstring")):
+            self.assertIn("checkbox が 0 件", text, "%s に checkbox 0 件の記述が無い" % name)
+            self.assertIn("exit 2", text, "%s に exit 2 の記述が無い" % name)
+
     def test_readme_pins_the_blocked_notation_meaning(self):
         # `[!]` の意味（保留＝人間対応・外部依存で AI 単独では進められない、直下に blocker: 理由）を
         # README が説明していること（記号だけでなく意味を pin する）。
