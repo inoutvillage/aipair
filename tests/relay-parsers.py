@@ -1881,7 +1881,11 @@ class LoglibStandalone(unittest.TestCase):
         rp = relay.review_protocol
         self.assertIn("【1行目】", rp.default_poke_codex("[AIPAIR_REVIEW_OK]"))
         self.assertIn("[AIPAIR_REVIEW_OK]", rp.default_poke_codex("[AIPAIR_REVIEW_OK]"))
-        self.assertIn("[AIPAIR_ALL_DONE]", rp.endless_poke_codex_next("tasks/todo.md", "[AIPAIR_ALL_DONE]"))
+        _codex_next = rp.endless_poke_codex_next("tasks/todo.md", "[AIPAIR_ALL_DONE]", "[AIPAIR_HUMAN_REQUIRED]")
+        self.assertIn("[AIPAIR_ALL_DONE]", _codex_next)
+        self.assertIn("[AIPAIR_HUMAN_REQUIRED]", _codex_next)          # §4: [!] のみ残なら HUMAN_REQUIRED
+        self.assertIn("【1行目】", _codex_next)                          # シグナルは 1行目に単独
+        self.assertIn("再指示しない", _codex_next)                       # [!] は AI では進められない→再指示禁止
         self.assertIn("[AIPAIR_NEXT]", rp.endless_poke_claude_pass("tasks/todo.md", "[AIPAIR_NEXT]"))
         self.assertIn("[AIPAIR_PLAN_APPROVED]", rp.plan_poke_codex("p.md", "[AIPAIR_PLAN_APPROVED]"))
         # relay re-exports the same objects (call sites unchanged)
