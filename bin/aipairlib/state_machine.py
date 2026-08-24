@@ -45,7 +45,8 @@ from .review_protocol import plan_poke_codex, question_poke_codex
 from .plan_flow import decide_plan_action
 from .question_flow import decide_question_action, handle_question_answer, decide_question_relay
 from .endless_flow import (decide_endless_terminal, resolve_task_identity, advance_no_progress,  # noqa: F401
-                           human_required_banner_lines, no_progress_banner_lines, UNRESOLVED)
+                           human_required_banner_lines, no_progress_banner_lines,
+                           handle_endless_response, UNRESOLVED)
 from . import tasklist
 
 # endless BLOCKED/HUMAN_REQUIRED（社長指示 2026-08-24 / _reference/new-task.md）: max-rounds(3) と
@@ -688,31 +689,26 @@ class StateMachine:
                         # sentinel（[AIPAIR_ALL_DONE]/[AIPAIR_HUMAN_REQUIRED]）は分類が一致した時だけ honor し、
                         # 着手可 [ ] が残る（READY）なら sentinel を無視して継続する（誤 sentinel で止めない）。
                         if a.endless:
-                            saw_done = hit_stop(texts, all_done_phrases)
-                            saw_hr = hit_stop(texts, human_required_phrases)
-                            term, term_cls = None, None
-                            if saw_done or saw_hr:
-                                term_cls = classify_tasklist()
-                                term = decide_endless_terminal(saw_done, saw_hr, term_cls["state"])
-                            if term == "all_done":
+                            # 判定・outcome 生成（終端 sentinel の honor/reject・no-progress・UNRESOLVED・
+                            # reject 再poke 方針）は endless_flow.handle_endless_response へ集約（P2-5）。
+                            # run() は outcome を《表示・exit code・poke・state 遷移》へ適用するだけ。
+                            eo = handle_endless_response(
+                                texts, all_done_phrases, human_required_phrases, pending_kind, np_state,
+                                rounds, EXIT_BLOCKED, BLOCKED_HR_REASON, BLOCKED_NOPROGRESS_REASON,
+                                classify_tasklist)
+                            np_state = eo.np_state
+                            if eo.log:
+                                log(c("warn", eo.log))
+                            if eo.kind == "all_done":
                                 all_done_hit = True
                                 done_banner(rounds, "codex", all_done=True); break
-                            if term == "human_required":
-                                blocked_reason = BLOCKED_HR_REASON
+                            if eo.kind in ("human_required", "no_progress"):
+                                blocked_reason = eo.reason
                                 code = EXIT_BLOCKED
-                                print_banner(human_required_banner_lines(term_cls, rounds, EXIT_BLOCKED)); break
-                            if term == "reject":
-                                # 誤 sentinel（分類は READY＝着手可 [ ] が残る）: Codex はタスクを選択して
-                                # いないので、Claude へ「次タスク指示」を送らず（未選択のタスクを着手させない）、
-                                # Codex に具体的な着手可タスクの選択を再要求する。UNRESOLVED として no-progress を
-                                # 進め、誤 sentinel の連発は 3 回で停止する（無限往復させない）。
-                                log(c("warn", "終端 sentinel を task-list 分類が支持しない（着手可 [ ] が残存）"
-                                               "→ Codex に具体的な着手可タスクの選択を再要求"))
-                                np_state, np_stop = advance_no_progress(np_state, UNRESOLVED, term_cls["hash"])
-                                if np_stop:
-                                    blocked_reason = BLOCKED_NOPROGRESS_REASON
-                                    code = EXIT_BLOCKED
-                                    print_banner(no_progress_banner_lines(np_state, rounds, EXIT_BLOCKED)); break
+                                print_banner(eo.banner); break
+                            if eo.kind == "reject_repoke":
+                                # 誤 sentinel（分類 READY）: Claude へ送らず Codex に選択を再要求（未選択の
+                                # タスクを着手させない）。poke 失敗は fail-closed で停止。
                                 sent = poke(panes["codex"], poke_codex_next,
                                             confirm=codex_poke_confirm(), busy_wait=bw)
                                 if not sent:
@@ -723,25 +719,9 @@ class StateMachine:
                                 rg.arm(sent)
                                 since = time.time(); state = "codex"; last_activity = time.time()
                                 continue
-                            if pending_kind == "next":
-                                # no-progress guard（§8）: Codex が指示したタスクの識別子＋task-list の
-                                # snapshot hash が「同一識別子 or UNRESOLVED かつ hash 不変」で 3 回連続なら、
-                                # 進捗のない再選択とみなし relay 内部理由で exit 8（agent sentinel は介さない）。
-                                cls = classify_tasklist()
-                                ident = resolve_task_identity("\n".join(texts), cls["ready"])
-                                if ident == UNRESOLVED:
-                                    # 契約（§8）: 抽出失敗・一致 0/≥2 件は警告ログを出し、UNRESOLVED として
-                                    # ストリークを進める（同一性を判定できないまま無限往復させない）。
-                                    log(c("warn", "next タスクの識別子を task-list 内で一意に同定できません"
-                                                  "（Codex の逐語エコー欠落 or 曖昧な複数一致）→ UNRESOLVED として "
-                                                  "no-progress ストリークを進めます"))
-                                np_state, np_stop = advance_no_progress(np_state, ident, cls["hash"])
-                                if np_stop:
-                                    blocked_reason = BLOCKED_NOPROGRESS_REASON
-                                    code = EXIT_BLOCKED
-                                    print_banner(no_progress_banner_lines(np_state, rounds, EXIT_BLOCKED)); break
+                            if eo.kind == "advance_next":
                                 msg_claude = poke_claude_next
-                            elif a.stop_side in ("codex", "both") and hit_stop(texts, stop_phrases):
+                            elif eo.kind == "review" and a.stop_side in ("codex", "both") and hit_stop(texts, stop_phrases):
                                 ok_gate, gate_msg = gate_or_message(a, gate_state, cwd)
                                 if ok_gate:
                                     log("◆ " + c("ok", "Codex がレビュー合格") + " → Claude に次のタスクを促す")

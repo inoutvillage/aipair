@@ -8,7 +8,10 @@ agent が出した終端 sentinel（`[AIPAIR_ALL_DONE]` / `[AIPAIR_HUMAN_REQUIRE
 
 no-progress（同一タスクの停滞）は分類とは独立の relay 内部経路（Phase 4）であり、ここでは扱わない。
 """
+import collections
 import re
+
+from .corelib import hit_stop
 
 # task-list 分類の state（tasklist.py と一致させる。循環 import を避けるため文字列で持つ）
 READY = "READY"
@@ -17,6 +20,12 @@ ALL_DONE = "ALL_DONE"
 
 # no-progress guard（§8）: 今回 Codex が指示したタスクの識別子が同定できない時の番兵。
 UNRESOLVED = "UNRESOLVED"
+
+# reject / UNRESOLVED 時の警告文言（P2-5: state_machine から controller へ集約）
+REJECT_LOG = ("終端 sentinel を task-list 分類が支持しない（着手可 [ ] が残存）"
+              "→ Codex に具体的な着手可タスクの選択を再要求")
+UNRESOLVED_LOG = ("next タスクの識別子を task-list 内で一意に同定できません"
+                  "（Codex の逐語エコー欠落 or 曖昧な複数一致）→ UNRESOLVED として no-progress ストリークを進めます")
 
 
 def _echo_candidates(codex_text):
@@ -120,3 +129,58 @@ def decide_endless_terminal(saw_all_done, saw_human_required, state):
     if saw_human_required and state == BLOCKED:
         return "human_required"
     return "reject"
+
+
+# run() が適用する endless 応答アウトカム（P2-5: 判定分岐を state_machine から controller へ集約）。
+#   kind:
+#     "all_done"       全タスク完了（分類 ALL_DONE が sentinel を支持）→ done_banner・exit 0
+#     "human_required" 人間対応のみ残（分類 BLOCKED が支持）→ banner・reason・exit 8
+#     "no_progress"    同一タスク停滞 3 連続 → banner・reason・exit 8
+#     "reject_repoke"  誤 sentinel（分類 READY）→ Claude へ送らず Codex に選択を再要求（continue）
+#     "advance_next"   次タスク指示を Claude へ配達（msg_claude=poke_claude_next）
+#     "review"         レビュー継続（pending_kind!=next・終端 sentinel 無し）→ run() が stop-word/gate 処理
+#   log    : run() が warn 色で出す 1 行（無ければ None）
+#   banner : 停止 banner の (level,text) 行列（stop 系のみ・他 None）
+#   reason : blocked_reason（stop 系のみ・他 None）
+#   np_state: 更新後の no-progress 状態（呼び出し側が持ち回す）
+EndlessOutcome = collections.namedtuple("EndlessOutcome", "kind log banner reason np_state")
+
+
+def handle_endless_response(texts, all_done_phrases, human_required_phrases,
+                            pending_kind, np_state, rounds, exit_code,
+                            hr_reason, noprogress_reason, classify):
+    """endless モードの Codex 応答 → run() が適用する `EndlessOutcome` を生成する（社長指示 §2/§4/§8）。
+
+    判定は純粋（終端 sentinel 検出・分類による honor/reject・no-progress ストリーク・UNRESOLVED 同定）。
+    task-list 分類だけは副作用なので `classify()`（run() の classify_tasklist）を注入で受け取り、
+    **元の実装と同じ条件でのみ**呼ぶ（終端 sentinel 検出時／pending_kind==next 時。レビュー継続時は呼ばない）。
+    run() 側はこの outcome を《表示・exit code・poke・state 遷移》へ適用するだけにする（P2-5）。
+    """
+    saw_done = hit_stop(texts, all_done_phrases)
+    saw_hr = hit_stop(texts, human_required_phrases)
+    if saw_done or saw_hr:
+        cls = classify()
+        term = decide_endless_terminal(saw_done, saw_hr, cls["state"])
+        if term == "all_done":
+            return EndlessOutcome("all_done", None, None, None, np_state)
+        if term == "human_required":
+            return EndlessOutcome("human_required", None,
+                                  human_required_banner_lines(cls, rounds, exit_code), hr_reason, np_state)
+        # term == "reject": 誤 sentinel（分類 READY）。Claude へ送らず Codex に選択を再要求。
+        # UNRESOLVED として no-progress を進め、誤 sentinel の連発は 3 回で停止する。
+        np2, stop = advance_no_progress(np_state, UNRESOLVED, cls["hash"])
+        if stop:
+            return EndlessOutcome("no_progress", REJECT_LOG,
+                                  no_progress_banner_lines(np2, rounds, exit_code), noprogress_reason, np2)
+        return EndlessOutcome("reject_repoke", REJECT_LOG, None, None, np2)
+    if pending_kind == "next":
+        cls = classify()
+        ident = resolve_task_identity("\n".join(texts), cls["ready"])
+        log = UNRESOLVED_LOG if ident == UNRESOLVED else None
+        np2, stop = advance_no_progress(np_state, ident, cls["hash"])
+        if stop:
+            return EndlessOutcome("no_progress", log,
+                                  no_progress_banner_lines(np2, rounds, exit_code), noprogress_reason, np2)
+        return EndlessOutcome("advance_next", log, None, None, np2)
+    # pending_kind != next かつ終端 sentinel 無し = レビュー継続（stop-word/gate は I/O なので run() 側）
+    return EndlessOutcome("review", None, None, None, np_state)
