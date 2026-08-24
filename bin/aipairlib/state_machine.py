@@ -44,6 +44,8 @@ from .corelib import hit_stop, oneline
 from .review_protocol import plan_poke_codex, question_poke_codex
 from .plan_flow import decide_plan_action
 from .question_flow import decide_question_action
+from .endless_flow import decide_endless_terminal       # noqa: F401 (再エクスポート)
+from . import tasklist
 
 # endless BLOCKED/HUMAN_REQUIRED（社長指示 2026-08-24 / _reference/new-task.md）: max-rounds(3) と
 # 区別する固有 exit code。同じ 8 でも 2 つの内部理由を reason 文字列で区別する（Phase 2/4 が設定）:
@@ -273,7 +275,8 @@ class StateMachine:
 
     def __init__(self, a, *, panes, own, cwd, tracked, claude_seen, codex_seen, baseline,
                  sg, rg, bw, poke_codex, poke_codex_next, poke_claude, poke_claude_pass,
-                 poke_claude_next, stop_phrases, next_ask_phrases, all_done_phrases):
+                 poke_claude_next, stop_phrases, next_ask_phrases, all_done_phrases,
+                 human_required_phrases=()):
         self.a = a
         self.panes = panes
         self.own = own
@@ -293,6 +296,7 @@ class StateMachine:
         self.stop_phrases = stop_phrases
         self.next_ask_phrases = next_ask_phrases
         self.all_done_phrases = all_done_phrases
+        self.human_required_phrases = human_required_phrases
 
     def run(self):
         """状態機械のメインループを回し、exit code を返す（P2-1: relay.main() から移設）。
@@ -307,6 +311,17 @@ class StateMachine:
                                                            self.poke_claude_next)
         stop_phrases, next_ask_phrases, all_done_phrases = (self.stop_phrases, self.next_ask_phrases,
                                                             self.all_done_phrases)
+        human_required_phrases = self.human_required_phrases
+
+        def classify_tasklist():
+            """endless: task-list を分類（唯一の権威）。読めない/解析不能は exit 2 で fail-closed。"""
+            return tasklist.load_or_exit(a.task_list, cwd, emit=lambda m: log(c("warn", m)))
+
+        if a.endless:
+            # 起動直後に一度分類して fail-closed 検証＋初期状態をログ（「読めない＝完了」で誤停止させない）
+            _init_cls = classify_tasklist()
+            log(dim("task-list 初期分類: %s（ready=%d blocked=%d）"
+                    % (_init_cls["state"], len(_init_cls["ready"]), len(_init_cls["blocked"]))))
 
         state = a.start_side
         gate_state = {"fails": 0}
@@ -624,12 +639,27 @@ class StateMachine:
                             if gate_msg is None:
                                 code = 6; break
                             msg_claude = back_text = gate_msg          # review passed, gate did not → back to Claude
-                        # 連続モードの終端は「全タスク完了」宣言のみ。レビュー中の宣言も尊重する
-                        # （hit_stop は最終メッセージの冒頭100字判定なので、明示的に書いた時だけ効く）
+                        # 連続モードの終端は task-list 分類が権威（社長指示 2026-08-24 §2）。Codex の終端
+                        # sentinel（[AIPAIR_ALL_DONE]/[AIPAIR_HUMAN_REQUIRED]）は分類が一致した時だけ honor し、
+                        # 着手可 [ ] が残る（READY）なら sentinel を無視して継続する（誤 sentinel で止めない）。
                         if a.endless:
-                            if hit_stop(texts, all_done_phrases):
+                            saw_done = hit_stop(texts, all_done_phrases)
+                            saw_hr = hit_stop(texts, human_required_phrases)
+                            term = (decide_endless_terminal(saw_done, saw_hr, classify_tasklist()["state"])
+                                    if (saw_done or saw_hr) else None)
+                            if term == "all_done":
                                 all_done_hit = True
                                 done_banner(rounds, "codex", all_done=True); break
+                            if term == "human_required":
+                                blocked_reason = BLOCKED_HR_REASON
+                                code = EXIT_BLOCKED
+                                print("\n" + c("warn", "│ ■ 人間対応待ち（HUMAN_REQUIRED）: 実行可能な "
+                                      "[ ] が尽き、人間対応の [!] のみ残存。exit %d で停止します。" % EXIT_BLOCKED),
+                                      flush=True)
+                                print("\a", end="", flush=True); break
+                            if term == "reject":
+                                log(c("warn", "終端 sentinel を task-list 分類が支持しない"
+                                               "（着手可 [ ] が残存）→ 無視して継続"))
                             if pending_kind == "next":
                                 msg_claude = poke_claude_next
                             elif a.stop_side in ("codex", "both") and hit_stop(texts, stop_phrases):

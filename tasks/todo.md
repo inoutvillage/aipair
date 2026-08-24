@@ -24,8 +24,8 @@
 - [x] `[!]` の意味を既存「チェックボックスの意味」節（endless relay が読む厳密定義）・README・SECURITY に記載。〔3箇所記載済。定義行はインライン code で分類器に誤カウントされないことを実 todo.md で検証〕
 
 ### Phase 2 — endless 終端の3状態化（§2/§10）
-- [ ] **起動直後・各 terminal sentinel 受信時に relay が task-list を再分類**し、分類結果を**唯一の権威**とする。`READY`=継続 / `BLOCKED`=HUMAN_REQUIRED で exit 8 停止 / `ALL_DONE`=exit 0。
-- [ ] **sentinel は分類が一致する時のみ honor**: `[AIPAIR_ALL_DONE]` は分類==`ALL_DONE` の時だけ終了、`[AIPAIR_HUMAN_REQUIRED]` は分類==`BLOCKED` の時だけ終了。**分類に `READY` が残る場合は sentinel を拒否して継続**（Case 6 に必須。誤 sentinel で未処理の `[ ]` を残して止めない）。no-progress による停止（exit 8）は分類とは独立の relay 内部経路であり error/max-rounds と同一扱いにしない。
+- [x] **起動直後・各 terminal sentinel 受信時に relay が task-list を再分類**し、分類結果を**唯一の権威**とする。`READY`=継続 / `BLOCKED`=HUMAN_REQUIRED で exit 8 停止 / `ALL_DONE`=exit 0。〔`endless_flow.decide_endless_terminal`＋`state_machine` に配線・起動時 fail-closed load〕
+- [x] **sentinel は分類が一致する時のみ honor**: `[AIPAIR_ALL_DONE]` は分類==`ALL_DONE` の時だけ終了、`[AIPAIR_HUMAN_REQUIRED]` は分類==`BLOCKED` の時だけ終了。**分類に `READY` が残る場合は sentinel を拒否して継続**（Case 6 に必須。誤 sentinel で未処理の `[ ]` を残して止めない）。no-progress による停止（exit 8）は分類とは独立の relay 内部経路であり error/max-rounds と同一扱いにしない。〔1件目と同一統合で実装〕
 
 ### Phase 3 — Codex/Claude の選択ロジック・プロンプト（§4/§5/§9）
 - [ ] **Codex 次タスク選択プロンプト**: `[ ]`優先→1件指示 / `[ ]`無→`[!]`確認→`[!]`あれば `[AIPAIR_HUMAN_REQUIRED]` / どちらも無→`[AIPAIR_ALL_DONE]`。**`[!]` を再指示しない**。

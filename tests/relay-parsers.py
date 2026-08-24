@@ -1448,14 +1448,34 @@ class StateMachineWiring(unittest.TestCase):
                 claude_seen=set(), codex_seen=set(), baseline=123.0, sg=object(), rg=object(),
                 bw=60, poke_codex="pc", poke_codex_next="pcn", poke_claude="pcl",
                 poke_claude_pass="pcp", poke_claude_next="pcnx", stop_phrases=["[AIPAIR_REVIEW_OK]"],
-                next_ask_phrases=["[AIPAIR_NEXT]"], all_done_phrases=["[AIPAIR_ALL_DONE]"])
+                next_ask_phrases=["[AIPAIR_NEXT]"], all_done_phrases=["[AIPAIR_ALL_DONE]"],
+                human_required_phrases=["[AIPAIR_HUMAN_REQUIRED]"])
         self.assertIs(sm.a, a)
         self.assertIs(sm.tracked, tracked)                 # relay と共有する可変 dict
         self.assertEqual((sm.own, sm.cwd, sm.baseline, sm.bw), ("%0", "/x", 123.0, 60))
         self.assertEqual(sm.panes["codex"], "%2")
         self.assertEqual((sm.poke_codex, sm.poke_claude_next), ("pc", "pcnx"))
         self.assertEqual(sm.all_done_phrases, ["[AIPAIR_ALL_DONE]"])
+        self.assertEqual(sm.human_required_phrases, ["[AIPAIR_HUMAN_REQUIRED]"])
         self.assertTrue(callable(sm.run))
+
+    def test_decide_endless_terminal_is_classification_gated(self):
+        # Phase 2: task-list 分類が権威。sentinel は分類一致時のみ honor、READY 残は reject（継続）。
+        d = relay.state_machine.decide_endless_terminal
+        tl = relay.state_machine.tasklist
+        self.assertEqual(d(True, False, tl.ALL_DONE), "all_done")        # §11 Case 2
+        self.assertEqual(d(False, True, tl.BLOCKED), "human_required")   # §11 Case 3
+        self.assertEqual(d(True, False, tl.READY), "reject")             # §11 Case 6: [ ] 残で ALL_DONE 拒否
+        self.assertEqual(d(False, True, tl.READY), "reject")             # [ ] 残で HUMAN_REQUIRED 拒否
+        self.assertEqual(d(True, False, tl.BLOCKED), "reject")           # sentinel と分類の不一致
+        self.assertIsNone(d(False, False, tl.READY))                     # sentinel 無し=通常継続
+
+    def test_relay_builds_and_passes_human_required_phrases(self):
+        # relay.main() が a.human_required を分割して StateMachine へ渡す配線
+        with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("human_required_phrases = [s for s in a.human_required.split", src)
+        self.assertIn("human_required_phrases=human_required_phrases", src)
 
     def test_exit_blocked_code_and_two_distinct_reasons(self):
         # endless BLOCKED/HUMAN_REQUIRED (社長指示 2026-08-24): exit 8 は max-rounds(3) と別コードで、
