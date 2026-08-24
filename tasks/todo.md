@@ -13,9 +13,9 @@
       / D（実装後・レビュー前に relay 再起動→**ALL_DONE にならない**＝分類 READY）。
 
 ## P1-1 — checkbox 0 件を ALL_DONE 扱いしない（誤 task-list の誤完了防止）
-- [ ] classifier: 認識 checkbox が **0 件なら ALL_DONE でなく TaskListError**（→ load_or_exit で exit 2）。
+- [x] classifier: 認識 checkbox が **0 件なら ALL_DONE でなく TaskListError**（→ load_or_exit で exit 2）。
       少なくとも endless 開始時は認識可能な checkbox ≥1 を要求。空許可の明示 marker は初版では未導入。
-- [ ] 回帰テスト: 通常 Markdown（README 等）/ 空ファイル / 見出し・散文のみ → exit 2。`[x]`のみ→ALL_DONE・
+- [x] 回帰テスト: 通常 Markdown（README 等）/ 空ファイル / 見出し・散文のみ → exit 2。`[x]`のみ→ALL_DONE・
       `[!]`のみ→BLOCKED・`[ ]`あり→READY は不変。
 
 ## P1-2 — AskUserQuestion に HUMAN_REQUIRED 経路を追加（別経路・§P1-2）

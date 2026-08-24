@@ -30,8 +30,10 @@ class State(unittest.TestCase):
         self.assertEqual(r["ready"], [])
         self.assertEqual(r["blocked"], [])
 
-    def test_all_done_when_no_checkboxes(self):
-        self.assertEqual(tl.classify("# heading\n\nprose only\n")["state"], tl.ALL_DONE)
+    def test_no_checkboxes_raises_not_all_done(self):
+        # P1-1: 認識 checkbox が 0 件のファイルは ALL_DONE にせず TaskListError（fail-closed）。
+        with self.assertRaises(tl.TaskListError):
+            tl.classify("# heading\n\nprose only\n")
 
     def test_blocked_when_only_blocked_remains(self):
         r = tl.classify("- [x] done\n- [!] set GitHub Secrets\n  - blocker: repo admin required\n")
@@ -223,6 +225,53 @@ class Section11Negatives(unittest.TestCase):
     def test_x_uppercase_marker_is_done(self):
         self._write("- [X] a\n- [x] b\n")                         # 正テスト: [X] を完了扱い
         self.assertEqual(tl.load("todo.md", self.dir)["state"], tl.ALL_DONE)
+
+
+class P1_1_EmptyTaskList(unittest.TestCase):
+    """P1-1（社長指示 2026-08-24）: 認識 checkbox が 0 件のファイルは ALL_DONE にせず **exit 2**
+    （`AIPAIR_TASK_LIST=README.md` 等の誤指定・空ファイルで誤って正常完了しない）。実際の終了経路
+    `load_or_exit` で固定する。`[x]`/`[!]`/`[ ]` が 1 件でもあれば従来どおり分類する。"""
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(self._rm)
+
+    def _rm(self):
+        for root, _d, files in os.walk(self.dir, topdown=False):
+            for f in files:
+                os.remove(os.path.join(root, f))
+            os.rmdir(root)
+
+    def _write(self, text):
+        with open(os.path.join(self.dir, "t.md"), "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def _exit2(self, text):
+        self._write(text)
+        with self.assertRaises(SystemExit) as cm:
+            tl.load_or_exit("t.md", self.dir, emit=lambda m: None)
+        self.assertEqual(cm.exception.code, 2)
+
+    def _state(self, text):
+        self._write(text)
+        return tl.load("t.md", self.dir)["state"]
+
+    def test_normal_markdown_exits_2(self):
+        self._exit2("# README\n\n本文だけ。\n- 箇条書きだが checkbox ではない\n")
+
+    def test_empty_file_exits_2(self):
+        self._exit2("")
+
+    def test_headings_and_prose_only_exits_2(self):
+        self._exit2("# 見出し\n## 節\n散文だけ。\n")
+
+    def test_done_only_is_all_done(self):
+        self.assertEqual(self._state("- [x] a\n- [X] b\n"), tl.ALL_DONE)
+
+    def test_blocked_only_is_blocked(self):
+        self.assertEqual(self._state("- [!] x\n  - blocker: y\n"), tl.BLOCKED)
+
+    def test_open_is_ready(self):
+        self.assertEqual(self._state("- [ ] a\n- [x] b\n"), tl.READY)
 
 
 if __name__ == "__main__":
