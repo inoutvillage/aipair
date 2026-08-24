@@ -703,8 +703,27 @@ class StateMachine:
                                 code = EXIT_BLOCKED
                                 human_required_banner(term_cls, rounds); break
                             if term == "reject":
-                                log(c("warn", "終端 sentinel を task-list 分類が支持しない"
-                                               "（着手可 [ ] が残存）→ 無視して継続"))
+                                # 誤 sentinel（分類は READY＝着手可 [ ] が残る）: Codex はタスクを選択して
+                                # いないので、Claude へ「次タスク指示」を送らず（未選択のタスクを着手させない）、
+                                # Codex に具体的な着手可タスクの選択を再要求する。UNRESOLVED として no-progress を
+                                # 進め、誤 sentinel の連発は 3 回で停止する（無限往復させない）。
+                                log(c("warn", "終端 sentinel を task-list 分類が支持しない（着手可 [ ] が残存）"
+                                               "→ Codex に具体的な着手可タスクの選択を再要求"))
+                                np_state, np_stop = advance_no_progress(np_state, UNRESOLVED, term_cls["hash"])
+                                if np_stop:
+                                    blocked_reason = BLOCKED_NOPROGRESS_REASON
+                                    code = EXIT_BLOCKED
+                                    no_progress_banner(np_state, rounds); break
+                                sent = poke(panes["codex"], poke_codex_next,
+                                            confirm=codex_poke_confirm(), busy_wait=bw)
+                                if not sent:
+                                    print(c("warn", "│ ■ Codex への選択再要求を配達できず（poke失敗）。停止します。"),
+                                          flush=True)
+                                    print("\a", end="", flush=True); code = 4; break
+                                pending_kind = "next"
+                                rg.arm(sent)
+                                since = time.time(); state = "codex"; last_activity = time.time()
+                                continue
                             if pending_kind == "next":
                                 # no-progress guard（§8）: Codex が指示したタスクの識別子＋task-list の
                                 # snapshot hash が「同一識別子 or UNRESOLVED かつ hash 不変」で 3 回連続なら、
