@@ -13,6 +13,44 @@ version match and verifies both states.
 
 ## [Unreleased]
 
+Correctness and safety of the autonomous `aipair loop --endless` relay: the loop now stops for a
+human (rather than guessing or spinning) whenever it cannot decide, and a task-list classification —
+not an agent's say-so — is the authority on when the run is finished.
+
+### Added
+- **Task-list classification is the termination authority** — in `--endless`, the relay reads the
+  task-list and classifies it (`READY` / `BLOCKED` / `ALL_DONE`); an all-done / human-required
+  sentinel is honored only when the classification agrees, so a misfired sentinel can neither end
+  nor wrongly continue the loop. Startup classification acts immediately (`ALL_DONE` → exit 0,
+  `BLOCKED` → exit 8, `READY` → run).
+- **`[!]` blocked-task notation** — a `- [!]` item with a required `blocker: <reason>` child line
+  marks work that needs a human or an external dependency; the agents move a task there instead of
+  leaving it `- [ ]` or guessing past it.
+- **`[AIPAIR_HUMAN_REQUIRED]` sentinel and exit code 8** — when only human-dependent `[!]` tasks
+  remain (classification `BLOCKED`), the loop stops for a human (exit 8) instead of spinning. Exit 8
+  is distinct from the max-rounds cap and carries a reason.
+- **no-progress guard** — if the same task is re-selected three rounds running with an unchanged
+  task-list snapshot, the loop stops (exit 8, no-progress) rather than looping forever.
+- **AskUserQuestion → HUMAN_REQUIRED** — when Claude stops on a choice dialog whose answer needs
+  human approval, authority, secrets, payment, or an irreversible/production action, Codex can
+  decline to proxy-answer (`[AIPAIR_HUMAN_REQUIRED]` on its reply's first line); the relay stops
+  (exit 8) without answering and leaves the dialog for a human. The task-list is untouched.
+- **Distinct exit-8 banners** — the human-wait and no-progress stops each print their own banner
+  (naming the blocking item or the question) so it is clear why the loop stopped and what to do.
+
+### Changed
+- **A task is checked off `- [x]` only after review passes** — in endless mode the implementer no
+  longer marks a task done at implementation time; the `- [x]` is written on the next turn once
+  Codex's review passes, so a restart mid-review cannot misread the task-list as `ALL_DONE`.
+- **Task-list loading is fail-closed** — a missing, unreadable, or zero-checkbox task-list now exits
+  2 (configuration error) instead of being read as "all done"; endless mode requires at least one
+  recognized checkbox (`- [ ]` / `- [x]` / `- [!]`).
+- **Oversized questions fail closed** — a question whose text exceeds the auto-relay size limit now
+  stops for a human (exit 8) instead of being truncated and proxy-answered from an incomplete prompt.
+- **A classification-rejected sentinel re-asks Codex** — if Codex emits a terminal sentinel the
+  classification does not support, the relay re-asks Codex to pick the next task instead of
+  forwarding to Claude.
+
 ## [0.1.0] - 2026-08-23
 
 The initial aipair release. aipair runs Claude Code and Codex CLI side by side in one tmux session with
