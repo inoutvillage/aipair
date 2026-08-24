@@ -2363,56 +2363,92 @@ class ResponseAttribution(unittest.TestCase):
 
 
 class EndlessScenarios(unittest.TestCase):
-    """§11 Case1-6: task-list 分類（tasklist.classify）＋終端判定（decide_endless_terminal）＋
-    no-progress（advance_no_progress）を合成し、endless の各シナリオを end-to-end で固定する
-    （社長指示 2026-08-24 / `_reference/new-task.md` §11）。"""
-    def setUp(self):
-        self.tl = relay.state_machine.tasklist
-        self.term = relay.state_machine.decide_endless_terminal
-        self.np = relay.state_machine.advance_no_progress
+    """§11 Case1-6（社長指示 2026-08-24 / `_reference/new-task.md`）。
 
-    def test_case1_ready_continues(self):
-        # [ ]+[x] → 分類 READY → 着手可を選んで継続。ALL_DONE/HUMAN_REQUIRED 誤宣言は分類が支持せず reject。
-        cls = self.tl.classify("- [ ] task A\n- [x] task B\n")
-        self.assertEqual(cls["state"], self.tl.READY)
-        self.assertEqual(cls["ready"], ["- [ ] task A"])
-        self.assertEqual(self.term(True, False, cls["state"]), "reject")
-        self.assertEqual(self.term(False, True, cls["state"]), "reject")
+    Case1/2/3/4/6 は **`StateMachine.run()` を実駆動**（tasklist 分類・set_pane_title・poke を mock）して
+    終端の戻り値（exit 0/8）と「停止後に poke しない／READY はループへ入る」を検証する。Case5（同一タスク
+    3 回で no-progress）は多ラウンドのループ駆動が必要なため、判定ロジック（advance_no_progress）と
+    exit 8 配線の source-check で担保する。"""
 
-    def test_case2_all_done_exit0(self):
-        cls = self.tl.classify("- [x] a\n- [x] b\n")
-        self.assertEqual(cls["state"], self.tl.ALL_DONE)
-        self.assertEqual(self.term(True, False, cls["state"]), "all_done")     # → exit 0
+    def _run(self, cls, sg=None):
+        """startup 分類 cls で run() を実駆動し (code, poke.called) を返す。sg 未指定なら loop skip 用の
+        ダミー、_Guard を渡せば READY 経路でループ突入を marker で捕捉できる。"""
+        import types
+        sm_mod = relay.state_machine
+        a = types.SimpleNamespace(start_side="claude", settle=0, poll=0, max_rounds=20,
+                                  endless=True, task_list="tasks/todo.md")
+        sm = sm_mod.StateMachine(
+            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x",
+            tracked={"claude": "a", "codex": "b"}, claude_seen=set(), codex_seen=set(), baseline=0.0,
+            sg=(sg or object()), rg=object(), bw=60, poke_codex="pc", poke_codex_next="pcn",
+            poke_claude="pcl", poke_claude_pass="pcp", poke_claude_next="pcnx",
+            stop_phrases=["[AIPAIR_REVIEW_OK]"], next_ask_phrases=["[AIPAIR_NEXT]"],
+            all_done_phrases=["[AIPAIR_ALL_DONE]"], human_required_phrases=["[AIPAIR_HUMAN_REQUIRED]"])
+        with mock.patch.object(sm_mod.tasklist, "load_or_exit", return_value=cls), \
+             mock.patch.object(sm_mod, "set_pane_title"), \
+             mock.patch.object(sm_mod, "poke") as poke_mock:
+            code = sm.run()
+        return code, poke_mock.called
 
-    def test_case3_human_required_exit8(self):
-        cls = self.tl.classify("- [x] done\n- [!] set secrets\n  - blocker: repo admin\n")
-        self.assertEqual(cls["state"], self.tl.BLOCKED)
-        self.assertEqual(self.term(False, True, cls["state"]), "human_required")   # → exit 8
-        # [!] は再指示しない＝Codex プロンプトが指定（②→HUMAN_REQUIRED）
-        prompt = relay.review_protocol.endless_poke_codex_next("t.md", "[AIPAIR_ALL_DONE]", "[AIPAIR_HUMAN_REQUIRED]")
-        self.assertIn("再指示しない", prompt)
+    def _cls(self, body):
+        return relay.state_machine.tasklist.classify(body)
 
-    def test_case4_ready_then_human_required(self):
-        # [ ]+[!] → 最初は READY（A 先行）。A 完了後は BLOCKED → HUMAN_REQUIRED。
-        before = self.tl.classify("- [ ] A\n- [!] human\n  - blocker: needs approval\n")
-        self.assertEqual(before["state"], self.tl.READY)
-        after = self.tl.classify("- [x] A\n- [!] human\n  - blocker: needs approval\n")
-        self.assertEqual(after["state"], self.tl.BLOCKED)
-        self.assertEqual(self.term(False, True, after["state"]), "human_required")
+    def test_case1_ready_enters_loop_and_continues(self):
+        # [ ]+[x] → 分類 READY → run() はループへ入る（起動時に skip・return しない）。
+        class _G:
+            def guard(self):
+                raise RuntimeError("LOOP-ENTERED")
+        with self.assertRaisesRegex(RuntimeError, "LOOP-ENTERED"):
+            self._run(self._cls("- [ ] task A\n- [x] task B\n"), sg=_G())
+
+    def test_case2_all_done_run_exits_0_no_poke(self):
+        code, poked = self._run(self._cls("- [x] a\n- [x] b\n"))
+        self.assertEqual(code, 0)                 # ALL_DONE → run() exit 0
+        self.assertFalse(poked)                   # 停止後に poke しない
+
+    def test_case3_human_required_run_exits_8_no_poke(self):
+        cls = self._cls("- [x] done\n- [!] set secrets\n  - blocker: repo admin\n")
+        code, poked = self._run(cls)
+        self.assertEqual(code, relay.state_machine.EXIT_BLOCKED)   # BLOCKED → run() exit 8
+        self.assertFalse(poked)
+        # [!] は Codex へ再指示しない（プロンプト契約）
+        self.assertIn("再指示しない", relay.review_protocol.endless_poke_codex_next(
+            "t.md", "[AIPAIR_ALL_DONE]", "[AIPAIR_HUMAN_REQUIRED]"))
+
+    def test_case4_ready_then_human_required_via_run(self):
+        # [ ]+[!] は READY（A 先行）→ run() はループへ入る。A 完了後は BLOCKED → run() exit 8。
+        class _G:
+            def guard(self):
+                raise RuntimeError("LOOP-ENTERED")
+        with self.assertRaisesRegex(RuntimeError, "LOOP-ENTERED"):
+            self._run(self._cls("- [ ] A\n- [!] human\n  - blocker: approval\n"), sg=_G())
+        code, poked = self._run(self._cls("- [x] A\n- [!] human\n  - blocker: approval\n"))
+        self.assertEqual(code, relay.state_machine.EXIT_BLOCKED)
+        self.assertFalse(poked)
 
     def test_case5_no_progress_stops_on_third(self):
-        h = self.tl.classify("- [ ] A\n- [x] b\n")["hash"]
-        s, stop = self.np(None, "- [ ] A", h); self.assertFalse(stop)
-        s, stop = self.np(s, "- [ ] A", h);    self.assertFalse(stop)    # 2回目まで継続
-        s, stop = self.np(s, "- [ ] A", h);    self.assertTrue(stop)     # 3回目で exit 8
-        self.assertEqual(s[2], 3)
+        # 多ラウンドのループ駆動は mock 面が広く過大なので、判定ロジック＋exit 8 配線で担保する。
+        np = relay.state_machine.advance_no_progress
+        h = self._cls("- [ ] A\n- [x] b\n")["hash"]
+        s, stop = np(None, "- [ ] A", h); self.assertFalse(stop)
+        s, stop = np(s, "- [ ] A", h);    self.assertFalse(stop)    # 2回目まで継続
+        s, stop = np(s, "- [ ] A", h);    self.assertTrue(stop)     # 3回目で exit 8
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        blk = src[src.index("if np_stop:"):][:300]
+        self.assertIn("BLOCKED_NOPROGRESS_REASON", blk)
+        self.assertIn("code = EXIT_BLOCKED", blk)
 
-    def test_case6_blocked_present_but_ready_exists(self):
-        # [!] があっても別の [ ] があれば READY → まだ HUMAN_REQUIRED にしない（誤 sentinel は reject）。
-        cls = self.tl.classify("- [ ] A\n- [!] human\n  - blocker: x\n")
-        self.assertEqual(cls["state"], self.tl.READY)
+    def test_case6_blocked_present_but_ready_enters_loop(self):
+        # [!] があっても別の [ ] があれば READY → run() はループへ入る（まだ HUMAN_REQUIRED にしない）。
+        cls = self._cls("- [ ] A\n- [!] human\n  - blocker: x\n")
+        self.assertEqual(cls["state"], relay.state_machine.tasklist.READY)
         self.assertEqual(len(cls["blocked"]), 1)
-        self.assertEqual(self.term(False, True, cls["state"]), "reject")
+        class _G:
+            def guard(self):
+                raise RuntimeError("LOOP-ENTERED")
+        with self.assertRaisesRegex(RuntimeError, "LOOP-ENTERED"):
+            self._run(cls, sg=_G())
 
 
 if __name__ == "__main__":
