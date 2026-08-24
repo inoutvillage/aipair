@@ -265,6 +265,35 @@ def done_banner(rounds, who, all_done=False):
     print("\a", end="", flush=True)
 
 
+def human_required_banner(cls, rounds):
+    """HUMAN_REQUIRED（分類 BLOCKED）の終了 banner（§6）: 残 `[!]` 項目名＋blocker 理由を一覧表示。"""
+    print("", flush=True)
+    print(c("warn", "│ ■ 自動処理を停止しました"), flush=True)
+    print(c("warn", "│   理由: 人間対応が必要なタスク（`[!]`）のみ残っています"
+                    f"（HUMAN_REQUIRED・exit {EXIT_BLOCKED}・{rounds} 往復）"), flush=True)
+    print(c("warn", "│   残タスク:"), flush=True)
+    for b in cls.get("blocked", []):
+        print(c("warn", f"│     {b['item']}"), flush=True)
+        print(c("dim", f"│       blocker: {b['blocker']}"), flush=True)
+    print(c("warn", "│   人間対応後、再度 endless を開始してください。"), flush=True)
+    print("\a", end="", flush=True)
+
+
+def no_progress_banner(np_state, rounds):
+    """no-progress（同一タスク停滞）の終了 banner（§6）: 繰り返された項目・ストリーク数・snapshot hash を
+    表示する。no-progress では `[!]` が存在しない場合があるので `[!]` 一覧に依存しない。"""
+    ident, hashv, streak = np_state
+    what = "UNRESOLVED（識別子を task-list 内で一意に同定できず）" if ident == UNRESOLVED else ident
+    print("", flush=True)
+    print(c("warn", "│ ■ 自動処理を停止しました"), flush=True)
+    print(c("warn", "│   理由: 進捗がないまま同じタスクが再選択されています"
+                    f"（no-progress・exit {EXIT_BLOCKED}・{rounds} 往復）"), flush=True)
+    print(c("warn", f"│   繰り返された項目: {what}"), flush=True)
+    print(c("dim", f"│   連続回数: {streak} / task-list snapshot hash: {hashv}"), flush=True)
+    print(c("warn", "│   人間確認が必要な可能性があります。"), flush=True)
+    print("\a", end="", flush=True)
+
+
 class StateMachine:
     """aipair relay の状態機械本体（P2-1: relay.main() から切り出し）。claude / codex /
     codex_plan / codex_question の 4 state を回し、ターン完了検知→相手ペインへの poke／ダイアログ
@@ -375,9 +404,7 @@ class StateMachine:
         elif _startup_state == tasklist.BLOCKED:
             blocked_reason = BLOCKED_HR_REASON
             code = EXIT_BLOCKED
-            print("\n" + c("warn", "│ ■ 人間対応待ち（HUMAN_REQUIRED）: 起動時点で実行可能な [ ] が無く "
-                  "[!] のみ残存。駆動せず exit %d で停止します。" % EXIT_BLOCKED), flush=True)
-            print("\a", end="", flush=True)
+            human_required_banner(_init_cls, rounds)      # 起動時点で [!] のみ → 駆動せず即終了
         _skip_loop = _startup_state in (tasklist.ALL_DONE, tasklist.BLOCKED)
         try:
             while True:
@@ -664,18 +691,17 @@ class StateMachine:
                         if a.endless:
                             saw_done = hit_stop(texts, all_done_phrases)
                             saw_hr = hit_stop(texts, human_required_phrases)
-                            term = (decide_endless_terminal(saw_done, saw_hr, classify_tasklist()["state"])
-                                    if (saw_done or saw_hr) else None)
+                            term, term_cls = None, None
+                            if saw_done or saw_hr:
+                                term_cls = classify_tasklist()
+                                term = decide_endless_terminal(saw_done, saw_hr, term_cls["state"])
                             if term == "all_done":
                                 all_done_hit = True
                                 done_banner(rounds, "codex", all_done=True); break
                             if term == "human_required":
                                 blocked_reason = BLOCKED_HR_REASON
                                 code = EXIT_BLOCKED
-                                print("\n" + c("warn", "│ ■ 人間対応待ち（HUMAN_REQUIRED）: 実行可能な "
-                                      "[ ] が尽き、人間対応の [!] のみ残存。exit %d で停止します。" % EXIT_BLOCKED),
-                                      flush=True)
-                                print("\a", end="", flush=True); break
+                                human_required_banner(term_cls, rounds); break
                             if term == "reject":
                                 log(c("warn", "終端 sentinel を task-list 分類が支持しない"
                                                "（着手可 [ ] が残存）→ 無視して継続"))
@@ -695,10 +721,7 @@ class StateMachine:
                                 if np_stop:
                                     blocked_reason = BLOCKED_NOPROGRESS_REASON
                                     code = EXIT_BLOCKED
-                                    print("\n" + c("warn", "│ ■ 進捗がないまま同じタスクが再選択されています"
-                                          "（no-progress）。人間確認が必要な可能性があります。exit %d で停止。"
-                                          % EXIT_BLOCKED), flush=True)
-                                    print("\a", end="", flush=True); break
+                                    no_progress_banner(np_state, rounds); break
                                 msg_claude = poke_claude_next
                             elif a.stop_side in ("codex", "both") and hit_stop(texts, stop_phrases):
                                 ok_gate, gate_msg = gate_or_message(a, gate_state, cwd)

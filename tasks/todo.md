@@ -38,7 +38,7 @@
 - [x] no-progress 判定は**簡易版に固定**〔`endless_flow.advance_no_progress`＋state_machine の pending_kind==next に配線・snapshot hash は tasklist の (indent,state,text,blocker) タプル〕（`git diff` 条件は採らない — 無関係な dirty/untracked で常にリセットされ判定不能になるため）。**意味的 task-list snapshot hash**（生バイトでなく、パースした checkbox 項目＋状態の正規化スナップショット。装飾的編集ではリセットしない）を用い、**(同一識別子の再選択 OR `UNRESOLVED`) AND snapshot hash 不変**が **3 回連続（初版は定数で固定。env 調整は導入しない — 全配線が未計画のため）** で **relay 内部 reason `BLOCKED (no-progress)` として直接 exit 8**（agent sentinel は介さない）。ストリークは「新しい識別子の解決」または「snapshot hash 変化」でリセット。snapshot hash は**順序付きの正規化タプル列 `(indent, state, item, blocker)` から生成**（行順を保持・状態と本文とインデントのみを織り込む）。
 
 ### Phase 5 — 人間待ち終了 UX（§6/§7）
-- [ ] 2種類の exit 8 を**別々の banner** で即終了（無駄往復なし）。pane title 反映。
+- [x] 2種類の exit 8 を**別々の banner** で即終了（無駄往復なし）。pane title 反映。〔`human_required_banner`/`no_progress_banner`＋起動時/終端/no-progress の3経路に配線・title は reason map〕
   - **HUMAN_REQUIRED（分類==BLOCKED）**: 「■ 自動処理を停止しました／理由: 人間対応が必要なタスクのみ残っています／残: `[!]` 項目名＋blocker 理由」を一覧表示。
   - **BLOCKED (no-progress)**: 「■ 自動処理を停止しました／理由: 進捗がないまま同じタスクが再選択／繰り返された READY 項目（or `UNRESOLVED`）／ストリーク数／task-list snapshot hash」を表示。**no-progress 時は `[!]` が存在しない場合があり**、`[!]` 一覧に依存しない。
 

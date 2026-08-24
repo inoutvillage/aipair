@@ -1511,6 +1511,37 @@ class StateMachineWiring(unittest.TestCase):
         # UNRESOLVED でも hash が変われば進捗ありでリセット
         s, stop = A((U, "H1", 2), U, "H2"); self.assertEqual((s[2], stop), (1, False))
 
+    def test_human_required_banner_lists_blocked_items(self):
+        # §6: HUMAN_REQUIRED の banner は残 [!] 項目名＋blocker 理由を一覧表示する。
+        import io, contextlib
+        cls = {"state": "BLOCKED", "ready": [],
+               "blocked": [{"item": "- [!] set GitHub Secrets", "blocker": "repo admin による設定"}], "hash": "h"}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            relay.state_machine.human_required_banner(cls, 5)
+        out = buf.getvalue()
+        self.assertIn("自動処理を停止しました", out)
+        self.assertIn("HUMAN_REQUIRED", out)
+        self.assertIn("- [!] set GitHub Secrets", out)     # 項目名
+        self.assertIn("repo admin による設定", out)          # blocker 理由
+
+    def test_no_progress_banner_shows_item_streak_hash(self):
+        # §6: no-progress の banner は繰り返された項目・ストリーク数・snapshot hash を表示（[!] 一覧に依存しない）。
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            relay.state_machine.no_progress_banner(("- [ ] task A", "abc123", 3), 7)
+        out = buf.getvalue()
+        self.assertIn("no-progress", out)
+        self.assertIn("- [ ] task A", out)
+        self.assertIn("3", out)              # ストリーク数
+        self.assertIn("abc123", out)         # snapshot hash
+        # UNRESOLVED（[!] が無い場合）でもクラッシュせず表示
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            relay.state_machine.no_progress_banner((relay.state_machine.UNRESOLVED, "h9", 3), 7)
+        self.assertIn("UNRESOLVED", buf2.getvalue())
+
     def test_no_progress_warns_on_unresolved_identity(self):
         # 契約（§8 / Codex relay-id:7292a881）: 識別子が UNRESOLVED（抽出失敗・0/≥2 一致）の時は、
         # ストリークを進める前に警告ログを出す。resolve→(UNRESOLVED 警告)→advance の順序を固定。
