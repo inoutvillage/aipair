@@ -1705,34 +1705,26 @@ class StateMachineWiring(unittest.TestCase):
         for gone in ("while True:", "= lock_codex(", "codex_done_ts(", "class LogWatch:"):
             self.assertNotIn(gone, relay_src, f"{gone!r} must have moved out of relay.py")
 
-    def test_question_human_required_wiring_stops_at_exit_8(self):
-        # P1-2: codex_question state で Codex が HUMAN_REQUIRED を宣言したら、Claude へ回答を送らず
-        # exit 8 で停止する。ループ本体は monolithic なので SchemaGuardOrdering と同じ source-structure
-        # 検査で配線を固定する（判定核 decide_question_action の human_required は QuestionRelayDecision
-        # で純粋被覆済み）。
+    def test_question_hr_reason_is_distinct(self):
+        # P1-2: 質問 HUMAN_REQUIRED は exit 8 の他 2 理由（endless HR / no-progress）と区別する reason を持つ。
+        # 実駆動での exit 8・banner・回答非送信は EndlessScenarios.test_question_* が固定する。
         sm = relay.state_machine
-        # (a) reason 定数が存在し、他の exit-8 理由と区別される
         self.assertTrue(sm.QUESTION_HR_REASON)
         self.assertNotIn(sm.QUESTION_HR_REASON, (sm.BLOCKED_HR_REASON, sm.BLOCKED_NOPROGRESS_REASON))
+
+    def test_question_handler_lives_outside_state_machine(self):
+        # P2-5（Codex relay-id:8938cb00）: 質問 HR の停止判定・banner は question_flow へ切り出し、
+        # state_machine には分岐・banner を直書きしない。run() は handler の outcome を適用するだけ。
         with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
-            src = fh.read().split("\n")
-        # (b) 判定核へ human_required_phrases を渡している（sentinel 照合の材料）
-        self.assertIn("decision = decide_question_action(texts, qdlg, human_required_phrases)",
-                      "\n".join(src))
-        # (c) human_required 分岐: EXIT_BLOCKED + QUESTION_HR_REASON + break、かつ回答は送らない
-        i = next(k for k, l in enumerate(src) if 'decision.action == "human_required"' in l)
-        branch_indent = len(src[i]) - len(src[i].lstrip())
-        body = []
-        for l in src[i + 1:]:
-            if l.strip() and (len(l) - len(l.lstrip())) <= branch_indent:
-                break                      # 次の elif/else（同 or 浅インデント）で分岐終了
-            body.append(l)
-        body = "\n".join(body)
-        self.assertIn("code = EXIT_BLOCKED", body)
-        self.assertIn("QUESTION_HR_REASON", body)
-        self.assertIn("break", body)
-        self.assertNotIn("send_question_answer", body,
-                         "HUMAN_REQUIRED 分岐は Claude へ回答を送らない（人間判断待ちで停止）")
+            sm_src = fh.read()
+        self.assertNotIn("def question_human_required_banner", sm_src,
+                         "banner は question_flow.human_required_banner_lines へ移す")
+        self.assertIn("handle_question_answer(", sm_src)     # handler を呼ぶだけ
+        self.assertNotIn('decision.action == "human_required"', sm_src,
+                         "分岐判定は question_flow.handle_question_answer 内へ")
+        from aipairlib import question_flow
+        self.assertTrue(hasattr(question_flow, "handle_question_answer"))
+        self.assertTrue(hasattr(question_flow, "human_required_banner_lines"))
 
 class QuestionRelayDecision(unittest.TestCase):
     """P2-1 question_flow: Codex の質問回答をどうするかの判定は純粋関数 decide_question_action。
@@ -2594,6 +2586,88 @@ class EndlessScenarios(unittest.TestCase):
         self.assertEqual(code, 0)                    # 誤 HUMAN_REQUIRED では exit 8 にしない
         # reject は Codex へ再要求（TO_CODEX_NEXT）、選択後に初めて Claude へ配達（TO_CLAUDE_NEXT）
         self.assertEqual(pokes, [self.TO_CODEX_NEXT, self.TO_CODEX_NEXT, self.TO_CLAUDE_NEXT, self.TO_CODEX_NEXT])
+
+    # --- P1-2: codex_question を実駆動（Codex relay-id:8938cb00 が要求した scripted fake） ------- #
+    def _drive_question(self, turns, qs_blocks, sqa_ok=True):
+        """`codex_question` を実 `StateMachine.run()` で駆動する scripted fake。
+
+        最初の Claude 反復は「AskUserQuestion で停止」（claude_done_ts=None → 質問 elif へ）とし、
+        detect_question_dialog/scrape_questions を mock して Codex へ回答依頼 → `codex_question` へ遷移。
+        以降の Claude 完了は done=100。turns=[(agent,[texts],cls_or_None),...] は codex_question/codex/
+        claude の turn_texts を供給する（最初の質問停止は turn_texts を消費しない）。
+        戻り値 (code, pokes, send_question_answer mock, stdout)。"""
+        import types, io, contextlib
+        sm = relay.state_machine
+        a = types.SimpleNamespace(start_side="claude", settle=0, poll=0, max_rounds=20, endless=True,
+                                  task_list="tasks/todo.md", stop_side="codex", no_plan_review=True,
+                                  no_question_relay=False, plan_rounds=5, question_rounds=5, plan_ok="[P]",
+                                  gate=None, gate_timeout=600, gate_rounds=3)
+        rg = types.SimpleNamespace(response_done=lambda who, path, done: done, noshow=lambda who: False,
+                                   arm=lambda nonce: None, probe=None, probe_ts_cache=0.0, clear=lambda: None)
+        sg = types.SimpleNamespace(guard=lambda: False)
+        box = {"cls": self._cls("- [ ] A\n")}
+        turn_iter = iter(turns)
+
+        def _turn_texts(who, *aa, **kk):
+            agent, texts, cls = next(turn_iter)
+            self.assertEqual(agent, who, "turn script mismatch")
+            if cls is not None:
+                box["cls"] = cls
+            return list(texts)
+
+        calls = {"cd": 0}
+
+        def _claude_done(*aa, **kk):
+            calls["cd"] += 1
+            return None if calls["cd"] == 1 else 100.0   # 初回のみ質問停止（done=None）、以降は完了
+
+        machine = sm.StateMachine(
+            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x",
+            tracked={"claude": "c.jsonl", "codex": "x.jsonl"}, claude_seen=set(), codex_seen=set(),
+            baseline=0.0, sg=sg, rg=rg, bw=60, poke_codex="POKE_CODEX", poke_codex_next="POKE_CODEX_NEXT",
+            poke_claude="POKE_CLAUDE", poke_claude_pass="POKE_CLAUDE_PASS", poke_claude_next="POKE_CLAUDE_NEXT",
+            stop_phrases=["[AIPAIR_REVIEW_OK]"], next_ask_phrases=["[AIPAIR_NEXT]"],
+            all_done_phrases=["[AIPAIR_ALL_DONE]"], human_required_phrases=["[AIPAIR_HUMAN_REQUIRED]"])
+        buf = io.StringIO()
+        with mock.patch.object(sm.tasklist, "load_or_exit", side_effect=lambda *a, **k: box["cls"]), \
+             mock.patch.object(sm, "set_pane_title"), \
+             mock.patch.object(sm, "claude_done_ts", side_effect=_claude_done), \
+             mock.patch.object(sm, "codex_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "claude_matches_pane", return_value=True), \
+             mock.patch.object(sm, "turn_texts", side_effect=_turn_texts), \
+             mock.patch.object(sm, "detect_question_dialog", return_value={"chat": "1"}), \
+             mock.patch.object(sm, "scrape_questions", return_value=list(qs_blocks)), \
+             mock.patch.object(sm, "send_question_answer", return_value=sqa_ok) as sqa, \
+             mock.patch.object(sm, "poke", return_value=object()) as poke_mock, \
+             mock.patch("time.sleep"), contextlib.redirect_stdout(buf):
+            code = machine.run()
+        pokes = [(cc.args[0], cc.args[1]) for cc in poke_mock.call_args_list]
+        return code, pokes, sqa, buf.getvalue()
+
+    def test_question_human_required_stops_at_exit_8_without_answering(self):
+        # P1-2: Codex が回答に [AIPAIR_HUMAN_REQUIRED] を出す → Claude へ回答を送らず exit 8、
+        # banner に質問内容を表示。実駆動で送信非呼び出し・exit・banner を固定する。
+        code, pokes, sqa, out = self._drive_question(
+            [("codex", ["[AIPAIR_HUMAN_REQUIRED]"], None)], ["Pick a database"])
+        self.assertEqual(code, relay.state_machine.EXIT_BLOCKED)     # exit 8
+        sqa.assert_not_called()                                      # Claude へ回答を送らない
+        self.assertIn("Pick a database", out)                       # banner に質問内容
+        self.assertIn("HUMAN_REQUIRED", out)                        # 停止理由を表示
+        # Codex への回答依頼（question_poke_codex）は 1 回だけ、Claude への配達は無い
+        self.assertEqual([p[0] for p in pokes], ["%2"])
+        self.assertNotIn("%1", [p[0] for p in pokes])
+
+    def test_question_deliver_answers_then_continues_to_all_done(self):
+        # 対照: 通常回答は send_question_answer で配達し、ループは継続（exit 8 にしない）。
+        # 配達後 Claude が [AIPAIR_NEXT] → Codex [AIPAIR_ALL_DONE] で exit 0。
+        code, pokes, sqa, out = self._drive_question([
+            ("codex", ["1問目: 選択肢1（Postgres）で"], None),        # codex_question: 通常回答 → 配達
+            ("claude", ["[AIPAIR_NEXT]"], None),                     # 配達後 Claude 完了 → 次依頼
+            ("codex", ["[AIPAIR_ALL_DONE]"], self._cls("- [x] A\n")),   # → exit 0
+        ], ["Pick a database"])
+        self.assertEqual(code, 0)
+        sqa.assert_called_once()
+        self.assertEqual(sqa.call_args.args[2], "1問目: 選択肢1（Postgres）で")   # 配達本文 = payload
 
 
 if __name__ == "__main__":

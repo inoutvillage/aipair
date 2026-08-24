@@ -1,15 +1,25 @@
-"""aipair question_flow — 質問リレー回答の判定核（P2-1: relay 状態機械の named module）。
+"""aipair question_flow — 質問リレー回答の判定核＋ハンドラ（P2-1 named module / P2-5 分離）。
 
 Claude が AskUserQuestion の選択ダイアログで停止したとき、relay は Codex に回答させ、その本文を
-『Chat about this』経由で Claude へ配達する。plan_flow と対称に、判定（回答本文をどう扱うか）を
-副作用（send_question_answer / log / code / break — state_machine.StateMachine 側）から切り離した
-純粋関数にする。プランと違い承認 sentinel は無く、回答はそのまま中継する。
+『Chat about this』経由で Claude へ配達する。plan_flow と対称に、判定（回答本文をどう扱うか）と
+「run() が適用すべき結果（outcome）」を副作用（send_question_answer / print / code / break —
+state_machine.StateMachine 側）から切り離した純粋関数にする。
+
+P2-5（社長指示 2026-08-24）: state_machine の再肥大化を避けるため、質問リレーの停止判定・banner・
+終了結果はこの module に集約し、`StateMachine.run()` は `handle_question_answer()` の返す
+`QuestionOutcome` を**適用するだけ**にする（分岐・banner を state_machine へ直書きしない）。
+tmux/ログには一切依存しない（banner は (level, text) の行データで返し、着色/print は run() 側）。
 """
 import collections
 
 from .corelib import hit_stop
 
 QuestionDecision = collections.namedtuple("QuestionDecision", "action payload")
+# run() が適用する結果。kind ∈ {retry_detect, human_required, back_to_wait, deliver}。
+#   level/log : 1 行ログ（未着色・run() が c(level, log) で出す）
+#   banner    : HUMAN_REQUIRED 停止時の (level|None, text) 行列（他は None）
+#   payload   : deliver 時の配達本文（他は None）
+QuestionOutcome = collections.namedtuple("QuestionOutcome", "kind level log banner payload")
 
 
 def decide_question_action(texts, qdlg, human_required_phrases=()):
@@ -31,3 +41,42 @@ def decide_question_action(texts, qdlg, human_required_phrases=()):
     if qdlg is None:
         return QuestionDecision("no_dialog", None)
     return QuestionDecision("deliver", text)
+
+
+def human_required_banner_lines(qs_blocks, rounds, exit_code):
+    """質問 HUMAN_REQUIRED 停止 banner を (level|None, text) の行列で返す（純粋・print は run() 側）。
+    level=None の行はそのまま（無着色）出力する。qs_blocks は検知した質問ブロック列。"""
+    lines = [(None, ""),
+             ("warn", "│ ■ 自動処理を停止しました"),
+             ("warn", "│   理由: Claude の質問に人間の判断が必要です"
+                      f"（HUMAN_REQUIRED・exit {exit_code}・{rounds} 往復）"),
+             ("warn", "│   質問:")]
+    lines += [("dim", f"│     {b}") for b in (qs_blocks or [])]
+    lines.append(("warn", "│   人間が Claude 側で回答した後、relay を再開してください。"))
+    return lines
+
+
+def handle_question_answer(texts, qdlg, human_required_phrases, qs_blocks, rounds, exit_code):
+    """Codex の質問回答 → `StateMachine.run()` が適用すべき `QuestionOutcome` を返す（純粋・P2-5）。
+
+    run() 側は kind に応じて:
+      retry_detect  : ログのみ → claude state へ戻す（ダイアログ再検知でやり直し）
+      human_required: ログ + banner を出し、exit `exit_code`（HUMAN_REQUIRED）で停止（回答は送らない）
+      back_to_wait  : ログのみ → claude state へ戻す（人間がダイアログ操作した想定）
+      deliver       : ログ後、payload を send_question_answer で配達（失敗時は run() が exit 4）
+    """
+    decision = decide_question_action(texts, qdlg, human_required_phrases)
+    if decision.action == "no_text":
+        return QuestionOutcome("retry_detect", "warn",
+                               "◆ Codex の回答本文を取得できず。ダイアログ検知からやり直します。",
+                               None, None)
+    if decision.action == "human_required":
+        return QuestionOutcome("human_required", "warn",
+                               "◆ Codex が回答を保留（HUMAN_REQUIRED）→ 人間判断が必要として停止します。",
+                               human_required_banner_lines(qs_blocks, rounds, exit_code), None)
+    if decision.action == "no_dialog":
+        return QuestionOutcome("back_to_wait", "warn",
+                               "◆ 質問ダイアログが見当たりません（人間が操作した？）。通常の待機に戻ります。",
+                               None, None)
+    return QuestionOutcome("deliver", "ok",
+                           "◆ Codex が回答 → 「Chat about this」経由で配達", None, decision.payload)
