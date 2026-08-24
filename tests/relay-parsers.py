@@ -1459,6 +1459,31 @@ class StateMachineWiring(unittest.TestCase):
         self.assertEqual(sm.human_required_phrases, ["[AIPAIR_HUMAN_REQUIRED]"])
         self.assertTrue(callable(sm.run))
 
+    def test_resolve_task_identity_verbatim_and_fail_closed(self):
+        # Phase 4（§8）: 識別子は task-list の verbatim `- [ ]` 行を丁度1件同定。抽出失敗・0/≥2 一致は
+        # UNRESOLVED（fail-closed）。返り値は原文の ready 行。
+        R = relay.state_machine.resolve_task_identity
+        U = relay.state_machine.UNRESOLVED
+        ready = ["- [ ] task A", "- [ ] task A extended", "  - [ ] nested B"]
+        # 単独行での逐語エコー → その行
+        self.assertEqual(R("次はこれ:\n- [ ] task A\n頑張って", ready), "- [ ] task A")
+        # バッククォート囲みでも同定（返り値は verbatim）
+        self.assertEqual(R("次は `  - [ ] nested B` を実装", ready), "  - [ ] nested B")
+        # prefix 部分一致で誤検出しない（full-line 比較）
+        self.assertEqual(R("- [ ] task A extended\n", ready), "- [ ] task A extended")
+        # 抽出失敗（どの行もエコーされていない）→ UNRESOLVED
+        self.assertEqual(R("適当に何かやって", ready), U)
+        # ≥2 一致（曖昧）→ UNRESOLVED
+        self.assertEqual(R("- [ ] task A\n- [ ] task A extended", ready), U)
+        # ready が空 → UNRESOLVED
+        self.assertEqual(R("- [ ] task A", []), U)
+
+    def test_codex_next_prompt_asks_to_echo_the_task_line(self):
+        # §8 の識別子契約: Codex は指示するタスク行を逐語エコーする（プロンプトで指定）。
+        txt = relay.review_protocol.endless_poke_codex_next("t.md", "[AIPAIR_ALL_DONE]", "[AIPAIR_HUMAN_REQUIRED]")
+        self.assertIn("逐語", txt)
+        self.assertIn("進捗検出", txt)
+
     def test_decide_endless_terminal_is_classification_gated(self):
         # Phase 2: task-list 分類が権威。sentinel は分類一致時のみ honor、READY 残は reject（継続）。
         d = relay.state_machine.decide_endless_terminal

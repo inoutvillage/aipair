@@ -8,10 +8,45 @@ agent が出した終端 sentinel（`[AIPAIR_ALL_DONE]` / `[AIPAIR_HUMAN_REQUIRE
 
 no-progress（同一タスクの停滞）は分類とは独立の relay 内部経路（Phase 4）であり、ここでは扱わない。
 """
+import re
+
 # task-list 分類の state（tasklist.py と一致させる。循環 import を避けるため文字列で持つ）
 READY = "READY"
 BLOCKED = "BLOCKED"
 ALL_DONE = "ALL_DONE"
+
+# no-progress guard（§8）: 今回 Codex が指示したタスクの識別子が同定できない時の番兵。
+UNRESOLVED = "UNRESOLVED"
+
+
+def _norm(line):
+    """行を正規化（前後空白・囲みバッククォートを除去）して逐語比較のキーにする。"""
+    return line.strip().strip("`").strip()
+
+
+def resolve_task_identity(codex_text, ready_lines):
+    """Codex の次タスク指示から、task-list の着手可行（`ready_lines`＝classify()['ready']）に
+    **逐語一致する行を丁度1件**同定して返す（no-progress 判定の識別子）。
+
+    識別子は task-list 上の verbatim `- [ ]` 行に固定（安定 ID 方式は採らない）。Codex はその行を
+    逐語エコーする契約（`endless_poke_codex_next` で指定）。**fail-closed**: 抽出失敗・一致 0 件・
+    一致 ≥2 件（曖昧）は `UNRESOLVED` を返し、呼び出し側は no-progress ストリークを進める
+    （同一性を判定できないまま無限往復させない）。
+
+    戻り値は一致した **verbatim の ready 行**（比較は正規化するが返り値は原文）、または `UNRESOLVED`。
+    """
+    seen = set()
+    for ln in codex_text.splitlines():          # 単独行での逐語エコー
+        key = _norm(ln)
+        if key:
+            seen.add(key)
+    for span in re.findall(r"`([^`\n]+)`", codex_text):   # 文中のバッククォート囲みエコー
+        key = _norm(span)
+        if key:
+            seen.add(key)
+    # full-line/span 単位の比較なので、prefix 部分一致（"…A" と "…A extended"）で誤検出しない
+    matched = [ln for ln in ready_lines if ln and _norm(ln) in seen]
+    return matched[0] if len(matched) == 1 else UNRESOLVED
 
 
 def decide_endless_terminal(saw_all_done, saw_human_required, state):

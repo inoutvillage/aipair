@@ -44,7 +44,7 @@ from .corelib import hit_stop, oneline
 from .review_protocol import plan_poke_codex, question_poke_codex
 from .plan_flow import decide_plan_action
 from .question_flow import decide_question_action
-from .endless_flow import decide_endless_terminal       # noqa: F401 (再エクスポート)
+from .endless_flow import decide_endless_terminal, resolve_task_identity, UNRESOLVED  # noqa: F401 (再エクスポート)
 from . import tasklist
 
 # endless BLOCKED/HUMAN_REQUIRED（社長指示 2026-08-24 / _reference/new-task.md）: max-rounds(3) と

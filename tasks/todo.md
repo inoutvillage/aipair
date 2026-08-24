@@ -34,7 +34,7 @@
 - [x] **配布済みドキュメントの旧契約を更新**〔relay.py help/起動ログ・bin/aipair コメント/title・claude-md-block・skills 2つ〕（新契約と矛盾するため必須）: `bin/aipairlib/relay.py` の help（`:58-73`「終端は Codex の --all-done 宣言のみ」）、`bin/aipair` のコメント・初期 title（`:278-286`）、`templates/claude-md-block.md`、`.claude/skills/aipair-relay/SKILL.md`、`.claude/skills/aipair-setup/SKILL.md` から**「終端は ALL_DONE のみ」を削除**し、**task-list 分類（READY/BLOCKED/ALL_DONE）＋ HUMAN_REQUIRED 終端＋ exit 8** を記載。
 
 ### Phase 4 — no-progress guard（§8）
-- [ ] **タスク同一性の契約を確定**: 識別子は **task-list 上の完全一致行テキスト（verbatim `- [ ]` 行）** に固定（安定 ID 方式は採らない）。Codex は次タスク指示時にその行を逐語エコー（プロンプトで指定）。relay は現 task-list 内で**厳密一致が丁度1件**である事を検証。**fail-closed**: 抽出失敗 or 一致 0/≥2 件は識別子=`UNRESOLVED` とし、警告ログ＋ no-progress ストリークを進める（同一性を判定できないまま無限往復させない）。
+- [x] **タスク同一性の契約を確定**〔`endless_flow.resolve_task_identity`＋Codex ① に逐語エコー指示〕: 識別子は **task-list 上の完全一致行テキスト（verbatim `- [ ]` 行）** に固定（安定 ID 方式は採らない）。Codex は次タスク指示時にその行を逐語エコー（プロンプトで指定）。relay は現 task-list 内で**厳密一致が丁度1件**である事を検証。**fail-closed**: 抽出失敗 or 一致 0/≥2 件は識別子=`UNRESOLVED` とし、警告ログ＋ no-progress ストリークを進める（同一性を判定できないまま無限往復させない）。〔ストリーク配線は次項目〕
 - [ ] no-progress 判定は**簡易版に固定**（`git diff` 条件は採らない — 無関係な dirty/untracked で常にリセットされ判定不能になるため）。**意味的 task-list snapshot hash**（生バイトでなく、パースした checkbox 項目＋状態の正規化スナップショット。装飾的編集ではリセットしない）を用い、**(同一識別子の再選択 OR `UNRESOLVED`) AND snapshot hash 不変**が **3 回連続（初版は定数で固定。env 調整は導入しない — 全配線が未計画のため）** で **relay 内部 reason `BLOCKED (no-progress)` として直接 exit 8**（agent sentinel は介さない）。ストリークは「新しい識別子の解決」または「snapshot hash 変化」でリセット。snapshot hash は**順序付きの正規化タプル列 `(indent, state, item, blocker)` から生成**（行順を保持・状態と本文とインデントのみを織り込む）。
 
 ### Phase 5 — 人間待ち終了 UX（§6/§7）
