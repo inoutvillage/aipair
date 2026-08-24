@@ -1715,19 +1715,34 @@ class StateMachineWiring(unittest.TestCase):
         self.assertTrue(sm.QUESTION_HR_REASON)
         self.assertNotIn(sm.QUESTION_HR_REASON, (sm.BLOCKED_HR_REASON, sm.BLOCKED_NOPROGRESS_REASON))
 
-    def test_question_handler_lives_outside_state_machine(self):
-        # P2-5（Codex relay-id:8938cb00）: 質問 HR の停止判定・banner は question_flow へ切り出し、
-        # state_machine には分岐・banner を直書きしない。run() は handler の outcome を適用するだけ。
+    def test_new_cycle_logic_lives_in_flow_modules_not_state_machine(self):
+        # P2-5（社長指示・Codex relay-id:8938cb00）: 今回追加した question / endless のロジック —
+        # 質問 HUMAN_REQUIRED（P1-2）・質問 payload guard（P1-3）・endless 終端 / no-progress — は
+        # question_flow / endless_flow に《純粋な判定＋banner 文言》として置き、state_machine は
+        # それらを《呼んで結果を適用するだけ》にする（判定分岐も banner 生成も state_machine に直書きしない）。
+        from aipairlib import question_flow, endless_flow, state_machine as sm
+        # 判定核 + banner 文言ビルダは flow module が所有する
+        for name in ("decide_question_action", "handle_question_answer", "decide_question_relay",
+                     "human_required_banner_lines", "question_oversize_banner_lines"):
+            self.assertTrue(hasattr(question_flow, name), f"question_flow must own {name}")
+        for name in ("decide_endless_terminal", "resolve_task_identity", "advance_no_progress"):
+            self.assertTrue(hasattr(endless_flow, name), f"endless_flow must own {name}")
+        # state_machine は import して同一オブジェクトを使う（再実装しない）
+        self.assertIs(sm.handle_question_answer, question_flow.handle_question_answer)
+        self.assertIs(sm.decide_question_relay, question_flow.decide_question_relay)
+        self.assertIs(sm.decide_endless_terminal, endless_flow.decide_endless_terminal)
+        self.assertIs(sm.advance_no_progress, endless_flow.advance_no_progress)
         with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
             sm_src = fh.read()
-        self.assertNotIn("def question_human_required_banner", sm_src,
-                         "banner は question_flow.human_required_banner_lines へ移す")
-        self.assertIn("handle_question_answer(", sm_src)     # handler を呼ぶだけ
+        # run() は handler を呼ぶ（P1-2/P1-3）— 判定分岐も banner も直書きしない
+        self.assertIn("handle_question_answer(", sm_src)
+        self.assertIn("decide_question_relay(", sm_src)
         self.assertNotIn('decision.action == "human_required"', sm_src,
-                         "分岐判定は question_flow.handle_question_answer 内へ")
-        from aipairlib import question_flow
-        self.assertTrue(hasattr(question_flow, "handle_question_answer"))
-        self.assertTrue(hasattr(question_flow, "human_required_banner_lines"))
+                         "質問の分岐判定は question_flow.handle_question_answer 内へ")
+        for gone in ("def question_human_required_banner", "def human_required_banner_lines",
+                     "def question_oversize_banner_lines", "def decide_question_relay",
+                     "def handle_question_answer", "def decide_endless_terminal"):
+            self.assertNotIn(gone, sm_src, f"{gone} は flow module 側に置く（state_machine で再定義しない）")
 
 class QuestionRelayDecision(unittest.TestCase):
     """P2-1 question_flow: Codex の質問回答をどうするかの判定は純粋関数 decide_question_action。
