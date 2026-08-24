@@ -181,5 +181,49 @@ class Loader(unittest.TestCase):
         self.assertTrue(emitted and "fail-closed" in emitted[0])
 
 
+class Section11Negatives(unittest.TestCase):
+    """§11 の負テスト（社長指示 2026-08-24 / `_reference/new-task.md` §11）を、**実際の終了経路
+    `load_or_exit`（fail-closed で exit 2）** で明示的に固定する。classify が例外を投げるだけでなく、
+    task-list ファイル → exit 2 の連鎖まで検証する。識別子 0/≥2→UNRESOLVED は relay-parsers 側で被覆。"""
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(self._rm)
+
+    def _rm(self):
+        for root, _d, files in os.walk(self.dir, topdown=False):
+            for f in files:
+                os.remove(os.path.join(root, f))
+            os.rmdir(root)
+
+    def _write(self, text):
+        with open(os.path.join(self.dir, "todo.md"), "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def _exit_code(self, name="todo.md"):
+        with self.assertRaises(SystemExit) as cm:
+            tl.load_or_exit(name, self.dir, emit=lambda m: None)
+        return cm.exception.code
+
+    def test_a_blocked_without_blocker_exits_2(self):
+        self._write("- [x] done\n- [!] set secrets\n")           # [!] に直下 blocker: が無い
+        self.assertEqual(self._exit_code(), 2)
+
+    def test_e_unknown_marker_exits_2_not_all_done(self):
+        self._write("- [?] mystery\n")                            # 未知記法は ALL_DONE にせず exit 2
+        self.assertEqual(self._exit_code(), 2)
+
+    def test_c_missing_taskfile_exits_2(self):
+        self.assertEqual(self._exit_code("does-not-exist.md"), 2)
+
+    def test_b_arbitrary_length_fences_ignored(self):
+        # 任意長のバッククォート／チルダ・コードフェンス内の疑似 checkbox は分類が無視する。
+        self._write("````\n- [ ] fenced A\n````\n~~~~\n- [!] fenced B\n~~~~\n- [x] real done\n")
+        self.assertEqual(tl.load("todo.md", self.dir)["state"], tl.ALL_DONE)
+
+    def test_x_uppercase_marker_is_done(self):
+        self._write("- [X] a\n- [x] b\n")                         # 正テスト: [X] を完了扱い
+        self.assertEqual(tl.load("todo.md", self.dir)["state"], tl.ALL_DONE)
+
+
 if __name__ == "__main__":
     unittest.main()
