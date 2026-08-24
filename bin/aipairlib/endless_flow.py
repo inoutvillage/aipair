@@ -19,9 +19,21 @@ ALL_DONE = "ALL_DONE"
 UNRESOLVED = "UNRESOLVED"
 
 
-def _norm(line):
-    """行を正規化（前後空白・囲みバッククォートを除去）して逐語比較のキーにする。"""
-    return line.strip().strip("`").strip()
+def _echo_candidates(codex_text):
+    """Codex 応答から、ready 行と**完全一致**で照合する候補文字列の集合を作る。
+
+    verbatim 契約: 行内容はそのまま保持し、除去するのは Markdown の**外側バッククォート**だけ
+    （内側の先頭・末尾空白＝インデントは保持）。候補は (a) 各行そのまま (b) 行全体が `` `…` `` なら
+    その中身 (c) 行内のバッククォート囲みスパン `` `…` ``。"""
+    cands = set()
+    for ln in codex_text.splitlines():
+        cands.add(ln)                              # 行そのまま（verbatim）
+        s = ln.strip()                             # 行全体が `…`（外側空白は装飾なので許容）
+        if len(s) >= 2 and s[0] == "`" and s[-1] == "`" and "`" not in s[1:-1]:
+            cands.add(s[1:-1])                     # 外側バッククォートのみ除去・内側空白は保持
+    for span in re.findall(r"`([^`\n]+)`", codex_text):
+        cands.add(span)                            # 行内バッククォート span（verbatim）
+    return cands
 
 
 def resolve_task_identity(codex_text, ready_lines):
@@ -35,17 +47,10 @@ def resolve_task_identity(codex_text, ready_lines):
 
     戻り値は一致した **verbatim の ready 行**（比較は正規化するが返り値は原文）、または `UNRESOLVED`。
     """
-    seen = set()
-    for ln in codex_text.splitlines():          # 単独行での逐語エコー
-        key = _norm(ln)
-        if key:
-            seen.add(key)
-    for span in re.findall(r"`([^`\n]+)`", codex_text):   # 文中のバッククォート囲みエコー
-        key = _norm(span)
-        if key:
-            seen.add(key)
-    # full-line/span 単位の比較なので、prefix 部分一致（"…A" と "…A extended"）で誤検出しない
-    matched = [ln for ln in ready_lines if ln and _norm(ln) in seen]
+    cands = _echo_candidates(codex_text)
+    # ready 行は verbatim で完全一致比較（正規化しない）。full-line/span 単位なので prefix 部分一致
+    # （"…A" と "…A extended"）でも、同本文でインデント違いの2項目でも誤検出しない。
+    matched = [ln for ln in ready_lines if ln and ln in cands]
     return matched[0] if len(matched) == 1 else UNRESOLVED
 
 
