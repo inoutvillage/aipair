@@ -233,8 +233,10 @@ def main():
     human_required_phrases = [s for s in a.human_required.split("||") if s]
     poke_claude_pass = endless_poke_claude_pass(a.task_list, next_ask_phrases[0] if next_ask_phrases
                                                 else "[AIPAIR_NEXT]")
-    poke_codex_next = endless_poke_codex_next(a.task_list, all_done_phrases[0] if all_done_phrases
-                                              else "[AIPAIR_ALL_DONE]")
+    poke_codex_next = endless_poke_codex_next(a.task_list,
+                                              all_done_phrases[0] if all_done_phrases else "[AIPAIR_ALL_DONE]",
+                                              human_required_phrases[0] if human_required_phrases
+                                              else "[AIPAIR_HUMAN_REQUIRED]")
     poke_claude_next = endless_poke_claude_next(a.task_list)
     if a.endless and not all_done_phrases:
         print(c("warn", "aipair-relay: --endless では --all-done が終端の唯一の手段です（空にできません）"),
