@@ -43,7 +43,7 @@ from .gate import gate_or_message
 from .corelib import hit_stop, oneline
 from .review_protocol import plan_poke_codex, question_poke_codex
 from .plan_flow import decide_plan_action
-from .question_flow import decide_question_action
+from .question_flow import decide_question_action, handle_question_answer
 from .endless_flow import (decide_endless_terminal, resolve_task_identity, advance_no_progress,  # noqa: F401
                            UNRESOLVED)
 from . import tasklist
@@ -292,20 +292,6 @@ def no_progress_banner(np_state, rounds):
     print(c("warn", f"│   繰り返された項目: {what}"), flush=True)
     print(c("dim", f"│   連続回数: {streak} / task-list snapshot hash: {hashv}"), flush=True)
     print(c("warn", "│   人間確認が必要な可能性があります。"), flush=True)
-    print("\a", end="", flush=True)
-
-
-def question_human_required_banner(qs_blocks, rounds):
-    """P1-2: AskUserQuestion に人間判断が必要（Codex が [AIPAIR_HUMAN_REQUIRED] を宣言）時の終了 banner。
-    質問内容を表示する。task-list の `[!]` とは別経路（todo は変更しない）。"""
-    print("", flush=True)
-    print(c("warn", "│ ■ 自動処理を停止しました"), flush=True)
-    print(c("warn", "│   理由: Claude の質問に人間の判断が必要です"
-                    f"（HUMAN_REQUIRED・exit {EXIT_BLOCKED}・{rounds} 往復）"), flush=True)
-    print(c("warn", "│   質問:"), flush=True)
-    for b in (qs_blocks or []):
-        print(c("dim", f"│     {b}"), flush=True)
-    print(c("warn", "│   人間が Claude 側で回答した後、relay を再開してください。"), flush=True)
     print("\a", end="", flush=True)
 
 
@@ -648,25 +634,23 @@ class StateMachine:
                         qdlg = detect_question_dialog(panes["claude"])
                         if text:
                             dim(c("codex", "codex") + ": " + oneline(text))
-                        # 判定（no_text / no_dialog / deliver）は state_machine.decide_question_action の
-                        # 純粋関数へ切り出した（P2-1・question_flow）。ここは決定→副作用の実行のみ。
-                        decision = decide_question_action(texts, qdlg, human_required_phrases)
-                        if decision.action == "no_text":
-                            log(c("warn", "◆ Codex の回答本文を取得できず。ダイアログ検知からやり直します。"))
-                        elif decision.action == "human_required":
+                        # 停止判定 / banner / 終了結果は question_flow.handle_question_answer に集約
+                        # （P2-5: state_machine へ分岐・banner を直書きしない）。run() は outcome を適用するだけ。
+                        outcome = handle_question_answer(texts, qdlg, human_required_phrases,
+                                                         qs_blocks, question_rounds, EXIT_BLOCKED)
+                        log(c(outcome.level, outcome.log))
+                        if outcome.kind == "human_required":
                             # P1-2: Codex が「この質問は人間判断が必要」と宣言 → Claude へ回答を送らず
-                            # exit 8（HUMAN_REQUIRED）で停止。ダイアログは開いたまま残し、人間が Claude 側で
-                            # 回答する。task-list の [!] とは別経路（todo は一切変更しない）。
-                            log(c("warn", "◆ Codex が回答を保留（HUMAN_REQUIRED）→ 人間判断が必要として停止します。"))
+                            # exit 8（HUMAN_REQUIRED）で停止。ダイアログは開いたまま残し人間が回答する。
+                            # task-list の [!] とは別経路（todo は一切変更しない）。
                             blocked_reason = QUESTION_HR_REASON
                             code = EXIT_BLOCKED
-                            question_human_required_banner(qs_blocks, question_rounds)
+                            for lvl, line in outcome.banner:
+                                print(c(lvl, line) if lvl else line, flush=True)
+                            print("\a", end="", flush=True)
                             break
-                        elif decision.action == "no_dialog":
-                            log(c("warn", "◆ 質問ダイアログが見当たりません（人間が操作した？）。通常の待機に戻ります。"))
-                        else:  # "deliver"
-                            log("◆ " + c("ok", "Codex が回答") + " → 「Chat about this」経由で配達")
-                            if not send_question_answer(panes["claude"], qdlg, decision.payload,
+                        if outcome.kind == "deliver":
+                            if not send_question_answer(panes["claude"], qdlg, outcome.payload,
                                                         watch=claude_watch()):
                                 # ダイアログは chat 押下で既に閉じており、未送信のまま state を
                                 # 進めると永久停止する（Codex レビュー指摘）→ 明示停止
@@ -675,6 +659,7 @@ class StateMachine:
                                 print("\a", end="", flush=True)
                                 code = 4
                                 break
+                        # retry_detect / back_to_wait / deliver 成功 → claude state へ戻す
                         rg.clear()    # ダイアログ経由の配達に nonce は無い（帰属ゲート不使用）
                         since = time.time(); state = "claude"; last_activity = time.time()
                     else:
