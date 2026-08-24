@@ -75,6 +75,35 @@ def advance_no_progress(prev, cur_id, cur_hash, limit=NO_PROGRESS_LIMIT):
     return ((cur_id, cur_hash, streak), streak >= limit)
 
 
+def human_required_banner_lines(cls, rounds, exit_code):
+    """HUMAN_REQUIRED（分類 BLOCKED）停止 banner を (level|None, text) 行列で返す（§6・純粋）。
+    残 `[!]` 項目名＋blocker 理由を列挙。level=None の行は無着色。print は run() 側（P2-5）。"""
+    lines = [(None, ""),
+             ("warn", "│ ■ 自動処理を停止しました"),
+             ("warn", "│   理由: 人間対応が必要なタスク（`[!]`）のみ残っています"
+                      f"（HUMAN_REQUIRED・exit {exit_code}・{rounds} 往復）"),
+             ("warn", "│   残タスク:")]
+    for b in cls.get("blocked", []):
+        lines.append(("warn", f"│     {b['item']}"))
+        lines.append(("dim", f"│       blocker: {b['blocker']}"))
+    lines.append(("warn", "│   人間対応後、再度 endless を開始してください。"))
+    return lines
+
+
+def no_progress_banner_lines(np_state, rounds, exit_code):
+    """no-progress（同一タスク停滞）停止 banner を (level|None, text) 行列で返す（§6・純粋）。
+    繰り返された項目・ストリーク数・snapshot hash を表示。`[!]` 一覧に依存しない。print は run() 側。"""
+    ident, hashv, streak = np_state
+    what = "UNRESOLVED（識別子を task-list 内で一意に同定できず）" if ident == UNRESOLVED else ident
+    return [(None, ""),
+            ("warn", "│ ■ 自動処理を停止しました"),
+            ("warn", "│   理由: 進捗がないまま同じタスクが再選択されています"
+                     f"（no-progress・exit {exit_code}・{rounds} 往復）"),
+            ("warn", f"│   繰り返された項目: {what}"),
+            ("dim", f"│   連続回数: {streak} / task-list snapshot hash: {hashv}"),
+            ("warn", "│   人間確認が必要な可能性があります。")]
+
+
 def decide_endless_terminal(saw_all_done, saw_human_required, state):
     """終端 sentinel フラグ＋task-list 分類 state から終端の可否を決める（純関数）。
 

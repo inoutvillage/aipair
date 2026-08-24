@@ -1528,35 +1528,32 @@ class StateMachineWiring(unittest.TestCase):
         s, stop = A((U, "H1", 2), U, "H2"); self.assertEqual((s[2], stop), (1, False))
 
     def test_human_required_banner_lists_blocked_items(self):
-        # §6: HUMAN_REQUIRED の banner は残 [!] 項目名＋blocker 理由を一覧表示する。
-        import io, contextlib
+        # §6/P2-5: HUMAN_REQUIRED banner は endless_flow が (level,text) 行データで返す（残 [!] 項目名＋
+        # blocker 理由を列挙）。print は state_machine.print_banner 経由（_drive テストで実駆動被覆）。
+        from aipairlib import endless_flow
         cls = {"state": "BLOCKED", "ready": [],
                "blocked": [{"item": "- [!] set GitHub Secrets", "blocker": "repo admin による設定"}], "hash": "h"}
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            relay.state_machine.human_required_banner(cls, 5)
-        out = buf.getvalue()
-        self.assertIn("自動処理を停止しました", out)
-        self.assertIn("HUMAN_REQUIRED", out)
-        self.assertIn("- [!] set GitHub Secrets", out)     # 項目名
-        self.assertIn("repo admin による設定", out)          # blocker 理由
+        flat = "\n".join(t for _l, t in endless_flow.human_required_banner_lines(cls, 5, 8))
+        self.assertIn("自動処理を停止しました", flat)
+        self.assertIn("HUMAN_REQUIRED", flat)
+        self.assertIn("exit 8", flat)                       # 渡した exit_code を表示
+        self.assertIn("- [!] set GitHub Secrets", flat)     # 項目名
+        self.assertIn("repo admin による設定", flat)          # blocker 理由
 
     def test_no_progress_banner_shows_item_streak_hash(self):
-        # §6: no-progress の banner は繰り返された項目・ストリーク数・snapshot hash を表示（[!] 一覧に依存しない）。
-        import io, contextlib
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            relay.state_machine.no_progress_banner(("- [ ] task A", "abc123", 3), 7)
-        out = buf.getvalue()
-        self.assertIn("no-progress", out)
-        self.assertIn("- [ ] task A", out)
-        self.assertIn("3", out)              # ストリーク数
-        self.assertIn("abc123", out)         # snapshot hash
+        # §6/P2-5: no-progress banner は endless_flow が (level,text) 行データで返す（繰り返し項目・
+        # ストリーク数・snapshot hash。[!] 一覧に依存しない）。
+        from aipairlib import endless_flow
+        flat = "\n".join(t for _l, t in
+                         endless_flow.no_progress_banner_lines(("- [ ] task A", "abc123", 3), 7, 8))
+        self.assertIn("no-progress", flat)
+        self.assertIn("- [ ] task A", flat)
+        self.assertIn("3", flat)              # ストリーク数
+        self.assertIn("abc123", flat)         # snapshot hash
         # UNRESOLVED（[!] が無い場合）でもクラッシュせず表示
-        buf2 = io.StringIO()
-        with contextlib.redirect_stdout(buf2):
-            relay.state_machine.no_progress_banner((relay.state_machine.UNRESOLVED, "h9", 3), 7)
-        self.assertIn("UNRESOLVED", buf2.getvalue())
+        flat2 = "\n".join(t for _l, t in
+                          endless_flow.no_progress_banner_lines((endless_flow.UNRESOLVED, "h9", 3), 7, 8))
+        self.assertIn("UNRESOLVED", flat2)
 
     def test_no_progress_warns_on_unresolved_identity(self):
         # 契約（§8 / Codex relay-id:7292a881）: 識別子が UNRESOLVED（抽出失敗・0/≥2 一致）の時は、
@@ -1725,21 +1722,30 @@ class StateMachineWiring(unittest.TestCase):
         for name in ("decide_question_action", "handle_question_answer", "decide_question_relay",
                      "human_required_banner_lines", "question_oversize_banner_lines"):
             self.assertTrue(hasattr(question_flow, name), f"question_flow must own {name}")
-        for name in ("decide_endless_terminal", "resolve_task_identity", "advance_no_progress"):
+        # endless の終端判定 + 停止 banner 文言（HUMAN_REQUIRED / no-progress）も endless_flow が所有する
+        for name in ("decide_endless_terminal", "resolve_task_identity", "advance_no_progress",
+                     "human_required_banner_lines", "no_progress_banner_lines"):
             self.assertTrue(hasattr(endless_flow, name), f"endless_flow must own {name}")
         # state_machine は import して同一オブジェクトを使う（再実装しない）
         self.assertIs(sm.handle_question_answer, question_flow.handle_question_answer)
         self.assertIs(sm.decide_question_relay, question_flow.decide_question_relay)
         self.assertIs(sm.decide_endless_terminal, endless_flow.decide_endless_terminal)
         self.assertIs(sm.advance_no_progress, endless_flow.advance_no_progress)
+        # endless 停止 banner は endless_flow の実装を使う（state_machine 内 print 関数ではない）
+        self.assertIs(sm.human_required_banner_lines, endless_flow.human_required_banner_lines)
+        self.assertIs(sm.no_progress_banner_lines, endless_flow.no_progress_banner_lines)
         with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
             sm_src = fh.read()
-        # run() は handler を呼ぶ（P1-2/P1-3）— 判定分岐も banner も直書きしない
+        # run() は handler / banner ビルダを呼ぶだけ（P1-2/P1-3/P2-5）— 判定分岐も banner 文言も直書きしない
         self.assertIn("handle_question_answer(", sm_src)
         self.assertIn("decide_question_relay(", sm_src)
+        self.assertIn("print_banner(human_required_banner_lines(", sm_src)   # endless HR は endless_flow の行を print
+        self.assertIn("print_banner(no_progress_banner_lines(", sm_src)
         self.assertNotIn('decision.action == "human_required"', sm_src,
                          "質問の分岐判定は question_flow.handle_question_answer 内へ")
-        for gone in ("def question_human_required_banner", "def human_required_banner_lines",
+        for gone in ("def question_human_required_banner",
+                     "def human_required_banner",   # 旧 endless HR print 関数 / _lines とも state_machine に置かない
+                     "def no_progress_banner",      # 旧 endless no-progress print 関数 / _lines も同様
                      "def question_oversize_banner_lines", "def decide_question_relay",
                      "def handle_question_answer", "def decide_endless_terminal"):
             self.assertNotIn(gone, sm_src, f"{gone} は flow module 側に置く（state_machine で再定義しない）")
