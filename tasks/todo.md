@@ -35,7 +35,7 @@
 
 ## P2-2 — main と release の version を区別
 - [!] release 直後の main を dev version（`0.2.0.dev0`）に。可能なら `+g<commit>` を付す。
-  - blocker: CEO 指定 `0.2.0.dev0`（PEP 440）は本プロジェクトの厳密 SemVer 契約（doc-sync `SEMVER`・git タグ `vX.Y.Z`・release.yml の tag==__version__ 検査）と衝突。案A=指定どおり `0.2.0.dev0` を採用し validator/タグ/release 契約を PEP 440 許容へ全面変更（released 版の SemVer/PEP440 曖昧化・広範囲）／案B=SemVer 等価の `0.2.0-dev.0`（ハイフン）を採用（CEO 指定文字列と不一致・契約変更ゼロ）。受入条件（version 形式）の変更は方針判断のため CEO 決定待ち。決定後 `- [ ]` 具体タスクへ落とす（詳細: tasks/decisions.md）。
+  - blocker: CEO 指定 `0.2.0.dev0`（PEP 440）は本プロジェクトが `__version__` 検証に使う SemVer 契約（doc-sync `SEMVER`・CHANGELOG lifecycle 判定）と非互換。dev サフィックスは **prepared 状態のみ**で使い release 時に最終 `0.2.0` へ落とすので、**git タグ `vX.Y.Z`・release.yml の tag==__version__ 契約は不変**（影響は prepared 版の validator・CHANGELOG lifecycle・文書のみ）。案A=指定どおり `0.2.0.dev0` を採用し prepared 版 validator（`SEMVER`）と CHANGELOG lifecycle を PEP 440 許容へ拡張＋文書対応／案B=SemVer 等価 `0.2.0-dev.0` を採用（validator は既に許容・契約変更ゼロ・文書対応のみ）。受入条件（version 形式）の変更は方針判断のため CEO 決定待ち。決定後 `- [ ]` 具体タスクへ落とす。
 
 ## P2-3 — CHANGELOG `[Unreleased]` に今回の変更を記載
 - [ ] Added/Changed/Fixed（READY/BLOCKED/ALL_DONE・`[!]`・`[AIPAIR_HUMAN_REQUIRED]`・no-progress/exit 8・
