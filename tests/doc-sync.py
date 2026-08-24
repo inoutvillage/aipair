@@ -372,6 +372,27 @@ class Version(unittest.TestCase):
         self.assertIn("tags:", wf)   # triggered by a tag push
 
     @staticmethod
+    def _latest_released_version(text):
+        # the newest DATED release『## [X.Y.Z] - YYYY-MM-DD』(skips『Unreleased』and any undated /
+        # prepared top version) — what the README's stable `--branch` must track.
+        m = re.search(r"^## \[([^\]]+)\] - \d{4}-\d{2}-\d{2}\s*$", text, re.M)
+        return m.group(1) if m else None
+
+    def test_readme_stable_branch_tracks_the_latest_release(self):
+        # P2-4 (Codex relay-id:bce7c4a8): the README pins the *stable* install to a release tag
+        # (`--branch vX.Y.Z`); that must equal the newest DATED release in CHANGELOG.md so it cannot
+        # go stale at the next release. RELEASING.md step 2 updates it; this test fails until it does.
+        latest = self._latest_released_version(_read("CHANGELOG.md"))
+        self.assertIsNotNone(latest, "CHANGELOG.md has no dated release『## [X.Y.Z] - YYYY-MM-DD』")
+        branches = re.findall(r"--branch (v\d+\.\d+\.\d+)\b", README)
+        self.assertTrue(branches, "README must document the stable install with `--branch vX.Y.Z`")
+        for b in branches:
+            self.assertEqual(b, "v" + latest,
+                             "README stable `--branch %s` is stale — the latest release is v%s. "
+                             "Update the README stable clone line(s) at release (RELEASING.md step 2)."
+                             % (b, latest))
+
+    @staticmethod
     def _extract_changelog_section(text, version):
         # mirror release.yml's awk: STRING-match the『## [version]』header (so a SemVer +build's `+`
         # is not treated as a regex metachar), take lines until the next『## [』, skip link defs.
