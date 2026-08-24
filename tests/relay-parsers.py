@@ -1911,6 +1911,11 @@ class LoglibStandalone(unittest.TestCase):
             self.assertIn("[!]", txt)
             self.assertIn("blocker:", txt)
             self.assertIn("[AIPAIR_NEXT]", txt)
+        # §9: endless 文面は「人間に伝言を頼むな」が [!]/HUMAN_REQUIRED エスカレーションを妨げないと明記。
+        for txt in (_pass, _next, _codex_next):
+            self.assertIn("妨げない", txt)
+        # 通常レビュー往復の文面（§9 の対象外）は従来どおり明確化を足さない。
+        self.assertNotIn("妨げない", rp.default_poke_codex("[AIPAIR_REVIEW_OK]"))
         self.assertIn("[AIPAIR_PLAN_APPROVED]", rp.plan_poke_codex("p.md", "[AIPAIR_PLAN_APPROVED]"))
         # relay re-exports the same objects (call sites unchanged)
         self.assertIs(relay.default_poke_codex, rp.default_poke_codex)
