@@ -6,9 +6,11 @@
 > work autonomously until a stop phrase appears. A one-shot installer and a Claude Code skill
 > (`/aipair-setup`) set everything up interactively, including tmux.
 >
-> **Quick start**
+> **Quick start** — `main` is the **development** line (newest changes, ahead of the latest release);
+> the **stable** version is the latest release tag (`v0.1.0`). Pick one to clone, then run the same installer.
 > ```bash
-> git clone https://github.com/inoutvillage/aipair && cd aipair
+> git clone https://github.com/inoutvillage/aipair && cd aipair            # development (main)
+> #  stable release instead:  git clone --branch v0.1.0 https://github.com/inoutvillage/aipair && cd aipair
 > ./aipair-install.sh --check          # diagnose: OS, tmux >= 3.1, python3 >= 3.8, claude, codex, PATH …
 > ./aipair-install.sh                  # install to ~/.local/bin (+ notice blocks, skills, smoke test)
 > #   add --install-tmux to let it install tmux (uses sudo unless root / brew)
@@ -80,8 +82,11 @@
 
 ### 方法 A: `aipair-install.sh`（冪等・非対話）
 
+**Stable か Development かを選んで clone する。** `main` は **開発版（development）** で、最新の修正・機能が入るが**未リリース**（最新タグより先）。**安定版（stable）が必要なら最新リリースタグ**（現在 `v0.1.0`）を clone する。どちらも同じ `aipair-install.sh` で導入する（インストーラの手順は同一）。リリースは git タグ `v<version>`、変更履歴は [CHANGELOG.md](CHANGELOG.md)。
+
 ```bash
-git clone https://github.com/inoutvillage/aipair && cd aipair
+git clone https://github.com/inoutvillage/aipair && cd aipair    # 開発版（development, main）: 最新の変更
+#   安定版（stable）なら:  git clone --branch v0.1.0 https://github.com/inoutvillage/aipair && cd aipair
 ./aipair-install.sh --check                 # 診断のみ（無変更）。KEY=VALUE で状態を出力
 ./aipair-install.sh                         # 導入（sudo は一切使わない。tmux が無ければ案内して exit 3）
 ./aipair-install.sh --install-tmux          # tmux の導入を明示的に許可（root なら sudo 無し、非 root は sudo <pkg> install tmux）
