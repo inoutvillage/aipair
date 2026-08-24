@@ -455,8 +455,16 @@ class EndlessContract(unittest.TestCase):
         self.assertIn("AIPAIR_HUMAN_REQUIRED", README)   # env 表／sentinel 一覧に載っている
         self.assertRegex(README, r"exit 8|・exit 8")     # exit 8 を README が記載
 
-    def test_relay_help_has_new_contract_and_no_stale(self):
-        self._check(_read("bin/aipairlib/relay.py"), "bin/aipairlib/relay.py")
+    def test_relay_help_docstring_has_new_contract_and_no_stale(self):
+        # relay.py 全体でなく **module docstring（= --help 文面）** だけを AST で抽出して検証する。
+        # 全文検索だと help から契約を消しても実装コードの HUMAN_REQUIRED で通ってしまう。
+        import ast
+        doc = ast.get_docstring(ast.parse(_read("bin/aipairlib/relay.py")))
+        self.assertTrue(doc, "relay.py に module docstring（--help）が無い")
+        self._check(doc, "relay.py の --help docstring")
+        self.assertRegex(doc, r"READY/BLOCKED/ALL_DONE|分類", "--help に task-list 分類が無い")
+        self.assertIn("exit 8", doc, "--help に exit 8 が無い")
+        self.assertIn("[!]", doc, "--help に保留記法 [!] が無い")
 
 
 if __name__ == "__main__":

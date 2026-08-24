@@ -167,6 +167,7 @@ echo "exit=$?"
 ▼ 自走ループの既定値（日本語）
   停止ワード「完了です」（AIPAIR_STOP）／ 判定側 codex（AIPAIR_STOP_SIDE）／ 最大 20 往復（AIPAIR_MAX_ROUNDS）
   連続モードの合図「次のタスクをください」／終端「全タスク完了」「人間対応待ち」（AIPAIR_NEXT_ASK / AIPAIR_ALL_DONE / AIPAIR_HUMAN_REQUIRED）
+  連続モードの終端は tasks/todo.md の分類（READY/BLOCKED/ALL_DONE）が権威: 全完了=ALL_DONE→exit 0、人間対応の `[!]`（直下に blocker: 理由・要 human）のみ残存=HUMAN_REQUIRED→exit 8
 
 ▼ 次にやること
   1. 新しいシェルを開く（PATH 反映）→ cd <project> → aipair
