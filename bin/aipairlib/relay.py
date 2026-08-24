@@ -230,6 +230,7 @@ def main():
     poke_claude = a.poke_claude
     next_ask_phrases = [s for s in a.next_ask.split("||") if s]
     all_done_phrases = [s for s in a.all_done.split("||") if s]
+    human_required_phrases = [s for s in a.human_required.split("||") if s]
     poke_claude_pass = endless_poke_claude_pass(a.task_list, next_ask_phrases[0] if next_ask_phrases
                                                 else "[AIPAIR_NEXT]")
     poke_codex_next = endless_poke_codex_next(a.task_list, all_done_phrases[0] if all_done_phrases
@@ -384,7 +385,7 @@ def main():
         poke_codex=poke_codex, poke_codex_next=poke_codex_next, poke_claude=poke_claude,
         poke_claude_pass=poke_claude_pass, poke_claude_next=poke_claude_next,
         stop_phrases=stop_phrases, next_ask_phrases=next_ask_phrases,
-        all_done_phrases=all_done_phrases,
+        all_done_phrases=all_done_phrases, human_required_phrases=human_required_phrases,
     ).run()
 
 
