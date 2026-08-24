@@ -15,15 +15,21 @@ def plan_poke_codex(plan_path, ok):
             f"（同じ行に他の文字を書かず）出力してください。否定文・説明の中に書いても承認にはなりません。")
 
 
-def question_poke_codex(blocks, limit=3000):
+def question_poke_codex(blocks, human_required, limit=3000):
     qtext = " ".join(f"◆{i}問目: {b}" for i, b in enumerate(blocks, 1))
     if len(qtext) > limit:
         qtext = qtext[: limit - 1] + "…"
+    # P1-2: human_required（sentinel トークン）が与えられた時だけ HUMAN_REQUIRED 経路を案内する。
+    # 通常モードで --human-required を空にした場合は None が来る → その場合は案内しない。
+    hr = ("⚠ ただし、人間の承認・権限・意思決定・秘密情報の入力・課金・契約・本番操作・不可逆操作が"
+          "必要な質問は AI が代理回答すべきではありません。その場合は最終回答の【1行目】に "
+          f"{human_required} を単独で（同じ行に他の文字を書かず）出力してください（Claude へ回答を送らず、"
+          "人間の回答待ちとして停止します）。 " if human_required else "")
     return ("【自動質問応答】Claudeが選択式の質問ダイアログで停止しています。必要なら `peer` で"
             "直近の文脈を確認し、以下の各質問に回答してください。あなたの返答はそのままClaudeへ"
             "送信されます—人間に伝言を頼まないでください。各質問について「N問目: 選択肢M（ラベル）」"
             "の形で選択を明示し、根拠を一言添えてください。どの選択肢も不適切なら、その旨と"
-            "代替案を明記してください。 " + qtext)
+            "代替案を明記してください。" + hr + qtext)
 
 
 # --------------------------------------------------------------------------- #
