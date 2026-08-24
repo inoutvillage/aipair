@@ -685,6 +685,12 @@ class StateMachine:
                                 # 進捗のない再選択とみなし relay 内部理由で exit 8（agent sentinel は介さない）。
                                 cls = classify_tasklist()
                                 ident = resolve_task_identity("\n".join(texts), cls["ready"])
+                                if ident == UNRESOLVED:
+                                    # 契約（§8）: 抽出失敗・一致 0/≥2 件は警告ログを出し、UNRESOLVED として
+                                    # ストリークを進める（同一性を判定できないまま無限往復させない）。
+                                    log(c("warn", "next タスクの識別子を task-list 内で一意に同定できません"
+                                                  "（Codex の逐語エコー欠落 or 曖昧な複数一致）→ UNRESOLVED として "
+                                                  "no-progress ストリークを進めます"))
                                 np_state, np_stop = advance_no_progress(np_state, ident, cls["hash"])
                                 if np_stop:
                                     blocked_reason = BLOCKED_NOPROGRESS_REASON

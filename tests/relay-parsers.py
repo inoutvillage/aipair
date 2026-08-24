@@ -1511,12 +1511,21 @@ class StateMachineWiring(unittest.TestCase):
         # UNRESOLVED でも hash が変われば進捗ありでリセット
         s, stop = A((U, "H1", 2), U, "H2"); self.assertEqual((s[2], stop), (1, False))
 
+    def test_no_progress_warns_on_unresolved_identity(self):
+        # 契約（§8 / Codex relay-id:7292a881）: 識別子が UNRESOLVED（抽出失敗・0/≥2 一致）の時は、
+        # ストリークを進める前に警告ログを出す。resolve→(UNRESOLVED 警告)→advance の順序を固定。
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        seg = src[src.index("ident = resolve_task_identity("):src.index("np_state, np_stop = advance_no_progress")]
+        self.assertIn("if ident == UNRESOLVED:", seg)
+        self.assertIn('log(c("warn"', seg)          # UNRESOLVED 分岐で警告を出す
+
     def test_no_progress_guard_wired_at_codex_next(self):
         # Codex 次タスク指示（pending_kind == "next"）の直後で識別子＋hash から no-progress を判定し、
         # 停止時は relay 内部理由 BLOCKED_NOPROGRESS_REASON ＋ EXIT_BLOCKED で break する配線を固定。
         with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
             src = fh.read()
-        block = src[src.index('if pending_kind == "next":'):][:900]
+        block = src[src.index('if pending_kind == "next":'):][:1300]
         self.assertIn("resolve_task_identity(", block)
         self.assertIn("advance_no_progress(np_state", block)
         self.assertIn("BLOCKED_NOPROGRESS_REASON", block)
