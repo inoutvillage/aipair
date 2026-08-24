@@ -44,7 +44,8 @@ from .corelib import hit_stop, oneline
 from .review_protocol import plan_poke_codex, question_poke_codex
 from .plan_flow import decide_plan_action
 from .question_flow import decide_question_action
-from .endless_flow import decide_endless_terminal, resolve_task_identity, UNRESOLVED  # noqa: F401 (再エクスポート)
+from .endless_flow import (decide_endless_terminal, resolve_task_identity, advance_no_progress,  # noqa: F401
+                           UNRESOLVED)
 from . import tasklist
 
 # endless BLOCKED/HUMAN_REQUIRED（社長指示 2026-08-24 / _reference/new-task.md）: max-rounds(3) と
@@ -365,6 +366,7 @@ class StateMachine:
         code = 0
         all_done_hit = False
         blocked_reason = None          # code==8 のサブ理由（BLOCKED_HR_REASON / BLOCKED_NOPROGRESS_REASON）
+        np_state = None                # no-progress guard の (id, hash, streak)。Codex 次タスク指示ごとに更新
         # 起動時分類が権威（社長指示 §2）: 既に ALL_DONE なら 1 度も poke せず即 exit 0、BLOCKED（[!] のみ）
         # なら即 exit 8。READY の時だけループを開始する。
         if _startup_state == tasklist.ALL_DONE:
@@ -678,6 +680,19 @@ class StateMachine:
                                 log(c("warn", "終端 sentinel を task-list 分類が支持しない"
                                                "（着手可 [ ] が残存）→ 無視して継続"))
                             if pending_kind == "next":
+                                # no-progress guard（§8）: Codex が指示したタスクの識別子＋task-list の
+                                # snapshot hash が「同一識別子 or UNRESOLVED かつ hash 不変」で 3 回連続なら、
+                                # 進捗のない再選択とみなし relay 内部理由で exit 8（agent sentinel は介さない）。
+                                cls = classify_tasklist()
+                                ident = resolve_task_identity("\n".join(texts), cls["ready"])
+                                np_state, np_stop = advance_no_progress(np_state, ident, cls["hash"])
+                                if np_stop:
+                                    blocked_reason = BLOCKED_NOPROGRESS_REASON
+                                    code = EXIT_BLOCKED
+                                    print("\n" + c("warn", "│ ■ 進捗がないまま同じタスクが再選択されています"
+                                          "（no-progress）。人間確認が必要な可能性があります。exit %d で停止。"
+                                          % EXIT_BLOCKED), flush=True)
+                                    print("\a", end="", flush=True); break
                                 msg_claude = poke_claude_next
                             elif a.stop_side in ("codex", "both") and hit_stop(texts, stop_phrases):
                                 ok_gate, gate_msg = gate_or_message(a, gate_state, cwd)

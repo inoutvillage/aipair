@@ -1492,6 +1492,36 @@ class StateMachineWiring(unittest.TestCase):
         self.assertEqual(R("- [ ] t  ", ["- [ ] t"]), U)               # ready に無い末尾空白
         self.assertEqual(R("- [ ] t", ["- [ ] t  "]), U)               # ready の末尾空白を欠落
 
+    def test_advance_no_progress_streak(self):
+        # Phase 4（§8）: (同一識別子 OR UNRESOLVED) AND snapshot hash 不変 が 3 回連続で停止。
+        A = relay.state_machine.advance_no_progress
+        U = relay.state_machine.UNRESOLVED
+        # Case 5: 同一 (X, H) を 3 回 → 2回目まで継続・3回目で停止
+        s, stop = A(None, "X", "H");   self.assertEqual((s, stop), (("X", "H", 1), False))
+        s, stop = A(s, "X", "H");      self.assertEqual((s, stop), (("X", "H", 2), False))
+        s, stop = A(s, "X", "H");      self.assertEqual((s, stop), (("X", "H", 3), True))
+        # 新しい識別子でリセット
+        s, stop = A(("X", "H", 2), "Y", "H"); self.assertEqual((s[2], stop), (1, False))
+        # snapshot hash 変化でリセット（＝進捗あり）
+        s, stop = A(("X", "H1", 2), "X", "H2"); self.assertEqual((s[2], stop), (1, False))
+        # UNRESOLVED が同一 hash で 3 連続 → 停止（同一性不明のまま無限往復させない）
+        s, stop = A(None, U, "H")
+        s, stop = A(s, U, "H");        self.assertFalse(stop)
+        s, stop = A(s, U, "H");        self.assertTrue(stop)
+        # UNRESOLVED でも hash が変われば進捗ありでリセット
+        s, stop = A((U, "H1", 2), U, "H2"); self.assertEqual((s[2], stop), (1, False))
+
+    def test_no_progress_guard_wired_at_codex_next(self):
+        # Codex 次タスク指示（pending_kind == "next"）の直後で識別子＋hash から no-progress を判定し、
+        # 停止時は relay 内部理由 BLOCKED_NOPROGRESS_REASON ＋ EXIT_BLOCKED で break する配線を固定。
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        block = src[src.index('if pending_kind == "next":'):][:900]
+        self.assertIn("resolve_task_identity(", block)
+        self.assertIn("advance_no_progress(np_state", block)
+        self.assertIn("BLOCKED_NOPROGRESS_REASON", block)
+        self.assertIn("code = EXIT_BLOCKED", block)
+
     def test_codex_next_prompt_asks_to_echo_the_task_line(self):
         # §8 の識別子契約: Codex は指示するタスク行を逐語エコーする（プロンプトで指定）。
         txt = relay.review_protocol.endless_poke_codex_next("t.md", "[AIPAIR_ALL_DONE]", "[AIPAIR_HUMAN_REQUIRED]")
