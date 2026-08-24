@@ -7,10 +7,13 @@ endless モードの task-list を READY / BLOCKED / ALL_DONE に分類する。
 state（社長指示 2026-08-24 / `_reference/new-task.md` §2）:
   READY    = 実行可能な `[ ]` が1件以上 → endless 継続
   BLOCKED  = `[ ]` は0件で `[!]` が1件以上 → 人間対応・外部依存で AI 単独では進行不能
-  ALL_DONE = `[ ]` も `[!]` も0件（全て `[x]`/`[X]` か、checkbox 項目なし）
+  ALL_DONE = **認識 checkbox が1件以上あり、全件 `[x]`/`[X]`**（`[ ]` も `[!]` も無い）→ 全完了
+  （認識 checkbox が **0 件**のファイルは ALL_DONE でなく TaskListError＝設定不備 → exit 2。P1-1）
 
 契約（Codex レビュー relay-id:d2ece9ce〜01f52208 で確定）:
 - 認識する checkbox 記法は**厳密に** `[ ]` / `[x]` / `[X]` / `[!]` のみ。
+- 認識 checkbox が **0 件**（通常 Markdown の誤指定・空ファイル・見出し/散文のみ）は ALL_DONE にせず
+  TaskListError（fail-closed → exit 2）。endless 開始時は checkbox を 1 件以上要求（P1-1・社長指示 2026-08-24）。
 - 未知の1文字マーカー（`[?]`・`[-]` 等）は**無視して ALL_DONE にせず** TaskListError（fail-closed）。
 - `[!]`（blocked）は**直下の子 `blocker:` 行が必須**。無ければ TaskListError。
 - Markdown コードフェンス（``` / ~~~、任意長）内の疑似 checkbox は無視。

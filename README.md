@@ -320,7 +320,8 @@ Claude 実装 ──▶ Codex レビュー
 - **タスクリストの記法（endless relay が厳密に読む）**: `- [ ]`=着手可、`- [x]`=完了、`- [!]`=**保留（人間対応・外部依存で
   AI だけでは進められない。直下に `blocker:` 理由）**。`[!]` は着手可に数えず、着手可 `- [ ]` が尽きて `- [!]` だけ残ると
   **HUMAN_REQUIRED として停止（exit 8）**し人間の対応を待ちます（無限往復させない）。認識記法は `[ ]`/`[x]`/`[X]`/`[!]` のみ
-  で、未知記法や `blocker:` 欠落は fail-closed（exit 2）。
+  で、未知記法・`blocker:` 欠落・**認識 checkbox が 0 件（`README.md` 等の誤指定・空ファイル・見出し/散文のみ）**は
+  設定不備として fail-closed（**exit 2**）。`- [x]`/`- [X]` だけが 1 件以上なら ALL_DONE（exit 0）。
 - 合図の判定は既定モードと同じ **最終メッセージの先頭行の sentinel 完全一致**です。4 つの合図
   （`[AIPAIR_REVIEW_OK]` ／ `[AIPAIR_NEXT]` ／ `[AIPAIR_ALL_DONE]` ／ `[AIPAIR_HUMAN_REQUIRED]`）はいずれも先頭行に
   単独で置かれた時だけ効きます。`[AIPAIR_ALL_DONE]` / `[AIPAIR_HUMAN_REQUIRED]` は **relay の task-list 分類が

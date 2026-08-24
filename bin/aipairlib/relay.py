@@ -78,6 +78,7 @@ Endless mode (--endless, opt-in; 既定は従来どおり停止ワードで終�
   次タスクの根拠は --task-list（既定 tasks/todo.md）の未チェック項目に限定し、
   リスト外の新規提案を禁じる文面を Codex へ送る（スコープ膨張の防止）。
   task-list の記法: [ ]=着手可 / [x]=完了 / [!]=人間対応・外部依存の保留（直下に blocker: 理由）。
+  認識 checkbox が 0 件（README 等の誤指定・空ファイル・見出し/散文のみ）は設定不備として exit 2（ALL_DONE にしない）。
   終端は上記2つ（ALL_DONE=exit 0 / HUMAN_REQUIRED=exit 8）。--max-rounds は安全キャップとして残る。
   --gate CMD（env AIPAIR_GATE）: 停止ワード検知後に CMD を --dir で実行し、exit 0 の時だけ停止／次タスクへ。
   失敗は出力の末尾を添えて Claude に差し戻す（--gate-rounds 回（既定 3）で exit 6）。未指定なら従来どおり。
