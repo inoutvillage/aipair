@@ -119,6 +119,13 @@ def classify(text):
         items.append((_indent_width(line), state, line,
                       (m.group("text") or "").strip(), blocker))
 
+    if not items:
+        # P1-1（社長指示 2026-08-24）: 認識できる checkbox が 1 件も無いファイル（通常 Markdown の誤指定・
+        # 空ファイル・見出し/散文のみ）は ALL_DONE にせず fail-closed（→ load_or_exit で exit 2）。
+        # 「読めない＝完了」で誤停止しないのと同じ理由。空を正式許可するなら将来 marker を導入する。
+        raise TaskListError(
+            "no recognized checkbox (`- [ ]` / `- [x]` / `- [!]`) found — task-list に見えない"
+            "（README 等の誤指定・空ファイル・見出し/散文のみ？）。endless は checkbox を 1 件以上要求する")
     ready = [it[2] for it in items if it[1] == "open"]
     blocked = [{"item": it[2], "blocker": it[4]} for it in items if it[1] == "blocked"]
     state = READY if ready else (BLOCKED if blocked else ALL_DONE)
