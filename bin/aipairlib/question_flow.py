@@ -13,8 +13,12 @@ tmux/ログには一切依存しない（banner は (level, text) の行デー�
 import collections
 
 from .corelib import hit_stop
+from .review_protocol import question_payload_text, QUESTION_RELAY_LIMIT
 
 QuestionDecision = collections.namedtuple("QuestionDecision", "action payload")
+# P1-3: 質問を自動中継してよいか（kind ∈ {relay, human_required}）。human_required は上限超過で
+# truncate せず停止する（level/log/banner は run() が出す）。relay は level/log/banner=None。
+QuestionRelay = collections.namedtuple("QuestionRelay", "kind level log banner")
 # run() が適用する結果。kind ∈ {retry_detect, human_required, back_to_wait, deliver}。
 #   level/log : 1 行ログ（未着色・run() が c(level, log) で出す）
 #   banner    : HUMAN_REQUIRED 停止時の (level|None, text) 行列（他は None）
@@ -41,6 +45,36 @@ def decide_question_action(texts, qdlg, human_required_phrases=()):
     if qdlg is None:
         return QuestionDecision("no_dialog", None)
     return QuestionDecision("deliver", text)
+
+
+def question_oversize_banner_lines(blocks, limit, actual, preview=200):
+    """P1-3: 質問が自動中継上限を超えたときの停止 banner を (level|None, text) 行列で返す（純粋）。
+    質問全文は載せず（長大なため）先頭のみ preview 文字だけ示す。"""
+    head = blocks[0] if blocks else ""
+    if len(head) > preview:
+        head = head[:preview] + "…"
+    return [(None, ""),
+            ("warn", "│ ■ 自動処理を停止しました"),
+            ("warn", f"│   理由: 質問内容が自動中継上限（{limit}字）を超えています（実 {actual}字）。"),
+            ("warn", "│         truncate すると Codex が不完全な質問に回答してしまうため、"
+                     "人間確認待ちで停止します。"),
+            ("warn", "│   質問（先頭のみ）:"),
+            ("dim", f"│     {head}"),
+            ("warn", "│   人間が Claude 側で回答した後、relay を再開してください。")]
+
+
+def decide_question_relay(blocks, limit=QUESTION_RELAY_LIMIT):
+    """Claude の質問を Codex へ自動中継してよいか判定する（P1-3・純粋・副作用なし）。
+
+    質問本文（`review_protocol.question_payload_text` と同一の組み立て）が limit を超えるなら、
+    **truncate せず** human_required（run() 側で exit 8）へ倒す — 不完全な質問を Codex に渡して
+    推測回答させない（社長指示: 完全な質問内容を取得できない場合は推測して進めない）。上限内は relay。"""
+    actual = len(question_payload_text(blocks))
+    if actual > limit:
+        return QuestionRelay("human_required", "warn",
+                             "◆ 質問内容が自動中継上限を超えたため人間確認待ちで停止します。",
+                             question_oversize_banner_lines(blocks, limit, actual))
+    return QuestionRelay("relay", None, None, None)
 
 
 def human_required_banner_lines(qs_blocks, rounds, exit_code):

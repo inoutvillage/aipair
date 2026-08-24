@@ -43,7 +43,7 @@ from .gate import gate_or_message
 from .corelib import hit_stop, oneline
 from .review_protocol import plan_poke_codex, question_poke_codex
 from .plan_flow import decide_plan_action
-from .question_flow import decide_question_action, handle_question_answer
+from .question_flow import decide_question_action, handle_question_answer, decide_question_relay
 from .endless_flow import (decide_endless_terminal, resolve_task_identity, advance_no_progress,  # noqa: F401
                            UNRESOLVED)
 from . import tasklist
@@ -56,6 +56,7 @@ EXIT_BLOCKED = 8
 BLOCKED_HR_REASON = "人間対応待ち（HUMAN_REQUIRED）"
 BLOCKED_NOPROGRESS_REASON = "進捗なし（BLOCKED / no-progress）"
 QUESTION_HR_REASON = "質問に人間判断が必要（HUMAN_REQUIRED）"    # P1-2: AskUserQuestion 経路の exit 8
+QUESTION_OVERSIZE_REASON = "質問が自動中継上限超過（HUMAN_REQUIRED）"    # P1-3: truncate せず停止
 
 
 class ResponseGate:
@@ -295,6 +296,14 @@ def no_progress_banner(np_state, rounds):
     print("\a", end="", flush=True)
 
 
+def print_banner(lines):
+    """(level|None, text) 行列を着色して出力し、最後にベルを鳴らす（level=None は無着色）。
+    banner の《文言》は question_flow 等の純 module 側で構築し、ここは表示だけ（P2-5）。"""
+    for lvl, line in lines:
+        print(c(lvl, line) if lvl else line, flush=True)
+    print("\a", end="", flush=True)
+
+
 class StateMachine:
     """aipair relay の状態機械本体（P2-1: relay.main() から切り出し）。claude / codex /
     codex_plan / codex_question の 4 state を回し、ターン完了検知→相手ペインへの poke／ダイアログ
@@ -515,6 +524,14 @@ class StateMachine:
                             if tracked["claude"]:
                                 tracked["claude"] = refresh_claude_lock(tracked["claude"], cwd, panes["claude"])
                             wait_heartbeat("Claude")
+                        elif (relay_decision := decide_question_relay(qs_blocks)).kind == "human_required":
+                            # P1-3: 質問本文が自動中継上限を超過 → truncate せず人間確認待ちで停止（exit 8）。
+                            # 不完全な質問を Codex に渡して推測回答させない（判定/banner は question_flow）。
+                            log(c(relay_decision.level, relay_decision.log))
+                            blocked_reason = QUESTION_OVERSIZE_REASON
+                            code = EXIT_BLOCKED
+                            print_banner(relay_decision.banner)
+                            break
                         else:
                             question_rounds += 1
                             log("◆ " + c("claude", "質問ダイアログ検知")
@@ -645,9 +662,7 @@ class StateMachine:
                             # task-list の [!] とは別経路（todo は一切変更しない）。
                             blocked_reason = QUESTION_HR_REASON
                             code = EXIT_BLOCKED
-                            for lvl, line in outcome.banner:
-                                print(c(lvl, line) if lvl else line, flush=True)
-                            print("\a", end="", flush=True)
+                            print_banner(outcome.banner)
                             break
                         if outcome.kind == "deliver":
                             if not send_question_answer(panes["claude"], qdlg, outcome.payload,
