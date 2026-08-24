@@ -2363,146 +2363,130 @@ class ResponseAttribution(unittest.TestCase):
 
 
 class EndlessScenarios(unittest.TestCase):
-    """§11 Case1-6（社長指示 2026-08-24 / `_reference/new-task.md`）。
+    """§11 Case1-6（社長指示 2026-08-24 / `_reference/new-task.md`）を **scripted fake で単一
+    `StateMachine.run()` を実駆動**し、分類推移・sentinel 処理・配達先/文面・最終 exit を固定する。
 
-    Case1/2/3/4/6 は **`StateMachine.run()` を実駆動**（tasklist 分類・set_pane_title・poke を mock）して
-    終端の戻り値（exit 0/8）と「停止後に poke しない／READY はループへ入る」を検証する。Case5（同一タスク
-    3 回で no-progress）は多ラウンドのループ駆動が必要なため、判定ロジック（advance_no_progress）と
-    exit 8 配線の source-check で担保する。"""
-
-    def _run(self, cls, sg=None):
-        """startup 分類 cls で run() を実駆動し (code, poke.called) を返す。sg 未指定なら loop skip 用の
-        ダミー、_Guard を渡せば READY 経路でループ突入を marker で捕捉できる。"""
-        import types
-        sm_mod = relay.state_machine
-        a = types.SimpleNamespace(start_side="claude", settle=0, poll=0, max_rounds=20,
-                                  endless=True, task_list="tasks/todo.md")
-        sm = sm_mod.StateMachine(
-            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x",
-            tracked={"claude": "a", "codex": "b"}, claude_seen=set(), codex_seen=set(), baseline=0.0,
-            sg=(sg or object()), rg=object(), bw=60, poke_codex="pc", poke_codex_next="pcn",
-            poke_claude="pcl", poke_claude_pass="pcp", poke_claude_next="pcnx",
-            stop_phrases=["[AIPAIR_REVIEW_OK]"], next_ask_phrases=["[AIPAIR_NEXT]"],
-            all_done_phrases=["[AIPAIR_ALL_DONE]"], human_required_phrases=["[AIPAIR_HUMAN_REQUIRED]"])
-        with mock.patch.object(sm_mod.tasklist, "load_or_exit", return_value=cls), \
-             mock.patch.object(sm_mod, "set_pane_title"), \
-             mock.patch.object(sm_mod, "poke") as poke_mock:
-            code = sm.run()
-        return code, poke_mock.called
+    `_drive` が sg.guard=False・応答完了・turn_texts・task-list 分類・poke を scenario 順に返し、
+    各ターン（Claude/Codex）を実際のループで処理させる。poke は (pane, 文面) の履歴で検証する。"""
 
     def _cls(self, body):
         return relay.state_machine.tasklist.classify(body)
 
-    def test_case1_ready_enters_loop_and_continues(self):
-        # [ ]+[x] → 分類 READY → run() はループへ入る（起動時に skip・return しない）。
-        class _G:
-            def guard(self):
-                raise RuntimeError("LOOP-ENTERED")
-        with self.assertRaisesRegex(RuntimeError, "LOOP-ENTERED"):
-            self._run(self._cls("- [ ] task A\n- [x] task B\n"), sg=_G())
-
-    def _drive_codex_turn(self, startup_cls, terminal_cls, codex_texts):
-        """start_side=codex で run() をループに入れ、Codex の 1 ターン（codex_texts）を実処理させて
-        終端まで駆動する scripted fake。startup 分類→(ループ突入)→終端点で terminal_cls を返す。
-        戻り値 (code, poke.called)。ターン検知・応答完了・turn_texts・分類・poke を scenario 順に返す。"""
+    def _drive(self, start_side, startup_cls, turns):
+        """turns = [(agent, [texts], cls_or_None), ...] を順に処理。cls はその Codex ターンの分類呼び出しが
+        返す値（None は据え置き）。startup 分類は startup_cls。run() の code と poke の (pane, msg) 履歴を返す。"""
         import types
         sm = relay.state_machine
-        a = types.SimpleNamespace(start_side="codex", settle=0, poll=0, max_rounds=20, endless=True,
-                                  task_list="tasks/todo.md", stop_side="codex", no_plan_review=True,
-                                  no_question_relay=True, plan_rounds=5, question_rounds=5, plan_ok="[P]")
-        rg = types.SimpleNamespace(response_done=lambda who, path, done: done, noshow=lambda who: False,
-                                   probe=None, probe_ts_cache=0.0)
-        sg = types.SimpleNamespace(guard=lambda: False)
-        cls_seq = iter([startup_cls, terminal_cls, terminal_cls, terminal_cls])
-        machine = sm.StateMachine(
-            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x",
-            tracked={"claude": "c.jsonl", "codex": "x.jsonl"}, claude_seen=set(), codex_seen=set(),
-            baseline=0.0, sg=sg, rg=rg, bw=60, poke_codex="pc", poke_codex_next="pcn",
-            poke_claude="pcl", poke_claude_pass="pcp", poke_claude_next="pcnx",
-            stop_phrases=["[AIPAIR_REVIEW_OK]"], next_ask_phrases=["[AIPAIR_NEXT]"],
-            all_done_phrases=["[AIPAIR_ALL_DONE]"], human_required_phrases=["[AIPAIR_HUMAN_REQUIRED]"])
-        with mock.patch.object(sm.tasklist, "load_or_exit", side_effect=lambda *a, **k: next(cls_seq)), \
-             mock.patch.object(sm, "set_pane_title"), \
-             mock.patch.object(sm, "codex_done_ts", return_value=100.0), \
-             mock.patch.object(sm, "turn_texts", return_value=list(codex_texts)), \
-             mock.patch.object(sm, "poke") as poke_mock, \
-             mock.patch("time.sleep"):
-            code = machine.run()
-        return code, poke_mock.called
-
-    def test_case2_all_done_through_loop_exits_0_no_poke(self):
-        # run() が READY でループへ入り、Codex ターンで [AIPAIR_ALL_DONE]＋分類 ALL_DONE → exit 0・poke 不発。
-        code, poked = self._drive_codex_turn(self._cls("- [ ] A\n"), self._cls("- [x] A\n"),
-                                             ["[AIPAIR_ALL_DONE]"])
-        self.assertEqual(code, 0)
-        self.assertFalse(poked)
-
-    def test_case3_human_required_through_loop_exits_8_no_poke(self):
-        # ループ内で [AIPAIR_HUMAN_REQUIRED]＋分類 BLOCKED → exit 8・停止後 poke 不発。
-        code, poked = self._drive_codex_turn(
-            self._cls("- [ ] A\n"), self._cls("- [!] human\n  - blocker: repo admin\n"),
-            ["[AIPAIR_HUMAN_REQUIRED]"])
-        self.assertEqual(code, relay.state_machine.EXIT_BLOCKED)
-        self.assertFalse(poked)
-        self.assertIn("再指示しない", relay.review_protocol.endless_poke_codex_next(
-            "t.md", "[AIPAIR_ALL_DONE]", "[AIPAIR_HUMAN_REQUIRED]"))
-
-    def test_case4_ready_then_human_required_via_run(self):
-        # [ ]+[!] は READY（A 先行）→ run() はループへ入る。A 完了後は BLOCKED → run() exit 8。
-        class _G:
-            def guard(self):
-                raise RuntimeError("LOOP-ENTERED")
-        with self.assertRaisesRegex(RuntimeError, "LOOP-ENTERED"):
-            self._run(self._cls("- [ ] A\n- [!] human\n  - blocker: approval\n"), sg=_G())
-        code, poked = self._run(self._cls("- [x] A\n- [!] human\n  - blocker: approval\n"))
-        self.assertEqual(code, relay.state_machine.EXIT_BLOCKED)
-        self.assertFalse(poked)
-
-    def test_case5_no_progress_through_loop_exits_8(self):
-        # ループを実駆動: 毎ラウンド Claude が [AIPAIR_NEXT]→Codex が同じ `- [ ] A` を割当（task-list は
-        # 不変）。同一識別子＋snapshot hash 不変が 3 回連続で no-progress → run() が exit 8。3 回目の割当で
-        # 停止し、その後 Claude へ配達しないこと（poke 履歴）まで検証する。
-        import types
-        sm = relay.state_machine
-        a = types.SimpleNamespace(start_side="claude", settle=0, poll=0, max_rounds=20, endless=True,
+        a = types.SimpleNamespace(start_side=start_side, settle=0, poll=0, max_rounds=20, endless=True,
                                   task_list="tasks/todo.md", stop_side="codex", no_plan_review=True,
                                   no_question_relay=True, plan_rounds=5, question_rounds=5, plan_ok="[P]")
         rg = types.SimpleNamespace(response_done=lambda who, path, done: done, noshow=lambda who: False,
                                    arm=lambda nonce: None, probe=None, probe_ts_cache=0.0)
         sg = types.SimpleNamespace(guard=lambda: False)
-        ready = self._cls("- [ ] A\n- [x] b\n")            # 毎回同じ分類（hash 不変・READY・A が着手可）
-        texts_for = {"claude": ["[AIPAIR_NEXT]"], "codex": ["- [ ] A"]}
+        box = {"cls": startup_cls}
+        turn_iter = iter(turns)
+
+        def _turn_texts(who, *aa, **kk):
+            agent, texts, cls = next(turn_iter)
+            self.assertEqual(agent, who, "turn script mismatch")
+            if cls is not None:
+                box["cls"] = cls
+            return list(texts)
+
         machine = sm.StateMachine(
             a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x",
             tracked={"claude": "c.jsonl", "codex": "x.jsonl"}, claude_seen=set(), codex_seen=set(),
-            baseline=0.0, sg=sg, rg=rg, bw=60, poke_codex="pc", poke_codex_next="pcn",
-            poke_claude="pcl", poke_claude_pass="pcp", poke_claude_next="pcnx",
+            baseline=0.0, sg=sg, rg=rg, bw=60, poke_codex="POKE_CODEX", poke_codex_next="POKE_CODEX_NEXT",
+            poke_claude="POKE_CLAUDE", poke_claude_pass="POKE_CLAUDE_PASS", poke_claude_next="POKE_CLAUDE_NEXT",
             stop_phrases=["[AIPAIR_REVIEW_OK]"], next_ask_phrases=["[AIPAIR_NEXT]"],
             all_done_phrases=["[AIPAIR_ALL_DONE]"], human_required_phrases=["[AIPAIR_HUMAN_REQUIRED]"])
-        with mock.patch.object(sm.tasklist, "load_or_exit", side_effect=lambda *a, **k: ready), \
+        with mock.patch.object(sm.tasklist, "load_or_exit", side_effect=lambda *a, **k: box["cls"]), \
              mock.patch.object(sm, "set_pane_title"), \
              mock.patch.object(sm, "claude_done_ts", return_value=100.0), \
              mock.patch.object(sm, "codex_done_ts", return_value=100.0), \
              mock.patch.object(sm, "claude_matches_pane", return_value=True), \
-             mock.patch.object(sm, "turn_texts", side_effect=lambda who, *a, **k: list(texts_for[who])), \
+             mock.patch.object(sm, "turn_texts", side_effect=_turn_texts), \
              mock.patch.object(sm, "poke", return_value=object()) as poke_mock, \
              mock.patch("time.sleep"):
             code = machine.run()
-        self.assertEqual(code, relay.state_machine.EXIT_BLOCKED)   # ループ 3 ラウンドで no-progress → exit 8
-        # 配達履歴: 各ラウンドの Claude→Codex（poke_codex_next）は 3 回、Codex→Claude は 3 回目で
-        # no-progress 停止のため 2 回のみ（3 回目以降 Claude へ配達しない）。
-        self.assertEqual(poke_mock.call_count, 5)
+        pokes = [(c.args[0], c.args[1]) for c in poke_mock.call_args_list]
+        return code, pokes
 
-    def test_case6_blocked_present_but_ready_enters_loop(self):
-        # [!] があっても別の [ ] があれば READY → run() はループへ入る（まだ HUMAN_REQUIRED にしない）。
-        cls = self._cls("- [ ] A\n- [!] human\n  - blocker: x\n")
-        self.assertEqual(cls["state"], relay.state_machine.tasklist.READY)
-        self.assertEqual(len(cls["blocked"]), 1)
-        class _G:
-            def guard(self):
-                raise RuntimeError("LOOP-ENTERED")
-        with self.assertRaisesRegex(RuntimeError, "LOOP-ENTERED"):
-            self._run(cls, sg=_G())
+    # 配達先/文面の定数（_drive の poke_* に対応）
+    TO_CODEX_NEXT = ("%2", "POKE_CODEX_NEXT")     # Claude→Codex（次タスク依頼）
+    TO_CLAUDE_NEXT = ("%1", "POKE_CLAUDE_NEXT")   # Codex→Claude（次タスク着手）
+
+    def test_case1_ready_selects_and_continues_then_all_done(self):
+        # [ ]+[x]（READY）: Claude [AIPAIR_NEXT] → Codex が `- [ ] A` を選択 → Claude へ POKE_CLAUDE_NEXT
+        # → 継続。次ラウンドで ALL_DONE → exit 0。
+        ready = self._cls("- [ ] A\n- [x] b\n")
+        alldone = self._cls("- [x] A\n- [x] b\n")
+        code, pokes = self._drive("claude", ready, [
+            ("claude", ["[AIPAIR_NEXT]"], None),
+            ("codex", ["- [ ] A"], ready),          # Codex が着手可 A を選択（no-progress round1・継続）
+            ("claude", ["[AIPAIR_NEXT]"], None),
+            ("codex", ["[AIPAIR_ALL_DONE]"], alldone),   # → exit 0
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(pokes, [self.TO_CODEX_NEXT, self.TO_CLAUDE_NEXT, self.TO_CODEX_NEXT])
+
+    def test_case2_all_done_through_loop_exits_0_no_poke(self):
+        ready = self._cls("- [ ] A\n")
+        code, pokes = self._drive("codex", ready, [("codex", ["[AIPAIR_ALL_DONE]"], self._cls("- [x] A\n"))])
+        self.assertEqual(code, 0)
+        self.assertEqual(pokes, [])                  # 終端の前に poke しない
+
+    def test_case3_human_required_through_loop_exits_8_no_poke(self):
+        ready = self._cls("- [ ] A\n")
+        blocked = self._cls("- [!] human\n  - blocker: repo admin\n")
+        code, pokes = self._drive("codex", ready, [("codex", ["[AIPAIR_HUMAN_REQUIRED]"], blocked)])
+        self.assertEqual(code, relay.state_machine.EXIT_BLOCKED)
+        self.assertEqual(pokes, [])
+        self.assertIn("再指示しない", relay.review_protocol.endless_poke_codex_next(
+            "t.md", "[AIPAIR_ALL_DONE]", "[AIPAIR_HUMAN_REQUIRED]"))
+
+    def test_case4_ready_then_human_required_same_run(self):
+        # 同一 run() 内で READY→BLOCKED 遷移: round1 は A を選択して継続、round2 は A 完了で BLOCKED →
+        # [AIPAIR_HUMAN_REQUIRED] を分類が支持 → exit 8。
+        ready = self._cls("- [ ] A\n- [!] human\n  - blocker: approval\n")
+        blocked = self._cls("- [x] A\n- [!] human\n  - blocker: approval\n")
+        code, pokes = self._drive("claude", ready, [
+            ("claude", ["[AIPAIR_NEXT]"], None),
+            ("codex", ["- [ ] A"], ready),            # READY: A を選択・継続
+            ("claude", ["[AIPAIR_NEXT]"], None),
+            ("codex", ["[AIPAIR_HUMAN_REQUIRED]"], blocked),   # BLOCKED: → exit 8
+        ])
+        self.assertEqual(code, relay.state_machine.EXIT_BLOCKED)
+        self.assertEqual(pokes, [self.TO_CODEX_NEXT, self.TO_CLAUDE_NEXT, self.TO_CODEX_NEXT])
+
+    def test_case5_no_progress_through_loop_exits_8(self):
+        # 毎ラウンド Claude [AIPAIR_NEXT]→Codex が同じ `- [ ] A` を割当（task-list 不変）を 3 ラウンド実駆動。
+        # 同一識別子＋snapshot hash 不変が 3 回連続で no-progress → exit 8。配達履歴（pane/文面の順序）を固定。
+        ready = self._cls("- [ ] A\n- [x] b\n")
+        code, pokes = self._drive("claude", ready, [
+            ("claude", ["[AIPAIR_NEXT]"], None), ("codex", ["- [ ] A"], ready),   # round1
+            ("claude", ["[AIPAIR_NEXT]"], None), ("codex", ["- [ ] A"], ready),   # round2
+            ("claude", ["[AIPAIR_NEXT]"], None), ("codex", ["- [ ] A"], ready),   # round3 → stop
+        ])
+        self.assertEqual(code, relay.state_machine.EXIT_BLOCKED)
+        # Codex 向け 3 回（POKE_CODEX_NEXT）・Claude 向け 2 回（POKE_CLAUDE_NEXT）＝3 回目以降 Claude へ配達しない
+        self.assertEqual(pokes, [self.TO_CODEX_NEXT, self.TO_CLAUDE_NEXT,
+                                 self.TO_CODEX_NEXT, self.TO_CLAUDE_NEXT,
+                                 self.TO_CODEX_NEXT])
+
+    def test_case6_ready_rejects_human_required_then_continues(self):
+        # [!] があっても着手可 [ ] があれば READY: Codex が [AIPAIR_HUMAN_REQUIRED] を出しても分類 READY が
+        # 支持せず reject → 継続（Claude へ POKE_CLAUDE_NEXT）。次ラウンド ALL_DONE → exit 0（exit 8 にしない）。
+        ready = self._cls("- [ ] A\n- [!] human\n  - blocker: x\n")
+        alldone = self._cls("- [x] A\n- [x] human\n")
+        code, pokes = self._drive("claude", ready, [
+            ("claude", ["[AIPAIR_NEXT]"], None),
+            ("codex", ["[AIPAIR_HUMAN_REQUIRED]"], ready),   # READY → reject → 継続
+            ("claude", ["[AIPAIR_NEXT]"], None),
+            ("codex", ["[AIPAIR_ALL_DONE]"], alldone),       # → exit 0
+        ])
+        self.assertEqual(code, 0)                    # 誤 HUMAN_REQUIRED では exit 8 にしない
+        self.assertEqual(pokes, [self.TO_CODEX_NEXT, self.TO_CLAUDE_NEXT, self.TO_CODEX_NEXT])
 
 
 if __name__ == "__main__":
