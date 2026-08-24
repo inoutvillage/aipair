@@ -1,3 +1,62 @@
+# aipair 改修 その2（社長指示 2026-08-24）— 正しさ・安全性を新機能より優先
+
+> **基本方針**: (1) task-list を「唯一の権威」にした以上、**「完了 `[x]`」を書き込むタイミングも
+> レビュー合格後に限定**する。(2) **AI が判断できない・入力が欠落・完全な質問を取得できない場合は、
+> 推測して進めず HUMAN_REQUIRED へ倒す**。優先順位: P0-1〜P1-3（自律運転の正しさ・安全性）を最優先。
+> HUMAN_REQUIRED / BLOCKED / no-progress の仕組み自体は維持する。
+
+## P0-1 — レビュー前の `[x]` 化を廃止（完了確定をレビュー合格後に限定）
+- [x] `endless_poke_claude_next()` から「終わったら該当項目を `- [x]` にチェック」指示を**削除**（実装しても
+      `[ ]` のまま。レビュー未完了で `[x]` にしない）。`[ ]`→`[!]`（blocker 併記）は作業中も**許可を維持**。
+- [x] `[x]` 化は `endless_poke_claude_pass()`（Codex レビュー合格後）**だけ**で行わせる（既存の「完了項目を `[x]`」を活かす）。
+- [x] 回帰テスト: Case A（実装完了・レビュー前→`[ ]`のまま）/ B（レビューNG→`[ ]`のまま）/ C（レビューOK→次ターンで`[x]`）
+      / D（実装後・レビュー前に relay 再起動→**ALL_DONE にならない**＝分類 READY）。
+
+## P1-1 — checkbox 0 件を ALL_DONE 扱いしない（誤 task-list の誤完了防止）
+- [ ] classifier: 認識 checkbox が **0 件なら ALL_DONE でなく TaskListError**（→ load_or_exit で exit 2）。
+      少なくとも endless 開始時は認識可能な checkbox ≥1 を要求。空許可の明示 marker は初版では未導入。
+- [ ] 回帰テスト: 通常 Markdown（README 等）/ 空ファイル / 見出し・散文のみ → exit 2。`[x]`のみ→ALL_DONE・
+      `[!]`のみ→BLOCKED・`[ ]`あり→READY は不変。
+
+## P1-2 — AskUserQuestion に HUMAN_REQUIRED 経路を追加（別経路・§P1-2）
+- [ ] Codex への質問 prompt に「人間の承認・権限・意思決定・秘密情報・課金・不可逆操作が必要なら
+      最終回答1行目に `[AIPAIR_HUMAN_REQUIRED]` を単独で」を追加（既存 sentinel を共用）。
+- [ ] StateMachine の `codex_question` state で `[AIPAIR_HUMAN_REQUIRED]` を検出したら **Claude へ回答を送らず**、
+      exit 8・reason=HUMAN_REQUIRED で停止。banner に質問内容を表示。
+- [ ] task-list の `[!]` とは**別経路**（質問停止で todo を勝手に `[!]` にしない）。回帰テスト追加。
+
+## P1-3 — 質問 truncate を fail-closed 化
+- [ ] 質問 payload が自動中継上限（現 3000 字）を超えたら **truncate せず HUMAN_REQUIRED（exit 8）**。
+      ログ「質問内容が自動中継上限を超えたため人間確認待ちで停止」。回帰テスト追加。
+
+## P2-1 — no-progress task identity の安定化（不可視空白に依存しない）
+- [ ] インデント・末尾空白・hard-break スペースに依存しない identity へ。**要 CEO 判断**: 案A（stable task ID
+      `- [ ] [T001] …`）か案B（内部 canonical key: 先頭 indent 除去・trailing 除去・checkbox 記法正規化・NFC）。
+      同一本文複数は `UNRESOLVED`（fail-closed）維持。3回連続で exit 8 は不変。
+
+## P2-2 — main と release の version を区別
+- [ ] release 直後の main を dev version（`0.2.0.dev0`）に。可能なら `+g<commit>` を付す。
+
+## P2-3 — CHANGELOG `[Unreleased]` に今回の変更を記載
+- [ ] Added/Changed/Fixed（READY/BLOCKED/ALL_DONE・`[!]`・`[AIPAIR_HUMAN_REQUIRED]`・no-progress/exit 8・
+      分類が終端の権威・人間依存タスクのみで spin しない）を人間が追える粒度で記載。
+
+## P2-4 — Quick Start を Stable / Development に分離
+- [ ] README: stable（`--branch v0.1.0`）/ development（main）を分け、**main = development version** を冒頭に明示。
+
+## P2-5 — state_machine 再肥大化の抑制（今回追加分を別 module へ）
+- [ ] 今回追加する question HUMAN_REQUIRED / question payload guard / task completion 系を、`state_machine.py`
+      に直接分岐を足さず別 module（例 `question_controller` / `endless_controller`）へ切り出す。run() は state 判定＋
+      handler 呼び出し＋next state＋exit code に寄せる。**P1-2/P1-3 実装時からこの原則で追加する**。
+
+## P3 — 同一 CWD 複数 pair（今回は README 明示のみ・将来対応）
+- [ ] README の制約に「1 canonical CWD = 1 aipair session」を明示。並列編集は git worktree 分離を推奨。
+
+### 依存順
+P0-1 → P1-1 → P1-2（P2-5 の module 分離を適用）→ P1-3 → P2-1（要 CEO 判断）→ P2-2 → P2-3 → P2-4 → P2-5 仕上げ → P3。
+
+---
+
 # endless モード BLOCKED / HUMAN_REQUIRED 対応（社長指示 2026-08-24）— `_reference/new-task.md`
 
 > **問題**: endless モードのタスク状態が実質「未完了/完了」の2値しかなく、人間対応・外部依存で

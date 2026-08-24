@@ -2029,6 +2029,10 @@ class LoglibStandalone(unittest.TestCase):
             self.assertIn("[!]", txt)
             self.assertIn("blocker:", txt)
             self.assertIn("[AIPAIR_NEXT]", txt)
+        # P0-1（社長指示 2026-08-24）: 実装しただけでは [x] にしない。[x] 化はレビュー合格後の pass 文面だけ。
+        self.assertNotIn("`- [x]` にチェック", _next)     # Case A: next（着手指示）は完了チェックを指示しない
+        self.assertIn("この時点では `- [x]` にしない", _next)
+        self.assertIn("完了した項目を `- [x]` にチェック", _pass)   # Case C: pass（レビュー合格）だけが [x] 化
         # §9: endless 文面は「人間に伝言を頼むな」が [!]/HUMAN_REQUIRED エスカレーションを妨げないと明記。
         for txt in (_pass, _next, _codex_next):
             self.assertIn("妨げない", txt)
@@ -2474,6 +2478,14 @@ class EndlessScenarios(unittest.TestCase):
         self.assertEqual(pokes, [self.TO_CODEX_NEXT, self.TO_CLAUDE_NEXT,
                                  self.TO_CODEX_NEXT, self.TO_CLAUDE_NEXT,
                                  self.TO_CODEX_NEXT])
+
+    def test_p0_1_case_d_unreviewed_task_stays_ready_on_restart(self):
+        # P0-1 Case D（社長指示 2026-08-24）: 実装後・レビュー前は task が [ ] のまま（next 文面は [x] 化を
+        # 指示しない）→ relay 再起動時の分類は READY で ALL_DONE にならない。
+        tl = relay.state_machine.tasklist
+        cls = self._cls("- [ ] task A（実装済み・未レビュー）\n- [x] task B（レビュー済み）\n")
+        self.assertEqual(cls["state"], tl.READY)
+        self.assertNotEqual(cls["state"], tl.ALL_DONE)
 
     def test_case6_ready_rejects_human_required_then_reselects(self):
         # [!] があっても着手可 [ ] があれば READY: Codex が [AIPAIR_HUMAN_REQUIRED] を出しても分類 READY が
