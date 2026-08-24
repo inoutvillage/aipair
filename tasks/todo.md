@@ -29,7 +29,7 @@
 
 ### Phase 3 — Codex/Claude の選択ロジック・プロンプト（§4/§5/§9）
 - [x] **Codex 次タスク選択プロンプト**〔`endless_poke_codex_next` に human_required 引数追加・①②③順・再指示禁止〕: `[ ]`優先→1件指示 / `[ ]`無→`[!]`確認→`[!]`あれば `[AIPAIR_HUMAN_REQUIRED]` / どちらも無→`[AIPAIR_ALL_DONE]`。**`[!]` を再指示しない**。
-- [ ] **Claude プロンプト**: 実行不能（承認/認証/管理者/外部反映/実機/環境）を検出したら `[ ]`→`[!]`＋`blocker:` 理由に更新してから、他の `[ ]` を続行 or 手詰まり宣言。
+- [x] **Claude プロンプト**〔`endless_poke_claude_pass`/`_next` に [!] 化指示〕: 実行不能（承認/認証/管理者/外部反映/実機/環境）を検出したら `[ ]`→`[!]`＋`blocker:` 理由に更新してから、他の `[ ]` を続行 or 手詰まり宣言。
 - [ ] **§9 修正**: 「人間に伝言を頼むな」は通常レビュー往復のみ維持。**HUMAN_REQUIRED まで人間へのエスカレーションを禁止しない**（「安易に人間へ投げるな」と「人間しか解けない時も止まるな」を混同しない）。
 - [ ] **配布済みドキュメントの旧契約を更新**（新契約と矛盾するため必須）: `bin/aipairlib/relay.py` の help（`:58-73`「終端は Codex の --all-done 宣言のみ」）、`bin/aipair` のコメント・初期 title（`:278-286`）、`templates/claude-md-block.md`、`.claude/skills/aipair-relay/SKILL.md`、`.claude/skills/aipair-setup/SKILL.md` から**「終端は ALL_DONE のみ」を削除**し、**task-list 分類（READY/BLOCKED/ALL_DONE）＋ HUMAN_REQUIRED 終端＋ exit 8** を記載。
 

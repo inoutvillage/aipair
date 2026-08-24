@@ -1902,7 +1902,12 @@ class LoglibStandalone(unittest.TestCase):
         self.assertIn("[AIPAIR_HUMAN_REQUIRED]", _codex_next)          # §4: [!] のみ残なら HUMAN_REQUIRED
         self.assertIn("【1行目】", _codex_next)                          # シグナルは 1行目に単独
         self.assertIn("再指示しない", _codex_next)                       # [!] は AI では進められない→再指示禁止
-        self.assertIn("[AIPAIR_NEXT]", rp.endless_poke_claude_pass("tasks/todo.md", "[AIPAIR_NEXT]"))
+        _pass = rp.endless_poke_claude_pass("tasks/todo.md", "[AIPAIR_NEXT]")
+        self.assertIn("[AIPAIR_NEXT]", _pass)
+        # §5: 実行不能を検出したら [ ]→[!]＋blocker を指示（両 Claude 文面）
+        for txt in (_pass, rp.endless_poke_claude_next("tasks/todo.md")):
+            self.assertIn("[!]", txt)
+            self.assertIn("blocker:", txt)
         self.assertIn("[AIPAIR_PLAN_APPROVED]", rp.plan_poke_codex("p.md", "[AIPAIR_PLAN_APPROVED]"))
         # relay re-exports the same objects (call sites unchanged)
         self.assertIs(relay.default_poke_codex, rp.default_poke_codex)
