@@ -1769,23 +1769,28 @@ class QuestionRelayDecision(unittest.TestCase):
         self.assertEqual(relay.decide_question_action([""], qdlg, HR).action, "no_text")
 
     def test_relay_length_gate(self):
-        # P1-3: 質問本文が自動中継上限を超えたら truncate せず human_required。上限内は relay。
+        # P1-3: 質問本文（payload）が自動中継上限を超えたら truncate せず human_required。上限内は relay。
         from aipairlib import question_flow
         from aipairlib.review_protocol import QUESTION_RELAY_LIMIT, question_payload_text
         self.assertEqual(question_flow.decide_question_relay(["短い質問"]).kind, "relay")
-        # ちょうど上限は relay、+1 で human_required（境界）
-        at = "x" * QUESTION_RELAY_LIMIT
-        self.assertEqual(len(question_payload_text([at])), QUESTION_RELAY_LIMIT + len("◆1問目: "))
-        over = question_flow.decide_question_relay([at])   # プレフィックス分で既に超過
+        # 境界は **payload 全体（プレフィックス込み）** で判定する。ブロック本体を調整して
+        # payload がちょうど LIMIT／LIMIT+1 になるケースを作り、relay / human_required を明示固定する。
+        prefix = len(question_payload_text([""]))       # "◆1問目: " の長さ
+        at_block = "x" * (QUESTION_RELAY_LIMIT - prefix)
+        over_block = "x" * (QUESTION_RELAY_LIMIT - prefix + 1)
+        self.assertEqual(len(question_payload_text([at_block])), QUESTION_RELAY_LIMIT)       # ちょうど 3000
+        self.assertEqual(len(question_payload_text([over_block])), QUESTION_RELAY_LIMIT + 1)  # 3001
+        self.assertEqual(question_flow.decide_question_relay([at_block]).kind, "relay")          # 3000 → relay
+        over = question_flow.decide_question_relay([over_block])                                 # 3001 → HR
         self.assertEqual(over.kind, "human_required")
         self.assertIsNotNone(over.banner)
         # banner は全文を載せず先頭 preview のみ（省略記号）＋実長を表示
         flat = "\n".join(t for _l, t in over.banner)
         self.assertIn("自動中継上限", flat)
         self.assertIn("…", flat)
-        self.assertLess(len(flat), 1200)               # 4000 字の質問全文は載らない
-        # 明確に上限内なら relay（level/log/banner は None）
-        ok = question_flow.decide_question_relay(["a"])
+        self.assertLess(len(flat), 1200)               # 3001 字の質問全文は載らない
+        # relay のときは level/log/banner が None
+        ok = question_flow.decide_question_relay([at_block])
         self.assertEqual((ok.kind, ok.level, ok.log, ok.banner), ("relay", None, None, None))
 
 
