@@ -15,10 +15,22 @@ def plan_poke_codex(plan_path, ok):
             f"（同じ行に他の文字を書かず）出力してください。否定文・説明の中に書いても承認にはなりません。")
 
 
-def question_poke_codex(blocks, human_required, limit=3000):
-    qtext = " ".join(f"◆{i}問目: {b}" for i, b in enumerate(blocks, 1))
-    if len(qtext) > limit:
-        qtext = qtext[: limit - 1] + "…"
+# 自動中継できる質問本文（qtext）の最大文字数。超過時は **truncate せず** HUMAN_REQUIRED（exit 8）へ
+# 倒す（P1-3・社長指示 2026-08-24: 完全な質問を取得できないなら推測で進めない）。判定は
+# question_flow.decide_question_relay、上限超過の停止は state_machine（claude state）が行う。
+QUESTION_RELAY_LIMIT = 3000
+
+
+def question_payload_text(blocks):
+    """質問ブロック列 → Codex へ渡す質問本文（qtext）。長さ判定（P1-3）と poke 文面で
+    **同一の組み立て**を使うため関数化する（片方だけ変えて上限判定がズレるのを防ぐ）。"""
+    return " ".join(f"◆{i}問目: {b}" for i, b in enumerate(blocks, 1))
+
+
+def question_poke_codex(blocks, human_required):
+    # P1-3: ここでは truncate しない。上限超過は呼び出し前に decide_question_relay が human_required へ
+    # 倒す（不完全な質問を Codex に渡して推測回答させない）。この文面は「上限内」の質問だけに使う。
+    qtext = question_payload_text(blocks)
     # P1-2: human_required（sentinel トークン）が与えられた時だけ HUMAN_REQUIRED 経路を案内する。
     # 通常モードで --human-required を空にした場合は None が来る → その場合は案内しない。
     hr = ("⚠ ただし、人間の承認・権限・意思決定・秘密情報の入力・課金・契約・本番操作・不可逆操作が"

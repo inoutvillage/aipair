@@ -533,10 +533,13 @@ class QuestionDialog(unittest.TestCase):
         self.assertIn("Pick a database", relay.dialoglib._question_block(screen))
         self.assertIsNone(relay.dialoglib._question_block("no footer here\n1. a\n2. b\n"))
 
-    def test_poke_text_is_capped(self):
-        text = relay.question_poke_codex(["q" * 5000], "[AIPAIR_HUMAN_REQUIRED]", limit=300)
-        self.assertLess(len(text), 900)
-        self.assertIn("…", text)
+    def test_poke_does_not_truncate_question_body(self):
+        # P1-3: question_poke_codex は truncate しない（上限超過は decide_question_relay が事前に停止）。
+        # payload 全文がそのまま含まれ、省略記号は入らない。
+        body = "q" * 5000
+        text = relay.question_poke_codex([body], "[AIPAIR_HUMAN_REQUIRED]")
+        self.assertIn(body, text)
+        self.assertNotIn("…", text)
 
     def test_poke_offers_human_required_when_token_given(self):
         # P1-2: sentinel トークンが与えられたら HUMAN_REQUIRED 経路（1行目に単独出力）を案内する。
@@ -1765,6 +1768,26 @@ class QuestionRelayDecision(unittest.TestCase):
         # 空本文は HR より優先（no_text）
         self.assertEqual(relay.decide_question_action([""], qdlg, HR).action, "no_text")
 
+    def test_relay_length_gate(self):
+        # P1-3: 質問本文が自動中継上限を超えたら truncate せず human_required。上限内は relay。
+        from aipairlib import question_flow
+        from aipairlib.review_protocol import QUESTION_RELAY_LIMIT, question_payload_text
+        self.assertEqual(question_flow.decide_question_relay(["短い質問"]).kind, "relay")
+        # ちょうど上限は relay、+1 で human_required（境界）
+        at = "x" * QUESTION_RELAY_LIMIT
+        self.assertEqual(len(question_payload_text([at])), QUESTION_RELAY_LIMIT + len("◆1問目: "))
+        over = question_flow.decide_question_relay([at])   # プレフィックス分で既に超過
+        self.assertEqual(over.kind, "human_required")
+        self.assertIsNotNone(over.banner)
+        # banner は全文を載せず先頭 preview のみ（省略記号）＋実長を表示
+        flat = "\n".join(t for _l, t in over.banner)
+        self.assertIn("自動中継上限", flat)
+        self.assertIn("…", flat)
+        self.assertLess(len(flat), 1200)               # 4000 字の質問全文は載らない
+        # 明確に上限内なら relay（level/log/banner は None）
+        ok = question_flow.decide_question_relay(["a"])
+        self.assertEqual((ok.kind, ok.level, ok.log, ok.banner), ("relay", None, None, None))
+
 
 class DialogSendScrape(unittest.TestCase):
     """aipairlib.dialoglib: multi-tab scrape, capture failure, plan revise/approve, question
@@ -2656,6 +2679,15 @@ class EndlessScenarios(unittest.TestCase):
         # Codex への回答依頼（question_poke_codex）は 1 回だけ、Claude への配達は無い
         self.assertEqual([p[0] for p in pokes], ["%2"])
         self.assertNotIn("%1", [p[0] for p in pokes])
+
+    def test_question_oversize_stops_at_exit_8_without_poking_codex(self):
+        # P1-3: 質問本文が自動中継上限を超えたら、truncate も Codex への回答依頼もせず exit 8 で停止。
+        # 不完全な質問で Codex に推測回答させない。banner に上限超過を表示。
+        code, pokes, sqa, out = self._drive_question([], ["Pick a very long option " * 200])
+        self.assertEqual(code, relay.state_machine.EXIT_BLOCKED)     # exit 8
+        self.assertEqual(pokes, [])                                  # Codex へ回答依頼を送らない
+        sqa.assert_not_called()                                      # Claude へも配達しない
+        self.assertIn("自動中継上限", out)                          # 上限超過を banner 表示
 
     def test_question_deliver_answers_then_continues_to_all_done(self):
         # 対照: 通常回答は send_question_answer で配達し、ループは継続（exit 8 にしない）。

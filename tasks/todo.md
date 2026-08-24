@@ -19,11 +19,11 @@
       `[!]`のみ→BLOCKED・`[ ]`あり→READY は不変。
 
 ## P1-2 — AskUserQuestion に HUMAN_REQUIRED 経路を追加（別経路・§P1-2）
-- [ ] Codex への質問 prompt に「人間の承認・権限・意思決定・秘密情報・課金・不可逆操作が必要なら
+- [x] Codex への質問 prompt に「人間の承認・権限・意思決定・秘密情報・課金・不可逆操作が必要なら
       最終回答1行目に `[AIPAIR_HUMAN_REQUIRED]` を単独で」を追加（既存 sentinel を共用）。
-- [ ] StateMachine の `codex_question` state で `[AIPAIR_HUMAN_REQUIRED]` を検出したら **Claude へ回答を送らず**、
+- [x] StateMachine の `codex_question` state で `[AIPAIR_HUMAN_REQUIRED]` を検出したら **Claude へ回答を送らず**、
       exit 8・reason=HUMAN_REQUIRED で停止。banner に質問内容を表示。
-- [ ] task-list の `[!]` とは**別経路**（質問停止で todo を勝手に `[!]` にしない）。回帰テスト追加。
+- [x] task-list の `[!]` とは**別経路**（質問停止で todo を勝手に `[!]` にしない）。回帰テスト追加。
 
 ## P1-3 — 質問 truncate を fail-closed 化
 - [ ] 質問 payload が自動中継上限（現 3000 字）を超えたら **truncate せず HUMAN_REQUIRED（exit 8）**。
