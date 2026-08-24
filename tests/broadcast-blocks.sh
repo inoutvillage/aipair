@@ -40,7 +40,7 @@ for f in templates/claude-md-block.md .claude/skills/aipair-relay/SKILL.md .clau
   chk "grep -qF 'HUMAN_REQUIRED' '$f'"                          "$f: HUMAN_REQUIRED を記載"
   chk "grep -qF 'exit 8' '$f'"                                 "$f: exit 8 を記載"
   chk "grep -qF '[!]' '$f'"                                    "$f: 保留記法 [!] を記載"
-  chk "grep -qE 'READY.*BLOCKED.*ALL_DONE|分類' '$f'"          "$f: task-list 分類（READY/BLOCKED/ALL_DONE）を記載"
+  chk "grep -qE 'READY.*BLOCKED.*ALL_DONE' '$f'"               "$f: 3 状態 READY/BLOCKED/ALL_DONE を明示（「分類」1語では不十分）"
 done
 
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED)"

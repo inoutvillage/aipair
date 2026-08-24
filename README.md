@@ -311,8 +311,9 @@ Claude 実装 ──▶ Codex レビュー
 ```
 
 - **終端は2つ**: 全タスク完了（Codex の `[AIPAIR_ALL_DONE]`・exit 0）と、実行可能タスクが尽き人間対応の `[!]` だけ
-  残る **HUMAN_REQUIRED**（`[AIPAIR_HUMAN_REQUIRED]`・exit 8）。いずれも **relay の `tasks/todo.md` 分類が一致した時のみ
-  成立**します（分類が READY のまま＝着手可 `- [ ]` が残るなら、sentinel を無視して継続）。`--max-rounds` は暴走防止の
+  残る **HUMAN_REQUIRED**（`[AIPAIR_HUMAN_REQUIRED]`・exit 8）。いずれも **relay の `tasks/todo.md` 分類
+  （READY/BLOCKED/ALL_DONE）が一致した時のみ成立**します（分類が READY のまま＝着手可 `- [ ]` が残るなら、
+  sentinel を無視して継続）。`--max-rounds` は暴走防止の
   キャップとして残るので、連続モードでは大きめ（例 `AIPAIR_MAX_ROUNDS=100`）にしてください。
 - **次タスクの根拠は `tasks/todo.md` の未チェック項目に限定**され、リスト外の新規提案を禁じる文面を
   Codex に送ります（放っておくと「改善案」が無限に湧いてスコープが膨らむため）。パスは `AIPAIR_TASK_LIST` で変更可。
