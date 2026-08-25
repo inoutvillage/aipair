@@ -44,5 +44,16 @@ chk "[ $rc -ne 0 ]" "missing lib → relay-here exits non-zero (got $rc)"
 echo "$out" | grep -q "ロードできない" && loaderr2=1 || loaderr2=0
 chk "[ $loaderr2 -eq 1 ]" "missing lib → reports the load failure, not a generic error"
 
+
+# VS Code 実行経路の回帰（Codex relay-id:4047abba）: VS Code の専用ターミナルは tmux 外で $TMUX 未設定。
+# その条件で --session なしの aipair-relay-here は「aipair セッションの外」で死ぬ（＝強制再点火タスクが
+# --session "$(aipair name)" を渡す理由）。--session を渡せばその tmux-outside ゲートは越える。
+rc=0; out="$(env -u TMUX AIPAIR_RELAY_BIN="$W/full/aipair-relay" bash "$REPO/bin/aipair-relay-here" --endless --max-rounds 100 --allow-untested-dialogs 2>&1)" || rc=$?
+chk "[ $rc -ne 0 ]" "TMUX unset + no --session -> exits non-zero (VS Code path without --session fails)"
+echo "$out" | grep -q "セッションの外" && outside=1 || outside=0
+chk "[ $outside -eq 1 ]" "TMUX unset + no --session -> reports aipair セッションの外 (why --session is required)"
+out2="$(env -u TMUX AIPAIR_RELAY_BIN="$W/full/aipair-relay" bash "$REPO/bin/aipair-relay-here" --session none --endless --max-rounds 100 --allow-untested-dialogs 2>&1)" || true
+echo "$out2" | grep -q "セッションの外" && still=1 || still=0
+chk "[ $still -eq 0 ]" "TMUX unset + --session -> clears the tmux-outside gate (fails later, not on outside)"
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED)"
 exit $fail
