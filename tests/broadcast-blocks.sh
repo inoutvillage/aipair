@@ -31,12 +31,11 @@ done
 chk "! grep -q 'claude --dangerously-skip-permissions' templates/vscode-tasks.json" "vscode: claude single-launch is not bypass-by-default"
 chk "! grep -q 'codex --dangerously-bypass-approvals-and-sandbox' templates/vscode-tasks.json" "vscode: codex single-launch is not bypass-by-default"
 chk "grep -q 'aipair loop --unsafe' templates/vscode-tasks.json" "vscode: the loop task opts into --unsafe explicitly"
-# The force-reignite task runs from OUTSIDE tmux (VS Code の専用ターミナル＝$TMUX 未設定)。bare
-# aipair-relay-here は --session なしだと「aipair セッションの外」で死ぬので、--session "$(aipair name)"
-# でワークスペースのセッションを明示する。endless/max100/untested-dialogs も同じ行で渡す。
-chk "grep 'aipair-relay-here' templates/vscode-tasks.json | grep -q -- '--session'" "vscode: force-reignite passes --session (works outside tmux)"
-chk "grep 'aipair-relay-here' templates/vscode-tasks.json | grep -q 'aipair name'" "vscode: force-reignite resolves the session via aipair name"
+# The force-reignite task runs from OUTSIDE tmux (VS Code の専用ターミナル＝$TMUX 未設定)。
+# aipair-relay-here は tmux外+--session無しの時、同梱 aipair name <cwd> へ委譲して対象ペアを自動解決
+# する（@aipair-dir で逆検証）。よって壊れやすい $(aipair name) はタスクに埋め込まない。
 chk "grep 'aipair-relay-here' templates/vscode-tasks.json | grep -q -- '--endless --max-rounds 100 --allow-untested-dialogs'" "vscode: force-reignite carries endless/max100/untested-dialogs"
+chk "! grep -q 'aipair name' templates/vscode-tasks.json" "vscode: force-reignite does not embed \$(aipair name) (auto-resolves from cwd)"
 
 # endless 新契約（社長指示 2026-08-24 §11 Phase 6）: 旧契約「終端は ALL_DONE のみ」を配布ドキュメントへ
 # 再発させない＋新契約（HUMAN_REQUIRED）が存在すること。ドキュメントが実装から drift しないよう固定する。

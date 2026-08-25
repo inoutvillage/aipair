@@ -45,15 +45,43 @@ echo "$out" | grep -q "ロードできない" && loaderr2=1 || loaderr2=0
 chk "[ $loaderr2 -eq 1 ]" "missing lib → reports the load failure, not a generic error"
 
 
-# VS Code 実行経路の回帰（Codex relay-id:4047abba）: VS Code の専用ターミナルは tmux 外で $TMUX 未設定。
-# その条件で --session なしの aipair-relay-here は「aipair セッションの外」で死ぬ（＝強制再点火タスクが
-# --session "$(aipair name)" を渡す理由）。--session を渡せばその tmux-outside ゲートは越える。
-rc=0; out="$(env -u TMUX AIPAIR_RELAY_BIN="$W/full/aipair-relay" bash "$REPO/bin/aipair-relay-here" --endless --max-rounds 100 --allow-untested-dialogs 2>&1)" || rc=$?
-chk "[ $rc -ne 0 ]" "TMUX unset + no --session -> exits non-zero (VS Code path without --session fails)"
-echo "$out" | grep -q "セッションの外" && outside=1 || outside=0
-chk "[ $outside -eq 1 ]" "TMUX unset + no --session -> reports aipair セッションの外 (why --session is required)"
-out2="$(env -u TMUX AIPAIR_RELAY_BIN="$W/full/aipair-relay" bash "$REPO/bin/aipair-relay-here" --session none --endless --max-rounds 100 --allow-untested-dialogs 2>&1)" || true
-echo "$out2" | grep -q "セッションの外" && still=1 || still=0
-chk "[ $still -eq 0 ]" "TMUX unset + --session -> clears the tmux-outside gate (fails later, not on outside)"
+# tmux外 自動解決 + @aipair-dir 逆検証（CEO 指示 2026-08-25）: VS Code の専用ターミナルは tmux 外
+# （$TMUX 未設定）。aipair-relay-here は session 名生成を自前で持たず、同梱 aipair name <cwd> へ委譲し、
+# 解決した session の @aipair-dir と canonical(cwd) を逆検証してから点火する。AIPAIR_BIN を差し替えて固定。
+FB="$W/fakebin"; mkdir -p "$FB"
+printf '#!/usr/bin/env bash\n[ "$1" = name ] && { echo aipair-fake-sess; exit 0; }\nexit 1\n' > "$FB/aipair"; chmod +x "$FB/aipair"
+
+# (1) AIPAIR_BIN が実行不能 → 「解決に必要な aipair が見つからない」で die（PATH 非依存＝$0 隣接を使う設計）
+rc=0; out="$( (cd "$W"; env -u TMUX AIPAIR_BIN="$W/nope/aipair" AIPAIR_RELAY_BIN="$W/full/aipair-relay" bash "$REPO/bin/aipair-relay-here" --print) 2>&1 )" || rc=$?
+printf '%s' "$out" | grep -q '解決に必要な aipair' && g=1 || g=0
+chk "[ $rc -ne 0 ] && [ $g -eq 1 ]" "auto: AIPAIR_BIN unusable -> dies with '解決に必要な aipair'"
+
+# (2) 委譲した session が存在しない → 'セッションが無い'（旧 'セッションの外' では死なない）
+rc=0; out="$( (cd "$W"; env -u TMUX AIPAIR_BIN="$FB/aipair" AIPAIR_RELAY_BIN="$W/full/aipair-relay" bash "$REPO/bin/aipair-relay-here" --print) 2>&1 )" || rc=$?
+printf '%s' "$out" | grep -q 'セッションが無い' && g=1 || g=0
+chk "[ $g -eq 1 ]" "auto: delegates to aipair name and checks existence (セッションが無い)"
+printf '%s' "$out" | grep -q 'セッションの外' && g=1 || g=0
+chk "[ $g -eq 0 ]" "auto: no longer dies on 'セッションの外' (it delegates)"
+
+# session を作り @aipair-dir を正しく設定 → 逆検証パス（--print が session を解決する）
+tmux new-session -d -s aipair-fake-sess -c "$W" 2>/dev/null
+tmux set-option -t aipair-fake-sess @aipair-dir "$W" 2>/dev/null
+tmux split-window -t aipair-fake-sess -c "$W" 2>/dev/null
+out="$( (cd "$W"; env -u TMUX AIPAIR_BIN="$FB/aipair" AIPAIR_RELAY_BIN="$W/full/aipair-relay" bash "$REPO/bin/aipair-relay-here" --print) 2>&1 )" || true
+printf '%s' "$out" | grep -q 'session : aipair-fake-sess' && g=1 || g=0
+chk "[ $g -eq 1 ]" "auto: @aipair-dir==canonical(cwd) -> resolves (reverse-verify passes)"
+
+# (3) @aipair-dir を別 dir に → 逆検証で不一致 die（identity 破壊防止・hash 衝突対策）
+tmux set-option -t aipair-fake-sess @aipair-dir "/tmp/aipair-mismatch-xyz" 2>/dev/null
+rc=0; out="$( (cd "$W"; env -u TMUX AIPAIR_BIN="$FB/aipair" AIPAIR_RELAY_BIN="$W/full/aipair-relay" bash "$REPO/bin/aipair-relay-here" --print) 2>&1 )" || rc=$?
+printf '%s' "$out" | grep -q '不一致' && g=1 || g=0
+chk "[ $rc -ne 0 ] && [ $g -eq 1 ]" "auto: @aipair-dir != cwd -> reverse-verify dies (不一致)"
+
+# (4) @aipair-dir 無し（旧形式）→ fail-closed
+tmux set-option -u -t aipair-fake-sess @aipair-dir 2>/dev/null || true
+rc=0; out="$( (cd "$W"; env -u TMUX AIPAIR_BIN="$FB/aipair" AIPAIR_RELAY_BIN="$W/full/aipair-relay" bash "$REPO/bin/aipair-relay-here" --print) 2>&1 )" || rc=$?
+printf '%s' "$out" | grep -q '@aipair-dir が無い' && g=1 || g=0
+chk "[ $rc -ne 0 ] && [ $g -eq 1 ]" "auto: legacy session (no @aipair-dir) -> fail-closed"
+tmux kill-session -t aipair-fake-sess 2>/dev/null || true
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED)"
 exit $fail
