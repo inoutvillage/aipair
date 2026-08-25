@@ -71,6 +71,18 @@ out="$( (cd "$W"; env -u TMUX AIPAIR_BIN="$FB/aipair" AIPAIR_RELAY_BIN="$W/full/
 printf '%s' "$out" | grep -q 'session : aipair-fake-sess' && g=1 || g=0
 chk "[ $g -eq 1 ]" "auto: @aipair-dir==canonical(cwd) -> resolves (reverse-verify passes)"
 
+# (2b) tmux外 + --dir=session の dir（別 cwd から）→ session 解決も監視 dir も --dir に揃う（cwd で選ばない）
+out="$( (cd /tmp; env -u TMUX AIPAIR_BIN="$FB/aipair" AIPAIR_RELAY_BIN="$W/full/aipair-relay" bash "$REPO/bin/aipair-relay-here" --print --dir "$W") 2>&1 )" || true
+printf '%s' "$out" | grep -q 'session : aipair-fake-sess' && g=1 || g=0
+chk "[ $g -eq 1 ]" "auto+--dir: --dir が対象を決める（cwd=/tmp でも --dir=W の pair を解決）"
+printf '%s' "$out" | grep '^dir' | grep -q "$(basename "$W")" && g=1 || g=0
+chk "[ $g -eq 1 ]" "auto+--dir: 監視 dir も --dir(W) 側（cwd=/tmp を採用しない=session/監視の分離なし）"
+
+# (2c) tmux外 + --dir=別ディレクトリ（session の @aipair-dir と不一致）→ 逆検証 die（poke X/watch Y を防ぐ）
+rc=0; out="$( (cd "$W"; env -u TMUX AIPAIR_BIN="$FB/aipair" AIPAIR_RELAY_BIN="$W/full/aipair-relay" bash "$REPO/bin/aipair-relay-here" --print --dir /tmp/aipair-elsewhere) 2>&1 )" || rc=$?
+printf '%s' "$out" | grep -q '不一致' && g=1 || g=0
+chk "[ $rc -ne 0 ] && [ $g -eq 1 ]" "auto+--dir: --dir != session dir -> reverse-verify dies (分離を作らない)"
+
 # (3) @aipair-dir を別 dir に → 逆検証で不一致 die（identity 破壊防止・hash 衝突対策）
 tmux set-option -t aipair-fake-sess @aipair-dir "/tmp/aipair-mismatch-xyz" 2>/dev/null
 rc=0; out="$( (cd "$W"; env -u TMUX AIPAIR_BIN="$FB/aipair" AIPAIR_RELAY_BIN="$W/full/aipair-relay" bash "$REPO/bin/aipair-relay-here" --print) 2>&1 )" || rc=$?
