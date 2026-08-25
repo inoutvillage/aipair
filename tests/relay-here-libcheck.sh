@@ -71,6 +71,13 @@ out="$( (cd "$W"; env -u TMUX AIPAIR_BIN="$FB/aipair" AIPAIR_RELAY_BIN="$W/full/
 printf '%s' "$out" | grep -q 'session : aipair-fake-sess' && g=1 || g=0
 chk "[ $g -eq 1 ]" "auto: @aipair-dir==canonical(cwd) -> resolves (reverse-verify passes)"
 
+# --no-endless + --allow-untested-dialogs → launch 行に両フラグが入り --endless は入らない（🔄 非endless タスク用）
+out="$( (cd "$W"; env -u TMUX AIPAIR_BIN="$FB/aipair" AIPAIR_RELAY_BIN="$W/full/aipair-relay" bash "$REPO/bin/aipair-relay-here" --print --no-endless --allow-untested-dialogs) 2>&1 )" || true
+printf '%s' "$out" | grep '^launch' | grep -qF "'--no-endless'" && a=1 || a=0
+printf '%s' "$out" | grep '^launch' | grep -qF "'--allow-untested-dialogs'" && b=1 || b=0
+printf '%s' "$out" | grep '^launch' | grep -qF "'--endless'" && c=1 || c=0
+chk "[ $a -eq 1 ] && [ $b -eq 1 ] && [ $c -eq 0 ]" "flags: --no-endless+--allow-untested-dialogs → launch に反映・--endless 無し"
+
 # (2b) tmux外 + --dir=session の dir（別 cwd から）→ session 解決も監視 dir も --dir に揃う（cwd で選ばない）
 out="$( (cd /tmp; env -u TMUX AIPAIR_BIN="$FB/aipair" AIPAIR_RELAY_BIN="$W/full/aipair-relay" bash "$REPO/bin/aipair-relay-here" --print --dir "$W") 2>&1 )" || true
 printf '%s' "$out" | grep -q 'session : aipair-fake-sess' && g=1 || g=0

@@ -36,6 +36,8 @@ chk "grep -q 'aipair loop --unsafe' templates/vscode-tasks.json" "vscode: the lo
 # する（@aipair-dir で逆検証）。よって壊れやすい $(aipair name) はタスクに埋め込まない。
 chk "grep 'aipair-relay-here' templates/vscode-tasks.json | grep -q -- '--endless --max-rounds 100 --allow-untested-dialogs'" "vscode: force-reignite carries endless/max100/untested-dialogs"
 chk "! grep -q 'aipair name' templates/vscode-tasks.json" "vscode: force-reignite does not embed \$(aipair name) (auto-resolves from cwd)"
+# 非endless の再点火タスク: --no-endless（環境変数に依らず確実に非endless）+ --allow-untested-dialogs（版差でも dialog ON）
+chk "grep 'aipair-relay-here' templates/vscode-tasks.json | grep -q -- '--no-endless --allow-untested-dialogs'" "vscode: non-endless reignite uses --no-endless + --allow-untested-dialogs"
 
 # endless 新契約（社長指示 2026-08-24 §11 Phase 6）: 旧契約「終端は ALL_DONE のみ」を配布ドキュメントへ
 # 再発させない＋新契約（HUMAN_REQUIRED）が存在すること。ドキュメントが実装から drift しないよう固定する。
