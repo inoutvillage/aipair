@@ -40,7 +40,7 @@
       "command": "wsl.exe",
       "args": [
         "--cd", "${workspaceFolder}",
-        "bash", "-ic", "aipair-relay-here --endless --max-rounds 100 --allow-untested-dialogs"
+        "bash", "-ic", "aipair-relay-here --session \"$(aipair name)\" --endless --max-rounds 100 --allow-untested-dialogs"
       ],
       "presentation": {
         "reveal": "always",
