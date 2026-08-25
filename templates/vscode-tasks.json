@@ -35,6 +35,22 @@
       "problemMatcher": []
     },
     {
+      "label": "⚡【AI Pair】relay 強制再点火（endless / max100 / 版無視）",
+      "type": "shell",
+      "command": "wsl.exe",
+      "args": [
+        "--cd", "${workspaceFolder}",
+        "bash", "-ic", "aipair-relay-here --endless --max-rounds 100 --allow-untested-dialogs"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": true,
+        "clear": true
+      },
+      "problemMatcher": []
+    },
+    {
       "label": "📜【AI Pair】統合ログ（bridge）だけ表示",
       "type": "shell",
       "command": "wsl.exe",
