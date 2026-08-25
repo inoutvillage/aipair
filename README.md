@@ -202,7 +202,7 @@ aipair name   [dir]    # tmux セッション名を表示
 |---|---|
 | 🤝 起動 / 再アタッチ | `aipair`（claude ┃ codex ／ 下段 bridge） |
 | 🔁 相互レビュー・ループ | `aipair loop`（自走。Codex が `[AIPAIR_REVIEW_OK]` で停止） |
-| ⚡ relay 強制再点火（版無視） | `aipair-relay-here --session "$(aipair name)" --endless --max-rounds 100 --allow-untested-dialogs`（**起動済みペア**へ endless で張り直す。CLI 版差でも `--allow-untested-dialogs` でプラン/質問の自動操作を継続＝未検証版では誤操作リスクあり） |
+| ⚡ relay 強制再点火（版無視） | `aipair-relay-here --endless --max-rounds 100 --allow-untested-dialogs`（**起動済みペア**へ endless で張り直す。tmux 外（VS Code）でも cwd から対象ペアを自動解決＝`aipair name <cwd>` へ委譲し `@aipair-dir` で逆検証。CLI 版差でも `--allow-untested-dialogs` でプラン/質問の自動操作を継続＝未検証版では誤操作リスクあり） |
 | 📜 統合ログ（bridge）だけ表示 | `peer-log both --watch`（アタッチせず会話を俯瞰） |
 | 🛑 停止 | `aipair stop` |
 | 🤖 claude 単体 / 🤖 codex 単体 | tmux 無しで片方だけ（`peer` 参照可） |

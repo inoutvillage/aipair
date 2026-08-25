@@ -28,6 +28,13 @@
 set -uo pipefail
 
 RELAY="${AIPAIR_RELAY_BIN:-$HOME/.local/bin/aipair-relay}"   # override for tests
+# session 名の解決は必ず「同梱の aipair name」へ委譲する（aipair-relay-here は session 名生成
+# ロジックを一切持たない — CEO 指示 2026-08-25）。$0 を realpath 解決してから隣の aipair を引く
+# （symlink 経由でも実体の隣を指す）。AIPAIR_BIN は override 可（テスト用）。
+if [ -z "${AIPAIR_BIN:-}" ]; then
+  _self_rp="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0" 2>/dev/null || printf '%s' "$0")"
+  AIPAIR_BIN="$(dirname "$_self_rp")/aipair"
+fi
 SHELLS="bash zsh sh fish"
 
 # ディレクトリの正準化。bin/aipair の canon_dir と同一ロジック（realpath + 大小文字/正規化を
@@ -97,11 +104,33 @@ command -v tmux >/dev/null 2>&1 || die "tmux が無い"
 "$RELAY" --help >/dev/null 2>&1 || die "aipair-relay がロードできない（同じディレクトリの corelib/loglib/tmuxlib/deliverylib/dialoglib/peer-log が揃っているか確認）: $RELAY"
 
 # --- セッション特定 ---------------------------------------------------------
+# tmux内: 現在の session。明示 --session: それ。tmux外+--session無し: 同梱 aipair name <cwd> へ
+# 委譲して解決する（session 名生成を二重実装しない — CEO 指示 2026-08-25）。$PWD が「どのプロジェクト
+# のペアを起こすか」の入力。自動解決した場合のみ、後段で @aipair-dir と canonical($PWD) を逆検証する。
+AUTO_RESOLVED=0
 if [ -z "$SESSION" ]; then
-  [ -n "${TMUX:-}" ] || die "aipair セッションの外です（tmux 外）。ペア内の Claude/Codex ペインから実行してください。"
-  SESSION="$(tmux display-message -p '#{session_name}' 2>/dev/null)" || die "現在の tmux セッション名を取得できない"
+  if [ -n "${TMUX:-}" ]; then
+    SESSION="$(tmux display-message -p '#{session_name}' 2>/dev/null)" || die "現在の tmux セッション名を取得できない"
+  else
+    [ -x "$AIPAIR_BIN" ] || die "session 解決に必要な aipair が見つからない: $AIPAIR_BIN（--session で明示指定するか AIPAIR_BIN を設定）"
+    SESSION="$("$AIPAIR_BIN" name "$PWD" 2>/dev/null)" || die "aipair name で session を解決できない（cwd=$PWD）"
+    [ -n "$SESSION" ] || die "aipair name が空を返した（cwd=$PWD）"
+    AUTO_RESOLVED=1
+  fi
 fi
 tmux has-session -t "=$SESSION" 2>/dev/null || die "セッションが無い（完全一致）: $SESSION"
+
+# 自動解決（tmux外+--session無し）は identity 破壊を防ぐため、解決した session の @aipair-dir と
+# canonical($PWD) の一致を逆検証してから進む（hash 衝突・cwd 取り違え対策 — CEO 指示 2026-08-25）。
+# 明示 --session/--dir 経路は従来どおり（呼び出し側が対象を分かって指定している）。@aipair-dir が
+# 無い旧形式セッションは自動解決では検証できないので fail-closed（--session/--dir を要求）。
+if [ "$AUTO_RESOLVED" = 1 ]; then
+  _adir="$(tmux display-message -p -t "$SESSION" '#{@aipair-dir}' 2>/dev/null)"
+  [ -n "$_adir" ] || die "自動解決した session=$SESSION に @aipair-dir が無い（旧形式）。ペア内ペインから、または --session/--dir で明示してください。"
+  _adir="$(canon_dir "$_adir")"; _want="$(canon_dir "$PWD")"
+  [ -n "$_want" ] || die "cwd を解決できない: $PWD"
+  [ "$_want" = "$_adir" ] || die "session と cwd が不一致（hash 衝突の疑い）: @aipair-dir=$_adir != canonical(cwd)=$_want。--session/--dir で明示してください。"
+fi
 
 # relay が監視するログの cwd は「対象セッションが所有するディレクトリ」でなければならない。
 # 別ディレクトリから `aipair-relay-here --session X` を叩くと $PWD は X の作業ディレクトリと
