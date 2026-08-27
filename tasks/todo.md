@@ -471,8 +471,10 @@ F1 ✅ → F2 ✅ → F3 ✅ → F6 ✅ → F4 ✅ → F5 ✅ → F9 ✅ → F8 
 
 ## スコープ外の検出（2026-08-27・未着手）
 
-- [ ] **`tests/codex-follow.py` が実機で 3 件 FAIL**（版更新作業中に検出。**この作業の変更とは無関係**で、
-  `git archive HEAD` で取り出した無改変コピーでも、単体実行でも、python3.9 / 3.11 いずれでも同じ 3 件が落ちる）
+- [ ] **`tests/codex-follow.py` がこの実機（WSL2 / AlmaLinux 9.7）でのみ 3 件 FAIL**（版更新作業中に検出。
+  **この作業の変更とは無関係**で、`git archive HEAD` の無改変コピーでも、単体実行でも、python3.9 / 3.11
+  いずれでも同じ 3 件が落ちる。一方 **GitHub Actions では py3.8 / py3.13 の全レーンで緑**（PR #161 の run）
+  → コード自体の恒常バグではなく、この環境（`/tmp` の mtime 解像度・DrvFs 等）依存の疑いが濃い）
   - `CodexFollow.test_load_follows_on_from_current` / `DiscoveryRaces.test_load_survives_current_vanishing_during_discovery`
     ＝ `peerlog.load(...)` が期待するファイルを返さず `None`。
   - `StaleEntries.test_load_survives_a_file_vanishing_after_selection` ＝ 選択後に消えたファイルが
