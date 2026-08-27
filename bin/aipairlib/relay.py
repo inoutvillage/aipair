@@ -14,7 +14,8 @@ Plan mode (auto plan review):
   the relay asks Codex to review the plan file (~/.claude/plans/*.md, path
   taken from the dialog itself). Codex's verdict is injected back:
     changes requested            → "Tell Claude what to change" + review + Enter
-    approved (冒頭に「プラン承認」) → "Yes, and bypass permissions"
+    approved (冒頭に「プラン承認」) → the first "Yes…" option (2.1.247: "Yes, and use auto
+                                   mode"; an older "Yes, and bypass permissions" wins if shown)
     approved with extra notes    → feedback + shift+tab (approve w/ feedback)
   Capped at --plan-rounds per plan (default 5); disable with --no-plan-review.
 

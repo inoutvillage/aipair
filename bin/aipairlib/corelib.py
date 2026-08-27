@@ -12,13 +12,13 @@ import unicodedata
 # --- version gate ----------------------------------------------------------- #
 # The plan-approval / question dialogs are read by scraping the CLIs' TUI, so they are
 # tied to specific claude/codex versions. Keep this in sync with README「検証済みバージョン」.
-TESTED_VERSIONS = {"claude": "2.1.238", "codex": "0.149.0"}
+TESTED_VERSIONS = {"claude": "2.1.247", "codex": "0.150.1"}
 
 
 def parse_version(text):
     """The first version token in `text`, captured WHOLE so nothing that differs from a
-    tested version can be truncated onto it: 2.1.238 → '2.1.238', but 2.1.238.1 /
-    2.1.238rc1 / 2.1.238-beta.1 keep their full form and therefore mismatch. Starts at a
+    tested version can be truncated onto it: 2.1.247 → '2.1.247', but 2.1.247.1 /
+    2.1.247rc1 / 2.1.247-beta.1 keep their full form and therefore mismatch. Starts at a
     `d.d` not glued to a preceding number, and runs to the last version char (never ends
     on a separator). None if there is no such token."""
     m = re.search(r"(?<![0-9.+-])\d+\.\d+(?:[0-9A-Za-z.+-]*[0-9A-Za-z])?", text or "")
