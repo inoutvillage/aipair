@@ -30,12 +30,31 @@
       ログ「質問内容が自動中継上限を超えたため人間確認待ちで停止」。回帰テスト追加。
 
 ## P2-1 — no-progress task identity の安定化（不可視空白に依存しない）
-- [!] no-progress identity を不可視空白（インデント/末尾空白/hard-break）に依存させない改善（案A: stable task ID `[T001]` 記法追加／案B: 内部 canonical key＝先頭 indent・trailing 除去＋checkbox 記法正規化＋NFC。同一本文複数は UNRESOLVED 維持・3回連続 exit 8 は不変）
-  - blocker: 案A（task-list 記法に ID 導入）か案B（記法据え置き・内部正規化）かは記法変更の是非を伴う CEO 判断待ち。決定後に具体 `- [ ]` タスクへ落とす。
+- [x] **案B を採用（CEO 判断 2026-08-27）— 内部 canonical key で正規化。task-list の記法は据え置き。**
+  - `endless_flow.canonical_task_key` を追加（NFC → 前後空白除去＝先頭インデントと行末 hard-break →
+    checkbox 記法の正規形化＝bullet `-`・`[X]`→`[x]`）。**本文は一切いじらない**（別タスクを同一視しない）。
+  - `resolve_task_identity` の照合と `advance_no_progress` の同一性比較を canonical key 経由に。
+    識別子として保持・banner 表示するのは従来どおり **task-list の原文行**。
+  - 代償（意図的・fail-closed）: 本文が同じでインデントだけ違う項目は区別できず `UNRESOLVED`。
+    旧テスト（インデントで区別する契約・relay-id:91e37007）は新契約のテストへ置換。
+  - テスト: `canonical_task_key` の落とすもの/落とさないもの、エコーのゆれ4種、同本文インデント違い、
+    空白差だけの再選択でストリークが継続すること（不当リセットでガードが緩まない）。relay-parsers 206 緑。
 
 ## P2-2 — main と release の version を区別
-- [!] release 直後の main を dev version（`0.2.0.dev0`）に。可能なら `+g<commit>` を付す。
-  - blocker: CEO 指定 `0.2.0.dev0`（PEP 440）は本プロジェクトが `__version__` 検証に使う SemVer 契約（doc-sync `SEMVER`・CHANGELOG lifecycle 判定）と非互換。dev サフィックスは **prepared 状態のみ**で使い release 時に最終 `0.2.0` へ落とすので、**git タグ `vX.Y.Z`・release.yml の tag==__version__ 契約は不変**（影響は prepared 版の validator・CHANGELOG lifecycle・文書のみ）。案A=指定どおり `0.2.0.dev0` を採用し prepared 版 validator（`SEMVER`）と CHANGELOG lifecycle を PEP 440 許容へ拡張＋文書対応／案B=SemVer 等価 `0.2.0-dev.0` を採用（validator は既に許容・契約変更ゼロ・文書対応のみ）。受入条件（version 形式）の変更は方針判断のため CEO 決定待ち。決定後 `- [ ]` 具体タスクへ落とす。
+- [x] **案B を採用（CEO 判断 2026-08-27）— SemVer 等価の `0.2.0-dev.0` を採用。**
+  - `__version__ = "0.2.0-dev.0"`。CHANGELOG を prepared 形へ（`## [Unreleased]` → `## [0.2.0] — unreleased`、
+    bottom link key も `[0.2.0]` に）。SemVer の prerelease なので `SEMVER` 契約・`v<version>` タグ契約・
+    release.yml は不変（PEP 440 の `0.2.0.dev0` は SemVer 不正のため不採用）。
+  - doc-sync を拡張: CHANGELOG 最上位版 == `__version__` の **release 部**（`-dev.N` を除いた形）／
+    **`-dev.N` は prepared 形、bare `X.Y.Z` は released 形にしか出てはいけない**（片側だけ直した中途半端な
+    コミットが落ちる）／dev 形式そのものの固定（PEP 440 表記は不正）。**mutation で非空検証済み**
+    （bare にすると lifecycle テストが実際に落ちることを確認）。doc-sync 31 緑。
+  - RELEASING.md に3状態と手順（release コミットで suffix を落とす／次サイクル開始で `-dev.0` を付ける）、
+    CHANGELOG 冒頭の lifecycle 説明、README のリリース節も更新。
+  - **`+g<commit>` は見送り**: `__version__` に静的に埋めると即座に陳腐化し、`aipair --version` の実行時に
+    git から付ける方式は「git チェックアウトかどうか」で出力が変わり、doc-sync が固定している
+    「`aipair --version` == `__version__`（単一の source of truth）」契約を崩す。開発者は `git rev-parse` で
+    直接分かるため利得も小さい。必要なら別途指示ください（そのときは契約の緩め方も併せて決める）。
 
 ## P2-3 — CHANGELOG `[Unreleased]` に今回の変更を記載
 - [x] Added/Changed/Fixed（READY/BLOCKED/ALL_DONE・`[!]`・`[AIPAIR_HUMAN_REQUIRED]`・no-progress/exit 8・
@@ -464,19 +483,23 @@ F1 ✅ → F2 ✅ → F3 ✅ → F6 ✅ → F4 ✅ → F5 ✅ → F9 ✅ → F8 
   `shift+tab to approve with this feedback` / `ctrl+g to edit in nano · <plan path>`）に差し替えて回帰対象にし、
   旧 UI は `LEGACY_BYPASS_PLAN_SCREEN` として分離（`test_legacy_bypass_screen_still_parses` と
   bypass 優先規則テストで維持）。plan_flow のスタブ `yes_label` も現行文言へ。
+- [x] **反映**: PR #161 を squash merge（main `04030cc`）。CI は py3.8 / py3.13 / tmux3.1 の 3 レーン緑
+  （途中の py3.8 赤は `env-forward.sh` の tmux flake で、再実行して緑を確認）。`./aipair-install.sh` を
+  再実行し `~/.local/bin` も更新（repo と全ファイル sha256 一致を確認）。
 - 申し送り: **稼働中の relay は起動時に読み込んだ旧 `TESTED_VERSIONS` のまま**なので、警告が消えるのは
-  再点火（`aipair-relay-here` / VS Code タスク）以降。導入済みコピー（`~/.local/bin`）は
-  `./aipair-install.sh` で更新する。導入ツリーは HEAD と `corelib.py` 以外バイト一致だったので
-  （sha256 照合）、再導入で入るのはこの版更新のみ。
+  再点火（`aipair-relay-here` / VS Code タスク）以降。
 
-## スコープ外の検出（2026-08-27・未着手）
+## スコープ外の検出（2026-08-27）— 対応済み
 
-- [ ] **`tests/codex-follow.py` がこの実機（WSL2 / AlmaLinux 9.7）でのみ 3 件 FAIL**（版更新作業中に検出。
-  **この作業の変更とは無関係**で、`git archive HEAD` の無改変コピーでも、単体実行でも、python3.9 / 3.11
-  いずれでも同じ 3 件が落ちる。一方 **GitHub Actions では py3.8 / py3.13 の全レーンで緑**（PR #161 の run）
-  → コード自体の恒常バグではなく、この環境（`/tmp` の mtime 解像度・DrvFs 等）依存の疑いが濃い）
-  - `CodexFollow.test_load_follows_on_from_current` / `DiscoveryRaces.test_load_survives_current_vanishing_during_discovery`
-    ＝ `peerlog.load(...)` が期待するファイルを返さず `None`。
-  - `StaleEntries.test_load_survives_a_file_vanishing_after_selection` ＝ 選択後に消えたファイルが
-    `CODEX_INDEX` から落ちず、`codex_newest` が消えた `r-24` を返し続ける（期待は `r-23`）。
-  - 影響範囲の切り分け（`peer` / relay の rollout 追従に実害があるか）と原因調査は未実施。
+- [x] **`tests/codex-follow.py` の 3 件 FAIL — 原因は環境依存ではなく《ペア内実行での env 漏れ》**（版更新作業中に検出）
+  - **根本原因**: `aipair` のペインから `bash tests/run-all.sh` を回すと、ペアが立てた
+    `AIPAIR_CODEX_SINCE`（launch epoch）と `AIPAIR_CLAUDE_SESSION` がテストプロセスへ継承される。
+    `peerlog.load` はこの pin を尊重する設計なので、固定 mtime のフィクスチャ（`1_700_000_000` ＝
+    2023-11、pin より古い）が全て除外され `load` が `(None, [])` を返していた。
+    → CI（env 無し）では緑、実機のペア内だけ赤、という差になっていた。当初「/tmp の mtime 解像度・
+    DrvFs 依存の疑い」と記録したが**それは誤りで、環境そのものではなく起動元の env が原因**。
+  - **実害の切り分け**: 製品コードの不具合ではない。`peer` / relay が pin を尊重するのは仕様どおりの
+    正しい挙動で、壊れていたのは**テスト側の隔離不足**のみ。
+  - **修正**: `tests/codex-follow.py` の `Fixture.setUp` と `_RootBase.setUp` で当該 env を落とす
+    （`tests/peer-pin.py` が既に持っていた同じガードを移植・理由をコメントで明示）。
+    ペア内でも、`AIPAIR_*` を明示的に載せて実行しても 38 tests 緑。

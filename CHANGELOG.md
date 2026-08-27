@@ -2,16 +2,20 @@
 
 All notable changes to aipair are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and aipair uses
-[Semantic Versioning](https://semver.org/). The version below is the single source of truth
+[Semantic Versioning](https://semver.org/). Between releases `aipairlib.__version__` carries the
+`-dev.N` prerelease suffix (`0.2.0-dev.0`) so a main checkout never claims to be a release; the
+release commit drops the suffix. The version headings below track the version being **prepared**
+(without the suffix). The version below is the single source of truth
 `aipairlib.__version__`; a release is the git tag `v<version>` and its GitHub Release (see
 [RELEASING.md](RELEASING.md)). The CHANGELOG top is in one of two lifecycle states: **while a
 version is being prepared**, a `## [X.Y.Z] — unreleased` section is at the top; **right after a
 release**, a `## [Unreleased]` section sits above the dated `## [X.Y.Z] - <date>` just shipped. In
-both, the topmost VERSION-numbered section is `aipairlib.__version__`; its date is filled in in the
-release commit, just before the `v<version>` tag is pushed. `tests/doc-sync.py` enforces the
-version match and verifies both states.
+both, the topmost VERSION-numbered section is `aipairlib.__version__` **with any `-dev.N` suffix
+stripped**; its date is filled in in the release commit, just before the `v<version>` tag is pushed.
+`tests/doc-sync.py` enforces the version match, verifies both states, and pins which state each
+version form may appear in (`-dev.N` ⇒ prepared, bare `X.Y.Z` ⇒ the released/just-shipped state).
 
-## [Unreleased]
+## [0.2.0] — unreleased (prepared; main は `0.2.0-dev.0`)
 
 Correctness and safety of the autonomous `aipair loop --endless` relay: a task-list classification —
 not an agent's say-so — is the authority on when a run is finished, and the loop stops for a human on
@@ -36,6 +40,17 @@ task makes no progress across rounds) instead of guessing or spinning.
   (naming the blocking item or the question) so it is clear why the loop stopped and what to do.
 
 ### Changed
+- **no-progress の同一性照合を「見えない差」に依存させない**（P2-1・案B）— `resolve_task_identity` /
+  `advance_no_progress` の比較を `canonical_task_key`（NFC → 前後の空白除去 → checkbox 記法の正規化）
+  経由にした。Codex のエコーが行頭インデントを落とす・Markdown の hard-break を付け外しする・bullet を
+  `*` に変える、といった差だけでは同一タスクを取り逃がさない（＝偽の `UNRESOLVED` で no-progress を
+  積まない）。識別子として保持・表示するのは従来どおり task-list の**原文行**。トレードオフとして、
+  本文が同じでインデントだけ違う項目は区別できず `UNRESOLVED`（fail-closed）になる。
+- **リリース間の main は開発版 `X.Y.Z-dev.N` を名乗る**（P2-2・案B）— `__version__` を `0.2.0-dev.0` に。
+  main のチェックアウトがリリース版を名乗らなくなり、bare `X.Y.Z` を持つのはリリースコミットだけになる。
+  SemVer の prerelease なので `SEMVER` 契約・`v<version>` タグ契約は不変（PEP 440 の `0.2.0.dev0` は
+  SemVer 不正のため不採用）。CHANGELOG の見出しは従来どおり *リリース* 版（`## [X.Y.Z] — unreleased`）で、
+  doc-sync が「どの版形式がどの CHANGELOG 状態に出てよいか」まで固定する。
 - **Endless termination is decided by the task-list classification, not by the agent's sentinel
   alone** — the relay reads and classifies the task-list (`READY` / `BLOCKED` / `ALL_DONE`), and a
   terminal sentinel (`[AIPAIR_ALL_DONE]` / `[AIPAIR_HUMAN_REQUIRED]`) ends the run only when the
@@ -95,5 +110,5 @@ mutual-review relay.
 - `SECURITY.md` threat model. Permission-bypass is opt-in (`--unsafe`) and required only for
   `aipair loop`; interactive `aipair` keeps each agent's normal permission prompts.
 
-[Unreleased]: https://github.com/inoutvillage/aipair/compare/v0.1.0...HEAD
+[0.2.0]: https://github.com/inoutvillage/aipair/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/inoutvillage/aipair/releases/tag/v0.1.0

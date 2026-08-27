@@ -597,7 +597,7 @@ aipair は `aipair loop` で **権限バイパスした2つの AI CLI を tmux �
 ## 版・リリース
 
 現在の版は `aipair --version`（`aipair-relay --version` も同じ）で確認できる。版の source of truth は
-`bin/aipairlib/__version__`、リリースは git タグ `v<version>` とその GitHub Release（`v*` タグの push で
+`bin/aipairlib/__version__`（**リリース間の main は `X.Y.Z-dev.N`**＝開発版。main のチェックアウトがリリース版を名乗らないようにするため。suffix を外すのはリリースコミットだけ）、リリースは git タグ `v<version>` とその GitHub Release（`v*` タグの push で
 `.github/workflows/release.yml` が tag==`__version__` を検証して発行）。変更履歴は [CHANGELOG.md](CHANGELOG.md)、
 手順は [RELEASING.md](RELEASING.md)。`tests/doc-sync.py` が `__version__`・CHANGELOG の最上位の版セクション（発行前は `## [X.Y.Z] — unreleased`／発行後は `## [Unreleased]` の下の dated 版。日付は tag push 前の release commit で付与）・
 `--version` 出力の一致を強制する（版ゲートの `TESTED_VERSIONS`＝検証済み claude/codex 版とは別物）。

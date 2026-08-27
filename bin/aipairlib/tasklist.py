@@ -118,7 +118,9 @@ def classify(text):
                 raise TaskListError(
                     "blocked item [!] without a child 'blocker:' line: %r" % line.strip())
         # verbatim 行（splitlines で改行のみ除去済み・末尾空白は保持）を ready/blocked.item に
-        # 使う。後続の「厳密一致タスク ID」契約（Phase 4）が逐語一致を要求するため rstrip しない。
+        # 使う。banner 表示と Codex への逐語エコー契約が原文を要求するため rstrip しない。
+        # no-progress の同一性照合は endless_flow.canonical_task_key を通す（P2-1・案B）ので、
+        # ここで空白を保持しても「見えない差」でのエコー取り逃がしは起きない。
         items.append((_indent_width(line), state, line,
                       (m.group("text") or "").strip(), blocker))
 
