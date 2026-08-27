@@ -1529,19 +1529,49 @@ class StateMachineWiring(unittest.TestCase):
         # ready が空 → UNRESOLVED
         self.assertEqual(R("- [ ] task A", []), U)
 
-    def test_resolve_task_identity_is_verbatim_indent_and_trailing_ws(self):
-        # Codex relay-id:91e37007: verbatim 完全一致。同本文でインデント違いの 2 項目を、正しく
-        # エコーされた行だけに一意同定する（前後空白を除去して両方一致＝UNRESOLVED にしない）。
+    def test_canonical_task_key_drops_only_invisible_differences(self):
+        # P2-1・案B（CEO 判断 2026-08-27）: 照合キーは「見えない差」だけを落とす。
+        # 落とすもの: 先頭インデント / 行末空白（hard-break）/ checkbox 記法ゆれ / NFC。
+        # 落とさないもの: 本文そのもの（内部空白・大小・語順）。
+        K = relay.state_machine.canonical_task_key
+        base = K("- [ ] task A")
+        for same in ("  - [ ] task A", "- [ ] task A  ", "\t- [ ] task A\t", "* [ ] task A",
+                     "+ [ ] task A", "-  [ ] task A"):
+            self.assertEqual(K(same), base, "%r should canonicalise to the same key" % same)
+        self.assertEqual(K("- [X] done"), K("- [x] done"))          # マーカーの大小
+        self.assertEqual(K("- [ ] \u30ac"), K("- [ ] \u30ab\u3099"))  # NFC（合成/結合）
+        self.assertNotEqual(K("- [ ] task A"), K("- [ ] task  A"))  # 本文の内部空白は保持
+        self.assertNotEqual(K("- [ ] task A"), K("- [ ] Task A"))   # 大小は本文の一部
+        self.assertNotEqual(K("- [ ] task A"), K("- [x] task A"))   # 状態は別物
+        self.assertEqual(K("ただの散文"), "ただの散文")             # checkbox でない行は trim のみ
+        self.assertEqual(K(None), "")
+
+    def test_resolve_task_identity_tolerates_echo_whitespace_and_notation(self):
+        # P2-1・案B: エコーが行頭インデントを落とす / 行末に hard-break を足す / bullet を変える、
+        # といった「見えない差」では取り逃がさない（旧: 逐語完全一致のみ → 偽 UNRESOLVED）。
+        R = relay.state_machine.resolve_task_identity
+        U = relay.state_machine.UNRESOLVED
+        ready = ["  - [ ] nested task", "- [ ] other task"]
+        for echo in ("- [ ] nested task",            # インデントを落としたエコー
+                     "  - [ ] nested task  ",        # hard-break 付き
+                     "* [ ] nested task",            # bullet ゆれ
+                     "次はこれ `- [ ] nested task` を実装"):   # バッククォート span
+            self.assertEqual(R(echo, ready), "  - [ ] nested task",
+                             "echo %r must resolve to the verbatim ready line" % echo)
+        # 本文が違えば当然一致しない（prefix 部分一致でも同定しない）
+        self.assertEqual(R("- [ ] nested", ready), U)
+
+    def test_resolve_task_identity_same_body_different_indent_is_unresolved(self):
+        # 案B の代償（意図的・fail-closed）: 本文が同じでインデントだけ違う 2 項目は canonical key が
+        # 一致するため区別できず、**両方一致 → UNRESOLVED**。安定 ID（案A）を採らない以上ここは
+        # 安全側に倒す（同一性不明のまま無限往復させない）。
         R = relay.state_machine.resolve_task_identity
         U = relay.state_machine.UNRESOLVED
         two = ["- [ ] task", "  - [ ] task"]                    # 同本文・インデント違い
-        self.assertEqual(R("- [ ] task", two), "- [ ] task")    # 親を逐語 → 親
-        self.assertEqual(R("  - [ ] task", two), "  - [ ] task")  # 子を逐語 → 子
-        self.assertEqual(R("`  - [ ] task`", two), "  - [ ] task")  # 子をバッククォート囲み → 子
-        # 末尾空白: 逐語一致は成立、非逐語（末尾空白の付け外し）は UNRESOLVED
-        self.assertEqual(R("- [ ] t  ", ["- [ ] t  "]), "- [ ] t  ")   # 末尾空白まで一致
-        self.assertEqual(R("- [ ] t  ", ["- [ ] t"]), U)               # ready に無い末尾空白
-        self.assertEqual(R("- [ ] t", ["- [ ] t  "]), U)               # ready の末尾空白を欠落
+        self.assertEqual(R("- [ ] task", two), U)
+        self.assertEqual(R("  - [ ] task", two), U)
+        # 片方だけなら（曖昧でないので）通常どおり同定できる
+        self.assertEqual(R("- [ ] task", ["  - [ ] task"]), "  - [ ] task")
 
     def test_advance_no_progress_streak(self):
         # Phase 4（§8）: (同一識別子 OR UNRESOLVED) AND snapshot hash 不変 が 3 回連続で停止。
@@ -1555,6 +1585,10 @@ class StateMachineWiring(unittest.TestCase):
         s, stop = A(("X", "H", 2), "Y", "H"); self.assertEqual((s[2], stop), (1, False))
         # snapshot hash 変化でリセット（＝進捗あり）
         s, stop = A(("X", "H1", 2), "X", "H2"); self.assertEqual((s[2], stop), (1, False))
+        # P2-1・案B: 識別子が「見えない差」だけ変わってもストリークは継続（不当リセットでガードが
+        # 緩まない）。task-list 側の行末空白を直しただけ、等。
+        s, stop = A(("- [ ] t", "H", 2), "  - [ ] t  ", "H")
+        self.assertEqual((s[2], stop), (3, True), "空白差だけの再選択は同一タスクとして停滞に数える")
         # UNRESOLVED が同一 hash で 3 連続 → 停止（同一性不明のまま無限往復させない）
         s, stop = A(None, U, "H")
         s, stop = A(s, U, "H");        self.assertFalse(stop)

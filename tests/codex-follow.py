@@ -48,6 +48,13 @@ class Fixture(unittest.TestCase):
         self.b_new = self.rollout("b-new", self.B, 3)
         self.a_mid = self.rollout("a-mid", self.A, 2)
         self.freeze_dirs()
+        # ペア内（aipair のペイン）から実行された時に AIPAIR_CODEX_SINCE /
+        # AIPAIR_CLAUDE_SESSION が漏れてくると、peerlog.load がその pin を尊重して
+        # 固定 mtime のフィクスチャ（1_700_000_000 ＝ pin より古い）を全て捨て、
+        # load が (None, []) になる。CI では緑・実機のペア内だけ赤という差になるので、
+        # peer-pin.py と同じく process env を落としてから走らせる。
+        for k in ("AIPAIR_CLAUDE_SESSION", "AIPAIR_CODEX_SINCE"):
+            os.environ.pop(k, None)
 
     def freeze_dirs(self, t=10):
         """Give every directory an old mtime, so that only a later change moves it."""
@@ -221,6 +228,13 @@ class _RootBase(unittest.TestCase):
         peerlog._CODEX_CWD_CACHE.clear()
         peerlog.CODEX_INDEX = peerlog.CodexIndex()
         peerlog.CODEX_INDEX.FULL_RESCAN_SECS = 10 ** 9
+        # ペア内（aipair のペイン）から実行された時に AIPAIR_CODEX_SINCE /
+        # AIPAIR_CLAUDE_SESSION が漏れてくると、peerlog.load がその pin を尊重して
+        # 固定 mtime のフィクスチャ（1_700_000_000 ＝ pin より古い）を全て捨て、
+        # load が (None, []) になる。CI では緑・実機のペア内だけ赤という差になるので、
+        # peer-pin.py と同じく process env を落としてから走らせる。
+        for k in ("AIPAIR_CLAUDE_SESSION", "AIPAIR_CODEX_SINCE"):
+            os.environ.pop(k, None)
 
     def tearDown(self):
         self.tmp.cleanup()

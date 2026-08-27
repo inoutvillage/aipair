@@ -22,6 +22,8 @@ classify は元の実装と同じ条件でのみ呼ぶ（終端 sentinel 検出�
 import collections
 import re
 
+import unicodedata
+
 from .corelib import hit_stop
 
 # task-list 分類の state（tasklist.py と一致させる。循環 import を避けるため文字列で持つ）
@@ -56,21 +58,48 @@ def _echo_candidates(codex_text):
     return cands
 
 
+# no-progress identity の比較キー（P2-1・案B・CEO 判断 2026-08-27）。
+# 識別子そのものは task-list の verbatim 行のまま（表示・banner は原文）だが、**照合だけ**は
+# 「見えない差」を落とした canonical key で行う。Codex のエコーは行頭インデントを落としたり、
+# Markdown の hard-break（行末2スペース）を付け外ししたり、bullet を `*` に変えたりするので、
+# 逐語完全一致だけだと同一タスクを取り逃がして UNRESOLVED＝偽の no-progress を積んでしまう。
+# 落とすのは4つだけ: 先頭インデント / 行末空白 / checkbox 記法ゆれ（bullet 文字・空白・[x]/[X]）/
+# Unicode 合成形（NFC）。**本文そのものは一切いじらない**（別タスクを同一視しないため）。
+# 代償: 本文が同じでインデントだけ違う項目は区別できず、両方一致 → UNRESOLVED（fail-closed）。
+# 安定 ID 方式（案A）を採らない以上これは受容する（fail-closed 側なので無限往復は起きない）。
+_KEY_ITEM = re.compile(r"^[-*+][ \t]+\[(?P<mark>.)\](?:[ \t]+(?P<body>.*))?$")
+
+
+def canonical_task_key(line):
+    """`line` の照合用 canonical key（比較専用・戻り値の識別子は常に原文）。
+
+    NFC 正規化 → 前後の空白を除去（＝先頭インデントと行末空白・hard-break）→ checkbox 行なら
+    `- [<mark>] <本文>` の正規形へ（bullet は `-`、マーカー `X` は `x` に畳む）。checkbox 行で
+    なければ trim した文字列そのもの。本文の内部空白は保持する。"""
+    s = unicodedata.normalize("NFC", line or "").strip()
+    m = _KEY_ITEM.match(s)
+    if not m:
+        return s
+    mark = m.group("mark")
+    return "- [%s] %s" % ("x" if mark == "X" else mark, m.group("body") or "")
+
+
 def resolve_task_identity(codex_text, ready_lines):
     """Codex の次タスク指示から、task-list の着手可行（`ready_lines`＝classify()['ready']）に
     **逐語一致する行を丁度1件**同定して返す（no-progress 判定の識別子）。
 
     識別子は task-list 上の verbatim `- [ ]` 行に固定（安定 ID 方式は採らない）。Codex はその行を
-    逐語エコーする契約（`endless_poke_codex_next` で指定）。**fail-closed**: 抽出失敗・一致 0 件・
-    一致 ≥2 件（曖昧）は `UNRESOLVED` を返し、呼び出し側は no-progress ストリークを進める
-    （同一性を判定できないまま無限往復させない）。
+    逐語エコーする契約（`endless_poke_codex_next` で指定）だが、照合は `canonical_task_key` を通して
+    行うので、**見えない差だけのエコーのゆれ**（先頭インデント・行末空白/hard-break・bullet や
+    `[X]` の記法ゆれ・Unicode 合成形）では取り逃がさない（P2-1・案B）。**fail-closed**: 抽出失敗・
+    一致 0 件・一致 ≥2 件（曖昧＝本文が同じでインデントだけ違う項目を含む）は `UNRESOLVED` を返し、
+    呼び出し側は no-progress ストリークを進める（同一性を判定できないまま無限往復させない）。
 
     戻り値は一致した **verbatim の ready 行**（比較は正規化するが返り値は原文）、または `UNRESOLVED`。
     """
-    cands = _echo_candidates(codex_text)
-    # ready 行は verbatim で完全一致比較（正規化しない）。full-line/span 単位なので prefix 部分一致
-    # （"…A" と "…A extended"）でも、同本文でインデント違いの2項目でも誤検出しない。
-    matched = [ln for ln in ready_lines if ln and ln in cands]
+    cands = {k for k in (canonical_task_key(c) for c in _echo_candidates(codex_text)) if k}
+    # full-line/span 単位の比較なので、prefix 部分一致（"…A" と "…A extended"）では誤検出しない。
+    matched = [ln for ln in ready_lines if ln and canonical_task_key(ln) in cands]
     return matched[0] if len(matched) == 1 else UNRESOLVED
 
 
@@ -90,7 +119,10 @@ def advance_no_progress(prev, cur_id, cur_hash, limit=NO_PROGRESS_LIMIT):
     if prev is None:
         return ((cur_id, cur_hash, 1), False)
     prev_id, prev_hash, streak = prev
-    stalled = (cur_hash == prev_hash) and (cur_id == UNRESOLVED or cur_id == prev_id)
+    # 同一性の比較も canonical key で（P2-1・案B）。task-list 側の行末空白やインデントを直しただけで
+    # 「別タスク」に見え、ストリークが不当にリセットされる（＝ガードが緩む）のを防ぐ。
+    stalled = (cur_hash == prev_hash) and (cur_id == UNRESOLVED
+                                           or canonical_task_key(cur_id) == canonical_task_key(prev_id))
     streak = streak + 1 if stalled else 1
     return ((cur_id, cur_hash, streak), streak >= limit)
 

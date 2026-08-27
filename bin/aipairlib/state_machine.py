@@ -45,6 +45,7 @@ from .review_protocol import plan_poke_codex, question_poke_codex
 from .plan_flow import decide_plan_action
 from .question_flow import decide_question_action, handle_question_answer, decide_question_relay
 from .endless_flow import (decide_endless_terminal, resolve_task_identity, advance_no_progress,  # noqa: F401
+                           canonical_task_key,
                            human_required_banner_lines, no_progress_banner_lines,
                            handle_endless_response, UNRESOLVED)
 from . import tasklist

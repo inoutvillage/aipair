@@ -4,11 +4,23 @@ aipair uses [Semantic Versioning](https://semver.org/). The **single source of t
 version is `bin/aipairlib/__version__` (read by `aipair --version` and `aipair-relay --version`).
 A release is a git tag **`v<version>`** plus its GitHub Release; the tag must equal `__version__`.
 
+**Between releases, main carries a development version** — the version being prepared plus the
+SemVer prerelease suffix `-dev.N`, e.g. `0.2.0-dev.0` (CEO decision 2026-08-27). A main checkout
+therefore never claims to BE a release, and `X.Y.Z-dev.N` sorts before `X.Y.Z`. Only the **release
+commit** carries a bare `X.Y.Z`, and that is the commit the `vX.Y.Z` tag points at. The CHANGELOG
+heading always names the *release* being prepared (`## [X.Y.Z] — unreleased`) — never the `-dev.N`
+form. doc-sync pins which version form may appear in which CHANGELOG state, so a half-done bump
+fails CI. (PEP 440's `0.2.0.dev0` was rejected: aipair is not published to PyPI and its whole
+version contract — doc-sync's `SEMVER`, `release.yml`'s tag check — is SemVer 2.0.0.)
+
 `tests/doc-sync.py` enforces the invariants below, so a mismatch fails CI before you can tag.
 
 ## Cutting a release
 
-1. **Confirm the version to release.** Between releases `__version__` is the *prepared* version and
+1. **Confirm the version to release, and drop the `-dev.N` suffix.** Between releases `__version__`
+   is `X.Y.Z-dev.N`; the release commit sets it to the bare `X.Y.Z` (this is the *only* commit that
+   carries a bare version — doc-sync requires the bare form to come with the dated CHANGELOG below).
+   The prepared version and
    has its own `## [X.Y.Z] — unreleased` section in `CHANGELOG.md` (right after a release the top is a
    fresh `## [Unreleased]` above the last dated version — start the next cycle first, see below) (it was set when this cycle started — see
    "Starting the next version"). If the scope changed the intended number, update `__version__` **and**
@@ -41,10 +53,12 @@ A release is a git tag **`v<version>`** plus its GitHub Release; the tag must eq
 
 After a release, choose the next version `NEXT_VERSION` per SemVer — e.g. `0.1.1` for a patch,
 `0.2.0` for features, `1.0.0` for a stable/breaking release — set `bin/aipairlib/__init__.py`
-`__version__ = "<NEXT_VERSION>"`, and **rename the `## [Unreleased]` section** (created by the
+`__version__ = "<NEXT_VERSION>-dev.0"` (the `-dev.N` suffix — bump `N` only if you ever need to
+distinguish dev states within one cycle), and **rename the `## [Unreleased]` section** (created by the
 release step above) **to `## [<NEXT_VERSION>] — unreleased (…)`** — and rename its bottom link key
 from `[Unreleased]` to `[<NEXT_VERSION>]` (it becomes the tag URL when NEXT_VERSION ships) — in the
-same commit, so `__version__` always has its own top version section (doc-sync enforces this). This is where `__version__` is
+same commit, so `__version__` (minus its `-dev.N` suffix) always has its own top version section
+(doc-sync enforces this). This is where `__version__` is
 **normally** bumped; the only exception is step 1, which adjusts it together with the heading if the
 release scope changed the intended number.
 

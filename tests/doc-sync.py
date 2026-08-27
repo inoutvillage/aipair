@@ -276,9 +276,50 @@ class Version(unittest.TestCase):
     """P2-4: aipairlib.__version__ が唯一の source of truth で、CHANGELOG の最上位の版セクション
     （発行前=prepared / 発行後=Unreleased+dated の両状態）・`aipair --version` /
     `aipair-relay --version` の出力・release workflow の tag 検査が一致する。"""
+    # P2-2（案B・CEO 判断 2026-08-27）: リリース間の main は `X.Y.Z-dev.N`。SemVer の prerelease なので
+    # 既存の SEMVER 契約・`v<version>` タグ契約はそのまま（PEP 440 の `0.2.0.dev0` は不採用＝SemVer 不正）。
+    DEV_RE = re.compile(r"^(?P<rel>\d+\.\d+\.\d+)-dev\.(?:0|[1-9]\d*)$")
+
+    @classmethod
+    def _release_part(cls, v):
+        """このチェックアウトが向かっているリリース版: `0.2.0-dev.3` → `0.2.0`（bare はそのまま）。"""
+        m = cls.DEV_RE.match(v)
+        return m.group("rel") if m else v
+
     def test_version_is_semver(self):
         self.assertRegex(aipairlib.__version__, SEMVER,
                          "__version__ %r is not SemVer 2.0.0" % aipairlib.__version__)
+
+    def test_dev_suffix_form_is_semver_not_pep440(self):
+        # 形式そのものを固定する（PEP 440 へ流れたら落ちる）。
+        self.assertRegex("0.2.0-dev.0", SEMVER)
+        self.assertNotRegex("0.2.0.dev0", SEMVER, "PEP 440 の dev 表記は SemVer 契約では不正")
+        self.assertTrue(self.DEV_RE.match("0.2.0-dev.0"))
+        self.assertTrue(self.DEV_RE.match("1.10.3-dev.12"))
+        self.assertFalse(self.DEV_RE.match("0.2.0"))
+        self.assertFalse(self.DEV_RE.match("0.2.0.dev0"))
+        self.assertFalse(self.DEV_RE.match("0.2.0-dev"), "N を省略した形は採らない")
+        self.assertEqual(self._release_part("0.2.0-dev.3"), "0.2.0")
+        self.assertEqual(self._release_part("0.2.0"), "0.2.0")
+        # SemVer precedence では prerelease は当該リリースより前（`0.2.0-dev.0` < `0.2.0`）。
+        # 文字列比較では表せない性質なので、ここでは形式（release 部の一致）だけを固定する。
+        self.assertEqual(self._release_part("0.2.0-dev.0"), "0.2.0")
+
+    def test_version_form_matches_the_changelog_lifecycle_state(self):
+        # main（開発中）= `-dev.N` ＋ prepared 形。release コミットだけが bare `X.Y.Z` ＋ released 形。
+        # どちらかだけを直した中途半端なコミットはここで落ちる。
+        v = aipairlib.__version__
+        shape = self._changelog_shape(_read("CHANGELOG.md"))
+        if self.DEV_RE.match(v):
+            self.assertEqual(shape, "prepared",
+                             "__version__ %s is a development version, so CHANGELOG.md must be in the"
+                             " prepared shape (『## [X.Y.Z] — unreleased』, no『## [Unreleased]』)" % v)
+        else:
+            self.assertEqual(shape, "released",
+                             "__version__ %s has no -dev.N suffix, so this must be the release commit"
+                             " (CHANGELOG.md in the released shape: 『## [Unreleased]』above the dated"
+                             " 『## [X.Y.Z] - YYYY-MM-DD』). Between releases main carries X.Y.Z-dev.N."
+                             % v)
 
     @staticmethod
     def _top_version(text):
@@ -317,9 +358,9 @@ class Version(unittest.TestCase):
         # the TOP version section must equal __version__ (bumping one without the other fails here).
         top = self._top_version(_read("CHANGELOG.md"))
         self.assertIsNotNone(top, "CHANGELOG.md has no『## [X.Y.Z]』version section")
-        self.assertEqual(top, aipairlib.__version__,
-                         "CHANGELOG.md top version section %s != __version__ %s (bump them together)"
-                         % (top, aipairlib.__version__))
+        self.assertEqual(top, self._release_part(aipairlib.__version__),
+                         "CHANGELOG.md top version section %s != __version__ %s (minus any -dev.N)"
+                         " — bump them together" % (top, aipairlib.__version__))
 
     def test_both_changelog_lifecycle_states_have_a_verified_shape(self):
         # the two VALID lifecycle SHAPES are accepted and INVALID ones are REJECTED — not merely
@@ -350,7 +391,7 @@ class Version(unittest.TestCase):
         real = _read("CHANGELOG.md")
         self.assertIn(shape(real), ("prepared", "released"),
                       "CHANGELOG.md is in an invalid lifecycle shape (%s)" % shape(real))
-        self.assertEqual(self._top_version(real), aipairlib.__version__)
+        self.assertEqual(self._top_version(real), self._release_part(aipairlib.__version__))
         self.assertIsNone(self._top_version("# CL\n\n## [Unreleased]\n\nwip\n"))
 
     def test_aipair_version_reports_the_source_of_truth(self):
@@ -420,8 +461,11 @@ class Version(unittest.TestCase):
         synthetic = ("# Changelog\n\n## [1.2.3+build.5] - 2026-01-01\n\nnotes body\n\n"
                      "## [1.2.2] - 2025-12-31\nold\n")
         self.assertEqual(self._extract_changelog_section(synthetic, "1.2.3+build.5"), "notes body")
-        # and the real CHANGELOG's current version extracts non-empty
-        self.assertTrue(self._extract_changelog_section(_read("CHANGELOG.md"), aipairlib.__version__),
+        # and the real CHANGELOG's current version extracts non-empty. main は `-dev.N` を持つので
+        # release 部（＝見出しに載る版）で引く: release.yml が走るのは suffix を落とした release
+        # コミットのタグ push だけ（P2-2）。
+        self.assertTrue(self._extract_changelog_section(_read("CHANGELOG.md"),
+                                                        self._release_part(aipairlib.__version__)),
                         "the current CHANGELOG section for __version__ must extract non-empty")
 
     @staticmethod
