@@ -429,3 +429,52 @@ F1 ✅ → F2 ✅ → F3 ✅ → F6 ✅ → F4 ✅ → F5 ✅ → F9 ✅ → F8 
   - 攻撃対象面（実コードと照合済み・盛らない）: ①権限バイパス実行（`aipair loop` は `--unsafe` 必須・未指定は exit 2）②トランスクリプト読取（peer/relay が全履歴を読む・pin あり）③tmux キー注入（stop=最終メッセージ冒頭100字・版/schema/停止ゲート）④自律 git push ⑤グローバル指示注入（マーカー境界・`--no-global-instructions`）⑥テストの private `-L` socket ガードレール。
   - **`aipair-queue`（本番 migration deploy）は D2 で撤去済み**（shipped FILES/README に無し）のため threat model から除外（存在しない機能を書かない）。
   - Codex レビュー派生（PR #22-#25・マージ済み）: クロスプロバイダー境界の明記（peer/relay 出力が相手クラウドへ＝Claude→OpenAI/Codex→Anthropic）＋private vulnerability reporting を API 有効化＋テンプレの push/PII 誤帰属修正（#22）／§6 のテスト隔離記述を正確化＋非公開 `tasks/lessons.md` 参照を一掃（#23）／SKILL の権限モードを安全既定に是正＋`launch-cmds`・`env-forward` に socket_path preflight（#24）／`AIPAIR_*_FLAGS` の『空でフラグ無し』を対話起動限定に是正（loop は危険フラグ除去不能・追記）（#25）。
+
+## 追記: 版ゲートの検証済み版を claude 2.1.247 / codex 0.150.1 へ更新（2026-08-27）
+
+> 稼働ペアの起動バナーが `⚠ claude 版 2.1.247 は検証済み 2.1.238 と異なる` / `⚠ codex 版 0.150.1 は
+> 検証済み 0.149.0 と異なる` を出し、ダイアログ自動操作が OFF に落ちていた。前回の申し送り
+> （「実 TUI 確認後に更新を検討。盲目的 bump はしない」）に従い、**実 CLI で全依存を実測してから** bump。
+
+- [x] **実 TUI / 実ログ検証**（既定 tmux server は不使用。私設 socket `-L aipair-vercheck` に
+  claude 2.1.247 × 2 窓・codex 0.150.1 × 1 窓を立て、`tmux -L` に差し替えたランナーで**本番コードの
+  判定・キー操作・LogWatch をそのまま実行**。scratch 作業 dir で完結・repo 非汚染）
+  - claude 2.1.247 プラン承認: `detect_plan_dialog` → `{tell:3, yes:1, plan:~/.claude/plans/*.md}`、
+    `send_plan_feedback(approve=False)` 差し戻し → 再プラン → `send_plan_feedback(approve=True)` の
+    **Shift+Tab 承認が成立し、承認後にプランが実際に実行された**（`hello.py` へ追記を確認）。
+  - claude 2.1.247 質問リレー: 単問（タブバー無し）・複数問（`←  ☐ … ✔ Submit  →`）とも
+    `detect_question_dialog` → `{chat:4}`、`scrape_questions` が 2 問とも収集、数字キーでの選択確定、
+    `send_question_answer`（「Chat about this」→ ペースト → Enter）の配達成立を確認。
+    フッターは `Enter to select · Tab/Arrow keys to navigate · Esc to cancel`（単問は `↑/↓ to navigate`）で
+    いずれも `QUESTION_FOOTER` 前方一致を満たす。
+  - **仕様変化（破壊的ではない）**: 承認肢が `1. Yes, and use auto mode` / `2. Yes, manually approve edits`
+    になり **"bypass" 表記が消えた**。`detect_plan_dialog` の優先規則（`yes` かつ `bypass` 優先）は
+    該当なしで先頭の `Yes…` を採る＝実害なし。差し戻し肢 `3. Tell Claude what to change` は不変。
+  - ログ schema: `schema_probe("claude", …)` が新規セッション 2 本とも `ok`（assistant+stop_reason+
+    timestamp+uuid+parentUuid / 入力行 / tool_result）。`schema_probe("codex", …)` は 0.150.1 の
+    rollout で `ok`（event_msg task_started+task_complete+timestamp / turn_id 対応付け）。
+    稼働ペアの relay も 2.1.247 の実ログで claude schema OK を出している。
+  - codex 0.150.1: 実行中バッジ `• Working (0s • esc to interrupt)` を確認（`submit_enter(badge=True)` の
+    Codex 宛フォールバックが機能）。`peer-log codex` も 0.150.1 の rollout を正しく整形。
+- [x] **bump**: `bin/aipairlib/corelib.py` の `TESTED_VERSIONS` と README「必要環境」表（実測日も
+  2026-08-27 へ）を更新。`tests/doc-sync.py` が両者一致を強制するので片側漏れは CI で落ちる。
+- [x] **Codex レビュー反映（relay-id:77daea3a、P2）**: 消滅した「Yes, and bypass permissions」を
+  現行動作として書いていた README（プランレビュー節）と `relay.py` の module docstring を現行文言へ。
+  `tests/relay-parsers.py` の主 fixture `PLAN_SCREEN` を **2.1.247 の実画面**（`Yes, and use auto mode` /
+  `shift+tab to approve with this feedback` / `ctrl+g to edit in nano · <plan path>`）に差し替えて回帰対象にし、
+  旧 UI は `LEGACY_BYPASS_PLAN_SCREEN` として分離（`test_legacy_bypass_screen_still_parses` と
+  bypass 優先規則テストで維持）。plan_flow のスタブ `yes_label` も現行文言へ。
+- 申し送り: **稼働中の relay は起動時に読み込んだ旧 `TESTED_VERSIONS` のまま**なので、警告が消えるのは
+  再点火（`aipair-relay-here` / VS Code タスク）以降。導入済みコピー（`~/.local/bin`）は
+  `./aipair-install.sh` で更新する。導入ツリーは HEAD と `corelib.py` 以外バイト一致だったので
+  （sha256 照合）、再導入で入るのはこの版更新のみ。
+
+## スコープ外の検出（2026-08-27・未着手）
+
+- [ ] **`tests/codex-follow.py` が実機で 3 件 FAIL**（版更新作業中に検出。**この作業の変更とは無関係**で、
+  `git archive HEAD` で取り出した無改変コピーでも、単体実行でも、python3.9 / 3.11 いずれでも同じ 3 件が落ちる）
+  - `CodexFollow.test_load_follows_on_from_current` / `DiscoveryRaces.test_load_survives_current_vanishing_during_discovery`
+    ＝ `peerlog.load(...)` が期待するファイルを返さず `None`。
+  - `StaleEntries.test_load_survives_a_file_vanishing_after_selection` ＝ 選択後に消えたファイルが
+    `CODEX_INDEX` から落ちず、`codex_newest` が消えた `r-24` を返し続ける（期待は `r-23`）。
+  - 影響範囲の切り分け（`peer` / relay の rollout 追従に実害があるか）と原因調査は未実施。

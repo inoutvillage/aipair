@@ -64,12 +64,12 @@
 
 ## 必要環境
 
-| 必要 | 最小 | 検証済みバージョン（2026-08-21 実測） | 備考 |
+| 必要 | 最小 | 検証済みバージョン（2026-08-27 実測） | 備考 |
 |---|---|---|---|
 | `tmux` | **≥ 3.1** | 3.2a | `split-window -l 30%`（割合指定）が 3.1 から。Ubuntu 20.04 の 3.0a は不可 |
 | `python3` | **≥ 3.8** | 3.9.25 | `peer-log` / `aipair-relay` の本体。**標準ライブラリのみ**（pip 不要） |
-| `claude` | — | 2.1.238 | Claude Code CLI（`npm install -g @anthropic-ai/claude-code`、要ログイン） |
-| `codex` | — | 0.149.0 | OpenAI Codex CLI（`npm install -g @openai/codex`、要ログイン） |
+| `claude` | — | 2.1.247 | Claude Code CLI（`npm install -g @anthropic-ai/claude-code`、要ログイン） |
+| `codex` | — | 0.150.1 | OpenAI Codex CLI（`npm install -g @openai/codex`、要ログイン） |
 | ロケール | UTF-8 | `en_US.UTF-8` | 停止ワード（日本語）や罫線を扱うため。非 UTF-8 だとインストーラが `[warn]` |
 
 - 検証した OS: **WSL2（AlmaLinux 9.7 / dnf）**、**Ubuntu 24.04 コンテナ（apt）**、**Arch Linux コンテナ（pacman）**。
@@ -356,7 +356,7 @@ Claude がプランモードで **「Would you like to proceed?」の承認待�
 1. ダイアログからプランファイルのパス（`~/.claude/plans/*.md`）を読み取り、**Codex にレビュー依頼**
 2. Codex の返答で分岐:
    - **修正要求** → 「Tell Claude what to change」を選択し、レビュー本文をペーストして **Enter**（Claude がプラン修正 → 再度ダイアログ → 繰り返し）
-   - **承認**（先頭行に `[AIPAIR_PLAN_APPROVED]` を単独で）→ 「Yes, and bypass permissions」を選択して実装開始
+   - **承認**（先頭行に `[AIPAIR_PLAN_APPROVED]` を単独で）→ 先頭の「Yes…」（claude 2.1.247 では「Yes, and use auto mode」。旧 UI の「Yes, and bypass permissions」が出る版ではそちらを優先）を選択して実装開始
    - **承認＋付帯コメント** → feedback をペーストして **shift+tab**（feedback 付き承認）
 3. プランレビューは 1 プランにつき最大 5 回（`--plan-rounds`）。超過時はベルを鳴らして人間に委ねる
 

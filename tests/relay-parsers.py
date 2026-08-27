@@ -267,7 +267,25 @@ class FindPanes(unittest.TestCase):
             self.assertEqual(relay.find_panes("s"), {"claude": "%0", "codex": "%2"})
 
 
+# claude 2.1.247 の実画面（2026-08-27 実測）。承認肢から "bypass" 表記が消え、プランのパスは
+# 「ctrl+g to edit in nano · <path>」の形で出る（`·` を挟むのでパス抽出の除外文字も回帰にかかる）。
 PLAN_SCREEN = """\
+   検証
+  ──────────────────────────────────────────────────
+   Claude has written up a plan and is ready to execute. Would you like to proceed?
+
+   ❯ 1. Yes, and use auto mode
+     2. Yes, manually approve edits
+     3. Tell Claude what to change
+        shift+tab to approve with this feedback
+
+   ctrl+g to edit in nano · ~/.claude/plans/snazzy-fox.md
+"""
+
+
+# 旧 UI（"Yes, and bypass permissions" があった頃）。承認肢の文言は版で動くので、
+# 現行と旧の両方を検出できることを別ケースとして残す。
+LEGACY_BYPASS_PLAN_SCREEN = """\
  ╭─ Plan ───────────────────────────────────╮
  │ Ready to code?                            │
  │ Plan saved: ~/.claude/plans/snazzy-fox.md │
@@ -483,13 +501,23 @@ class PlanDialog(unittest.TestCase):
             return relay.detect_plan_dialog("%0")
 
     def test_reads_numbers_from_the_screen(self):
+        # 現行 UI: "bypass" 表記が無いので、先頭の "Yes…"（= auto mode）が承認肢になる
         d = self.detect(PLAN_SCREEN)
+        self.assertEqual((d["tell"], d["yes"]), ("3", "1"))
+        self.assertEqual(d["yes_label"], "Yes, and use auto mode")
+        self.assertEqual(d["plan"], os.path.expanduser("~/.claude/plans/snazzy-fox.md"))
+
+    def test_legacy_bypass_screen_still_parses(self):
+        # 旧 UI 互換: 文言が変わっても検出は壊れない（番号は画面から読む）
+        d = self.detect(LEGACY_BYPASS_PLAN_SCREEN)
         self.assertEqual((d["tell"], d["yes"]), ("3", "1"))
         self.assertTrue(d["yes_label"].startswith("Yes, and bypass"))
         self.assertEqual(d["plan"], os.path.expanduser("~/.claude/plans/snazzy-fox.md"))
 
     def test_prefers_the_bypass_variant_wherever_it_is(self):
-        screen = PLAN_SCREEN.replace("1. Yes, and bypass permissions", "1. Yes").replace("2. Yes, manually approve edits", "2. Yes, and bypass permissions")
+        screen = (LEGACY_BYPASS_PLAN_SCREEN
+                  .replace("1. Yes, and bypass permissions", "1. Yes")
+                  .replace("2. Yes, manually approve edits", "2. Yes, and bypass permissions"))
         self.assertEqual(self.detect(screen)["yes"], "2")
 
     def test_no_dialog(self):
@@ -720,17 +748,21 @@ class VersionGate(unittest.TestCase):
         self.assertEqual(relay.parse_version("codex-cli 0.149.0-nightly.2"), "0.149.0-nightly.2")
         self.assertEqual(relay.parse_version("1.2.3+build.5"), "1.2.3+build.5")
         self.assertNotEqual(relay.parse_version("2.1.238-beta.1"), "2.1.238")
-        # a 4th component or a glued suffix must NOT truncate onto the tested 3-part version
+        # a 4th component or a glued suffix must NOT truncate onto the tested 3-part version.
+        # Derived from TESTED_VERSIONS so a version bump can never leave this checking strings
+        # that are no longer the tested ones (which would pass vacuously).
         self.assertEqual(relay.parse_version("2.1.238.1"), "2.1.238.1")
         self.assertEqual(relay.parse_version("2.1.238rc1"), "2.1.238rc1")
-        self.assertEqual(relay.parse_version("0.149.0.1"), "0.149.0.1")
-        for bad in ("2.1.238.1", "2.1.238rc1", "0.149.0.1"):
-            self.assertNotIn(relay.parse_version(bad), relay.TESTED_VERSIONS.values())
+        for tested in relay.TESTED_VERSIONS.values():
+            for bad in (tested + ".1", tested + "rc1", tested + "-beta.1"):
+                self.assertEqual(relay.parse_version(bad), bad)
+                self.assertNotIn(relay.parse_version(bad), relay.TESTED_VERSIONS.values())
         self.assertEqual(relay.parse_version("2.1."), "2.1")   # never ends on a separator
 
     def test_prerelease_is_treated_as_a_mismatch(self):
         a = self.a()
-        _rows, bad = relay.version_gate(a, {"claude": "2.1.238-beta.1", "codex": "0.149.0"})
+        _rows, bad = relay.version_gate(a, {"claude": relay.TESTED_VERSIONS["claude"] + "-beta.1",
+                                            "codex": relay.TESTED_VERSIONS["codex"]})
         self.assertEqual(bad, ["claude"])
         self.assertTrue(a.no_plan_review, "a prerelease of the tested version is still untested")
 
@@ -760,28 +792,31 @@ class VersionGate(unittest.TestCase):
     def test_non_utf8_version_disables_dialog_automation(self):
         a = self.a()
         with mock.patch.object(relay, "detect_version",
-                               side_effect=lambda b: None if b == "claude" else "0.149.0"):
+                               side_effect=lambda b: None if b == "claude"
+                               else relay.TESTED_VERSIONS["codex"]):
             _rows, bad = relay.version_gate(a, {n: relay.detect_version(n) for n in ("claude", "codex")})
         self.assertEqual(bad, ["claude"])
         self.assertTrue(a.no_plan_review and a.no_question_relay)
 
     def test_matching_versions_keep_dialogs_on(self):
         a = self.a()
-        rows, bad = relay.version_gate(a, {"claude": "2.1.238", "codex": "0.149.0"})
+        rows, bad = relay.version_gate(a, dict(relay.TESTED_VERSIONS))
         self.assertEqual(bad, [])
         self.assertFalse(a.no_plan_review or a.no_question_relay)
         self.assertTrue(all(s == "ok" for _n, _d, _t, s in rows))
 
     def test_mismatch_turns_dialog_automation_off(self):
         a = self.a()
-        rows, bad = relay.version_gate(a, {"claude": "9.9.9", "codex": "0.149.0"})
+        rows, bad = relay.version_gate(a, {"claude": "9.9.9",
+                                           "codex": relay.TESTED_VERSIONS["codex"]})
         self.assertEqual(bad, ["claude"])
         self.assertTrue(a.no_plan_review and a.no_question_relay, "dialogs disabled")
         self.assertEqual([s for _n, _d, _t, s in rows], ["mismatch", "ok"])
 
     def test_undetectable_version_is_treated_as_untested(self):
         a = self.a()
-        _rows, bad = relay.version_gate(a, {"claude": None, "codex": "0.149.0"})
+        _rows, bad = relay.version_gate(a, {"claude": None,
+                                            "codex": relay.TESTED_VERSIONS["codex"]})
         self.assertEqual(bad, ["claude"])
         self.assertTrue(a.no_plan_review)
 
@@ -1402,7 +1437,7 @@ class PlanApproval(unittest.TestCase):
         self.assertEqual(relay.plan_extra_comment([self.OK], self.OK), "")
 
     def _dlg(self, tell="2"):
-        return {"tell": tell, "yes": "1", "yes_label": "Yes, and bypass permissions", "plan": "p.md"}
+        return {"tell": tell, "yes": "1", "yes_label": "Yes, and use auto mode", "plan": "p.md"}
 
     def test_approve_feedback_delivers_extra_not_the_joined_turn(self):
         # Regression (P1-c, delivery side): the feedback-approve path must carry `extra` (the
