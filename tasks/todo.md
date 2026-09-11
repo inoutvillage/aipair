@@ -503,3 +503,32 @@ F1 ✅ → F2 ✅ → F3 ✅ → F6 ✅ → F4 ✅ → F5 ✅ → F9 ✅ → F8 
   - **修正**: `tests/codex-follow.py` の `Fixture.setUp` と `_RootBase.setUp` で当該 env を落とす
     （`tests/peer-pin.py` が既に持っていた同じガードを移植・理由をコメントで明示）。
     ペア内でも、`AIPAIR_*` を明示的に載せて実行しても 38 tests 緑。
+
+## 追記: 版ゲートの検証済み版を claude 2.1.268 / codex 0.154.0 へ更新（2026-09-12）
+
+> 稼働ペアの起動バナーが `⚠ claude 版 2.1.268 は検証済み 2.1.247 と異なる` / `⚠ codex 版 0.153.4 は
+> 検証済み 0.150.1 と異なる` を出していた。codex はバナー表示後に自動更新されており、実測時点の導入版は
+> **0.154.0**（npm-global の 1 本のみ・PATH 上に別バイナリ無しを確認）。前回同様、実 CLI で全依存を実測してから bump。
+
+- [x] **実 TUI / 実ログ検証**（ローカル専用の検証ツール〈repo 外・非公開〉・
+  私設 socket `-L aipair-livecheck-<pid>`・scratch dir で完結・既定 tmux server 不使用）: **30 / 30 PASS**
+  - claude 2.1.268 プラン承認: `detect_plan_dialog` → `{tell:3, yes:1, yes_label:"Yes, and use auto mode"}`＋
+    プランパス抽出、`send_plan_feedback(approve=False)` 差し戻し → 再プラン → `approve=True` の Shift+Tab 承認 →
+    **承認後にプランが実際に実行された**（`hello.py` 追記を確認）。
+  - claude 2.1.268 質問リレー: 単問・複数問（`←  ☐ … ✔ Submit  →`）とも `detect_question_dialog` → `{chat:4}`、
+    `scrape_questions` が 2 問収集、「Chat about this」経由の `send_question_answer` 配達成立。
+  - ログ schema: `schema_probe` が claude 新規セッション 2 本・codex 0.154.0 rollout とも `ok`。
+    codex 実行中バッジ `esc to interrupt` を確認。
+  - 採取した実画面（プラン・単問・複数問）は 2.1.247 で採った fixture と構造・文言とも同一
+    → `tests/relay-parsers.py` の `PLAN_SCREEN` 等は据え置き（差し替える差分が無い）。
+- [x] **検証ツール側の追従（repo 外・ローカルのみ）**: claude 2.1.268 で初回の「このフォルダを信頼するか」
+  ダイアログが **番号無し・既定カーソル「❯ No, exit」** に変わり、ツールの `1. Yes` 前提の判定が一致せず
+  起動待ちで停止していた（Codex レビュー relay-id:acac1063 で検出。停止した回は PID 指定の SIGINT で止め、
+  私設 socket・scratch dir の後片付けを確認）。番号に頼らず、カーソル（❯/›）が Yes 行に来たことを画面で
+  確かめてから Enter する方式に変更（採取画面 8 ケースでオフライン確認 → ライブ再実行で 30/30）。
+  aipair 本体（`bin/`・installer）は信頼ダイアログを操作しないので製品コードへの影響は無い（grep で確認）。
+- [x] **bump**: `corelib.TESTED_VERSIONS` と README「必要環境」表（実測日 2026-09-12）を更新。CHANGELOG の
+  版行、README プランレビュー節・`relay.py` docstring の承認肢の版注記を「2.1.247 / 2.1.268」へ。
+  `bash tests/run-all.sh` 全緑（relay-parsers 206 / doc-sync 31 / codex-follow 38 ほか計 12 系統）。
+- 申し送り: 稼働中の relay は起動時に読んだ旧 `TESTED_VERSIONS` のまま。マージ後に `./aipair-install.sh` を
+  再実行し、再点火（`aipair-relay-here` / VS Code タスク）すると警告が消える。
