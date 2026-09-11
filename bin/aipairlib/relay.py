@@ -34,10 +34,11 @@ SourceFileLoader and no runtime attribute injection):
   review_protocol  the poke wording (7 templates) — pure
   gate          the stop-gate runner (subprocess) + gate_or_message
   log_lock      per-pane transcript locking / refresh
-  schema_guard  SchemaGuard: fail-closed runtime JSONL-schema watch
+  schema_guard  SchemaGuard: fail-closed runtime JSONL-schema watch; VersionGuard: re-checks the
+                claude a pane is RUNNING right before any of its dialogs is touched
   state_machine the state machine: StateMachine.run() (the loop) + LogWatch + approval_took_effect +
                 done_banner, plus the pure decision cores ResponseGate / decide_plan_action /
-                decide_question_action
+                decide_question_action / decide_delivery_back
 The delivery<->dialog cycle is a plain module import used at call-time. What stays in relay: only
 main() — arg parse, dependency construction, startup banner, gates, then StateMachine(...).run() —
 and unqualified re-exports of the sibling helpers so tests keep calling them as relay.X. The thin
@@ -115,8 +116,9 @@ import unicodedata
 # as relay.X. The delivery<->dialog cycle, the shared logger, and the idle budget are now real
 # imports / a poke(busy_wait=...) argument, handled inside those modules — no injection here.
 from . import peerlog, corelib, loglib, tmuxlib, deliverylib, dialoglib, logs, review_protocol, gate, log_lock, cli, state_machine
-from .schema_guard import SchemaGuard
-from .state_machine import (ResponseGate, StateMachine, decide_plan_action, decide_question_action)
+from .schema_guard import SchemaGuard, VersionGuard
+from .state_machine import (ResponseGate, StateMachine, decide_plan_action, decide_question_action,
+                            decide_delivery_back)
 from .gate import run_gate, gate_or_message
 from .cli import build_parser
 from .log_lock import (claude_glob, codex_all, codex_cwd_matches, claude_matches_pane, lock_claude,
@@ -132,6 +134,8 @@ TESTED_VERSIONS = corelib.TESTED_VERSIONS
 GATE_OUTPUT_CAP = corelib.GATE_OUTPUT_CAP
 parse_version = corelib.parse_version
 detect_version = corelib.detect_version
+version_output = corelib.version_output
+cli_version = corelib.cli_version
 version_gate = corelib.version_gate
 schema_probe = corelib.schema_probe
 schema_gate = corelib.schema_gate
@@ -173,6 +177,68 @@ def probe_log_schema(agent, path):
         # malformed レコードを reset 後も拾い、即 terminal mismatch に戻る（P1-4/Codex）。
         records = records_since_compaction(records)
     return schema_probe(agent, records)
+
+
+# --- version gate: what each pane is RUNNING (2026-09-12) ------------------- #
+# npm upgrades swap the file on disk under a live TUI, so PATH's `--version` can describe a binary
+# nobody is scraping. These ask the pane's own process instead (Linux /proc; see peerlog.cli_process).
+
+def locate_running(pane, name):
+    """("unsupported" | "none" | "found", ident) — the locating half of probe_running."""
+    if not peerlog.proc_available():
+        return ("unsupported", None)
+    ident = peerlog.cli_process(pane, name)
+    return ("found", ident) if ident else ("none", None)
+
+
+def measure_running(ident, name):
+    """("ok", version) | ("fail", None) for a located process — the measuring half of probe_running."""
+    ver, is_cli = cli_version(name, version_output("/proc/%d/exe" % ident[0]))
+    if not (is_cli and ver) or not peerlog.same_process(ident):
+        return ("fail", None)
+    return ("ok", ver)
+
+
+def probe_running(pane, name):
+    """What the `name` CLI in `pane` is ACTUALLY running — the TUI the relay scrapes. Returns
+    (state, version, ident) under a fail-closed contract:
+      "unsupported" — no /proc here (macOS…): the running version can't be known; callers keep PATH.
+      "none"        — /proc exists but no `name` process is found in the pane (not started yet /
+                      restarting / the tmux query failed / an unusual launch whose comm differs).
+      "fail"        — a `name` process IS there but its version can't be confirmed: its executable
+                      won't run or parse, answers as something else (an interpreter), or the pid was
+                      replaced while probing. Unknown — never falls back to PATH.
+      "ok"          — /proc/<pid>/exe (the exact binary the process started from, even if an upgrade
+                      has since deleted it) reports `name`'s own version, and it is still the same process."""
+    state, ident = locate_running(pane, name)
+    if state != "found":
+        return (state, None, None)
+    status, ver = measure_running(ident, name)
+    return (status, ver, ident)
+
+
+def startup_version(pane, name):
+    """The startup (INITIAL) version-gate input for `name`: {"version", "source", "ident", "disk"}.
+    ok → the running process's version; fail → None (unknown → dialog automation OFF); none /
+    unsupported → PATH's --version as before (`source` says which). `disk` = PATH's version next to a
+    running one, so a pending switch on restart is visible. On Linux the authoritative check is
+    VersionGuard.dialog_ok() right before a dialog is touched — this only seeds the flags."""
+    state, ver, ident = probe_running(pane, name)
+    if state in ("ok", "fail"):
+        return {"version": ver, "source": state, "ident": ident, "disk": detect_version(name)}
+    return {"version": detect_version(name), "source": state, "ident": None, "disk": None}
+
+
+def version_source_note(name, source):
+    """Where a banner's version came from (a probe_running state), for the startup log."""
+    if source == "ok":
+        return "ペインで実行中"
+    if source == "fail":
+        return "ペインの実行中プロセスが版を答えない"
+    if source == "unsupported":
+        return "PATH の --version・/proc が無く実行中の版は不明"
+    return ("PATH の --version・ペインの実行中プロセスは未特定"
+            + ("（ダイアログ操作の直前に再判定）" if name == "claude" else ""))
 
 
 # tmuxlib (tmux runner + pane helpers)
@@ -280,10 +346,14 @@ def main():
         return 2
 
     # Version gate: an untested claude/codex keeps the safe relay (poke + transcripts) but
-    # loses the TUI-scraping dialog automation, which its version might have changed.
-    vrows, vbad = ([], [])
+    # loses the TUI-scraping dialog automation, which its version might have changed. It judges
+    # what each pane is RUNNING (startup_version → probe_running), not what PATH resolves to now.
+    # This is the INITIAL value: on Linux VersionGuard.dialog_ok() re-checks the running claude
+    # right before any dialog is touched (the CLI may not be up yet here, or restart later).
+    vrows, vbad, vinfo = ([], [], {})
     if not a.no_version_gate:
-        vrows, vbad = version_gate(a, {n: detect_version(n) for n in ("claude", "codex")})
+        vinfo = {n: startup_version(panes[n], n) for n in ("claude", "codex")}
+        vrows, vbad = version_gate(a, {n: vinfo[n]["version"] for n in vinfo})
 
     # Schema feature-probe: the version gate only knows --version strings, so also probe the
     # actual JSONL the core relay reads. At startup only EXPLICIT pins exist (an `aipair loop`
@@ -310,12 +380,17 @@ def main():
     if a.gate:
         log(f"停止ゲート={a.gate}（timeout {a.gate_timeout}s / 差し戻し上限 {a.gate_rounds} 回）")
     for name, det, tst, status in vrows:
+        where = version_source_note(name, vinfo[name]["source"])
         if status == "ok":
-            log(c("dim", f"{name} 版 {det}（検証済み）"))
+            log(c("dim", f"{name} 版 {det}（検証済み・{where}）"))
         elif status == "mismatch":
-            log(c("warn", f"⚠ {name} 版 {det} は検証済み {tst} と異なる"))
+            log(c("warn", f"⚠ {name} 版 {det} は検証済み {tst} と異なる（{where}）"))
         else:
-            log(c("warn", f"⚠ {name} 版を取得できず（検証済み {tst}）"))
+            log(c("warn", f"⚠ {name} 版を取得できず（検証済み {tst}・{where}）"))
+        disk = vinfo[name]["disk"]
+        if disk and disk != det:
+            log(c("dim", f"  ディスク上の {name} は {disk}（ペインで再起動すると切り替わる。"
+                  + ("ダイアログ操作の直前に再判定）" if name == "claude" else "relay 再点火で再判定）")))
     if vbad:
         log((c("dim", "  → --allow-untested-dialogs によりダイアログ自動操作は継続")
              if a.allow_untested_dialogs else
@@ -405,11 +480,15 @@ def main():
     # poke 応答帰属ゲート（response_done / poke no-show）も同型で切り出し（P2-1・state_machine.py）。
     rg = ResponseGate(tracked, find_poke_ts, codex_response_complete,
                       claude_response_attributed, dim, _warn)
+    # 版ゲートの《Claude のダイアログに触れる直前》の再判定（schema_guard.VersionGuard・claude のみ）。
+    vg = VersionGuard(a, locate=lambda: locate_running(panes["claude"], "claude"),
+                      measure=lambda ident: measure_running(ident, "claude"),
+                      tested=TESTED_VERSIONS["claude"], dim=dim, warn=_warn)
 
     return StateMachine(
         a, panes=panes, own=own, cwd=cwd, tracked=tracked,
         claude_seen=claude_seen, codex_seen=codex_seen, baseline=baseline,
-        sg=sg, rg=rg, bw=bw,
+        sg=sg, rg=rg, vg=vg, bw=bw,
         poke_codex=poke_codex, poke_codex_next=poke_codex_next, poke_claude=poke_claude,
         poke_claude_pass=poke_claude_pass, poke_claude_next=poke_claude_next,
         stop_phrases=stop_phrases, next_ask_phrases=next_ask_phrases,

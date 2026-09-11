@@ -328,5 +328,82 @@ class ProcIdentity(Base):
         self.assertFalse(pl._valid_rollout(notroll), "a non-rollout basename is refused")
 
 
+class CliProcess(unittest.TestCase):
+    """Version gate (2026-09-12): the relay judges the CLI a pane is RUNNING. cli_process picks the
+    pair's own claude/codex process under the pane — exact comm, shallowest first, live only."""
+
+    def _run(self, comms, stats, descendants, pane_pid="1000", name="codex"):
+        def fake_tmux(*a):
+            return pane_pid if (a[0] == "display-message" and "-t" in a) else None
+        with mock.patch.object(pl, "proc_available", return_value=True), \
+             mock.patch.object(pl, "_tmux", side_effect=fake_tmux), \
+             mock.patch.object(pl, "_descendants", return_value=descendants), \
+             mock.patch.object(pl, "_proc_comm", side_effect=lambda pid: comms.get(pid)), \
+             mock.patch.object(pl, "_proc_stat", side_effect=lambda pid: stats.get(pid)), \
+             mock.patch.object(pl, "_exe_id", side_effect=lambda pid: (1, pid)):
+            return pl.cli_process("%9", name)
+
+    def test_skips_the_node_wrapper_and_takes_the_shallowest_exact_match(self):
+        # BFS: node (codex.js) → native codex → code-mode host (comm truncated to 'codex-code-mode')
+        # → a nested codex deeper down. Only the native pair codex may win.
+        comms = {1000: "bash", 1001: "node", 1002: "codex", 1003: "codex-code-mode", 1004: "codex"}
+        stats = {p: ("S", 500 + p) for p in comms}
+        self.assertEqual(self._run(comms, stats, [1001, 1002, 1003, 1004]), (1002, 1502, (1, 1002)))
+
+    def test_the_pane_pid_itself_can_be_the_cli(self):
+        comms = {1000: "claude", 1001: "claude"}
+        stats = {1000: ("S", 7), 1001: ("S", 8)}
+        self.assertEqual(self._run(comms, stats, [1001], name="claude"), (1000, 7, (1, 1000)))
+
+    def test_zombie_or_dead_is_skipped(self):
+        comms = {1000: "bash", 1001: "claude", 1002: "claude"}
+        stats = {1000: ("S", 1), 1001: ("Z", 2), 1002: ("S", 3)}
+        self.assertEqual(self._run(comms, stats, [1001, 1002], name="claude"), (1002, 3, (1, 1002)))
+        stats[1002] = ("X", 3)
+        self.assertIsNone(self._run(comms, stats, [1001, 1002], name="claude"))
+
+    def test_none_when_no_match_the_tmux_query_fails_or_no_proc(self):
+        comms = {1000: "bash", 1001: "node"}
+        stats = {1000: ("S", 1), 1001: ("S", 2)}
+        self.assertIsNone(self._run(comms, stats, [1001], name="codex"), "no codex process")
+        self.assertIsNone(self._run(comms, stats, [1001], pane_pid=None, name="codex"), "tmux query failed")
+        with mock.patch.object(pl, "proc_available", return_value=False), mock.patch.object(pl, "_tmux") as t:
+            self.assertIsNone(pl.cli_process("%9", "claude"))
+            t.assert_not_called()
+
+    def test_same_process_requires_the_same_starttime_exe_and_a_live_state(self):
+        ident = (10, 42, (5, 100))
+        with mock.patch.object(pl, "_proc_stat", return_value=("S", 42)), \
+             mock.patch.object(pl, "_exe_id", return_value=(5, 100)):
+            self.assertTrue(pl.same_process(ident))
+            self.assertFalse(pl.same_process((10, 41, (5, 100))), "a recycled pid has another starttime")
+        with mock.patch.object(pl, "_proc_stat", return_value=("S", 42)), \
+             mock.patch.object(pl, "_exe_id", return_value=(5, 200)):
+            self.assertFalse(pl.same_process(ident), "same pid + starttime but it execve'd another binary")
+        with mock.patch.object(pl, "_proc_stat", return_value=("S", 42)), \
+             mock.patch.object(pl, "_exe_id", return_value=None):
+            self.assertFalse(pl.same_process(ident), "the executable can no longer be identified")
+        self.assertFalse(pl.same_process((10, 42, None)), "an ident without an exe identity is never trusted")
+        self.assertFalse(pl.same_process((10, 42)), "a legacy 2-tuple ident is never trusted")
+        with mock.patch.object(pl, "_proc_stat", return_value=("Z", 42)), \
+             mock.patch.object(pl, "_exe_id", return_value=(5, 100)):
+            self.assertFalse(pl.same_process(ident), "a zombie is no longer the running CLI")
+        with mock.patch.object(pl, "_proc_stat", return_value=None):
+            self.assertFalse(pl.same_process(ident), "gone")
+        self.assertFalse(pl.same_process(None))
+
+    @unittest.skipUnless(os.path.isdir("/proc"), "needs /proc (Linux)")
+    def test_proc_stat_and_exe_id_read_a_real_process(self):
+        st = pl._proc_stat(os.getpid())
+        self.assertIsNotNone(st)
+        self.assertIn(st[0], ("R", "S", "D"))
+        self.assertGreater(st[1], 0)
+        eid = pl._exe_id(os.getpid())
+        self.assertIsNotNone(eid)
+        self.assertEqual(eid, (os.stat(sys.executable).st_dev, os.stat(sys.executable).st_ino),
+                         "exe_id is the identity of the binary actually running (this python)")
+        self.assertTrue(pl.same_process((os.getpid(), st[1], eid)))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

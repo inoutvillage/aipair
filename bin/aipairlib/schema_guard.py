@@ -1,4 +1,5 @@
-"""aipair schema guard — relay のランタイム JSONL schema 監視（D3 relay 分割 / P2-1 増分1）。
+"""aipair schema guard — relay のランタイム JSONL schema 監視（D3 relay 分割 / P2-1 増分1）と、
+版ゲートの《ダイアログ操作直前》の再判定（VersionGuard・末尾）。以下は SchemaGuard の説明。
 
 モノリシックな relay メインループから《schema_watch / schema_guard》を切り出してクラス化した。
 各エージェントの (agent, ログ世代) 単位の latch と identity を《このオブジェクトが所有》し、poll
@@ -97,4 +98,68 @@ class SchemaGuard:
         if self.a.schema_stop:
             self._warn("│ ■ ログschema不一致を検出 → fail-closed で停止します（exit 7）。")
             return True
+        return False
+
+
+class VersionGuard:
+    """版ゲートの《Claude のダイアログに触れる直前》の再判定（claude のみ。ダイアログは claude ペインにしか出ない）。
+
+    起動時の版ゲートは初期値にすぎない: `aipair loop` 直後は CLI が未起動で PATH の版を置くしかなく、また
+    検知後・Codex の応答中にペインで Claude が再起動（更新通知に従う等）されうる。そこで操作の直前に、ペインで
+    《今》動いている claude を測り直す。
+
+    入力（コンストラクタ）:
+      a               argparse.Namespace（読み: no_version_gate / allow_untested_dialogs、
+                      書き: no_plan_review / no_question_relay — OFF 方向のみ）
+      locate()        -> ("unsupported" | "none" | "found", ident)   relay.locate_running
+      measure(ident)  -> ("ok", version) | ("fail", None)            relay.measure_running
+      tested          検証済みの claude 版
+      dim(msg) / warn(msg, bell=False)
+
+    dialog_ok() の判定（fail-closed）:
+      found → ok ∧ 検証済み → True（ident ごとに結果をキャッシュ＝同じプロセスへ exec し直さない。
+              ident は (pid, starttime, 実行ファイルの dev/ino) なので、同じ pid が別バイナリへ execve
+              した場合は別 ident として測り直す）
+      found → ok ∧ 未検証 / fail → 自動操作を OFF にラッチ（ON には戻さない）＋警告 → False
+      none（/proc は在るのに特定できない）→ False（ラッチしない＝次の poll で再試行。警告は 1 回）
+      unsupported（/proc 無し）→ True＝起動時判定（PATH）を継承（flags は起動時に反映済み）
+      --no-version-gate / --allow-untested-dialogs → 常に True
+    OFF の後は呼び出し側（flags ∧ dialog_ok）が flags で止まるので、警告は重ならない。
+    """
+
+    def __init__(self, a, locate, measure, tested, dim, warn):
+        self.a = a
+        self._locate = locate
+        self._measure = measure
+        self.tested = tested
+        self._dim = dim
+        self._warn = warn
+        self.cache = {}            # ident -> ("ok", version) | ("fail", None)
+        self._none_warned = False
+
+    def dialog_ok(self):
+        a = self.a
+        if a.no_version_gate or a.allow_untested_dialogs:
+            return True
+        state, ident = self._locate()
+        if state == "unsupported":
+            return True
+        if state != "found":
+            if not self._none_warned:
+                self._none_warned = True
+                self._warn("│ ⚠ ペインの claude プロセスを特定できず、版を確かめられない → "
+                           "ダイアログには触れません（次の poll で再試行）。")
+            return False
+        self._none_warned = False
+        if ident not in self.cache:
+            self.cache[ident] = self._measure(ident)
+        status, ver = self.cache[ident]
+        if status == "ok" and ver == self.tested:
+            return True
+        a.no_plan_review = True        # OFF にラッチ（ON には戻さない）
+        a.no_question_relay = True
+        why = (f"版 {ver} は検証済み {self.tested} と異なる" if status == "ok"
+               else "実行中の claude が版を答えない（別物・実行不能・probe 中の入れ替わり）")
+        self._warn(f"│ ■ ダイアログ操作の直前にペインの claude を再判定: {why} → プラン承認・質問リレーの"
+                   "自動操作を OFF（ダイアログには触れません。relay を再点火すると再判定）。", bell=True)
         return False

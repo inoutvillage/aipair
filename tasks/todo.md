@@ -532,3 +532,36 @@ F1 ✅ → F2 ✅ → F3 ✅ → F6 ✅ → F4 ✅ → F5 ✅ → F9 ✅ → F8 
   `bash tests/run-all.sh` 全緑（relay-parsers 206 / doc-sync 31 / codex-follow 38 ほか計 12 系統）。
 - 申し送り: 稼働中の relay は起動時に読んだ旧 `TESTED_VERSIONS` のまま。マージ後に `./aipair-install.sh` を
   再実行し、再点火（`aipair-relay-here` / VS Code タスク）すると警告が消える。
+
+## 追記: 版ゲートを「ペインで実際に動いている CLI の版」で判定する（2026-09-12）
+
+> 背景: npm の自動更新はディスク上のバイナリだけを差し替え、ペインの TUI は起動時の版のまま動き続ける。版ゲートは PATH の
+> `--version` を見ていたため「relay が読んでいない版」を判定していた（実測: ディスク claude 2.1.269 / codex 0.154.0 に対し、
+> 実行中は claude 2.1.266 / 2.1.268、codex 0.153.4 / 0.154.0）。誤警告（検証済み TUI で自動操作 OFF）と見逃しの両方が起きうる。
+> 全 10 プロセスで `/proc/<pid>/exe --version` が削除済みバイナリでも実行中の版を返すことを確認。プランは Codex のプラン
+> レビュー 3 往復（送信直前の再判定・ダイアログ上に poke しない・候補ありの検証不能は fail・Linux の特定不能は操作しない）で確定。
+
+- [x] peerlog: `cli_process`（pane の最浅・comm 完全一致・Z/X 除外）/ `same_process`（starttime 照合）/ `proc_available`
+- [x] corelib: `version_output` / `cli_version`（実出力 `(Claude Code)` / 行頭 `codex-cli` で CLI 自身か判定）。`detect_version` は薄いラッパ
+- [x] relay: `probe_running`（unsupported / none / fail / ok の fail-closed 契約）、起動時判定＝初期値（出どころ表示・ディスク版の併記）
+- [x] schema_guard: `VersionGuard.dialog_ok()`（Claude ダイアログ操作の直前に再判定。none は操作しない・unsupported のみ起動時判定を継承）
+- [x] state_machine: 不変条件「flags ∧ dialog_ok の時だけダイアログを操作・ダイアログ上へ poke しない」を 8 箇所へ配線、`decide_delivery_back`
+- [x] README 版ゲート節・exit code 5、CHANGELOG
+- [x] テスト: relay-parsers 206 → 224（`RunningVersion` / `VersionGuardClass` / `DecideDeliveryBack` / 配線の構造テスト
+  `VersionGuardWiring`＝起動時 OFF を含む・実 /proc スモーク＝`claude` 名の別物プロセスは削除後も exe が走り `fail`）、
+  peer-pin 25 → 31（`CliProcess`）。`bash tests/run-all.sh` 12 系統全緑
+- [x] 実機（読み取りのみ）照合: 稼働中 5 ペアに `probe_running` / `VersionGuard` を当て実測と一致 — このペアと他 1 ペアは
+  claude 2.1.268 / codex 0.154.0（ダイアログ直前判定 = 可）、残る 3 ペアは 2.1.266 / 0.153.4（= 不可）。
+  いずれもディスクは 2.1.269 / 0.154.0
+- [x] **Codex コードレビュー反映（relay-id:2b641f14）**: (1) `codex_plan` が `detect_plan_dialog(...) or plan_dialog` で
+  検知時の古い解析結果を使い回し、Codex の応答中にダイアログが消えた後の通常コンポーザへ承認の数字や feedback を送りえた
+  （承認経路は `approval_took_effect()` が「既にダイアログ無し」を成功扱い）→ 操作は《今》検知したダイアログのみ、無ければ
+  `no_dialog`＝画面に触れない。実 `run()` を駆動する回帰テスト `StalePlanDialogIsNeverOperated` を追加。(2) CHANGELOG の
+  「PATH は /proc の無い環境のみ」を「Linux でも起動時の初期値には PATH を使うことがあるが、ダイアログ操作の許可には使わない」へ是正
+- [x] **Codex コードレビュー反映（relay-id:4e6efeeb）**: (1) プロセス identity を `(pid, starttime, 実行ファイルの dev/ino)` に。
+  同じ pid が `execve` で別版へ置き換わると starttime は不変のため、旧 identity のキャッシュを再利用しえた → `same_process` も
+  exe を照合し、exe を読めない ident は信用しない（fail-closed）。(2) `cli_version` が出力全体の最初の版を返していた（先行する
+  通知の番号を検証済み版と誤認しうる）→ 版は版表示に結び付いた位置（claude は `(Claude Code)` の直前、codex は行頭 `codex-cli`
+  の直後）から取り、食い違う複数の版表示・数字の無い版表示は不明。各テスト追加
+- 申し送り: 反映（PR・install・再点火）はユーザー判断。`--allow-untested-dialogs` 付きで動いている他プロジェクトの
+  relay は再点火後もダイアログ自動操作は継続（ゲートを明示的に外しているため）
