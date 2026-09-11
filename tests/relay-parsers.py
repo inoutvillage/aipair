@@ -827,6 +827,335 @@ class VersionGate(unittest.TestCase):
         self.assertFalse(a.no_plan_review or a.no_question_relay, "opt-in keeps them on")
 
 
+class RunningVersion(unittest.TestCase):
+    """The version gate judges what the pane is RUNNING, not what PATH resolves to (2026-09-12):
+    corelib.cli_version, relay.probe_running's fail-closed 4-state contract, and the startup value."""
+    CLAUDE_OUT = "2.1.268 (Claude Code)\n"
+    CODEX_OUT = "codex-cli 0.154.0\n"
+
+    def test_cli_version_accepts_only_the_clis_own_banner(self):
+        self.assertEqual(relay.cli_version("claude", self.CLAUDE_OUT), ("2.1.268", True))
+        self.assertEqual(relay.cli_version("codex", self.CODEX_OUT), ("0.154.0", True))
+        for foreign in ("v20.11.1\n", "GNU bash, version 5.1.8(1)-release (x86_64-redhat-linux-gnu)\n",
+                        "sleep (GNU coreutils) 8.32\n"):
+            self.assertEqual(relay.cli_version("claude", foreign), (None, False), foreign)
+            self.assertEqual(relay.cli_version("codex", foreign), (None, False), foreign)
+        self.assertEqual(relay.cli_version("codex", self.CLAUDE_OUT), (None, False), "claude's banner is not codex's")
+        self.assertEqual(relay.cli_version("claude", None), (None, False))
+
+    def test_cli_version_takes_the_version_bound_to_the_banner_not_the_first_number(self):
+        # Codex review 2026-09-12: a preceding notice must not pass as the running version.
+        self.assertEqual(relay.cli_version("claude", "notice 2.1.268\n2.1.269 (Claude Code)\n"), ("2.1.269", True))
+        self.assertEqual(relay.cli_version("codex", "update available: 0.150.1\ncodex-cli 0.154.0\n"),
+                         ("0.154.0", True))
+        self.assertEqual(relay.cli_version("codex", "see codex-cli 0.150.1 notes\ncodex-cli 0.154.0\n"),
+                         ("0.154.0", True), "only a line-LEADING codex-cli is the banner")
+        # the banner must carry its number on the same line; disagreeing banners are unknown
+        self.assertEqual(relay.cli_version("claude", "2.1.268\n(Claude Code)\n"), (None, False))
+        self.assertEqual(relay.cli_version("claude", "2.1.268 (Claude Code)\n2.1.269 (Claude Code)\n"), (None, True))
+        self.assertEqual(relay.cli_version("claude", "beta (Claude Code)\n"), (None, True), "no parseable number")
+        # a prerelease stays whole so it can't pass as the tested release
+        self.assertEqual(relay.cli_version("claude", "2.1.268-beta.1 (Claude Code)\n"), ("2.1.268-beta.1", True))
+
+    def _probe(self, *, proc=True, ident=(4242, 99), out=None, same=True):
+        with mock.patch.object(relay.peerlog, "proc_available", return_value=proc), \
+             mock.patch.object(relay.peerlog, "cli_process", return_value=ident) as cp, \
+             mock.patch.object(relay.peerlog, "same_process", return_value=same), \
+             mock.patch.object(relay, "version_output", return_value=out) as vo:
+            return relay.probe_running("%1", "claude"), cp, vo
+
+    def test_probe_running_ok_reads_the_running_executable(self):
+        res, _cp, vo = self._probe(out=self.CLAUDE_OUT)
+        self.assertEqual(res, ("ok", "2.1.268", (4242, 99)))
+        vo.assert_called_once_with("/proc/4242/exe")
+
+    def test_probe_running_unsupported_only_without_proc(self):
+        res, cp, vo = self._probe(proc=False)
+        self.assertEqual(res, ("unsupported", None, None))
+        cp.assert_not_called()
+        vo.assert_not_called()
+
+    def test_probe_running_none_when_there_is_no_candidate_process(self):
+        # not started / restarting / tmux query failed / unusual comm all surface as cli_process() → None
+        # (the tmux-failure path itself is covered in tests/peer-pin.py)
+        res, _cp, vo = self._probe(ident=None)
+        self.assertEqual(res, ("none", None, None))
+        vo.assert_not_called()
+
+    def test_probe_running_is_fail_closed_when_a_candidate_cannot_be_verified(self):
+        # a `claude` process IS there, so each of these must be "fail" (unknown → OFF), never "none" (→ PATH)
+        for out, same, why in ((None, True, "exe won't run / non-zero / non-UTF-8"),
+                               ("v20.11.1\n", True, "an interpreter's banner (script-type CLI)"),
+                               ("(Claude Code)\n", True, "no parseable number"),
+                               (self.CLAUDE_OUT, False, "pid replaced while probing")):
+            res, _cp, _vo = self._probe(out=out, same=same)
+            self.assertEqual(res, ("fail", None, (4242, 99)), why)
+
+    def test_startup_version_is_the_initial_value(self):
+        with mock.patch.object(relay, "probe_running", return_value=("ok", "2.1.268", (1, 2))), \
+             mock.patch.object(relay, "detect_version", return_value="2.1.269"):
+            self.assertEqual(relay.startup_version("%1", "claude"),
+                             {"version": "2.1.268", "source": "ok", "ident": (1, 2), "disk": "2.1.269"})
+        with mock.patch.object(relay, "probe_running", return_value=("fail", None, (1, 2))), \
+             mock.patch.object(relay, "detect_version", return_value="2.1.269"):
+            self.assertIsNone(relay.startup_version("%1", "claude")["version"],
+                              "fail → unknown, NOT the PATH version")
+        for st in ("none", "unsupported"):
+            with mock.patch.object(relay, "probe_running", return_value=(st, None, None)), \
+                 mock.patch.object(relay, "detect_version", return_value="2.1.269") as dv:
+                info = relay.startup_version("%1", "claude")
+                self.assertEqual((info["version"], info["source"], info["disk"]), ("2.1.269", st, None), st)
+                dv.assert_called_once_with("claude")
+        notes = {s: relay.version_source_note("claude", s) for s in ("ok", "fail", "none", "unsupported")}
+        self.assertEqual(len(set(notes.values())), 4, "the banner tells the four sources apart")
+        self.assertIn("PATH", notes["none"])
+        self.assertIn("PATH", notes["unsupported"])
+        self.assertNotIn("PATH", notes["ok"])
+
+    @unittest.skipUnless(os.path.isdir("/proc") and os.path.exists("/bin/sleep"), "needs /proc + /bin/sleep")
+    def test_real_proc_a_look_alike_process_is_fail_not_none(self):
+        # A real child whose comm is `claude` but whose executable is something else (/bin/sleep copied
+        # under that name). It is found; after the file is DELETED (like an npm upgrade) its /proc exe
+        # still answers; the answer is not Claude Code's banner → "fail" (fail-closed), never "none".
+        import shutil
+        with tempfile.TemporaryDirectory() as d:
+            fake = os.path.join(d, "claude")
+            shutil.copy("/bin/sleep", fake)
+            if relay.version_output(fake) is None:
+                self.skipTest("this sleep has no --version")
+            proc = subprocess.Popen([fake, "30"])
+            try:
+                os.remove(fake)
+                with mock.patch.object(relay.peerlog, "_tmux", return_value=str(os.getpid())):
+                    ident, deadline = None, time.time() + 5
+                    while ident is None and time.time() < deadline:
+                        ident = relay.peerlog.cli_process("%0", "claude")
+                        if ident is None:
+                            time.sleep(0.05)
+                    self.assertIsNotNone(ident, "the child is found by its exact comm")
+                    self.assertEqual(ident[0], proc.pid)
+                    self.assertTrue(relay.peerlog.same_process(ident))
+                    self.assertIsNotNone(relay.version_output("/proc/%d/exe" % proc.pid),
+                                         "a deleted executable still runs via /proc/<pid>/exe")
+                    self.assertEqual(relay.probe_running("%0", "claude"), ("fail", None, ident))
+            finally:
+                proc.kill()
+                proc.wait()
+
+
+class VersionGuardClass(unittest.TestCase):
+    """The authoritative version check right before a Claude dialog is touched (2026-09-12)."""
+    TESTED = "2.1.268"
+
+    def _vg(self, locates, measures=None, allow=False, no_gate=False):
+        from aipairlib.schema_guard import VersionGuard
+        a = types.SimpleNamespace(no_version_gate=no_gate, allow_untested_dialogs=allow,
+                                  no_plan_review=False, no_question_relay=False)
+        self.warns, self.measured = [], []
+        seq, measures = iter(locates), (measures or {})
+
+        def measure(ident):
+            self.measured.append(ident)
+            return measures[ident]
+        vg = VersionGuard(a, locate=lambda: next(seq), measure=measure, tested=self.TESTED,
+                          dim=lambda m: None, warn=lambda m, bell=False: self.warns.append((m, bell)))
+        return a, vg
+
+    def test_a_tested_running_claude_is_allowed_and_measured_once(self):
+        A = (10, 1)
+        a, vg = self._vg([("found", A)] * 3, {A: ("ok", self.TESTED)})
+        self.assertTrue(vg.dialog_ok() and vg.dialog_ok() and vg.dialog_ok())
+        self.assertEqual(self.measured, [A], "the same process is not exec'd again")
+        self.assertFalse(a.no_plan_review or a.no_question_relay)
+        self.assertEqual(self.warns, [])
+
+    def test_identity_change_mid_dialog_to_an_untested_claude_stops_before_sending(self):
+        # detection saw A (tested); before sending, Claude was restarted in the pane as B (untested)
+        A, B = (10, 1), (11, 2)
+        a, vg = self._vg([("found", A), ("found", B)], {A: ("ok", self.TESTED), B: ("ok", "2.1.269")})
+        self.assertTrue(vg.dialog_ok(), "at detection")
+        self.assertFalse(vg.dialog_ok(), "right before sending")
+        self.assertTrue(a.no_plan_review and a.no_question_relay, "latched OFF")
+        self.assertEqual(len(self.warns), 1)
+        self.assertTrue(self.warns[0][1], "with a bell")
+        self.assertIn("2.1.269", self.warns[0][0])
+
+    def test_same_pid_that_execs_another_binary_is_measured_again(self):
+        # Codex review 2026-09-12: an execve keeps the pid AND the starttime — only the executable changes,
+        # so the old binary's cached verdict must not be reused.
+        A, A_exec = (10, 1, (5, 100)), (10, 1, (5, 200))
+        a, vg = self._vg([("found", A), ("found", A_exec)],
+                         {A: ("ok", self.TESTED), A_exec: ("ok", "2.1.269")})
+        self.assertTrue(vg.dialog_ok())
+        self.assertFalse(vg.dialog_ok(), "not the cached verdict of the old binary")
+        self.assertEqual(self.measured, [A, A_exec])
+        self.assertTrue(a.no_plan_review and a.no_question_relay)
+
+    def test_fail_turns_automation_off(self):
+        A = (10, 1)
+        a, vg = self._vg([("found", A)], {A: ("fail", None)})
+        self.assertFalse(vg.dialog_ok())
+        self.assertTrue(a.no_plan_review and a.no_question_relay)
+
+    def test_none_on_linux_is_never_operated_even_first_time_and_does_not_latch(self):
+        # /proc exists but the process can't be identified (not found / tmux failed): PATH is not trusted →
+        # False even on the very first dialog; not latched, so a later poll that finds it proceeds.
+        A = (10, 1)
+        a, vg = self._vg([("none", None), ("none", None), ("found", A)], {A: ("ok", self.TESTED)})
+        self.assertFalse(vg.dialog_ok())
+        self.assertFalse(vg.dialog_ok())
+        self.assertFalse(a.no_plan_review or a.no_question_relay, "not latched")
+        self.assertEqual(len(self.warns), 1, "warned once, not every poll")
+        self.assertTrue(vg.dialog_ok(), "identified on a later poll → allowed")
+
+    def test_only_unsupported_inherits_the_startup_decision(self):
+        a, vg = self._vg([("unsupported", None)])
+        self.assertTrue(vg.dialog_ok(), "no /proc → the startup (PATH) decision already in the flags stands")
+        self.assertEqual(self.measured, [])
+
+    def test_overrides_skip_the_probe(self):
+        for kw in ({"allow": True}, {"no_gate": True}):
+            _a, vg = self._vg([], **kw)                 # locate() would raise StopIteration if called
+            self.assertTrue(vg.dialog_ok(), kw)
+
+    def test_never_turns_automation_back_on(self):
+        A = (10, 1)
+        a, vg = self._vg([("found", A)], {A: ("ok", self.TESTED)})
+        a.no_plan_review = a.no_question_relay = True   # OFF for another reason (schema fail-open, flags)
+        vg.dialog_ok()
+        self.assertTrue(a.no_plan_review and a.no_question_relay)
+
+
+class DecideDeliveryBack(unittest.TestCase):
+    """Never type a plain poke into a Claude dialog (2026-09-12): the review goes back through the dialog
+    when that automation may run, otherwise the relay stops with the screen untouched."""
+    PLAN = {"tell": "3", "yes": "1"}
+    PLAN_NO_TELL = {"tell": None, "yes": "1"}
+    Q = {"chat": "4"}
+
+    def test_decision_table(self):
+        d = relay.decide_delivery_back
+        self.assertEqual(d(None, None, False, False), "poke", "no dialog → the normal poke")
+        self.assertEqual(d(self.PLAN, None, True, False), "plan_tell")
+        self.assertEqual(d(None, self.Q, False, True), "question_chat")
+        self.assertEqual(d(self.PLAN, None, False, False), "stop", "plan automation OFF (incl. from startup)")
+        self.assertEqual(d(None, self.Q, False, False), "stop", "question automation OFF (incl. from startup)")
+        self.assertEqual(d(self.PLAN_NO_TELL, None, True, False), "stop", "no Tell option")
+        self.assertEqual(d(self.PLAN, self.Q, True, True), "plan_tell", "plan first")
+        self.assertEqual(d(self.PLAN, self.Q, False, True), "stop", "a plan dialog on screen is never bypassed")
+
+
+class VersionGuardWiring(unittest.TestCase):
+    """Source-structure check (like SchemaGuardOrdering — the loop is one monolithic run()): every Claude
+    dialog operation is gated by allowed(...) with an exit-5 stop, the detection sites re-check the running
+    version, and the delivery-back never skips detection because a flag is OFF (incl. OFF from startup)."""
+    OPS = ('send_plan_feedback(panes["claude"]', 'send_question_answer(panes["claude"]',
+           'press(panes["claude"], dialog["yes"])')
+    STATE_HDR = ("if state ==", "elif state ==", "else:  # codex")
+
+    def _loop(self):
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
+            src = fh.read().split("\n")
+        start = next(i for i, l in enumerate(src) if l.strip() == "while True:")
+        return src[start:]
+
+    def test_every_dialog_operation_is_preceded_by_allowed_and_an_exit5_stop(self):
+        lines = self._loop()
+        ops = [i for i, l in enumerate(lines) if any(o in l for o in self.OPS)]
+        self.assertEqual(len(ops), 6, "plan approve/feedback x3 + question answer + delivery-back x2")
+        for i in ops:
+            hdr = max(k for k in range(i) if lines[k].strip().startswith(self.STATE_HDR))
+            guards = [k for k in range(hdr, i) if "allowed(" in lines[k]]
+            self.assertTrue(guards, f"no allowed(...) guard before loop-line {i}: {lines[i].strip()}")
+            self.assertIn("code = 5", "\n".join(lines[guards[-1]:i]),
+                          f"the guard before loop-line {i} must stop with exit 5")
+
+    def test_detection_sites_recheck_the_running_version(self):
+        lines = self._loop()
+        for det in ("(plan_dialog := detect_plan_dialog(", 'and detect_question_dialog(panes["claude"])'):
+            hit = [l for l in lines if det in l and l.strip().startswith("elif")]
+            self.assertEqual(len(hit), 1, det)
+            self.assertIn("vg.dialog_ok()", hit[0])
+
+    def test_delivery_back_detects_regardless_of_flags_and_pokes_only_without_a_dialog(self):
+        lines = self._loop()
+        src = "\n".join(lines)
+        self.assertNotIn("None if a.no_plan_review else detect_plan_dialog", src)
+        self.assertNotIn("None if a.no_question_relay else detect_question_dialog", src)
+        k = next(i for i, l in enumerate(lines) if "decide_delivery_back(" in l)
+        first = next(i for i, l in enumerate(lines) if i > k and 'poke(panes["claude"]' in l)
+        branch = max(i for i in range(k, first)
+                     if lines[i].strip().startswith(("if back", "elif back", "else:")))
+        self.assertIn('back == "poke"', lines[branch], "the Claude poke lives only in the no-dialog branch")
+
+
+class StalePlanDialogIsNeverOperated(unittest.TestCase):
+    """Regression (Codex review 2026-09-12): codex_plan used `detect_plan_dialog(...) or plan_dialog`, so a
+    plan dialog that vanished while Codex was reviewing (a human handled it) was still 'answered' from the
+    stale parse — the approve digit / feedback typed into the normal composer. Drives the real run():
+    claude state detects the dialog → Codex approves → at send time the dialog is gone → nothing is pressed
+    or sent (even though the running version is fine), and the loop goes back to waiting."""
+
+    class _Stop(Exception):
+        pass
+
+    DIALOG = {"tell": "3", "yes": "1", "yes_label": "Yes, and use auto mode", "plan": "/tmp/p.md"}
+
+    def test_vanished_dialog_with_a_cached_parse_is_left_alone(self):
+        sm = relay.state_machine
+        a = types.SimpleNamespace(start_side="claude", settle=0, poll=0, max_rounds=20, endless=False,
+                                  stop_side="codex", no_plan_review=False, no_question_relay=False,
+                                  plan_rounds=5, question_rounds=5, plan_ok="[AIPAIR_PLAN_APPROVED]",
+                                  gate=None, gate_timeout=600, gate_rounds=3)
+        rg = types.SimpleNamespace(response_done=lambda who, path, done: done, noshow=lambda who: False,
+                                   arm=lambda nonce: None, clear=lambda: None, probe=None, probe_ts_cache=0.0)
+        box = {"stop": False}
+
+        def guard():
+            if box["stop"]:
+                raise self._Stop()
+            return False
+
+        detections = iter([self.DIALOG, None])       # detected in claude state → gone when sending
+
+        def detect(pane):
+            d = next(detections)
+            if d is None:
+                box["stop"] = True                   # stop at the NEXT loop-top guard
+            return d
+
+        vg = types.SimpleNamespace(dialog_ok=lambda: True)   # the version is fine: only staleness matters
+        machine = sm.StateMachine(
+            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x",
+            tracked={"claude": "c.jsonl", "codex": "x.jsonl"}, claude_seen=set(), codex_seen=set(),
+            baseline=0.0, sg=types.SimpleNamespace(guard=guard), rg=rg, vg=vg, bw=60,
+            poke_codex="PC", poke_codex_next="PCN", poke_claude="PCL", poke_claude_pass="PCP",
+            poke_claude_next="PCX", stop_phrases=["[AIPAIR_REVIEW_OK]"], next_ask_phrases=["[AIPAIR_NEXT]"],
+            all_done_phrases=["[AIPAIR_ALL_DONE]"], human_required_phrases=["[AIPAIR_HUMAN_REQUIRED]"])
+        with mock.patch.object(sm, "set_pane_title"), \
+             mock.patch.object(sm, "claude_done_ts", return_value=None), \
+             mock.patch.object(sm, "codex_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "turn_texts", return_value=["[AIPAIR_PLAN_APPROVED]"]), \
+             mock.patch.object(sm, "detect_plan_dialog", side_effect=detect) as det, \
+             mock.patch.object(sm, "poke", return_value=object()) as poke_mock, \
+             mock.patch.object(sm, "press") as press_mock, \
+             mock.patch.object(sm, "send_plan_feedback") as feedback_mock, \
+             mock.patch.object(sm, "approval_took_effect", return_value=True), \
+             mock.patch("time.sleep"):
+            with self.assertRaises(self._Stop):
+                machine.run()
+        self.assertEqual(det.call_count, 2, "detected once to start the review, once right before sending")
+        self.assertEqual([c.args[0] for c in poke_mock.call_args_list], ["%2"], "only the plan review to Codex")
+        press_mock.assert_not_called()
+        feedback_mock.assert_not_called()
+
+    def test_codex_plan_does_not_fall_back_to_the_cached_parse(self):
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertFalse("or plan_dialog" in src,
+                         "codex_plan must act only on a dialog detected right now, never the cached parse")
+
+
 class SchemaProbe(unittest.TestCase):
     """The JSONL schema feature-probe (corelib.schema_probe/schema_gate + relay.probe_log_schema):
     the version gate only sees --version strings, so the core relay also probes the real
@@ -2136,6 +2465,9 @@ class CorelibStandalone(unittest.TestCase):
         # relay.X is bound to the corelib implementation (not a stale copy)
         self.assertIs(relay.parse_version, relay.corelib.parse_version)
         self.assertIs(relay.version_gate, relay.corelib.version_gate)
+        self.assertIs(relay.version_output, relay.corelib.version_output)
+        self.assertIs(relay.cli_version, relay.corelib.cli_version)
+        self.assertIs(relay.decide_delivery_back, relay.state_machine.decide_delivery_back)
         self.assertIs(relay.schema_probe, relay.corelib.schema_probe)
         self.assertIs(relay.schema_gate, relay.corelib.schema_gate)
 

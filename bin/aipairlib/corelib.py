@@ -25,9 +25,9 @@ def parse_version(text):
     return m.group(0) if m else None
 
 
-def detect_version(binary):
-    """`binary --version` → version string, or None if it can't be run, exits non-zero, or
-    prints nothing parseable. errors='replace' keeps the decode from RAISING; if that
+def version_output(binary):
+    """Raw `binary --version` output, or None if it can't be run or exits non-zero.
+    errors='replace' keeps the decode from RAISING; if that
     replacement actually fired (U+FFFD present) the output is not valid UTF-8, so it is
     treated as unknown (None) rather than parsed — 'unknown' is the safe side of the
     version gate, and half-decoded bytes must not read as a tested version."""
@@ -41,7 +41,34 @@ def detect_version(binary):
     out = (p.stdout or "") + (p.stderr or "")
     if "\ufffd" in out:
         return None
-    return parse_version(out)
+    return out
+
+
+def detect_version(binary):
+    """`binary --version` → version string, or None if it can't be run, exits non-zero, or
+    prints nothing parseable (see version_output)."""
+    return parse_version(version_output(binary))
+
+
+# What each CLI's OWN `--version` banner looks like (実出力: "2.1.268 (Claude Code)" / "codex-cli 0.154.0"),
+# with the version captured FROM THAT banner on the same line: claude's is the token right before
+# "(Claude Code)", codex's the token right after a line-leading "codex-cli". Any other number in the
+# output (a notice, an update hint) is ignored. A process found by its comm whose executable prints no
+# such banner is not that CLI's binary — e.g. an interpreter running a script CLI — and is not trusted.
+_CLI_VERSION_MARK = {"claude": re.compile(r"(\S+)[ \t]+\(Claude Code\)"),
+                     "codex": re.compile(r"^codex-cli[ \t]+(\S+)", re.M)}
+
+
+def cli_version(name, out):
+    """(version, is_cli) from a `--version` output for CLI `name`. is_cli is False when the output has
+    no banner of that CLI (_CLI_VERSION_MARK) — the caller must not trust it. The version is the one
+    bound to the banner; two banners that disagree (or one without a parseable number) give None."""
+    mark = _CLI_VERSION_MARK.get(name)
+    tokens = mark.findall(out) if (out and mark) else []
+    if not tokens:
+        return None, False
+    found = {parse_version(t) for t in tokens}
+    return (found.pop() if len(found) == 1 else None), True
 
 
 def version_gate(a, detected, tested=TESTED_VERSIONS):

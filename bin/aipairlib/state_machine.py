@@ -277,6 +277,28 @@ def print_banner(lines):
     print("\a", end="", flush=True)
 
 
+def decide_delivery_back(dialog, qdlg, plan_allowed, question_allowed):
+    """差し戻し（Codex のレビュー → Claude）の配達方法を決める純関数（P2-1 の decide_* と同じ流儀）。
+
+    不変条件: Claude の画面にダイアログがある時は通常の poke に落とさない — ダイアログは入力をエコーせず、
+    poke の nonce（16進）の数字が選択肢として解釈されうる。ダイアログ経由で配達できない時は画面に触れず停止。
+      ダイアログ無し                                   → "poke"
+      プラン: 許可（flags ON ∧ 版の再判定 OK）∧ Tell 肢 → "plan_tell"     それ以外 → "stop"
+      質問:   許可                                     → "question_chat" それ以外 → "stop"
+    優先順はプラン → 質問（現行どおり）。"""
+    if dialog:
+        return "plan_tell" if (plan_allowed and dialog.get("tell")) else "stop"
+    if qdlg:
+        return "question_chat" if question_allowed else "stop"
+    return "poke"
+
+
+class _NoVersionGuard:
+    """vg 未指定（テスト等）用: 版の再判定をしない＝flags だけで判断する。"""
+    def dialog_ok(self):
+        return True
+
+
 class StateMachine:
     """aipair relay の状態機械本体（P2-1: relay.main() から切り出し）。claude / codex /
     codex_plan / codex_question の 4 state を回し、ターン完了検知→相手ペインへの poke／ダイアログ
@@ -289,8 +311,10 @@ class StateMachine:
     def __init__(self, a, *, panes, own, cwd, tracked, claude_seen, codex_seen, baseline,
                  sg, rg, bw, poke_codex, poke_codex_next, poke_claude, poke_claude_pass,
                  poke_claude_next, stop_phrases, next_ask_phrases, all_done_phrases,
-                 human_required_phrases=()):
+                 human_required_phrases=(), vg=None):
         self.a = a
+        # VersionGuard（schema_guard.py）: Claude のダイアログに触れる直前の版の再判定。未指定は flags のみ。
+        self.vg = vg if vg is not None else _NoVersionGuard()
         self.panes = panes
         self.own = own
         self.cwd = cwd
@@ -318,7 +342,7 @@ class StateMachine:
         a = self.a
         panes, own, cwd, tracked = self.panes, self.own, self.cwd, self.tracked
         claude_seen, codex_seen, baseline = self.claude_seen, self.codex_seen, self.baseline
-        sg, rg, bw = self.sg, self.rg, self.bw
+        sg, rg, vg, bw = self.sg, self.rg, self.vg, self.bw
         poke_codex, poke_codex_next = self.poke_codex, self.poke_codex_next
         poke_claude, poke_claude_pass, poke_claude_next = (self.poke_claude, self.poke_claude_pass,
                                                            self.poke_claude_next)
@@ -332,6 +356,13 @@ class StateMachine:
         def classify_tasklist():
             """endless: task-list を分類（唯一の権威）。読めない/解析不能は exit 2 で fail-closed。"""
             return tasklist.load_or_exit(a.task_list, cwd, emit=lambda m: log(c("warn", m)))
+
+        def allowed(kind):
+            """不変条件: Claude のダイアログ（kind = "plan" / "question"）を操作するのは、その自動操作が
+            《今》ON で、かつペインで今動いている claude が検証済み（VersionGuard.dialog_ok）の時だけ。
+            schema の fail-open 等で実行中に OFF になった場合も、ここで送信前に止まる。"""
+            off = a.no_plan_review if kind == "plan" else a.no_question_relay
+            return (not off) and vg.dialog_ok()
 
         _startup_state = None
         if a.endless:
@@ -460,7 +491,9 @@ class StateMachine:
                         pending_kind = "next" if ask_next else "review"
                         rg.arm(sent)
                         since = time.time(); state = "claude" if gate_msg else "codex"; last_activity = time.time()
-                    elif (not a.no_plan_review) and (plan_dialog := detect_plan_dialog(panes["claude"])):
+                    # ダイアログを検知した時だけ、ペインで今動いている claude の版を再判定する（毎 poll の
+                    # /proc 走査を避ける）。不可なら分岐に入らず画面に触れない＝起動時から OFF と同じ経路。
+                    elif (not a.no_plan_review) and (plan_dialog := detect_plan_dialog(panes["claude"])) and vg.dialog_ok():
                         if plan_rounds >= a.plan_rounds:
                             print(c("warn", f"│ ■ プランレビュー上限 {a.plan_rounds} 回に到達。"
                                             f"人間の判断が必要です（ダイアログはそのまま）。停止します。"), flush=True)
@@ -481,7 +514,7 @@ class StateMachine:
                             break
                         rg.arm(sent)
                         since = time.time(); state = "codex_plan"; last_activity = time.time()
-                    elif (not a.no_question_relay) and detect_question_dialog(panes["claude"]):
+                    elif (not a.no_question_relay) and detect_question_dialog(panes["claude"]) and vg.dialog_ok():
                         if question_rounds >= a.question_rounds:
                             print(c("warn", f"│ ■ 質問リレー上限 {a.question_rounds} 回に到達。"
                                             f"人間の判断が必要です（ダイアログはそのまま）。停止します。"), flush=True)
@@ -545,13 +578,25 @@ class StateMachine:
                         # 承認判定は停止ワードと同じく sentinel の先頭行完全一致で行う。プランの
                         # 自動承認は不可逆な自動操作なので、否定文・引用・指示文中の言及
                         # （「[AIPAIR_PLAN_APPROVED]とは判断できません」等）を絶対に承認にしない。
-                        dialog = detect_plan_dialog(panes["claude"]) or plan_dialog
+                        # 操作は《今》画面にあるダイアログだけに対して行う。検知時の古い解析結果（plan_dialog）を
+                        # 使い回すと、Codex の応答中にダイアログが消えた（人間が操作した等）後の通常コンポーザへ
+                        # 数字や feedback を送りうる。今無ければ decide_plan_action が "no_dialog"＝画面に触れない。
+                        dialog = detect_plan_dialog(panes["claude"])
                         if text:
                             dim(c("codex", "codex") + ": " + oneline(text))
                         # 承認判定（sentinel 先頭行完全一致・feedback 閾値・修正 vs 承認）は
                         # state_machine.decide_plan_action の純粋関数へ切り出した（P2-1・plan_flow）。
                         # ここは「決定 → 副作用（press/send/log/code）」の実行のみ。
                         decision = decide_plan_action(texts, a.plan_ok, dialog)
+                        # 送信直前の再判定（Codex の応答中にペインで Claude が再起動した・schema で OFF になった等）。
+                        # 画面を操作するアクションで不可なら、一切触れず停止する（exit 5・ダイアログはそのまま）。
+                        if decision.action not in ("no_text", "no_dialog", "no_tell_option") and not allowed("plan"):
+                            print(c("warn", "│ ■ プラン承認ダイアログへの送信直前の再判定で自動操作が不可"
+                                            "（自動操作 OFF／版の再判定で不可）。画面には触れず停止します"
+                                            "（ダイアログはそのまま・人間の判断が必要）。"), flush=True)
+                            print("\a", end="", flush=True)
+                            code = 5
+                            break
                         if decision.action == "no_text":
                             log(c("warn", "◆ Codex のレビュー本文を取得できず。ダイアログ検知からやり直します。"))
                         elif decision.action == "no_dialog":
@@ -638,6 +683,14 @@ class StateMachine:
                             print_banner(outcome.banner)
                             break
                         if outcome.kind == "deliver":
+                            # 送信直前の再判定（検知後にペインで Claude が再起動した等）。不可なら画面に一切触れず停止。
+                            if not allowed("question"):
+                                print(c("warn", "│ ■ 質問ダイアログへの回答送信直前の再判定で自動操作が不可"
+                                                "（自動操作 OFF／版の再判定で不可）。画面には触れず停止します"
+                                                "（ダイアログはそのまま・人間の判断が必要）。"), flush=True)
+                                print("\a", end="", flush=True)
+                                code = 5
+                                break
                             if not send_question_answer(panes["claude"], qdlg, outcome.payload,
                                                         watch=claude_watch()):
                                 # ダイアログは chat 押下で既に閉じており、未送信のまま state を
@@ -740,24 +793,38 @@ class StateMachine:
                         # （ダイアログはリテラル入力をエコーしない）。その場合は Codex のレビューを
                         # 「Tell Claude what to change」経由で配達する（2026-07-20 実バグ:
                         # レビュー中に Claude がプランを提示 → poke 3連続失敗で relay 死亡）。
-                        dialog = None if a.no_plan_review else detect_plan_dialog(panes["claude"])
                         # 質問ダイアログ中も同様に poke は届かず、さらに poke の nonce（16進）の数字が
                         # 選択として解釈され画面が変わると「画面変化=配達成功」フォールバックが誤爆して
-                        # Enter が飛ぶ（=選択肢を誤送信）リスクがある → 「Chat about this」経由で配達
-                        qdlg = None if a.no_question_relay else detect_question_dialog(panes["claude"])
+                        # Enter が飛ぶ（=選択肢を誤送信）リスクがある → 「Chat about this」経由で配達。
+                        # 検知は自動操作の ON/OFF に関係なく行う: OFF（起動時から・版の再判定・schema）でも
+                        # ダイアログ上へ poke に落とすと同じ誤送信が起きるため、その時は画面に触れず停止する。
+                        dialog = detect_plan_dialog(panes["claude"])
+                        qdlg = detect_question_dialog(panes["claude"])
+                        back = decide_delivery_back(dialog, qdlg,
+                                                    plan_allowed=bool(dialog) and allowed("plan"),
+                                                    question_allowed=bool(qdlg) and allowed("question"))
                         delivered_back = True
                         new_probe = None
-                        if dialog and dialog["tell"]:
+                        if back == "stop":
+                            print(c("warn", f"│ ■ Claude が{'プラン承認' if dialog else '質問'}ダイアログで停止中ですが、"
+                                            "ダイアログ経由でレビューを配達できません（自動操作 OFF／版の再判定で不可"
+                                            "／「Tell Claude what to change」肢なし）。通常の poke はダイアログへ誤入力"
+                                            "しうるため、画面には触れず停止します（ダイアログはそのまま・人間の判断が必要）。"),
+                                  flush=True)
+                            print("\a", end="", flush=True)
+                            code = 5
+                            break
+                        if back == "plan_tell":
                             log("◆ " + c("claude", "Claude はプラン承認待ち")
                                 + " → レビューを「Tell Claude what to change」経由で配達")
                             delivered_back = send_plan_feedback(panes["claude"], dialog, back_text, approve=False,
                                                                 watch=claude_watch())
-                        elif qdlg:
+                        elif back == "question_chat":
                             log("◆ " + c("claude", "Claude は質問ダイアログ表示中")
                                 + " → レビューを「Chat about this」経由で配達")
                             delivered_back = send_question_answer(panes["claude"], qdlg, back_text,
                                                                   watch=claude_watch())
-                        else:
+                        else:  # back == "poke"（ダイアログ無し）
                             # Claude 宛: 画面バッジは信用しない（badge=False）。ログ未特定の
                             # 劣化時のみバッジにフォールバックし、その旨を可視化する
                             if tracked["claude"] is None:

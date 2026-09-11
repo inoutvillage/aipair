@@ -65,6 +65,18 @@ task makes no progress across rounds) instead of guessing or spinning.
   manually approve edits" (no "bypass" wording), so the picker selects the first `Yes…` option.
 
 ### Fixed
+- **The version gate judges the CLI a pane is actually running, not the one on disk** — npm upgrades
+  replace the file under a live TUI, so `claude --version` from PATH described a binary the relay was
+  not scraping (measured: disk 2.1.269 while the panes ran 2.1.266 / 2.1.268) — a false ⚠ that turned
+  dialog automation off on a tested TUI, or a pass for an untested one. On Linux the relay now finds
+  each pane's CLI process under `/proc` and asks its own executable (`/proc/<pid>/exe --version`, valid
+  even after the upgrade deleted it), and re-checks the running claude right before touching any of its
+  dialogs; a process it cannot identify or verify is never operated (fail-closed). On Linux PATH's
+  version may still seed the startup value when a CLI is not up yet, but it never permits a dialog
+  operation — only where `/proc` does not exist does the PATH-based decision stand as before. The plan
+  approval also acts only on a dialog detected right now (a stale one that vanished while Codex was
+  reviewing is left alone). While Claude sits in a dialog, a review is also no longer typed in as a
+  plain poke (its digits could pick an option): the relay stops with exit 5 and leaves the screen untouched.
 - **Endless mode no longer marks a task done before review** — the `- [x]` is written only on the
   next turn after Codex's review passes, not at implementation time, so a relay restart mid-review
   can no longer misread the task-list as `ALL_DONE` and stop early.

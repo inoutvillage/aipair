@@ -458,6 +458,88 @@ def codex_via_pane(cwd, pane=None):
     return None
 
 
+# --- the CLI process a pane is actually running (version gate) -------------- #
+# npm upgrades swap the file on disk under a live TUI, so `claude --version` from PATH can describe
+# a binary nobody is scraping. The relay's version gate asks the RUNNING process instead.
+
+def proc_available():
+    """True when /proc exists (Linux/WSL) — the only way to see which binary a pane's CLI is running.
+    False on macOS etc., where callers keep the PATH-based answer."""
+    return os.path.isdir("/proc")
+
+
+def _proc_stat(pid):
+    """(state, starttime) from /proc/<pid>/stat, or None. Fields are split after the LAST ')' (comm
+    may contain spaces and ')'): [0] = state (field 3), [19] = starttime (field 22, ticks since boot)."""
+    try:
+        with open("/proc/%d/stat" % pid, "r", encoding="utf-8", errors="replace") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    rp = data.rfind(")")
+    if rp < 0:
+        return None
+    rest = data[rp + 2:].split()
+    try:
+        return rest[0], int(rest[19])
+    except (ValueError, IndexError):
+        return None
+
+
+def _proc_comm(pid):
+    try:
+        with open("/proc/%d/comm" % pid, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def _exe_id(pid):
+    """(st_dev, st_ino) of the executable `pid` is running. /proc/<pid>/exe resolves to it even after an
+    upgrade deleted the file, and it CHANGES when the pid execve's another binary (its starttime does
+    not). None when it can't be read."""
+    try:
+        st = os.stat("/proc/%d/exe" % pid)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def cli_process(pane, name):
+    """(pid, starttime, exe_id) of the `name` CLI (claude / codex) running in tmux `pane` — the process
+    whose TUI the relay scrapes. Checks the pane's own pid, then its descendants breadth-first, and takes
+    the SHALLOWEST live process whose /proc comm is exactly `name`: the pane shell's child for claude, the
+    native binary under node's codex.js for codex (node's comm is 'node'). A nested CLI started by a tool
+    sits deeper and never wins; a truncated look-alike ('codex-code-mode') does not match; a zombie/dead
+    one (Z/X) is skipped. None when /proc is absent, the pane pid can't be queried, or no such process
+    exists. exe_id may be None (unreadable) — same_process() then never trusts the ident."""
+    if not (pane and proc_available()):
+        return None
+    ppid = _tmux("display-message", "-p", "-t", pane, "#{pane_pid}")
+    if not (ppid and ppid.isdigit()):
+        return None
+    root = int(ppid)
+    for pid in [root] + _descendants(root):
+        if _proc_comm(pid) != name:
+            continue
+        st = _proc_stat(pid)
+        if st and st[0] not in ("Z", "X"):
+            return (pid, st[1], _exe_id(pid))
+    return None
+
+
+def same_process(ident):
+    """True while `ident` = (pid, starttime, exe_id) still names the same live process running the same
+    executable — a recycled pid has a different starttime, a pid that execve'd another binary has a
+    different exe_id, and a zombie/dead one no longer counts. An ident whose exe_id couldn't be read is
+    never trusted (fail-closed)."""
+    if not ident or len(ident) < 3 or ident[2] is None:
+        return False
+    st = _proc_stat(ident[0])
+    return (bool(st) and st[0] not in ("Z", "X") and st[1] == ident[1]
+            and _exe_id(ident[0]) == ident[2])
+
+
 def codex_since(cwd, since, limit=CODEX_SCAN_LIMIT):
     """The pair's own rollout: the EARLIEST rollout for cwd whose session started at/after
     `since` (the pair-launch epoch aipair stamps as AIPAIR_CODEX_SINCE). Unlike codex_newest
