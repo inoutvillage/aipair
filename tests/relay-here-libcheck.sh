@@ -158,7 +158,7 @@ mkses() {
 bridge_of() { tmux list-panes -t "$1" -F '#{pane_id}' | head -1; }
 ignite() {   # $1=session $2=relay bin、以降は env 追加（KEY=VAL）
   local s=$1 relay=$2; shift 2
-  (cd "$W"; env -u TMUX "$@" AIPAIR_RELAY_BIN="$relay" bash "$REPO/bin/aipair-relay-here" --session "$s") 2>&1
+  (cd "$W" || exit 1; env -u TMUX "$@" AIPAIR_RELAY_BIN="$relay" bash "$REPO/bin/aipair-relay-here" --session "$s") 2>&1
 }
 
 mk_relay "$W/relay_ok" banner_sleep
