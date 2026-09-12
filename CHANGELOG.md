@@ -65,6 +65,16 @@ task makes no progress across rounds) instead of guessing or spinning.
   manually approve edits" (no "bypass" wording), so the picker selects the first `Yes…` option.
 
 ### Fixed
+- **`aipair-relay-here` verifies the relay actually started** — it used to send the launch line into the
+  bridge pane and report success unconditionally, so a bridge whose shell held half-typed input (the line
+  concatenated into `command not found`) or a pane left in copy-mode silently produced no relay while the
+  command exited 0 — and the previous relay's banner still in the scrollback made it look started. It now
+  cancels copy-mode, discards the pending input line, re-checks that the bridge is still an idle shell
+  **right before sending** (so it never types a launch line into a relay someone else just started), and
+  then waits for a NEW `┌─ aipair-relay` banner (`AIPAIR_IGNITE_TIMEOUT`, default 8s) before reporting
+  success; when it cannot confirm the start — or the relay exited immediately — it prints the bridge pane's
+  last lines and exits 2. The idle-shell test is now one shared check that also covers `dash` and login
+  shells (`-bash` / `-zsh`), which were previously misread as "busy".
 - **The version gate judges the CLI a pane is actually running, not the one on disk** — npm upgrades
   replace the file under a live TUI, so `claude --version` from PATH described a binary the relay was
   not scraping (measured: disk 2.1.269 while the panes ran 2.1.266 / 2.1.268) — a false ⚠ that turned

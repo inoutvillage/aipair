@@ -70,3 +70,5 @@ aipair-relay-here -- --endless --max-rounds 100
 ## 失敗時
 
 - `aipair-relay-here` が exit≠0 を返したら、その stderr（tmux外 / bridge が busy / bridge 未検出 等）を**そのままユーザーに伝えて停止**する。勝手に別手段で relay を起こそうとしない。
+- **点火したのに relay が立たなかった場合も exit≠0** になる（bridge の打ちかけ入力・copy-mode・launch 行のエラー等）。
+  その時は stderr に出る **bridge ペインの末尾**をそのままユーザーへ伝える。成功時は「起動を確認」と前景プロセス名が出る。

@@ -565,3 +565,36 @@ F1 ✅ → F2 ✅ → F3 ✅ → F6 ✅ → F4 ✅ → F5 ✅ → F9 ✅ → F8 
   の直後）から取り、食い違う複数の版表示・数字の無い版表示は不明。各テスト追加
 - 申し送り: 反映（PR・install・再点火）はユーザー判断。`--allow-untested-dialogs` 付きで動いている他プロジェクトの
   relay は再点火後もダイアログ自動操作は継続（ゲートを明示的に外しているため）
+
+## 追記: `aipair-relay-here` の点火を確認する（2026-09-12）
+
+> 実障害: bridge ペインのシェル入力行に打ちかけの文字（`rbo-p`）が残っていたため、send-keys で打ち込んだ launch 行が
+> 連結され `-bash: rbo-penv: command not found`。relay-here は送信までしか見ないので **rc=0＋「relay 点火」表示のまま
+> relay は立たなかった**。スクロールバックに前回のバナーが残るため、画面を見ても起動したように誤読する。SKILL と
+> VS Code タスクは rc で判断するので、rc が嘘をつくとエージェント運用が黙って先へ進む。
+
+- [x] シェル判定を `is_shell_cmd()` に共通化（`bash zsh sh fish dash -bash -zsh`＝`bin/aipair` と同じ集合）。
+  bridge 検出のフォールバック・初回ガード・送信直前の再確認・起動後の判定で同じ基準を使う（ログインシェルの
+  bridge を busy と誤判定していた副次バグも解消）
+- [x] 送信前の掃除: copy-mode 解除（`#{pane_in_mode}`→`-X cancel`・`tmuxlib` と同手順）＋ `C-c` で入力行を破棄
+- [x] TOCTOU 再確認を 2 回（掃除の前・**launch 送信の直前**）。送信直前に busy なら**何も送らず** exit 2
+- [x] 点火の確認: `┌─ aipair-relay` の**件数が増えたか**で判定（古いバナー・コマンドのエコーで誤検知しない。
+  プロセス名やタイミングに依存しない）。上限 `AIPAIR_IGNITE_TIMEOUT`（既定 8・数字と 1 以上を検証）、経過は bash の `SECONDS`
+- [x] tmux 呼び出し（capture-pane / copy-mode / C-c / literal / Enter / 前景取得）の失敗を無視せず exit 2 に倒す
+- [x] 起動後に前景がシェルへ戻っていれば「起動したが即終了」として exit 2（bridge 末尾を stderr に添える）
+- [x] テスト: `tests/relay-here-libcheck.sh` 13 → **23 項目**（私設 socket のシムに tmux 呼び出しログと
+  `pane_current_command` の応答差し替えを追加。`sed -i` は macOS 非互換なので `tail -n +2` で消費）。内容は
+  成功／打ちかけ入力の回帰／copy-mode／空振り／古いバナーだけ／バナー直後に終了／送信直前 busy（launch を送らない）／
+  `AIPAIR_IGNITE_TIMEOUT` 不正値・0／ログインシェル
+- [x] README「relay の再点火」節・SKILL の失敗時の扱い・CHANGELOG（exit code 表は doc-sync が正準集合固定なので触らず、
+  節の文中に記載）。`-h` の出力はヘッダ行を足しても崩れないよう行番号固定をやめた（`awk` でコメントブロック全体）
+- [x] **空振りしないテストである証明**: 修正前の `bin/aipair-relay-here`（`git show main:`）に差し替えたコピーで、新規 10 項目の
+  うち **9 項目が落ちる**ことを確認（特に「送信直前 busy」は `sent=1`＝走っているプロセスへ launch を送ってしまう証拠）。
+  ログインシェルの 1 項目だけは修正前でも通る＝今後の退行に対する前向きの確認
+- [x] **Codex コードレビュー反映（relay-id:9af903a2）**: 取得失敗を安全側に倒していない 2 箇所を是正。(1) `pane_in_mode`
+  の取得失敗を `0`（copy-mode でない）に変換していたため、実は copy-mode なのに取得だけ失敗すると送信へ進んでいた
+  → 取得失敗・`0/1` 以外は送信前に exit 2。(2) `bridge_cmd_now` の終了ステータスを見ておらず、起動後の取得失敗が
+  「既に終了」と誤報されていた → 取得失敗は専用の診断で exit 2、送信前の 2 箇所も「取得できない＝busy 判断不能」で中止。
+  テストを 23 → **26 項目**へ（シムに `AIPAIR_TEST_FAIL_FORMAT` と `__FAIL__` の失敗注入を追加）。修正前コピーでは
+  3 件とも落ちる（`pane_in_mode` 失敗時は `rc=0 sent=1`＝copy-mode かもしれないペインへ実際に送っていた証拠）
+- [x] `bash tests/run-all.sh` 12 系統全緑（relay-here 26 / doc-sync 31 / relay-parsers 228 ほか）

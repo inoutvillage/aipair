@@ -348,6 +348,16 @@ aipair-relay-here [rounds N] [stop "フレーズ"] [stop-side codex|claude|both]
 aipair-relay-here -- --endless --max-rounds 100                                        # relay 本体のフラグを素通し
 ```
 
+点火は **起動を確認してから成功を返す**（送るだけで成功を返すと無言の空振りを見逃す。2026-09-12 実障害: bridge の
+入力行に打ちかけの文字が残っていて launch 行と連結し `command not found`、relay は立たないのに exit 0 だった）:
+
+- 送信前に bridge ペインの copy-mode を解除し、**打ちかけの入力行を破棄**する（残っていると launch 行と連結して別コマンドになる）
+- **送信直前にもう一度** bridge が idle シェルであることを確認する（その間に別 relay が起動していたら、**何も送らずに**中止）
+- 送信後、relay のバナー（`┌─ aipair-relay`）が**新しく 1 つ増える**まで待つ（上限 `AIPAIR_IGNITE_TIMEOUT`・既定 8 秒。
+  古いバナーが画面に残っていても件数比較なので誤検知しない）
+- 確認できない／起動直後に終了した場合は、**bridge ペインの末尾を添えて exit 2**（relay-here の失敗は前提不備と同じ 2。
+  relay 本体の exit code 表とは別物）
+
 ### プラン承認ダイアログの自動処理（プランレビュー）
 
 Claude がプランモードで **「Would you like to proceed?」の承認待ち**になると、

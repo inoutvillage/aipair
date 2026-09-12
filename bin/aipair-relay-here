@@ -16,6 +16,10 @@
 #      例: aipair-relay-here --max-rounds 100 --endless
 # 既定: --adopt / relay 側の既定（--stop 完了です / --stop-side codex / --max-rounds 20）
 #
+# 点火は《確認してから》成功を返す: bridge の copy-mode を解除し打ちかけの入力行を破棄 → 送信直前に
+# bridge が idle シェルか再確認 → 投入後、relay のバナーが新しく出るまで待つ。確認できない／起動直後に
+# 終了した場合は bridge ペインの末尾を添えて exit 2（成功時は「起動を確認」と前景プロセス名を表示）。
+#
 # env でも指定できる（優先順位: 引数 > 環境変数 > 既定）。send-keys 投入では呼び出し側の
 # env が bridge に届かないため、ここでフラグへ展開して渡す。--print で結果を確認できる:
 #   AIPAIR_MAX_ROUNDS  最大往復数        AIPAIR_STOP / AIPAIR_STOP_SIDE  停止ワードと判定側
@@ -24,6 +28,7 @@
 #   AIPAIR_GATE / AIPAIR_GATE_TIMEOUT / AIPAIR_GATE_ROUNDS  停止ゲート
 #   AIPAIR_ALLOW_UNTESTED_DIALOGS / AIPAIR_NO_VERSION_GATE  版ゲート
 #   AIPAIR_ALLOW_UNTESTED_SCHEMA / AIPAIR_NO_SCHEMA_PROBE  JSONL schema ゲート
+#   AIPAIR_IGNITE_TIMEOUT  点火確認の待ち上限（秒・既定 8・1 以上の整数）
 # 例: AIPAIR_MAX_ROUNDS=100 AIPAIR_ENDLESS=1 aipair-relay-here --print
 set -uo pipefail
 
@@ -35,7 +40,17 @@ if [ -z "${AIPAIR_BIN:-}" ]; then
   _self_rp="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$0" 2>/dev/null || printf '%s' "$0")"
   AIPAIR_BIN="$(dirname "$_self_rp")/aipair"
 fi
-SHELLS="bash zsh sh fish"
+# ペインが「アイドルのシェル」かの判定。集合は bin/aipair の status 表示と同じ（ログインシェルは
+# `-bash` と報告される。dash も含む）。bridge 検出のフォールバック・二重起動ガード・送信直前の
+# 再確認・起動後の判定で《同じ基準》を使う。取得失敗（空文字）はシェル扱いにしない＝fail-closed。
+SHELLS="bash zsh sh fish dash -bash -zsh"
+is_shell_cmd() {
+  case " $SHELLS " in *" ${1:-} "*) return 0 ;; *) return 1 ;; esac
+}
+# bridge の前景コマンドを《今この瞬間》取り直す（空文字＝取得失敗）。$BRIDGE 確定後にのみ呼ぶ。
+bridge_cmd_now() {
+  tmux display-message -p -t "$BRIDGE" '#{pane_current_command}' 2>/dev/null
+}
 
 # ディレクトリの正準化。bin/aipair の canon_dir と同一ロジック（realpath + 大小文字/正規化を
 # ディスク上の綴りへ統一）。`pwd -P` は WSL DrvFs の大小文字を統一しないため、明示 --dir が
@@ -81,7 +96,8 @@ while [ $# -gt 0 ]; do
     --dir)      DIR_OVERRIDE="${2:?--dir にパスが要る}"; shift 2 ;;
     --print|-n) DRYRUN=1; shift ;;
     --)         shift; EXTRA=("$@"); break ;;
-    -h|--help)  sed -n '2,23p' "$0"; exit 0 ;;
+    # 先頭のコメントブロック全体を出す（行数を足しても範囲がズレない＝ハードコードした行番号を持たない）
+    -h|--help)  awk 'NR>1 { if ($0 ~ /^#/) print; else exit }' "$0"; exit 0 ;;
     # relay 本体のフラグ（--max-rounds / --endless 等）は `--` 無しでもそのまま受ける。
     # 値を伴うフラグは「次が別フラグでも既知キーワードでもなければ値」とみなして一緒に取り込む。
     # 例: `--max-rounds 100 --endless` / `--endless rounds 100` / `--endless --print` すべて可。
@@ -170,7 +186,9 @@ done <<< "$panes"
 if [ -z "$BRIDGE" ]; then
   while IFS=$'\t' read -r pid cmd title; do
     [ "$pid" = "$SELF" ] && continue
-    case " $SHELLS python3 python " in *" $cmd "*) BRIDGE="$pid"; BRIDGE_CMD="$cmd"; break ;; esac
+    if is_shell_cmd "$cmd" || [ "$cmd" = python3 ] || [ "$cmd" = python ]; then
+      BRIDGE="$pid"; BRIDGE_CMD="$cmd"; break
+    fi
   done <<< "$panes"
 fi
 # --- 自ペインが bridge のケース（relay 終了後、bridge の bash プロンプトから叩いた）---
@@ -189,10 +207,8 @@ fi
 # --- 二重起動ガード: bridge が idle シェルの時だけ点火する -------------------
 # （自ペイン実行時は不要: プロンプトからこのスクリプトを叩けている＝relay は走っていない）
 if [ "$RUN_IN_PLACE" != 1 ]; then
-  case " $SHELLS " in
-    *" $BRIDGE_CMD "*) : ;;  # idle → OK
-    *) die "bridge ペイン($BRIDGE)が busy（current_command=$BRIDGE_CMD）。relay 走行中か collaborate(peer-log)モードの可能性。二重起動回避のため中止。停止は bridge で Ctrl-C 後に再実行。" ;;
-  esac
+  is_shell_cmd "$BRIDGE_CMD" \
+    || die "bridge ペイン($BRIDGE)が busy（current_command=$BRIDGE_CMD）。relay 走行中か collaborate(peer-log)モードの可能性。二重起動回避のため中止。停止は bridge で Ctrl-C 後に再実行。"
 fi
 
 # --- env 既定の取り込み（明示引数が無い項目だけ）-----------------------------
@@ -283,11 +299,104 @@ if [ "$RUN_IN_PLACE" = 1 ]; then
   exec "${CMD[@]}"
 fi
 
-# --- bridge へ投入（literal → 0.3s → Enter：実績ある作法）-------------------
-tmux send-keys -t "$BRIDGE" -l "$LINE"
+# --- bridge へ投入し、《点火を確認してから》成功を返す -----------------------
+# 送信だけして成功を返すと無言の空振りを見逃す（2026-09-12 実障害: bridge の入力行に打ちかけの文字が
+# 残っていて launch 行と連結 → `command not found` → relay は立たないのに rc=0。しかもスクロールバックに
+# 前回のバナーが残るため画面を見ても起動したように誤読した）。
+# 手順: 掃除（copy-mode / 入力行）→ 送信直前の再確認 → literal → Enter → relay 自身のバナーが増えたか。
+IGNITE_TIMEOUT="${AIPAIR_IGNITE_TIMEOUT:-8}"
+case "$IGNITE_TIMEOUT" in
+  ''|*[!0-9]*) die "AIPAIR_IGNITE_TIMEOUT は 1 以上の整数（秒）で指定してください: $IGNITE_TIMEOUT" ;;
+esac
+[ "$IGNITE_TIMEOUT" -ge 1 ] || die "AIPAIR_IGNITE_TIMEOUT は 1 以上の整数（秒）で指定してください: $IGNITE_TIMEOUT"
+
+# relay が起動時に必ず出す枠線。打ち込む launch 行には `┌─` が無いのでエコーで誤検知しない。
+BANNER='┌─ aipair-relay'
+banner_count() {
+  local out n
+  out="$(tmux capture-pane -p -S - -t "$BRIDGE" 2>/dev/null)" || return 1
+  n="$(printf '%s\n' "$out" | grep -cF "$BANNER")" || n=0
+  printf '%s' "$n"
+}
+bridge_tail() {
+  tmux capture-pane -p -t "$BRIDGE" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -5 | sed 's/^/    /'
+}
+
+# 掃除の前に前景コマンドを取り直す: 上の busy ガードは bridge 検出時のスナップショットなので、その後に
+# 別の relay が起動していると C-c でそのプロセスを殺してしまう。取得不能（空）も busy 扱いで止める。
+cmd_now="$(bridge_cmd_now)" \
+  || die "bridge ペイン($BRIDGE)の前景コマンドを取得できません（tmux 失敗）。busy かどうか判断できないため中止（何も送っていません）。"
+[ -n "$cmd_now" ] \
+  || die "bridge ペイン($BRIDGE)の前景コマンドが空です。busy かどうか判断できないため中止（何も送っていません）。"
+is_shell_cmd "$cmd_now" \
+  || die "bridge ペイン($BRIDGE)が busy になりました（current_command=$cmd_now）。二重起動回避のため中止（何も送っていません）。"
+
+# 基準値は「送る前」に取る。ここで読めないなら点火を検証できない → 撃たずに中止（fail-closed）。
+BASE="$(banner_count)" \
+  || die "bridge ペイン($BRIDGE)の内容を読めません（capture-pane 失敗）。点火を検証できないため中止（何も送っていません）。"
+
+# copy-mode だと send-keys がキー操作として食われ launch 行が届かない（aipairlib/tmuxlib.py と同じ手順）。
+# 取得できない・0/1 以外は「copy-mode でない」とみなさず中止する（実は copy-mode なのに取得だけ失敗した
+# 時に送ってしまうと、launch 行が操作として食われて無言の空振りになる＝fail-closed）。
+in_mode="$(tmux display-message -p -t "$BRIDGE" '#{pane_in_mode}' 2>/dev/null)" \
+  || die "bridge ペイン($BRIDGE)の copy-mode 状態を取得できません（tmux 失敗）。copy-mode だと launch 行が届かないため中止（何も送っていません）。"
+case "$in_mode" in
+  0) : ;;
+  1) tmux send-keys -t "$BRIDGE" -X cancel \
+       || die "bridge ペイン($BRIDGE)の copy-mode を解除できません（何も送っていません）。"
+     sleep 0.2 ;;
+  *) die "bridge ペイン($BRIDGE)の copy-mode 状態が想定外です（pane_in_mode=${in_mode:-空}）。中止（何も送っていません）。" ;;
+esac
+# 打ちかけの入力が残っていると launch 行と連結して別コマンドになる → 行を破棄する（PS2 継続行の解消も兼ねる）
+tmux send-keys -t "$BRIDGE" C-c || die "bridge ペイン($BRIDGE)へ C-c を送れません（何も送っていません）。"
 sleep 0.3
-tmux send-keys -t "$BRIDGE" Enter
-printf 'relay 点火: session=%s / bridge=%s\n' "$SESSION" "$BRIDGE"
+
+# 送信直前にもう一度確認: 掃除・待機の間に別 relay が起動していたら、走っているプロセスへ launch 文字列を
+# 打ち込むことになる。ここで止めれば launch は送っていない。
+cmd_now="$(bridge_cmd_now)" \
+  || die "bridge ペイン($BRIDGE)の前景コマンドを取得できません（tmux 失敗）。launch は送っていません。"
+[ -n "$cmd_now" ] \
+  || die "bridge ペイン($BRIDGE)の前景コマンドが空です。launch は送っていません。"
+is_shell_cmd "$cmd_now" \
+  || die "bridge ペイン($BRIDGE)が送信直前に busy になりました（current_command=$cmd_now）。launch は送っていません。"
+
+tmux send-keys -t "$BRIDGE" -l "$LINE" || die "bridge ペイン($BRIDGE)へ launch 行を送れません。"
+sleep 0.3
+if ! tmux send-keys -t "$BRIDGE" Enter; then
+  printf 'aipair-relay-here: bridge ペイン(%s)へ Enter を送れません（launch 行はコンポーザに残っています）。\n' "$BRIDGE" >&2
+  exit 2
+fi
+
+# --- 点火の確認: relay のバナーが 1 つ増えるまで待つ -------------------------
+started=0; SECONDS=0
+while [ "$SECONDS" -lt "$IGNITE_TIMEOUT" ]; do
+  now="$(banner_count)" || now=""
+  if [ -n "$now" ] && [ "$now" -gt "$BASE" ]; then started=1; break; fi
+  sleep 0.25
+done
+if [ "$started" != 1 ]; then
+  printf 'aipair-relay-here: relay の起動を確認できません（%s 秒以内に bridge ペイン(%s)へ relay のバナーが出ませんでした）。\n' \
+    "$IGNITE_TIMEOUT" "$BRIDGE" >&2
+  printf '  bridge ペインの末尾:\n' >&2
+  bridge_tail >&2
+  printf '  打ちかけの入力・copy-mode・launch 行のエラーを確認してください（AIPAIR_IGNITE_TIMEOUT で待ち時間を延ばせます）。\n' >&2
+  exit 2
+fi
+# 起動後の前景コマンド取得: 失敗（tmux エラー・空）は「既に終了」ではない別の事象なので診断を分ける。
+# どちらも失敗（exit 2）だが、誤った原因を報告すると調査が的外れになる。
+if ! cmd_now="$(bridge_cmd_now)" || [ -z "$cmd_now" ]; then
+  printf 'aipair-relay-here: relay のバナーは出ましたが、bridge ペイン(%s)の前景コマンドを取得できません（tmux 失敗）。起動状態を確認できないため失敗として扱います。\n' "$BRIDGE" >&2
+  printf '  bridge ペインの末尾:\n' >&2
+  bridge_tail >&2
+  exit 2
+fi
+if is_shell_cmd "$cmd_now"; then
+  printf 'aipair-relay-here: relay は起動しましたが既に終了しています（bridge ペイン(%s)はシェルに戻っています: %s）。\n' "$BRIDGE" "$cmd_now" >&2
+  printf '  bridge ペインの末尾:\n' >&2
+  bridge_tail >&2
+  exit 2
+fi
+printf 'relay 点火: session=%s / bridge=%s（起動を確認・前景=%s）\n' "$SESSION" "$BRIDGE" "$cmd_now"
 printf '  %s\n' "$LINE"
 printf '  → 会話は  peer / peer-log both  で追える。停止は bridge ペインで Ctrl-C。\n'
 exit 0
