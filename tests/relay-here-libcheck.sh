@@ -10,8 +10,40 @@ W="$(mktemp -d "${TMPDIR:-/tmp}/aipair-lc.XXXXXX")"
 # user's DEFAULT server. Force every tmux call onto a PRIVATE -L socket so this test never
 # touches the production server (guardrail; same isolation as the other tmux tests).
 REAL_TMUX="$(command -v tmux)"; SOCKET="aipair-lc-$$-$RANDOM"
-printf '#!/usr/bin/env bash\n%q -L %q start-server 2>/dev/null || true\n%q -L %q set-option -g exit-empty off 2>/dev/null || true\nexec %q -L %q "$@"\n' \
-  "$REAL_TMUX" "$SOCKET" "$REAL_TMUX" "$SOCKET" "$REAL_TMUX" "$SOCKET" > "$W/tmux"; chmod +x "$W/tmux"
+# The shim also carries two TEST HOOKS used by the ignition tests below (both opt-in per test):
+#   AIPAIR_TEST_TMUX_LOG   — append every tmux invocation (so a test can prove nothing was sent)
+#   AIPAIR_TEST_CMD_ANSWERS — a file of canned `#{pane_current_command}` answers, one per line,
+#                             consumed in order (then it falls through to the real tmux). Lets a test
+#                             make the bridge "become busy" exactly between two checks. Consumption
+#                             uses tail -n +2 (never `sed -i`, which needs an argument on macOS).
+#                             The line `__FAIL__` makes that one query FAIL (exit 1, no output).
+#   AIPAIR_TEST_FAIL_FORMAT — every `display-message` whose format contains this string fails
+#                             (exit 1, no output): injects a tmux query failure for one format.
+cat > "$W/tmux" <<'SHIM'
+#!/usr/bin/env bash
+REAL="$AIPAIR_TEST_REAL_TMUX"; SOCK="$AIPAIR_TEST_SOCKET"
+"$REAL" -L "$SOCK" start-server 2>/dev/null || true
+"$REAL" -L "$SOCK" set-option -g exit-empty off 2>/dev/null || true
+[ -n "${AIPAIR_TEST_TMUX_LOG:-}" ] && printf '%s\n' "$*" >> "$AIPAIR_TEST_TMUX_LOG"
+if [ -n "${AIPAIR_TEST_FAIL_FORMAT:-}" ] && [ "${1:-}" = display-message ]; then
+  case " $* " in *"$AIPAIR_TEST_FAIL_FORMAT"*) exit 1 ;; esac
+fi
+if [ -n "${AIPAIR_TEST_CMD_ANSWERS:-}" ] && [ "${1:-}" = display-message ]; then
+  case " $* " in
+    *"#{pane_current_command}"*)
+      ans="$(head -1 "$AIPAIR_TEST_CMD_ANSWERS" 2>/dev/null)"
+      if [ -n "$ans" ]; then
+        tail -n +2 "$AIPAIR_TEST_CMD_ANSWERS" > "$AIPAIR_TEST_CMD_ANSWERS.rest" 2>/dev/null \
+          && mv "$AIPAIR_TEST_CMD_ANSWERS.rest" "$AIPAIR_TEST_CMD_ANSWERS"
+        [ "$ans" = __FAIL__ ] && exit 1
+        printf '%s\n' "$ans"; exit 0
+      fi ;;
+  esac
+fi
+exec "$REAL" -L "$SOCK" "$@"
+SHIM
+chmod +x "$W/tmux"
+export AIPAIR_TEST_REAL_TMUX="$REAL_TMUX" AIPAIR_TEST_SOCKET="$SOCKET"
 trap '"$REAL_TMUX" -L "$SOCKET" kill-server 2>/dev/null || true; rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SOCKET" 2>/dev/null || true; rm -rf "$W"' EXIT
 # refuse to run unless the shim provably targets the private socket (never the default server)
 "$REAL_TMUX" -L "$SOCKET" new-session -d -s probe 2>/dev/null
@@ -102,5 +134,136 @@ rc=0; out="$( (cd "$W"; env -u TMUX AIPAIR_BIN="$FB/aipair" AIPAIR_RELAY_BIN="$W
 printf '%s' "$out" | grep -q '@aipair-dir が無い' && g=1 || g=0
 chk "[ $rc -ne 0 ] && [ $g -eq 1 ]" "auto: legacy session (no @aipair-dir) -> fail-closed"
 tmux kill-session -t aipair-fake-sess 2>/dev/null || true
+# --- 点火の確認（2026-09-12 実障害: bridge の打ちかけ入力で launch 行が壊れ、relay が立たないのに rc=0）---
+# 偽 relay: --help に応答（relay-here の load gate 用）。mode=banner_sleep はバナーを出して走り続ける /
+# banner_exit はバナーを出して即終了 / silent_exit はバナーを出さずに即終了。
+mk_relay() {
+  cat > "$1" <<EOF
+#!/usr/bin/env bash
+case "\$1" in --help) exit 0 ;; esac
+case "$2" in banner*) printf '┌─ aipair-relay ──────────────\n' ;; esac
+case "$2" in banner_sleep) exec sleep 30 ;; esac
+exit 0
+EOF
+  chmod +x "$1"
+}
+# 偽ペア。bridge 検出は「自ペイン以外の最初のシェルペイン」に落ちるので pane 一覧の先頭が bridge になる。
+# default-shell が fish/nu でもガードに掛からないよう bash を明示する。tmux は必ず PATH のシム（私設 socket）。
+mkses() {
+  tmux kill-session -t "$1" 2>/dev/null || true
+  tmux new-session -d -s "$1" -c "$W" bash 2>/dev/null
+  tmux set-option -t "$1" @aipair-dir "$W" 2>/dev/null
+  tmux split-window -t "$1" -c "$W" bash 2>/dev/null
+}
+bridge_of() { tmux list-panes -t "$1" -F '#{pane_id}' | head -1; }
+ignite() {   # $1=session $2=relay bin、以降は env 追加（KEY=VAL）
+  local s=$1 relay=$2; shift 2
+  (cd "$W"; env -u TMUX "$@" AIPAIR_RELAY_BIN="$relay" bash "$REPO/bin/aipair-relay-here" --session "$s") 2>&1
+}
+
+mk_relay "$W/relay_ok" banner_sleep
+mk_relay "$W/relay_silent" silent_exit
+mk_relay "$W/relay_diesfast" banner_exit
+
+S=aipair-ig1; mkses "$S"
+rc=0; out="$(ignite "$S" "$W/relay_ok")" || rc=$?
+printf '%s' "$out" | grep -q '起動を確認' && g=1 || g=0
+chk "[ $rc -eq 0 ] && [ $g -eq 1 ]" "ignite: banner appeared -> exit 0 + confirmation (rc=$rc)"
+tmux kill-session -t "$S" 2>/dev/null || true
+
+# 打ちかけの入力が残っていても点火できる（C-c で行を破棄する＝今回の実障害の回帰）
+S=aipair-ig2; mkses "$S"; B="$(bridge_of "$S")"
+tmux send-keys -t "$B" -l 'rbo-p'
+rc=0; out="$(ignite "$S" "$W/relay_ok")" || rc=$?
+# rc だけでは修正前コード（送るだけで 0 を返す）でも通ってしまう → 起動の確認まで要求する
+printf '%s' "$out" | grep -q '起動を確認' && g=1 || g=0
+chk "[ $rc -eq 0 ] && [ $g -eq 1 ]" "ignite: half-typed input in the bridge -> still ignites, start CONFIRMED (rc=$rc)"
+tmux kill-session -t "$S" 2>/dev/null || true
+
+# copy-mode のままでも点火できる（解除してから送る）
+S=aipair-ig3; mkses "$S"; B="$(bridge_of "$S")"
+tmux copy-mode -t "$B" 2>/dev/null
+rc=0; out="$(ignite "$S" "$W/relay_ok")" || rc=$?
+printf '%s' "$out" | grep -q '起動を確認' && g=1 || g=0
+chk "[ $rc -eq 0 ] && [ $g -eq 1 ]" "ignite: copy-mode is cancelled -> still ignites, start CONFIRMED (rc=$rc)"
+tmux kill-session -t "$S" 2>/dev/null || true
+
+# バナーが出ない（launch が壊れた / relay が即死）→ 非ゼロ＋bridge 末尾
+S=aipair-ig4; mkses "$S"
+rc=0; out="$(ignite "$S" "$W/relay_silent" AIPAIR_IGNITE_TIMEOUT=2)" || rc=$?
+printf '%s' "$out" | grep -q '起動を確認できません' && g=1 || g=0
+chk "[ $rc -ne 0 ] && [ $g -eq 1 ]" "ignite: no banner -> non-zero with the bridge tail (rc=$rc)"
+tmux kill-session -t "$S" 2>/dev/null || true
+
+# 古いバナーが画面に残っているだけでは成功にしない（存在判定ではなく件数比較）
+S=aipair-ig5; mkses "$S"; B="$(bridge_of "$S")"
+tmux send-keys -t "$B" -l "printf '┌─ aipair-relay ─\\n'"; tmux send-keys -t "$B" Enter
+sleep 0.5
+rc=0; out="$(ignite "$S" "$W/relay_silent" AIPAIR_IGNITE_TIMEOUT=2)" || rc=$?
+chk "[ $rc -ne 0 ]" "ignite: a STALE banner alone is not success (count, not presence) (rc=$rc)"
+tmux kill-session -t "$S" 2>/dev/null || true
+
+# バナーを出した直後に終了 → 「起動したが即終了」で非ゼロ
+S=aipair-ig6; mkses "$S"
+rc=0; out="$(ignite "$S" "$W/relay_diesfast" AIPAIR_IGNITE_TIMEOUT=4)" || rc=$?
+printf '%s' "$out" | grep -q '既に終了' && g=1 || g=0
+chk "[ $rc -ne 0 ] && [ $g -eq 1 ]" "ignite: banner then immediate exit -> non-zero (rc=$rc)"
+tmux kill-session -t "$S" 2>/dev/null || true
+
+# 送信直前に busy 化 → launch を送らずに中止（TOCTOU。シムが pane_current_command の答えを差し替える）
+S=aipair-ig7; mkses "$S"
+printf 'bash\npython3\n' > "$W/answers7"      # 掃除前=シェル → 送信直前=relay 走行中
+: > "$W/tmuxlog"
+rc=0; out="$(ignite "$S" "$W/relay_ok" AIPAIR_TEST_CMD_ANSWERS="$W/answers7" AIPAIR_TEST_TMUX_LOG="$W/tmuxlog")" || rc=$?
+printf '%s' "$out" | grep -q '送信直前に busy' && g=1 || g=0
+grep -F 'send-keys' "$W/tmuxlog" 2>/dev/null | grep -qF -- '--adopt' && sent=1 || sent=0
+chk "[ $rc -ne 0 ] && [ $g -eq 1 ] && [ $sent -eq 0 ]" "ignite: busy right before sending -> aborts WITHOUT sending launch (rc=$rc sent=$sent)"
+tmux kill-session -t "$S" 2>/dev/null || true
+
+# AIPAIR_IGNITE_TIMEOUT の不正値・0 → 送る前に死ぬ（無限待ち/算術エラーにしない）
+S=aipair-ig8; mkses "$S"
+for bad in abc 0; do
+  : > "$W/tmuxlog"
+  rc=0; out="$(ignite "$S" "$W/relay_ok" AIPAIR_IGNITE_TIMEOUT="$bad" AIPAIR_TEST_TMUX_LOG="$W/tmuxlog")" || rc=$?
+  printf '%s' "$out" | grep -q 'AIPAIR_IGNITE_TIMEOUT' && g=1 || g=0
+  grep -F 'send-keys' "$W/tmuxlog" 2>/dev/null | grep -qF -- '--adopt' && sent=1 || sent=0
+  chk "[ $rc -ne 0 ] && [ $g -eq 1 ] && [ $sent -eq 0 ]" "ignite: AIPAIR_IGNITE_TIMEOUT=$bad -> dies before sending (rc=$rc)"
+done
+tmux kill-session -t "$S" 2>/dev/null || true
+
+# ログインシェル（-bash）の bridge を busy と誤判定しない（シェル判定の共通化）
+S=aipair-ig9; mkses "$S"
+printf -- '-bash\n-bash\n' > "$W/answers9"
+rc=0; out="$(ignite "$S" "$W/relay_ok" AIPAIR_TEST_CMD_ANSWERS="$W/answers9")" || rc=$?
+chk "[ $rc -eq 0 ]" "ignite: a login shell (-bash) bridge counts as idle, not busy (rc=$rc)"
+tmux kill-session -t "$S" 2>/dev/null || true
+
+# copy-mode 状態の取得失敗を「copy-mode でない」と扱わない（実は copy-mode なのに送ると無言の空振り）
+S=aipair-ig10; mkses "$S"
+: > "$W/tmuxlog"
+rc=0; out="$(ignite "$S" "$W/relay_ok" AIPAIR_TEST_FAIL_FORMAT='#{pane_in_mode}' AIPAIR_TEST_TMUX_LOG="$W/tmuxlog")" || rc=$?
+printf '%s' "$out" | grep -q 'copy-mode 状態を取得できません' && g=1 || g=0
+grep -F 'send-keys' "$W/tmuxlog" 2>/dev/null | grep -qF -- '--adopt' && sent=1 || sent=0
+chk "[ $rc -ne 0 ] && [ $g -eq 1 ] && [ $sent -eq 0 ]" "ignite: pane_in_mode query FAILS -> abort without sending (rc=$rc sent=$sent)"
+tmux kill-session -t "$S" 2>/dev/null || true
+
+# 前景コマンドの取得失敗も「busy か判断できない」として送らずに中止
+S=aipair-ig11; mkses "$S"
+: > "$W/tmuxlog"
+rc=0; out="$(ignite "$S" "$W/relay_ok" AIPAIR_TEST_FAIL_FORMAT='#{pane_current_command}' AIPAIR_TEST_TMUX_LOG="$W/tmuxlog")" || rc=$?
+printf '%s' "$out" | grep -q '前景コマンドを取得できません' && g=1 || g=0
+grep -F 'send-keys' "$W/tmuxlog" 2>/dev/null | grep -qF -- '--adopt' && sent=1 || sent=0
+chk "[ $rc -ne 0 ] && [ $g -eq 1 ] && [ $sent -eq 0 ]" "ignite: pane_current_command query FAILS -> abort without sending (rc=$rc sent=$sent)"
+tmux kill-session -t "$S" 2>/dev/null || true
+
+# 起動後の取得失敗を「既に終了」と誤報しない（原因の取り違えで調査が的外れになる）
+S=aipair-ig12; mkses "$S"
+printf 'bash\nbash\n__FAIL__\n' > "$W/answers12"   # 掃除前・送信直前は成功 → 起動後の取得だけ失敗
+rc=0; out="$(ignite "$S" "$W/relay_ok" AIPAIR_TEST_CMD_ANSWERS="$W/answers12")" || rc=$?
+printf '%s' "$out" | grep -q '起動状態を確認できない' && g=1 || g=0
+printf '%s' "$out" | grep -q '既に終了' && bad=1 || bad=0
+chk "[ $rc -ne 0 ] && [ $g -eq 1 ] && [ $bad -eq 0 ]" "ignite: post-start query failure is diagnosed as such, not '既に終了' (rc=$rc)"
+tmux kill-session -t "$S" 2>/dev/null || true
+
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED)"
 exit $fail
