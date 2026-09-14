@@ -24,6 +24,18 @@ tasks left, Codex declares `[AIPAIR_HUMAN_REQUIRED]`, a question is too large to
 task makes no progress across rounds) instead of guessing or spinning.
 
 ### Added
+- **Codex-first start (`--start-side codex`)** — `aipair loop --unsafe --start-side codex` (or
+  `AIPAIR_START_SIDE=codex`) and `aipair-relay-here --start-side codex` make the relay wait for **Codex's**
+  first completion instead of Claude's. It is not a role swap: once Codex finishes, its result goes to
+  Claude with the usual `poke_claude` and the loop continues as normal. The relay already had
+  `--start-side`; it now also reads `AIPAIR_START_SIDE` (validated — env values bypass argparse
+  `choices`). `aipair` checks the flag before touching tmux (a missing, empty or unknown value, two
+  different values, or using it outside `loop` exits 2) and reads the environment variable only for `loop`,
+  so an invalid value never breaks `start` / `attach` / `status`. `aipair-relay-here` lets an explicit
+  `--start-side=codex` win over the environment — its explicit-flag check now recognises the
+  `--flag=value` form, which also fixes that case for every flag it maps from the environment — and
+  checks every `--start-side` it is given by the same rules before building the launch line. The setting
+  applies to that one launch only: nothing is saved, so pass it again when re-igniting.
 - **`[!]` blocked-task notation** — a `- [!]` item with a required `blocker: <reason>` child line
   marks work that needs a human or an external dependency; the agents move a task there instead of
   leaving it `- [ ]` or guessing past it.

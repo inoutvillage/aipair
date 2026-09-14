@@ -256,6 +256,7 @@ peer-log codex --full      # セッション全体
 |---|---|---|
 | `AIPAIR_STOP` | `[AIPAIR_REVIEW_OK]` | 停止 sentinel（`\|\|` 区切りで複数可）。**最終回答の先頭行に単独で置かれた時のみ成立**（否定文・引用・文中言及では不成立）。例: `AIPAIR_STOP="LGTM\|\|[AIPAIR_REVIEW_OK]"` |
 | `AIPAIR_STOP_SIDE` | `codex` | どちらの発言で止めるか（`codex` / `claude` / `both`） |
+| `AIPAIR_START_SIDE` | `claude` | relay が**最初に完了を待つ相手**（`claude` / `codex`）。`codex` は Codex の完了を先に待ち、その結果を Claude へ渡して通常の往復に入る（**役割交換ではない**）。`aipair loop`（`--start-side codex` でも可）と `aipair-relay-here` が読む。**起動ごとの指定で保存はされない**（再点火でも指定し直す） |
 | `AIPAIR_MAX_ROUNDS` | `20` | 最大往復数（暴走防止） |
 | `AIPAIR_ENDLESS` | （未設定＝off） | `1` で連続モード（→ 次節） |
 | `AIPAIR_TASK_LIST` | `tasks/todo.md` | 連続モードの次タスクの根拠ファイル |
@@ -275,16 +276,20 @@ peer-log codex --full      # セッション全体
 | `AIPAIR_NO_SCHEMA_PROBE` | （未設定＝off） | `1` で起動時・実行時の **JSONL schema feature-probe** をしない |
 
 `AIPAIR_*_FLAGS` 以外の値は**そのまま 1 引数**として relay に渡る（`'`・空白・`$`・`;` を含んでも壊れない。launcher がシングルクォートで包む）。
-不正値（`AIPAIR_MAX_ROUNDS=abc` / `0` / 負数、`AIPAIR_STOP_SIDE=typo`）は**既定へ落とさず exit 2** で即エラー。
+不正値（`AIPAIR_MAX_ROUNDS=abc` / `0` / 負数、`AIPAIR_STOP_SIDE=typo`・`AIPAIR_START_SIDE=typo`）は**既定へ落とさず exit 2** で即エラー。
 `AIPAIR_ENDLESS` / `AIPAIR_DRY_RUN` は `0` / `false` / `no` / `off`（大小文字・前後空白は無視）で明示的に off。環境に残っている時、その 1 本だけ通常モードに戻すには `--no-endless`。
 
-**3 つの起動経路すべてで効きます**:
+**3 つの起動経路すべてで効きます**（効くのは**その起動時に読める値**だけ。aipair が設定を保存することはない）:
 
 | 起動 | 効き方 |
 |---|---|
-| `AIPAIR_MAX_ROUNDS=100 aipair loop <dir>` | ランチャーがフラグへ展開。tmux が env を引き継ぐので**ペア内の各ペインにも残る** |
-| relay ペインから直接 `aipair-relay --adopt …` | relay 本体が env を読む（`aipair loop` 時に指定していれば**そのまま継承されている**） |
-| 任意のペインから `aipair-relay-here` | `aipair-relay-here` が env をフラグへ展開して渡す（下記の理由で必須） |
+| `AIPAIR_MAX_ROUNDS=100 aipair loop <dir>` | ランチャーがフラグへ展開し、relay のコマンドにも値を固定する。ペインのシェルに env が残るのは**この `aipair loop` が tmux サーバーを起動した場合だけ**（既に動いているサーバーでは、ペインが持つのはサーバーを起動した時の env） |
+| relay ペインから直接 `aipair-relay --adopt …` | relay 本体が**そのペインのシェルの** env を読む（`aipair loop` 時の値とは限らない＝上の条件次第。フラグで明示するのが確実） |
+| 任意のペインから `aipair-relay-here` | `aipair-relay-here` が**呼び出し側の** env をフラグへ展開して渡す（下記の理由で必須） |
+
+> **再点火では設定を指定し直す**（例: Codex 先攻）。`aipair loop` の `--start-side codex` / `AIPAIR_START_SIDE=codex` は
+> その起動の relay にだけ効き、後の `aipair-relay-here` には保存されない（呼び出したペインに env が残っていればそれが
+> 読まれるが、上の条件次第なので当てにしない）。`aipair-relay-here --start-side codex` と毎回指定し、`--print` で確認する。
 
 > 🔴 **`aipair-relay-here` を Claude/Codex ペインから呼ぶ場合**、relay は bridge ペインへ
 > `send-keys` で**コマンド文字列として**投入されるため、呼び出し側シェルの env は relay に届きません。
@@ -346,6 +351,7 @@ Claude からは `aipair-relay` スキルでも同じことができる。**オ�
 aipair-relay-here --print [rounds N] [stop "フレーズ"] [stop-side codex|claude|both]   # ドライラン（組み立てたコマンドを表示）
 aipair-relay-here [rounds N] [stop "フレーズ"] [stop-side codex|claude|both]           # 本番
 aipair-relay-here -- --endless --max-rounds 100                                        # relay 本体のフラグを素通し
+aipair-relay-here --start-side codex                                                   # Codex の完了待ちから始める（役割交換ではない）
 ```
 
 点火は **起動を確認してから成功を返す**（送るだけで成功を返すと無言の空振りを見逃す。2026-09-12 実障害: bridge の
@@ -401,8 +407,13 @@ Codex のレビュー配達時（通常ループ）も、Claude が質問ダイ�
 > ループ稼働中に relay だけ再起動する場合は `--claude-log` / `--codex-log` で既存ログを指定すること。
 
 - **ポーク方式**: 本文は各自 `peer` で読むので長文・多行でも壊れない。
-- 注入は `send-keys -l` → 配達確認 → 画面静止待ち → `Enter` → busy 確認（「text+Enter」を一発で送ると TUI が改行として解釈するため）。
+- 注入は **本文をブラケットペースト → 確認用の nonce（`relay-id:…`）だけリテラル入力 → nonce の画面表示を確認 → 画面静止待ち → `Enter` → 送信確認**（ログへの追記。Codex 宛は実行中バッジも可）。長文を `send-keys -l` で打つと取り込みバーストに後続の Enter が吸われて未送信になり、「text+Enter」を一発で送ると TUI が改行として解釈するため。nonce が画面に出なければ Enter は送らない。
 - **停止**: relay ペイン（下段）で `Ctrl-C`、または「🛑 停止」タスク。
+
+**Codex 先攻**（`aipair loop --unsafe --start-side codex` または `AIPAIR_START_SIDE=codex aipair loop --unsafe`。
+再点火でも毎回 `aipair-relay-here --start-side codex` と指定する。`aipair loop` 時の指定は保存されない）: relay が**最初に待つ相手を Codex にするだけ**で、**役割交換ではない**。
+人間が Codex に最初の依頼を入れ、その完了を relay が Claude へ `poke_claude` で渡し、以後は通常どおり
+「Claude の完了 → Codex へレビュー依頼 → …」と往復する。既定は Claude 先攻。
 
 `aipair-relay` を直接呼べば `--poke-claude` / `--poke-codex`（ポーク文面）・`--start-side`（先攻）も変更可（`aipair-relay --help`）。
 

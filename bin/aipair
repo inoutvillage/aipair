@@ -12,6 +12,9 @@
 #   --unsafe (or AIPAIR_UNSAFE=1): launch agents with permission-bypass flags.
 #   Required for `aipair loop`; optional for interactive `aipair` (default: agents
 #   keep their normal permission prompts).
+#   --start-side claude|codex (or AIPAIR_START_SIDE; `aipair loop` only): which agent the
+#   relay waits on first (default claude). codex = wait for Codex to finish, then hand its
+#   result to Claude and continue as usual — NOT a role swap.
 #
 # Layout:
 #   ┌───────────────┬───────────────┐
@@ -46,9 +49,32 @@ done
 # unattended relay) REQUIRES it, since the relay cannot answer those prompts.
 UNSAFE=0
 case " ${AIPAIR_UNSAFE:-} " in *" 1 "*|*" true "*|*" yes "*|*" on "*) UNSAFE=1 ;; esac
+# --start-side <claude|codex> / --start-side=<claude|codex>: which agent the relay waits on FIRST
+# (`aipair loop` only). Its SYNTAX is checked here, before anything touches tmux: a missing value,
+# an empty `--start-side=`, anything but claude|codex, or two different values all exit 2.
+START_SIDE_FLAG=""
 _args=()
-for _a in "$@"; do
-  if [ "$_a" = "--unsafe" ]; then UNSAFE=1; else _args+=("$_a"); fi
+while [ $# -gt 0 ]; do
+  _a="$1"; shift
+  case "$_a" in
+    --unsafe) UNSAFE=1 ;;
+    --start-side|--start-side=*)
+      if [ "$_a" = --start-side ]; then
+        [ $# -gt 0 ] || { echo "aipair: --start-side needs a value (claude|codex)" >&2; exit 2; }
+        _v="$1"; shift
+      else
+        _v="${_a#--start-side=}"
+      fi
+      case "$_v" in
+        claude|codex) : ;;
+        *) echo "aipair: --start-side must be claude or codex (got '$_v')" >&2; exit 2 ;;
+      esac
+      if [ -n "$START_SIDE_FLAG" ] && [ "$START_SIDE_FLAG" != "$_v" ]; then
+        echo "aipair: --start-side given twice with different values ($START_SIDE_FLAG / $_v)" >&2; exit 2
+      fi
+      START_SIDE_FLAG="$_v" ;;
+    *) _args+=("$_a") ;;
+  esac
 done
 set -- ${_args[@]+"${_args[@]}"}
 
@@ -149,6 +175,25 @@ cmd="start"
 case "${1:-}" in
   start|loop|attach|stop|name|status) cmd="$1"; shift ;;
 esac
+
+# --start-side is a relay setting, so it is valid ONLY with `loop`. Refuse it for every other command
+# right here — before any tmux query, and long before `stop`'s kill-session or `attach`.
+if [ -n "$START_SIDE_FLAG" ] && [ "$cmd" != loop ]; then
+  echo "aipair: --start-side is only valid with 'aipair loop' (got: aipair $cmd)" >&2; exit 2
+fi
+# Effective start side for `loop`: flag > AIPAIR_START_SIDE > the relay's default (claude). The
+# environment is read ONLY for `loop`: start / attach / status / stop / name never look at it, so an
+# invalid value cannot break them. Nothing is saved for later — aipair-relay-here reads its own
+# caller's environment when it ignites. Not a role swap: the relay just waits on Codex first.
+START_SIDE=""
+if [ "$cmd" = loop ]; then
+  START_SIDE="${START_SIDE_FLAG:-${AIPAIR_START_SIDE:-}}"
+  case "$START_SIDE" in
+    ""|claude|codex) : ;;
+    *) echo "aipair: AIPAIR_START_SIDE must be claude or codex (got '$START_SIDE')" >&2; exit 2 ;;
+  esac
+  AIPAIR_START_SIDE="$START_SIDE"   # the relay's env pin (RELAY_ENV_VARS) carries the effective value
+fi
 
 DIR="${1:-$PWD}"
 if [ ! -d "$DIR" ]; then
@@ -273,6 +318,10 @@ fi
 if [ "$cmd" = loop ]; then
   bridge=(aipair-relay --max-rounds "${AIPAIR_MAX_ROUNDS:-20}"
           --stop "${AIPAIR_STOP:-[AIPAIR_REVIEW_OK]}" --stop-side "${AIPAIR_STOP_SIDE:-codex}")
+  # Codex-first (--start-side / AIPAIR_START_SIDE, resolved and validated right after the subcommand):
+  # the relay waits on Codex's completion first, then hands it to Claude as usual. Added only when
+  # set, so the default command line stays exactly as it was.
+  [ -n "$START_SIDE" ] && bridge+=(--start-side "$START_SIDE")
   # 起動直後の暫定タイトル。relay 本体が起動後に実際の設定で名乗り直す
   BRIDGE_TITLE="relay ● 1タスク / max ${AIPAIR_MAX_ROUNDS:-20} / Ctrl-C で停止"
   # AIPAIR_ENDLESS=1: 停止ワードで終わらず「次のタスクへ」を促し続ける連続モード。
@@ -334,7 +383,7 @@ CODEX_LINE="clear; env AI_SELF=codex AI_PEER=claude $PAIR_PINS codex $CODEX_FLAG
 # the relay's own command. A pre-existing tmux server may hold a stale value from an
 # earlier run; without pinning, `AIPAIR_GATE= aipair loop` could still run yesterday's
 # gate, and a stale invalid int would make the relay exit 2 before argparse even ran.
-RELAY_ENV_VARS=(AIPAIR_STOP AIPAIR_STOP_SIDE AIPAIR_MAX_ROUNDS AIPAIR_ENDLESS
+RELAY_ENV_VARS=(AIPAIR_STOP AIPAIR_STOP_SIDE AIPAIR_START_SIDE AIPAIR_MAX_ROUNDS AIPAIR_ENDLESS
                 AIPAIR_TASK_LIST AIPAIR_NEXT_ASK AIPAIR_ALL_DONE AIPAIR_HUMAN_REQUIRED
                 AIPAIR_GATE AIPAIR_GATE_TIMEOUT AIPAIR_GATE_ROUNDS
                 AIPAIR_ALLOW_UNTESTED_DIALOGS AIPAIR_NO_VERSION_GATE

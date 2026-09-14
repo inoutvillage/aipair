@@ -84,8 +84,9 @@ def build_parser(description=""):
                     help="ゲートコマンドのタイムアウト秒（既定 600 / env AIPAIR_GATE_TIMEOUT）")
     ap.add_argument("--gate-rounds", type=int, default=_env_int("AIPAIR_GATE_ROUNDS", 3),
                     help="ゲート失敗で差し戻す上限回数。到達で exit 6（既定 3 / env AIPAIR_GATE_ROUNDS）")
-    ap.add_argument("--start-side", default="claude", choices=["claude", "codex"],
-                    help="who acts first (default claude)")
+    ap.add_argument("--start-side", default=_env_str("AIPAIR_START_SIDE", "claude"), choices=["claude", "codex"],
+                    help="最初に完了を待つ相手（claude|codex。既定 claude / env AIPAIR_START_SIDE）。役割交換ではない:"
+                         " codex なら Codex の完了を先に待ち、その結果を Claude へ渡して通常の往復に入る")
     ap.add_argument("--poll", type=float, default=3.0, help="poll seconds (default 3)")
     ap.add_argument("--busy-wait", type=int, default=90,
                     help="poke 前に相手ペインのアイドルを待つ上限秒。超過後は中止せず注入を続行する（既定90）")

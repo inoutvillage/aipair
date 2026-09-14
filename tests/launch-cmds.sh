@@ -16,7 +16,9 @@ for s in claude codex aipair-relay peer-log; do
   printf '#!/usr/bin/env bash\necho "cmd=%s self=${AI_SELF:-} peer=${AI_PEER:-}"\nfor a in "$@"; do printf "[%%s]\\n" "$a"; done\n' "$s" > "$W/bin/$s"
 done
 printf '#!/usr/bin/env bash\nexit 0\n' > "$W/bin/clear"
-printf '#!/usr/bin/env bash\nexec %q -L %q "$@"\n' "$REAL_TMUX" "$SOCKET" > "$W/bin/tmux"
+# AIPAIR_TEST_TMUX_LOG (opt-in per command): the shim appends each tmux invocation there, so a test can
+# prove that a rejected launch never called tmux at all.
+printf '#!/usr/bin/env bash\n[ -n "${AIPAIR_TEST_TMUX_LOG:-}" ] && printf "%%s\\n" "$*" >> "$AIPAIR_TEST_TMUX_LOG"\nexec %q -L %q "$@"\n' "$REAL_TMUX" "$SOCKET" > "$W/bin/tmux"
 chmod +x "$W"/bin/*; export PATH="$W/bin:$REPO/bin:$PATH"
 # Preflight: prove the tmux shim provably targets the PRIVATE socket before anything runs, so a
 # broken shim can never touch the user's default server (guardrail; same as the other tmux tests).
@@ -145,6 +147,53 @@ for v in 0 false no off; do
   if [ -z "$out" ] && "$REAL_TMUX" -L "$SOCKET" has-session -t "=$NAME" 2>/dev/null; then n=$((n+1)); echo "ok   AIPAIR_DRY_RUN='$v' → real start (session created, nothing printed)"; else n=$((n+1)); echo "FAIL AIPAIR_DRY_RUN='$v': out='$out'"; fail=1; fi
   "$REAL_TMUX" -L "$SOCKET" kill-session -t "=$NAME" 2>/dev/null || true
 done
+
+echo "# [8] --start-side / AIPAIR_START_SIDE (Codex-first: the relay waits on Codex first — not a role swap)"
+# argline PANE [VAR=value ...] aipair ARGS... → like line(), but with arbitrary aipair arguments (flags anywhere)
+argline() { local pane="$1"; shift; env AIPAIR_UNSAFE=1 AIPAIR_DRY_RUN=1 "$@" | sed -n "s/^$pane:  *//p"; }
+argrun() { bash -c "$(argline "$@")"; }
+WANT_SS="cmd=aipair-relay self=bridge peer=${J}[--max-rounds]${J}[20]${J}[--stop]${J}[[AIPAIR_REVIEW_OK]]${J}[--stop-side]${J}[codex]${J}[--start-side]${J}[codex]"
+chk "$(argrun bridge AIPAIR_START_SIDE=codex aipair loop "$W/proj")" "$WANT_SS" "AIPAIR_START_SIDE=codex → relay gets --start-side codex"
+chk "$(argrun bridge aipair loop --start-side codex "$W/proj")" "$WANT_SS" "--start-side codex → relay gets --start-side codex"
+chk "$(argrun bridge aipair loop --start-side=codex "$W/proj")" "$WANT_SS" "--start-side=codex → same"
+chk "$(argrun bridge aipair --start-side codex loop "$W/proj")" "$WANT_SS" "flag before the subcommand → same"
+chk "$(argrun bridge aipair loop "$W/proj" --start-side codex --start-side=codex)" "$WANT_SS" "the same value twice is accepted"
+chk "$(argrun bridge AIPAIR_START_SIDE=claude aipair loop --start-side codex "$W/proj")" "$WANT_SS" "flag beats env (env claude + flag codex → codex)"
+chk "$(argrun bridge AIPAIR_START_SIDE=codex aipair loop --start-side claude "$W/proj" | tail -2 | paste -sd' ')" "[--start-side] [claude]" "flag beats env (env codex + flag claude → claude)"
+chk "$(run loop bridge 'AIPAIR_START_SIDE=' | grep -c -- '--start-side' || true)" "0" "empty AIPAIR_START_SIDE → no --start-side (the default line is unchanged)"
+# The relay's own env is pinned to the EFFECTIVE value: a stale value held by an old tmux server never leaks in.
+mkdir -p "$W/envbin"
+printf '#!/usr/bin/env bash\necho "AIPAIR_START_SIDE=[${AIPAIR_START_SIDE-<unset>}]"\n' > "$W/envbin/aipair-relay"; chmod +x "$W/envbin/aipair-relay"
+envrun() { local l; l="$(argline bridge "$@")"; env AIPAIR_START_SIDE=stale PATH="$W/envbin:$PATH" bash -c "$l"; }
+chk "$(envrun aipair loop "$W/proj")" "AIPAIR_START_SIDE=[]" "unset → the relay's env is pinned empty (stale server value neutralized)"
+chk "$(envrun aipair loop --start-side codex "$W/proj")" "AIPAIR_START_SIDE=[codex]" "the pin carries the flag's value"
+chk "$(envrun AIPAIR_START_SIDE=claude aipair loop --start-side codex "$W/proj")" "AIPAIR_START_SIDE=[codex]" "the pin carries the effective value (flag over env)"
+# Rejected: exit 2, nothing on stdout, and tmux is never called (the shim logs every call). Deliberately NOT a
+# dry run — a check that failed to fire would really reach tmux (the private socket) and show up in the log.
+reject() {   # reject DESC [VAR=value ...] aipair ARGS...
+  local desc="$1" rc=0 out err; shift
+  : > "$W/tmuxcalls"
+  out="$(timeout 10 env AIPAIR_UNSAFE=1 AIPAIR_TEST_TMUX_LOG="$W/tmuxcalls" "$@" </dev/null 2>"$W/err")" || rc=$?
+  err="$(cat "$W/err")"; n=$((n+1))
+  if [ "$rc" = 2 ] && [ -z "$out" ] && [ ! -s "$W/tmuxcalls" ] && printf '%s' "$err" | grep -q 'start-side\|START_SIDE'; then
+    echo "ok   $desc"
+  else
+    echo "FAIL $desc (rc=$rc stdout='$out' stderr='$err' tmux: $(paste -sd';' "$W/tmuxcalls"))"; fail=1
+  fi
+}
+reject "trailing --start-side (no value) → exit 2, tmux untouched" aipair loop "$W/proj" --start-side
+reject "--start-side= (empty) → exit 2, tmux untouched" aipair loop --start-side= "$W/proj"
+reject "--start-side typo → exit 2, tmux untouched" aipair loop --start-side typo "$W/proj"
+reject "--start-side <dir> (a directory is not a value) → exit 2, tmux untouched" aipair loop --start-side "$W/proj"
+reject "two different values → exit 2, tmux untouched" aipair loop --start-side codex --start-side=claude "$W/proj"
+reject "AIPAIR_START_SIDE=typo aipair loop → exit 2, tmux untouched" AIPAIR_START_SIDE=typo aipair loop "$W/proj"
+for sub in "" start attach stop name status; do
+  reject "aipair ${sub:-(no subcommand)} --start-side codex → exit 2 (loop only), tmux untouched" aipair ${sub:+"$sub"} --start-side codex "$W/proj"
+done
+# The env is read ONLY by loop: an invalid AIPAIR_START_SIDE cannot break the other commands.
+chk "$(env AIPAIR_START_SIDE=typo aipair name "$W/proj" 2>&1)" "$(aipair name "$W/proj")" "AIPAIR_START_SIDE=typo: 'aipair name' is unaffected"
+out="$(env AIPAIR_START_SIDE=typo AIPAIR_DRY_RUN=1 aipair start "$W/proj" 2>&1 || true)"
+chk "$(printf '%s\n' "$out" | grep -c '^session: ' || true)/$(printf '%s\n' "$out" | grep -c 'start-side\|START_SIDE' || true)" "1/0" "AIPAIR_START_SIDE=typo: 'aipair start' still runs (dry run) and mentions no start side"
 
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED)"
 exit $fail

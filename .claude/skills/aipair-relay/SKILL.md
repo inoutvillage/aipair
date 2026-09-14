@@ -41,6 +41,8 @@ aipair-relay-here [rounds N] [stop "フレーズ"] [stop-side codex|claude|both]
   - 「10ラウンドで」 → `rounds 10`
   - 「私が OK と言ったら止めて」 → `stop OK stop-side claude`
   - 「Codex が納得したら終わり」 → 既定（stop-side codex）でよい
+  - 「Codex から始めて」「Codex の返事を待つところから」 → `--start-side codex`（**役割は変わらない**。最初に Codex の
+    完了を待ち、その結果を Claude に渡して通常の往復に入るだけ）
 - relay は **bridge ペイン**で走り出す。呼んだ側のターンはすぐ戻る（ブロックしない）。
 - **二重起動はガードされる**: bridge が busy（relay 走行中 / peer-log watch 中）なら exit 2 で中止する。その旨をユーザーに伝える。
 
