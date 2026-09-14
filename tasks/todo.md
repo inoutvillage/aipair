@@ -598,3 +598,31 @@ F1 ✅ → F2 ✅ → F3 ✅ → F6 ✅ → F4 ✅ → F5 ✅ → F9 ✅ → F8 
   テストを 23 → **26 項目**へ（シムに `AIPAIR_TEST_FAIL_FORMAT` と `__FAIL__` の失敗注入を追加）。修正前コピーでは
   3 件とも落ちる（`pane_in_mode` 失敗時は `rc=0 sent=1`＝copy-mode かもしれないペインへ実際に送っていた証拠）
 - [x] `bash tests/run-all.sh` 12 系統全緑（relay-here 26 / doc-sync 31 / relay-parsers 228 ほか）
+
+## 追記: 長文 poke が送信されない（Enter が取り込みに吸われる）— 2026-09-14
+
+> 実障害: 質問リレーで `Enter が効いていない（送信を確認できず）→ 再打鍵 1..3` の後 `■ Codex への回答依頼を
+> 配達できず（poke失敗）` で停止。社長の観測では手動の Enter も改行になり、Ctrl+Enter で送信できた。
+
+- **原因（Codex が私設 tmux で実測）**: 本文は複数行ではなく **1 行 ~1,900 字**。`poke()` はこれを
+  `send-keys -l` で全文打っており、幅 57 のペインでは取り込みバーストに後続の Enter が吸収されて未送信になる
+  （codex 0.153.4 / 0.154.0 とも再現）。同じ長さでも**ブラケットペーストなら通常の Enter で即送信**できる。
+- **不採用**: Ctrl+Enter フォールバックと本番 tmux の `extended-keys` 変更。`send-keys C-Enter` は tmux 3.2a の
+  `off / on / always` すべてで PTY に何も出さない（実測）。人間の Ctrl+Enter 成功は端末側の入力経路固有。
+- [x] `poke()`: 本文をブラケットペーストで投入し、画面確認用の nonce だけを短いリテラル入力として追記
+- [x] `paste_text()`: 固定バッファ名 `aipair-relay` は同時実行の relay 同士で競合するため、呼び出しごとに一意な名前へ
+- [x] 回帰テスト（`tests/relay-parsers.py` の `Delivery`・228 → 230 件）: 実障害相当の長文（1,900 字）が
+  `send-keys -l` に一切渡らないこと／本文が set-buffer に入ること／「ペースト → nonce → Enter」の順序／
+  nonce が短いリテラルとして打たれること／`paste_text` が呼び出しごとに一意なバッファ名を使い `-d` で消すこと
+- [x] 空振りしないことの確認: `git show main:bin/aipairlib/deliverylib.py` に差し替えたコピーで新規 2 件とも落ちる
+- [x] **Codex コードレビュー反映（relay-id:eabf5120）**: 失敗経路 2 点。(1) 本文冒頭フォールバックを削除
+  — 本文ペーストと nonce 入力が別コマンドになったため「本文だけ届き nonce が届かない」が起こりうるのに、
+  旧フォールバックはそれを配達成立とみなし、届いていない nonce で Enter を押して arm しうる（Codex 宛は
+  実行中バッジで submit_enter まで成功扱い）。配達の成立条件を **nonce の画面確認のみ**にした（不要になった
+  `head` と "before" キャプチャも撤去）。(2) `paste_text` を try/finally 化 — `paste-buffer -d` は貼り付け成功時
+  しか消さず、失敗すると本文入りバッファが一意名のぶん溜まる。`delete-buffer` を必ず実行（`check=False`
+  `capture=True` で元の例外を隠さない）
+- [x] 追加テスト 2 件（計 4 件・relay-parsers 232）: 本文だけ見えて nonce が出ない → **Enter を送らず失敗**／
+  貼り付け失敗時も同じバッファ名の削除が試行され、元の例外はそのまま伝播する
+- [x] 空振りしないことの確認: main 版の `deliverylib.py` に差し替えたコピーで **新規 4 件すべてが落ちる**
+- [x] `bash tests/run-all.sh` 12 系統全緑（relay-parsers 232 / relay-here 26 / doc-sync 31 ほか）

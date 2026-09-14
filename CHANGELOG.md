@@ -65,6 +65,19 @@ task makes no progress across rounds) instead of guessing or spinning.
   manually approve edits" (no "bypass" wording), so the picker selects the first `Yes…` option.
 
 ### Fixed
+- **A long poke is pasted, not typed — so the Enter that follows actually submits** — `poke()` typed the
+  whole body with `send-keys -l`; on a narrow pane a long body (measured: ~1,900 chars of a question
+  relay in a 57-column pane) keeps the TUI ingesting, and the Enter that follows is swallowed as part of
+  that input burst, leaving the text in the composer unsent (the relay then stopped with "Enter を3回
+  送っても送信を確認できず"). The body now goes in as a bracketed paste — which submits on a plain Enter
+  at the same length on codex 0.153.4 and 0.154.0 — and only the short `relay-id:` nonce is typed after
+  it, so the delivery check still sees it (`[Pasted Content … chars] relay-id:…`) even on a narrow pane.
+  The paste buffer is also named per call instead of the fixed `aipair-relay`, so concurrent relays
+  cannot clobber each other's paste, and it is deleted in a `finally` (`paste-buffer -d` only deletes on
+  success, so a failed paste used to leave the prompt body sitting in a tmux buffer). Delivery is now
+  confirmed by the nonce alone: with the body and the nonce arriving as two separate commands, the old
+  "the body's first characters showed up" fallback could call a body-only arrival delivered and press
+  Enter for a nonce that never landed (on the Codex side the running badge would then mark it sent).
 - **`aipair-relay-here` verifies the relay actually started** — it used to send the launch line into the
   bridge pane and report success unconditionally, so a bridge whose shell held half-typed input (the line
   concatenated into `command not found`) or a pane left in copy-mode silently produced no relay while the
