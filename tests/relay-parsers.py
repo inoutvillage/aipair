@@ -820,6 +820,74 @@ class CliBoundaries(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("--stop-side", r.stderr)
 
+    def test_bad_start_side_env_exits_2(self):
+        # argparse の choices は env 由来の既定値を検証しない → main() で弾く（stop_side と同型）
+        r = self.run_relay(env={"AIPAIR_START_SIDE": "typo"})
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--start-side", r.stderr)
+        self.assertIn("typo", r.stderr)
+
+
+class CodexFirstStart(unittest.TestCase):
+    """--start-side codex（Codex 先攻）は《最初に完了を待つ相手》だけを Codex にする。役割交換ではない:
+    Codex の完了 → poke_claude で Claude へ → Claude の完了 → poke_codex で Codex へ、の通常の往復になる。
+    非 endless の実 `StateMachine.run()` を scripted fake で駆動し、poke の (pane, 文面) 履歴で固定する。"""
+
+    def _drive(self, start_side, turns):
+        sm = relay.state_machine
+        a = types.SimpleNamespace(start_side=start_side, settle=0, poll=0, max_rounds=20, endless=False,
+                                  task_list="tasks/todo.md", stop_side="codex", no_plan_review=True,
+                                  no_question_relay=True, plan_rounds=5, question_rounds=5, plan_ok="[P]",
+                                  gate=None, gate_timeout=600, gate_rounds=3)
+        rg = types.SimpleNamespace(response_done=lambda who, path, done: done, noshow=lambda who: False,
+                                   arm=lambda nonce: None, clear=lambda: None, probe=None, probe_ts_cache=0.0)
+        turn_iter = iter(turns)
+
+        def _turn_texts(who, *aa, **kk):
+            agent, texts = next(turn_iter)
+            self.assertEqual(agent, who, "turn script mismatch")
+            return list(texts)
+
+        machine = sm.StateMachine(
+            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x",
+            tracked={"claude": "c.jsonl", "codex": "x.jsonl"}, claude_seen=set(), codex_seen=set(),
+            baseline=0.0, sg=types.SimpleNamespace(guard=lambda: False), rg=rg, bw=60,
+            poke_codex="POKE_CODEX", poke_codex_next="POKE_CODEX_NEXT", poke_claude="POKE_CLAUDE",
+            poke_claude_pass="POKE_CLAUDE_PASS", poke_claude_next="POKE_CLAUDE_NEXT",
+            stop_phrases=["[AIPAIR_REVIEW_OK]"], next_ask_phrases=["[AIPAIR_NEXT]"],
+            all_done_phrases=["[AIPAIR_ALL_DONE]"], human_required_phrases=["[AIPAIR_HUMAN_REQUIRED]"])
+        with mock.patch.object(sm, "set_pane_title"), \
+             mock.patch.object(sm, "claude_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "codex_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "claude_matches_pane", return_value=True), \
+             mock.patch.object(sm, "detect_plan_dialog", return_value=None), \
+             mock.patch.object(sm, "detect_question_dialog", return_value=None), \
+             mock.patch.object(sm, "turn_texts", side_effect=_turn_texts), \
+             mock.patch.object(sm, "poke", return_value=object()) as poke_mock, \
+             mock.patch("time.sleep"):
+            code = machine.run()
+        self.assertRaises(StopIteration, next, turn_iter)   # 台本を最後まで消費した（途中で止まっていない）
+        return code, [(c.args[0], c.args[1]) for c in poke_mock.call_args_list]
+
+    def test_codex_first_waits_on_codex_then_hands_to_claude(self):
+        code, pokes = self._drive("codex", [
+            ("codex", ["X を直してください"]),    # 最初に待つのは Codex の完了（依頼は人間が Codex に出した想定）
+            ("claude", ["直しました"]),
+            ("codex", ["[AIPAIR_REVIEW_OK]"]),    # stop_side=codex の停止ワード → exit 0
+        ])
+        self.assertEqual(code, 0)
+        # 最初の配達は Claude ペインへの poke_claude（Codex への poke はそれより前に出ない）。以後は通常の往復で、
+        # 宛先と文面の組は Claude 先攻と同じ（Codex へは poke_codex）＝役割は入れ替わらない。
+        self.assertEqual(pokes, [("%1", "POKE_CLAUDE"), ("%2", "POKE_CODEX")])
+
+    def test_claude_first_default_is_unchanged(self):
+        code, pokes = self._drive("claude", [
+            ("claude", ["実装しました"]),
+            ("codex", ["[AIPAIR_REVIEW_OK]"]),
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(pokes, [("%2", "POKE_CODEX")])
+
 
 class VersionGate(unittest.TestCase):
     def a(self, allow=False):

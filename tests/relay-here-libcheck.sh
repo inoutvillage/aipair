@@ -265,5 +265,49 @@ printf '%s' "$out" | grep -q '既に終了' && bad=1 || bad=0
 chk "[ $rc -ne 0 ] && [ $g -eq 1 ] && [ $bad -eq 0 ]" "ignite: post-start query failure is diagnosed as such, not '既に終了' (rc=$rc)"
 tmux kill-session -t "$S" 2>/dev/null || true
 
+# --start-side（Codex 先攻・役割交換ではない）: env の展開・CLI 優先（= 形も）・不正値は launch 行を組む前に止める
+S=aipair-ss; mkses "$S"
+hereprint() { (cd "$W" || exit 1; env -u TMUX "$@" AIPAIR_RELAY_BIN="$W/relay_ok" bash "$REPO/bin/aipair-relay-here" --print --session "$S") 2>&1; }
+out="$(hereprint AIPAIR_START_SIDE=codex)" || true
+printf '%s' "$out" | grep '^launch' | grep -qF "'--start-side' 'codex'" && a=1 || a=0
+printf '%s' "$out" | grep '^launch' | grep -qF "'AIPAIR_START_SIDE=codex'" && b=1 || b=0
+chk "[ $a -eq 1 ] && [ $b -eq 1 ]" "start-side: AIPAIR_START_SIDE=codex → launch has --start-side codex + the pinned env"
+out="$( (cd "$W" || exit 1; env -u TMUX AIPAIR_START_SIDE=claude AIPAIR_RELAY_BIN="$W/relay_ok" bash "$REPO/bin/aipair-relay-here" --print --session "$S" --start-side=codex) 2>&1 )" || true
+printf '%s' "$out" | grep '^launch' | grep -qF "'--start-side=codex'" && a=1 || a=0
+printf '%s' "$out" | grep '^launch' | grep -qF "'--start-side' 'claude'" && b=1 || b=0
+chk "[ $a -eq 1 ] && [ $b -eq 0 ]" "start-side: explicit --start-side=codex wins over AIPAIR_START_SIDE=claude (no env-derived flag)"
+rc=0; out="$(hereprint AIPAIR_START_SIDE=typo)" || rc=$?
+printf '%s' "$out" | grep -q '^launch' && l=1 || l=0
+chk "[ $rc -ne 0 ] && [ $l -eq 0 ]" "start-side: AIPAIR_START_SIDE=typo → non-zero before building the launch line (rc=$rc)"
+rc=0; out="$( (cd "$W" || exit 1; env -u TMUX -u AIPAIR_START_SIDE AIPAIR_RELAY_BIN="$W/relay_ok" bash "$REPO/bin/aipair-relay-here" --print --session "$S" --start-side) 2>&1 )" || rc=$?
+printf '%s' "$out" | grep -q '^launch' && l=1 || l=0
+chk "[ $rc -ne 0 ] && [ $l -eq 0 ]" "start-side: explicit --start-side with no value → non-zero before the launch line (rc=$rc)"
+# 明示 --start-side は《全出現》を検証する。最後の値だけを見ると --print は通るのに、relay の argparse は出現ごとに
+# 検査するので bridge で即死する（Codex レビュー 2026-09-14）。食い違う重複も bin/aipair と同じく拒否。
+hereflags() { (cd "$W" || exit 1; env -u TMUX -u AIPAIR_START_SIDE AIPAIR_RELAY_BIN="$W/relay_ok" bash "$REPO/bin/aipair-relay-here" --print --session "$S" "$@") 2>&1; }
+for bad in "--start-side=typo --start-side=codex" "--start-side --start-side=codex" "--start-side codex --start-side=claude"; do
+  read -ra _f <<< "$bad"
+  rc=0; out="$(hereflags "${_f[@]}")" || rc=$?
+  printf '%s' "$out" | grep -q '^launch' && l=1 || l=0
+  chk "[ $rc -ne 0 ] && [ $l -eq 0 ]" "start-side: '$bad' → non-zero before the launch line (rc=$rc)"
+done
+# 同じ値の重複は可。launch 行の relay 引数を《実物の relay の argparse》に通し、--print が通す形は relay も受理することを確認
+out="$(hereflags --start-side codex --start-side=codex)" || true
+ln="$(printf '%s\n' "$out" | grep '^launch' | sed 's/^launch  *: //')"
+g=0
+if [ -n "$ln" ]; then
+  eval "set -- $ln"
+  while [ $# -gt 0 ] && [ "$1" != "$W/relay_ok" ]; do shift; done
+  [ $# -gt 0 ] && shift
+  python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); from aipairlib.cli import build_parser
+a = build_parser().parse_args(sys.argv[2:]); sys.exit(0 if a.start_side == "codex" else 1)' "$REPO/bin" "$@" >/dev/null 2>&1 && g=1
+fi
+chk "[ $g -eq 1 ]" "start-side: the same value twice → launch line, and the real relay parser accepts its args (start_side=codex)"
+out="$( (cd "$W" || exit 1; env -u TMUX -u AIPAIR_START_SIDE AIPAIR_RELAY_BIN="$W/relay_ok" bash "$REPO/bin/aipair-relay-here" --print --session "$S") 2>&1 )" || true
+printf '%s' "$out" | grep '^launch' | grep -qF "'AIPAIR_START_SIDE='" && a=1 || a=0
+printf '%s' "$out" | grep '^launch' | grep -qF -- "--start-side" && b=1 || b=0
+chk "[ $a -eq 1 ] && [ $b -eq 0 ]" "start-side: unset → pinned empty and no --start-side flag"
+tmux kill-session -t "$S" 2>/dev/null || true
+
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED)"
 exit $fail

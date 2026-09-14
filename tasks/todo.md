@@ -626,3 +626,30 @@ F1 ✅ → F2 ✅ → F3 ✅ → F6 ✅ → F4 ✅ → F5 ✅ → F9 ✅ → F8 
   貼り付け失敗時も同じバッファ名の削除が試行され、元の例外はそのまま伝播する
 - [x] 空振りしないことの確認: main 版の `deliverylib.py` に差し替えたコピーで **新規 4 件すべてが落ちる**
 - [x] `bash tests/run-all.sh` 12 系統全緑（relay-parsers 232 / relay-here 26 / doc-sync 31 ほか）
+
+## 追記: Codex 先攻で relay を始めるオプション（`--start-side codex`）— 2026-09-14
+
+> 要望: `aipair` や relay の開始時に、Codex 側の受付待ち（完了待ち）から始めたい。**役割交換ではなく**、relay が最初に
+> 待つ相手を Codex にするだけ（Codex の完了 → `poke_claude` で Claude へ → 以後は通常の往復）。relay 本体の
+> `--start-side` は既存で、入口（`aipair loop` / `aipair-relay-here` / env）が無かった。プランは Codex のプラン
+> レビュー 1 往復（解析仕様の明確化・`=` 形の CLI 優先・非 loop で env を読まない・役割交換でない旨・README 旧記述）で確定。
+
+- [x] relay: `--start-side` の既定を `AIPAIR_START_SIDE` から読み、`main()` で env 由来の不正値を exit 2
+- [x] `aipair`: `--start-side <v>` / `--start-side=<v>` を冒頭で抽出し、欠落・空・不正値・食い違う重複を tmux を呼ぶ前に exit 2。
+  `loop` 以外での指定は exit 2。env は `loop` の時だけ読む（無関係なコマンドは不正な env でも失敗しない）。
+  relay 引数への展開（指定時のみ）と `RELAY_ENV_VARS` への追加
+- [x] `aipair-relay-here`: `--flag=value` を 1 トークンとして扱い、`has_extra` を `=` 形にも一致させて CLI 優先を保証。
+  env の展開・実効値の検証（launch 行を組む前に exit 2）・`RELAY_ENV` への追加
+- [x] README（Codex 先攻の説明・env 表・旧「注入は send-keys -l」記述の是正）・SKILL・CHANGELOG
+- [x] テスト（launch-cmds / relay-parsers / relay-here-libcheck）・`bash tests/run-all.sh`
+
+**結果**: `bash tests/run-all.sh` 12 本すべて緑（launch-cmds 79 / relay-here-libcheck 31 / relay-parsers 235 ほか）。
+テストが空振りでないことをミュータント 9 種で確認（`RELAY_ENV_VARS` から外す／main の `bin/aipair`／env 検証を全コマンドへ／
+非 loop で受理／`has_extra` を完全一致に戻す／relay-here の検証削除／状態機械が `start_side` を無視／relay.py の検証削除／
+cli の既定が env を読まない）→ いずれも該当テストが FAIL。
+
+- [x] Codex レビュー対応（relay-id:16f9c0ae）: `aipair-relay-here` が明示 `--start-side` の**全出現**（値の欠落・不正値・
+  食い違う重複）を launch 行の前に検証する（最後の値だけ見ていたため `--start-side=typo --start-side=codex` などが
+  `--print` を通り、relay の argparse で落ちた）＋回帰テスト 4 件（受理した形は実物の relay parser に通して確認）。
+  README の「env が各ペインに残り、直接再起動にも継承される」を実測（私設 tmux: ペインの env はサーバーを起動した
+  クライアントのもの）に合わせて是正し、再点火では設定を指定し直す旨を明記。

@@ -23,6 +23,7 @@
 # env でも指定できる（優先順位: 引数 > 環境変数 > 既定）。send-keys 投入では呼び出し側の
 # env が bridge に届かないため、ここでフラグへ展開して渡す。--print で結果を確認できる:
 #   AIPAIR_MAX_ROUNDS  最大往復数        AIPAIR_STOP / AIPAIR_STOP_SIDE  停止ワードと判定側
+#   AIPAIR_START_SIDE  最初に完了を待つ相手（claude|codex・既定 claude。codex でも役割交換ではない）
 #   AIPAIR_ENDLESS     連続モード(1でon)  AIPAIR_TASK_LIST / AIPAIR_NEXT_ASK / AIPAIR_ALL_DONE
 #   AIPAIR_HUMAN_REQUIRED  人間対応待ち終端 sentinel（分類 BLOCKED 時のみ honor）
 #   AIPAIR_GATE / AIPAIR_GATE_TIMEOUT / AIPAIR_GATE_ROUNDS  停止ゲート
@@ -101,6 +102,8 @@ while [ $# -gt 0 ]; do
     # relay 本体のフラグ（--max-rounds / --endless 等）は `--` 無しでもそのまま受ける。
     # 値を伴うフラグは「次が別フラグでも既知キーワードでもなければ値」とみなして一緒に取り込む。
     # 例: `--max-rounds 100 --endless` / `--endless rounds 100` / `--endless --print` すべて可。
+    # `--flag=value` は 1 トークンで完結している → 次のトークンを値として取り込まない。
+    --*=*)      EXTRA+=("$1"); shift ;;
     --*)        EXTRA+=("$1"); shift
                 if [ $# -gt 0 ]; then
                   case "$1" in
@@ -220,13 +223,46 @@ fi
 has_extra() {
   local needle=$1 e
   [ ${#EXTRA[@]} -eq 0 ] && return 1
-  for e in "${EXTRA[@]}"; do [ "$e" = "$needle" ] && return 0; done
+  # `--flag value` と `--flag=value` の両方を「明示あり」とみなす。= 形を見落とすと env 由来の値も launch 行に
+  # 重なり、どちらが効くかが argparse の後勝ち任せになる（CLI 指定が常に優先、を保証するため）。
+  for e in "${EXTRA[@]}"; do
+    case "$e" in "$needle"|"$needle"=*) return 0 ;; esac
+  done
   return 1
+}
+# 明示 --start-side の《全出現》を検証する（`--start-side v` / `--start-side=v`）。relay の argparse は出現ごとに
+# 値の有無と choices を検査するので、最後の値だけを見ると --print は通るのに bridge の relay が起動直後に落ちる
+# （例: `--start-side=typo --start-side=codex` / `--start-side --start-side=codex`）。値の欠落・claude|codex 以外・
+# 食い違う重複はここで die する（bin/aipair と同じ規則。同じ値の重複は可）。
+check_start_side_flags() {
+  local i n=${#EXTRA[@]} v seen=""
+  for ((i = 0; i < n; i++)); do
+    case "${EXTRA[i]}" in
+      --start-side=*) v="${EXTRA[i]#--start-side=}" ;;
+      --start-side)   v=""; if [ $((i + 1)) -lt "$n" ]; then i=$((i + 1)); v="${EXTRA[i]}"; fi ;;
+      *) continue ;;
+    esac
+    case "$v" in
+      claude|codex) : ;;
+      *) die "--start-side は claude|codex のいずれか（実際の値: '$v'）" ;;
+    esac
+    [ -z "$seen" ] || [ "$seen" = "$v" ] || die "--start-side が異なる値で重複指定されている（$seen / $v）"
+    seen="$v"
+  done
 }
 # 明示フラグ（`--` 以降 or 直接指定）で既に渡されている項目には env を重ねない
 if [ -z "$ROUNDS" ]    && ! has_extra --max-rounds; then ROUNDS="${AIPAIR_MAX_ROUNDS:-}"; fi
 if [ -z "$STOP" ]      && ! has_extra --stop;       then STOP="${AIPAIR_STOP:-}"; fi
 if [ -z "$STOP_SIDE" ] && ! has_extra --stop-side;  then STOP_SIDE="${AIPAIR_STOP_SIDE:-}"; fi
+# --start-side（最初に完了を待つ相手。役割交換ではない）: 明示（`--start-side v` / `--start-side=v`）が常に優先で、
+# 明示が無い時だけ AIPAIR_START_SIDE を展開する。実効値は launch 行を組む前に検証する（--print でも同じ・何も送らない）。
+START_SIDE=""
+if has_extra --start-side; then
+  check_start_side_flags    # 明示指定は EXTRA のまま relay へ渡る（env 由来の値は重ねない）
+else
+  START_SIDE="${AIPAIR_START_SIDE:-}"
+  case "$START_SIDE" in ""|claude|codex) : ;; *) die "AIPAIR_START_SIDE は claude|codex のいずれか（実際の値: '$START_SIDE'）" ;; esac
+fi
 
 ENV_ARGS=()
 if ! has_extra --endless && ! has_extra --no-endless; then
@@ -268,7 +304,7 @@ if [ -n "${AIPAIR_GATE_ROUNDS:-}" ]  && ! has_extra --gate-rounds;  then ENV_ARG
 # value left in the bridge pane's environment cannot leak into the relay (same reason as
 # bin/aipair; see there). Then append the flag translations and any explicit EXTRA flags.
 RELAY_ENV=()
-for v in AIPAIR_STOP AIPAIR_STOP_SIDE AIPAIR_MAX_ROUNDS AIPAIR_ENDLESS \
+for v in AIPAIR_STOP AIPAIR_STOP_SIDE AIPAIR_START_SIDE AIPAIR_MAX_ROUNDS AIPAIR_ENDLESS \
          AIPAIR_TASK_LIST AIPAIR_NEXT_ASK AIPAIR_ALL_DONE AIPAIR_HUMAN_REQUIRED \
          AIPAIR_GATE AIPAIR_GATE_TIMEOUT AIPAIR_GATE_ROUNDS \
          AIPAIR_ALLOW_UNTESTED_DIALOGS AIPAIR_NO_VERSION_GATE \
@@ -279,6 +315,7 @@ CMD=(env "${RELAY_ENV[@]}" "$RELAY" --adopt --session "$SESSION" --dir "$DIR")
 [ -n "$ROUNDS" ]    && CMD+=(--max-rounds "$ROUNDS")
 [ -n "$STOP" ]      && CMD+=(--stop "$STOP")
 [ -n "$STOP_SIDE" ] && CMD+=(--stop-side "$STOP_SIDE")
+[ -n "$START_SIDE" ] && CMD+=(--start-side "$START_SIDE")
 [ ${#ENV_ARGS[@]} -gt 0 ] && CMD+=("${ENV_ARGS[@]}")
 [ ${#EXTRA[@]} -gt 0 ] && CMD+=("${EXTRA[@]}")
 LINE=""; for a in "${CMD[@]}"; do LINE+="$(sq "$a") "; done; LINE="${LINE% }"

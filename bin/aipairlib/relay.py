@@ -287,6 +287,11 @@ def main():
         print(f"aipair-relay: --stop-side / AIPAIR_STOP_SIDE は codex|claude|both のいずれか"
               f"（実際の値: {a.stop_side!r}）", file=sys.stderr)
         return 2
+    # AIPAIR_START_SIDE も同じ（choices は env 由来の既定値を検証しない）。最初に完了を待つ相手であって、役割交換ではない。
+    if a.start_side not in ("claude", "codex"):
+        print(f"aipair-relay: --start-side / AIPAIR_START_SIDE は claude|codex のいずれか"
+              f"（実際の値: {a.start_side!r}）", file=sys.stderr)
+        return 2
     # argparse type=int accepts 0 / negatives on the command line; _env_int already
     # guards the env path, so validate the resolved values here for both.
     for name, val in (("--gate-timeout", a.gate_timeout), ("--gate-rounds", a.gate_rounds),
