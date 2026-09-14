@@ -477,6 +477,94 @@ class Delivery(unittest.TestCase):
         self.assertTrue(res and res.startswith("relay-id:"))
 
 
+    def test_poke_pastes_the_body_and_types_only_the_nonce(self):
+        # 2026-09-14 実測（Codex）: 幅 57 のペインへ ~1,900 字を send-keys -l で打つと、後続の Enter が
+        # TUI の取り込みバーストに吸収されて未送信のまま残る（codex 0.153.4 / 0.154.0 とも。実障害:
+        # 質問リレーが「Enter を3回送っても送信を確認できず」で停止）。同じ長さでもブラケットペースト
+        # なら通常の Enter で即送信できる → 本文はペースト、画面確認用の nonce だけをリテラル入力する。
+        body = "Q" * 1900
+        seen = []
+        state = {"buf": ""}
+
+        def fake(*a, **k):
+            seen.append(a)
+            if a[:2] == ("send-keys", "-t") and "-l" in a:
+                state["buf"] += a[-1]                       # composer echoes only what was typed
+            if a[:1] == ("capture-pane",):
+                return types.SimpleNamespace(stdout=state["buf"])
+            return types.SimpleNamespace(stdout="")
+        with self._tmux(fake), mock.patch.object(self.dl, "cancel_copy_mode"), \
+             mock.patch.object(self.dl, "pane_busy", return_value=False), \
+             mock.patch.object(relay.dialoglib, "dialog_on_screen", return_value=False):
+            res = self.dl.poke("%0", body, confirm=lambda p: True, badge=False)
+        self.assertTrue(res and res.startswith("relay-id:"))
+        literals = [a[-1] for a in seen if a[:2] == ("send-keys", "-t") and "-l" in a]
+        self.assertTrue(all(body not in x for x in literals), "the long body must NEVER go through send-keys -l")
+        self.assertTrue(any(res in x and len(x) < 60 for x in literals), "only the short nonce is typed")
+        self.assertTrue(any(body in a for a in seen if a[:1] == ("set-buffer",)), "the body goes into a paste buffer")
+        i_paste = max(i for i, a in enumerate(seen) if a[:1] == ("paste-buffer",))
+        i_nonce = max(i for i, a in enumerate(seen) if a[:2] == ("send-keys", "-t") and "-l" in a)
+        i_enter = min(i for i, a in enumerate(seen) if a[-1:] == ("Enter",))
+        self.assertLess(i_paste, i_nonce, "paste the body first")
+        self.assertLess(i_nonce, i_enter, "type the nonce, then Enter")
+
+    def test_poke_fails_when_only_the_body_arrives_and_the_nonce_does_not(self):
+        # 本文ペーストと nonce 入力は別コマンドなので「本文だけ届き nonce が届かない」が起こりうる。
+        # 以前の《本文冒頭が見えたら配達とみなす》フォールバックはこれを成功扱いにし、届いていない
+        # nonce で Enter を押して arm してしまう（Codex レビュー 2026-09-14）→ nonce 確認のみを成立条件に。
+        body = "PLEASE REVIEW THE DIFF" * 10
+        enters = []
+        caps = {"n": 0}
+
+        def fake(*a, **k):
+            if a[-1:] == ("Enter",):
+                enters.append(a)
+            if a[:1] == ("capture-pane",):
+                caps["n"] += 1
+                # 1 回目（旧実装が撮る "before"）は本文の無い画面。以後は本文だけが見え nonce は出ない
+                # ＝旧実装が「本文冒頭が新たに現れた」と見て配達成立にしてしまう条件そのもの。
+                return types.SimpleNamespace(stdout="" if caps["n"] == 1 else body)
+            return types.SimpleNamespace(stdout="")
+        with self._tmux(fake), mock.patch.object(self.dl, "cancel_copy_mode"), \
+             mock.patch.object(self.dl, "pane_busy", return_value=False), \
+             mock.patch.object(relay.dialoglib, "dialog_on_screen", return_value=False), \
+             mock.patch.object(self.dl.sys.stdout, "write"), mock.patch.object(self.dl.sys.stdout, "flush"):
+            res = self.dl.poke("%0", body, confirm=lambda p: True, badge=True)
+        self.assertFalse(res, "delivery is confirmed by the nonce alone — the body being visible is not enough")
+        self.assertEqual(enters, [], "no Enter when the nonce never appeared")
+
+    def test_paste_text_deletes_its_buffer_even_when_the_paste_fails(self):
+        # paste-buffer -d は貼り付けが成功した時しか消さない。失敗（ペイン消失等）で本文入りバッファが
+        # 残り、一意名にしたぶん溜まっていく（Codex レビュー 2026-09-14）→ try/finally で必ず消す。
+        seen = []
+
+        def fake(*a, **k):
+            seen.append(a)
+            if a[:1] == ("paste-buffer",):
+                raise subprocess.CalledProcessError(1, "tmux")
+            return types.SimpleNamespace(stdout="")
+        with self._tmux(fake), mock.patch.object(self.dl, "cancel_copy_mode"):
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.dl.paste_text("%0", "body")               # 元の例外は握り潰さない
+        name = next(a[a.index("-b") + 1] for a in seen if a[:1] == ("set-buffer",))
+        deletes = [a for a in seen if a[:1] == ("delete-buffer",)]
+        self.assertTrue(deletes, "the buffer is deleted even when the paste failed")
+        self.assertEqual(deletes[-1][deletes[-1].index("-b") + 1], name, "the same buffer name is deleted")
+
+    def test_paste_text_uses_a_unique_buffer_per_call(self):
+        # 固定名 (`aipair-relay`) は、同時に走る別 relay の貼り付けを上書きしうる（Codex レビュー）。
+        seen = []
+        with self._tmux(lambda *a, **k: seen.append(a) or types.SimpleNamespace(stdout="")), \
+             mock.patch.object(self.dl, "cancel_copy_mode"):
+            self.dl.paste_text("%0", "a")
+            self.dl.paste_text("%0", "b")
+        names = [a[a.index("-b") + 1] for a in seen if a[:1] in (("set-buffer",), ("paste-buffer",))]
+        self.assertEqual(len(names), 4, "set-buffer + paste-buffer per call")
+        self.assertEqual(len(set(names)), 2, "each call uses its own buffer name")
+        self.assertNotIn("aipair-relay", names, "the old fixed buffer name is gone")
+        self.assertTrue(all("-d" in a for a in seen if a[:1] == ("paste-buffer",)), "the buffer is deleted after pasting")
+
+
 class DeliverylibStandalone(unittest.TestCase):
     def test_loads_without_relay_and_re_exports(self):
         self.assertTrue(_imports_without_relay("deliverylib", "poke", "submit_enter", "press", "paste_text"))

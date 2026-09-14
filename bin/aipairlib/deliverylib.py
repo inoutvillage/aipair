@@ -57,7 +57,8 @@ def submit_enter(pane, confirm=None, badge=True):
 
 
 def poke(pane, text, confirm=None, badge=True, busy_wait=90):
-    """Inject text into a pane the way the agent TUIs expect (literal, then Enter).
+    """Inject text into a pane the way the agent TUIs expect (本文はブラケットペースト、確認用の
+    nonce だけリテラル入力、そして Enter)．
     Verifies the text actually reached the composer before pressing Enter;
     if delivery can't be confirmed, never presses Enter (a blind Enter submits
     empty/partial input and strands the loop).
@@ -83,8 +84,7 @@ def poke(pane, text, confirm=None, badge=True, busy_wait=90):
     elif waited:
         dim(f"アイドル確認（{waited}s 待機）→ 注入開始")
     probe = "relay-id:" + os.urandom(4).hex()
-    text = f"{text} {probe}"
-    head = "".join(text[:60].split())[:40]
+    body = text
     delivered = False
     shown = ""
     for attempt in range(3):
@@ -103,12 +103,14 @@ def poke(pane, text, confirm=None, badge=True, busy_wait=90):
             tmux("send-keys", "-t", pane, "-H",
                  "1b", "5b", "32", "30", "31", "7e", check=False)
             time.sleep(0.3)
-        try:
-            before = "".join(tmux("capture-pane", "-p", "-t", pane,
-                                  capture=True).stdout.split())
-        except subprocess.CalledProcessError:
-            before = ""
-        tmux("send-keys", "-t", pane, "-l", text)
+        # 本文は《ブラケットペースト》で投入する。長文を send-keys -l で打つと、TUI の取り込み
+        # バーストに後続の Enter が吸収され、本文がコンポーザに残ったまま送信されない（2026-09-14
+        # 実測: 幅 57 のペインへ ~1,900 字の質問リレー本文を打つと再現。codex 0.153.4 / 0.154.0 とも。
+        # 同じ長さでもブラケットペーストなら通常の Enter で即送信できる）。画面で確認する nonce だけ
+        # 短いリテラル入力として足す — 狭い画面でも `[Pasted Content … chars] relay-id:xxxx` と見える。
+        paste_text(pane, body)
+        time.sleep(0.2)
+        tmux("send-keys", "-t", pane, "-l", " " + probe)
         # 長文は TUI の取り込み・再描画が数秒続き、固定 0.3s の一発チェックでは
         # nonce がまだ描画されていない（2026-08-14 実測）。出現をポーリングで待つ。
         seen_deadline = time.time() + 3.5
@@ -123,15 +125,12 @@ def poke(pane, text, confirm=None, badge=True, busy_wait=90):
                 break
         if delivered:
             break
-        # nonce が出ない場合の傍証は「本文冒頭が新たに画面に現れた」こと（切詰め表示対策）。
-        # before 側にも同じ冒頭が見える場合は過去ポークの転写と区別できないので不採用。
-        # 旧実装の「画面が変化した」だけの判定は、残骸ペーストのチップカウンタ更新の
-        # ような無関係な再描画でも通ってしまい、未配達のまま Enter に進む誤爆があった
-        # （2026-08-14 実バグ）。
-        if head and head in shown and head not in before:
-            dim("nonce は画面外（コンポーザー切詰め表示）だが本文冒頭の表示を確認 → 配達とみなす")
-            delivered = True
-            break
+        # 配達の成立条件は《nonce が画面に出たこと》だけ。本文ペーストと nonce 入力は別コマンドなので
+        # 「本文だけ届き nonce が届かない」が起こりうるが、以前の《本文冒頭が見えたら配達とみなす》
+        # フォールバックはそれを成功扱いにし、届いていない nonce で Enter を押して arm してしまう
+        # （Codex レビュー 2026-09-14。Codex 宛は実行中バッジで submit_enter まで成功扱いになる）。
+        # ブラケットペーストでは nonce が末尾＝カーソル位置に出るため、切詰め表示でも見える
+        # （実測: コンポーザには `[Pasted Content … chars] relay-id:xxxx`）。
         dim(f"poke が画面に届いていない（copy-mode・未終端ペースト等）→ 再試行 {attempt + 1}/3")
         time.sleep(0.5)
     if not delivered:
@@ -176,7 +175,21 @@ def press(pane, key):
 
 
 def paste_text(pane, text):
-    """Bracketed paste so multi-line review text does not submit early."""
+    """Bracketed paste: multi-line review text does not submit early, AND a long body does not swallow
+    the Enter that follows it (2026-09-14 実測: 幅 57 のペインへ ~1,900 字を send-keys -l で打つと、
+    後続の Enter が TUI の取り込みバーストに吸収されて未送信のまま残る。同じ長さでもブラケット
+    ペーストなら通常の Enter で即送信できる — codex 0.153.4 / 0.154.0 の両方で確認)。
+
+    バッファ名は呼び出しごとに一意にする: 固定名だと、同時に走る別 relay の貼り付けを上書きしうる
+    （複数ペアを並行運用するのが前提のツールなので実際に起こりうる）。貼り付け後は -d で削除する。"""
     cancel_copy_mode(pane)
-    tmux("set-buffer", "-b", "aipair-relay", text)
-    tmux("paste-buffer", "-p", "-d", "-b", "aipair-relay", "-t", pane)
+    buf = "aipair-relay-%d-%s" % (os.getpid(), os.urandom(3).hex())
+    tmux("set-buffer", "-b", buf, text)
+    try:
+        tmux("paste-buffer", "-p", "-d", "-b", buf, "-t", pane)
+    finally:
+        # `paste-buffer -d` が消すのは《貼り付けが成功した時だけ》。ペイン消失等で失敗すると本文入りの
+        # バッファが残り、名前が一意なぶん失敗のたびに溜まる（Codex レビュー 2026-09-14 実測）。
+        # 削除は best-effort（check=False）で、元の例外を隠さない。capture=True で tmux のエラー出力を
+        # 画面へ漏らさない（既に消えている時の "no buffer" は想定内）。
+        tmux("delete-buffer", "-b", buf, check=False, capture=True)
