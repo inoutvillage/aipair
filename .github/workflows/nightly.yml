@@ -109,7 +109,7 @@ jobs:
           SID="$(cat /proc/sys/kernel/random/uuid)"
           NONCE="E2E-$(cat /proc/sys/kernel/random/uuid)"
           # AIPAIR_STOP_SIDE=claude is DELIBERATE: with the default (codex), codex — following the
-          # review prompt — replies "完了です" on approval, which is the stop phrase, so the relay
+          # review prompt — replies "[AIPAIR_REVIEW_OK]" on approval, which is the stop phrase, so the relay
           # would terminate on the codex turn and NEVER poke claude back. That would make the
           # return-hop signal unreachable even when both sides authenticated (a false failure).
           # Ending only on CLAUDE's stop phrase (which our nonce reply never contains) lets the
@@ -159,7 +159,7 @@ jobs:
           #  (3) the relay POKED CLAUDE BACK: a `relay-id:<hex>` appears in claude's own rollout.
           #      claude's first turn is our injected prompt (no relay-id), so any relay-id there is
           #      unambiguously the return hop. (AIPAIR_STOP_SIDE=claude below keeps codex's
-          #      approving "完了です" from ending the relay before that hop.)
+          #      approving "[AIPAIR_REVIEW_OK]" from ending the relay before that hop.)
           claude_echoed() {
             python3 - "$SID" "$NONCE" <<'PY' 2>/dev/null
           import sys, os, json, glob
