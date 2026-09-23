@@ -77,6 +77,14 @@ task makes no progress across rounds) instead of guessing or spinning.
   "Yes, manually approve edits" (no "bypass" wording), so the picker selects the first `Yes…` option.
 
 ### Fixed
+- **The skills and `aipair-relay-here -h` name the relay's real default sentinels** — they still gave the
+  old Japanese defaults (「完了です」 to stop, 「次のタスクをください」 to ask for the next task, 「全タスク完了」 /
+  「人間対応待ち」 as the terminals) although the code defaults are `[AIPAIR_REVIEW_OK]` / `[AIPAIR_NEXT]` /
+  `[AIPAIR_ALL_DONE]` / `[AIPAIR_HUMAN_REQUIRED]`, so a user or Claude following them could pass
+  `stop 完了です` or explain the loop wrongly. Stop detection itself was unaffected (the relay's prompt to
+  Codex names the real sentinel). `tests/doc-sync.py` now checks these distributed docs — both skills, the
+  real `aipair-relay-here -h` output and the global-instructions template — against the code defaults,
+  not only the README.
 - **A long poke is pasted, not typed — so the Enter that follows actually submits** — `poke()` typed the
   whole body with `send-keys -l`; on a narrow pane a long body (measured: ~1,900 chars of a question
   relay in a 57-column pane) keeps the TUI ingesting, and the Enter that follows is swallowed as part of

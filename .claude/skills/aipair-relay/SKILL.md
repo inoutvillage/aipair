@@ -1,12 +1,12 @@
 ---
 name: aipair-relay
-description: "aipair セッション内で、Codex との自律レビュー往復（relay）をオンデマンドで1本起こす。relay は「完了です」等で終了して往復が止まるので、新しい仕事ができた時に再点火する。起動トリガー例『リレーで処理して』『relay で回して』『Codex にレビューさせて』『レビュー往復を起こして』『もう一周レビュー回して』。前提: 実行中の aipair ペア（tmux）の Claude ペイン内であること。ペア外の通常セッションでは使えない。"
+description: "aipair セッション内で、Codex との自律レビュー往復（relay）をオンデマンドで1本起こす。relay は停止フレーズ（既定 [AIPAIR_REVIEW_OK]）等で終了して往復が止まるので、新しい仕事ができた時に再点火する。起動トリガー例『リレーで処理して』『relay で回して』『Codex にレビューさせて』『レビュー往復を起こして』『もう一周レビュー回して』。前提: 実行中の aipair ペア（tmux）の Claude ペイン内であること。ペア外の通常セッションでは使えない。"
 ---
 
 # aipair-relay（レビュー往復のオンデマンド点火）
 
 `aipair` は Claude + Codex を tmux で並走させ、`aipair-relay` が両者のペインを交互に poke して
-自律的にレビューし合わせる。relay は停止フレーズ（既定「完了です」）や上限ラウンドで**終了する**＝
+自律的にレビューし合わせる。relay は停止フレーズ（既定 `[AIPAIR_REVIEW_OK]`）や上限ラウンドで**終了する**＝
 そこで往復が止まる。このスキルは、**新しい仕事ができた時に relay を1本だけ起こし直す**ためのもの。
 
 ## いつ使うか（オンデマンド。自動再起動ではない）
@@ -15,7 +15,7 @@ description: "aipair セッション内で、Codex との自律レビュー往�
 - **自分（Claude）がレビュー往復を回す価値があると判断した**（＝②のトリガー。例: 大きめの実装を終え、Codex の批判的レビューを一周かけたい）。
 - **前の relay が終了した後**、次の仕事について改めて往復したい（＝①。前 relay が終わっているのが前提）。
 
-> 🚫 これは「終わったら勝手に次を回す」常駐ではない。**1回叩けば relay 1本**。無限ループにしないための設計（maintainer decision）。「完了です」で終わった直後に無条件で再点火すると、Codex がまた即「完了です」→ 延々ループになるため、**新しい入力がある時だけ**起こす。
+> 🚫 これは「終わったら勝手に次を回す」常駐ではない。**1回叩けば relay 1本**。無限ループにしないための設計（maintainer decision）。停止フレーズ（`[AIPAIR_REVIEW_OK]`）で終わった直後に無条件で再点火すると、Codex がまた即 `[AIPAIR_REVIEW_OK]` → 延々ループになるため、**新しい入力がある時だけ**起こす。
 
 ## 前提チェック（最初に必ず）
 
@@ -34,7 +34,7 @@ aipair-relay-here --print [rounds N] [stop "フレーズ"] [stop-side codex|clau
 aipair-relay-here [rounds N] [stop "フレーズ"] [stop-side codex|claude|both]
 ```
 
-- 引数なし = `aipair-relay --adopt`（既存ペアに乗る）＋ relay 既定（stop=完了です / stop-side=codex / max-rounds=20）。
+- 引数なし = `aipair-relay --adopt`（既存ペアに乗る）＋ relay 既定（stop=`[AIPAIR_REVIEW_OK]` / stop-side=codex / max-rounds=20）。
   ただし `AIPAIR_*` が環境にあればそれが既定になる（**優先順位: 引数 > env > 既定**）。
   何が実際に渡るかは必ず `--print` で確認する（env が効いていると見た目の引数と違う）。
 - 自然言語 → 引数の対応:
@@ -55,8 +55,8 @@ aipair-relay-here --print -- --endless --max-rounds 100     # まずドライラ
 aipair-relay-here -- --endless --max-rounds 100
 ```
 
-- 「完了です」は**終了ではなく「レビュー合格→次のタスクへ」**の合図になる。
-- Claude 側の手持ちが尽きたら本文冒頭に「**次のタスクをください**」と書く → relay が Codex に
+- 停止フレーズ（`[AIPAIR_REVIEW_OK]`）は**終了ではなく「レビュー合格→次のタスクへ」**の合図になる。
+- Claude 側の手持ちが尽きたら本文冒頭に **`[AIPAIR_NEXT]`** と書く → relay が Codex に
   `tasks/todo.md` の未チェック項目から次の1件を指示させる。
 - **終端は relay の task-list 分類（READY/BLOCKED/ALL_DONE）が権威で 2 つ**: 全完了（`[AIPAIR_ALL_DONE]`・exit 0）と、人間対応の `- [!]`（直下に `blocker:` 理由）だけが残る HUMAN_REQUIRED（`[AIPAIR_HUMAN_REQUIRED]`・exit 8・人間対応待ち）。着手可 `- [ ]` が残る間は終端 sentinel を無視して継続（+ `--max-rounds` の安全キャップ）。
   既定の 20 往復ではすぐキャップに当たるので `--max-rounds` を大きめに。

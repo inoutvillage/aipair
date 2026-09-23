@@ -75,7 +75,7 @@ class Versions(unittest.TestCase):
 
 
 class Sentinels(unittest.TestCase):
-    """停止・状態遷移 sentinel の《既定値》== build_parser の argparse 既定（README がドキュメント）。"""
+    """停止・状態遷移 sentinel の《既定値》== build_parser の argparse 既定（README と配布文書がドキュメント）。"""
     # argparse dest → the env var README documents it under
     CASES = [("stop", "AIPAIR_STOP"), ("next_ask", "AIPAIR_NEXT_ASK"),
              ("all_done", "AIPAIR_ALL_DONE"), ("human_required", "AIPAIR_HUMAN_REQUIRED"),
@@ -96,6 +96,34 @@ class Sentinels(unittest.TestCase):
             val = self.defaults[attr]
             lines = [ln for ln in README.splitlines() if env in ln and val in ln]
             self.assertTrue(lines, "README has no line documenting %s's default as %s" % (env, val))
+
+    # README 以外で既定値を説明している配布物 — install で ~/.claude/skills・グローバル指示へ配られる文書と、
+    # 利用者が実際に打つ `aipair-relay-here -h`。README だけを固定していたため、sentinel の改名後もここが
+    # 旧・日本語の既定語のまま残った（2026-09-23 Codex レビューで検出）。
+    STALE = ("完了です", "次のタスクをください")
+
+    def _distributed_docs(self):
+        r = subprocess.run([os.path.join(REPO, "bin", "aipair-relay-here"), "-h"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        docs = {"aipair-relay-here -h": r.stdout}
+        for rel in (".claude/skills/aipair-relay/SKILL.md", ".claude/skills/aipair-setup/SKILL.md",
+                    "templates/claude-md-block.md"):
+            docs[rel] = _read(rel)
+        return docs
+
+    def test_distributed_docs_state_the_code_defaults_not_the_old_words(self):
+        docs = self._distributed_docs()
+        for name, text in docs.items():
+            self.assertIn(self.defaults["stop"], text,
+                          "%s does not state the stop default %s" % (name, self.defaults["stop"]))
+            for old in self.STALE:
+                self.assertNotIn(old, text, "%s still names the old default %r" % (name, old))
+        # 連続モードの合図・終端まで説明している文書は、その値も実装どおりに（-h は env 名だけを載せる）
+        for name in (n for n in docs if n != "aipair-relay-here -h"):
+            for attr in ("next_ask", "all_done", "human_required"):
+                self.assertIn(self.defaults[attr], docs[name],
+                              "%s does not state the %s default %s" % (name, attr, self.defaults[attr]))
 
 
 class ExitCodes(unittest.TestCase):

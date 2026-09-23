@@ -686,3 +686,31 @@ cli の既定が env を読まない）→ いずれも該当テストが FAIL�
   shellcheck はローカル未導入のため skip＝CI で実行）
 - 申し送り: 反映（PR・マージ・`./aipair-install.sh` 再実行・再点火）はユーザー判断。稼働中の relay は起動時に読んだ
   旧 `TESTED_VERSIONS` のままなので、警告が消えるのは install 後の再点火（`aipair-relay-here` / VS Code タスク）以降。
+
+## スコープ外の検出（2026-09-23）— 別 PR で対応（ユーザー承認）
+
+> 版ゲート更新（#168）後のレビュー往復で Codex が指摘（relay-id:789d0062）。版更新とは別件のため、スコープ規律に従い
+> いったん直さず記録し、ユーザーの「別 PR で直して」を受けて対応した。反映には PR のマージと `./aipair-install.sh`
+> 再実行（スキルは `~/.claude/skills` へ配布される）が要る。
+
+- [x] **sentinel の改名に文書が追従していない**: 実装の既定（`bin/aipairlib/cli.py`）は停止 `[AIPAIR_REVIEW_OK]`・連続モードの
+  合図 `[AIPAIR_NEXT]`・終端 `[AIPAIR_ALL_DONE]` / `[AIPAIR_HUMAN_REQUIRED]` だが、以下が旧語のまま。
+  - `.claude/skills/aipair-relay/SKILL.md` L3・L9・L18・L37・L58（「完了です」）、L59（「次のタスクをください」）
+  - `.claude/skills/aipair-setup/SKILL.md` L168（「完了です」）、L169（「次のタスクをください」「全タスク完了」「人間対応待ち」）
+  - `bin/aipair-relay-here` L6・L17（`-h` に出るヘッダ。「--stop 完了です」）
+  - `.github/workflows/nightly.yml` L111–112・L161–162（`AIPAIR_STOP_SIDE=claude` の理由を述べるコメントのみ。設定自体は正しい）
+  - 影響: relay の判定は実装の既定で動き、Codex への poke 文も `[AIPAIR_REVIEW_OK]` を明示するので停止判定は壊れていない
+    （2026-09-23 のこのペアでも 1 往復で正常停止）。害は、スキルを読んだ Claude や `-h` を見た人が旧語を既定と誤解し、
+    `stop 完了です` のような指定や誤った説明をすること。
+- [x] **修正**: 上記 4 ファイルの記述を実装の既定値へ。setup スキルの見出し「自走ループの既定値（日本語）」の「（日本語）」は、
+  既定が日本語の語だった初期リリース（2026-08-21）の名残なので削除。
+- [x] **再発防止**: 漏れの原因は `tests/doc-sync.py` が README だけを既定値と照合していたこと。
+  `Sentinels.test_distributed_docs_state_the_code_defaults_not_the_old_words` を追加し、両スキル・**`aipair-relay-here -h` の
+  実出力**・`templates/claude-md-block.md` を `build_parser` の既定と照合、旧語「完了です」「次のタスクをください」の再発も検出する
+  （nightly はコメントのみなので対象外）。
+- [x] **空振りしないことの確認**: main の文書のままでは落ちる。4 文書を 1 つずつ旧版に戻しても、それぞれで落ちる。
+- [x] `bash tests/run-all.sh` 12 系統全緑（doc-sync 31 → 32）。setup スキルの終端は当初「終端 [AIPAIR_ALL_DONE]・…」と書いて
+  既存の旧契約検査（`tests/broadcast-blocks.sh`：「終端は ALL_DONE だけ」と読める形を禁止）に掛かったため、
+  「終端 2 種: 全完了 `[AIPAIR_ALL_DONE]`・人間対応待ち `[AIPAIR_HUMAN_REQUIRED]`」と 2 種であることが明確な形にした。
+- [x] **Codex レビュー反映（relay-id:522171b8）**: `nightly.yml` L161 のコメントが `AIPAIR_STOP_SIDE=claude` を「below」と
+  指していたが、設定は上（L117）にある → 「above」へ。同じ PR で書き換えている文の中の誤りなので、この PR で直した。

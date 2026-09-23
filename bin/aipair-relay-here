@@ -3,7 +3,7 @@
 # オンデマンドで1本だけ起こす。Claude / Codex / bridge どのペインからでも呼べる共通コマンド
 # （bridge ペイン自身から叩いた場合は send-keys ではなくそのまま直接実行する）。
 #
-# relay は「完了です」等で終了する＝そこで自律往復が止まる。新しい仕事ができた時
+# relay は停止ワード（既定 [AIPAIR_REVIEW_OK]）等で終了する＝そこで自律往復が止まる。新しい仕事ができた時
 # （Claude が必要と判断 / ユーザーが「リレーで処理して」と言った / 前 relay 終了後）に
 # これを1回叩くと、bridge ペインで relay を張り直す（--adopt で既存ペアに乗る）。
 # ※ 自動再起動デーモンではない。1回 = 1 relay。無限ループにしない設計（maintainer decision）。
@@ -14,7 +14,7 @@
 #                     [<aipair-relay のフラグ...>]  [-- <以降すべて relay へ素通し>]
 #   ※ --max-rounds / --endless など relay 本体のフラグは `--` 無しでもそのまま書ける
 #      例: aipair-relay-here --max-rounds 100 --endless
-# 既定: --adopt / relay 側の既定（--stop 完了です / --stop-side codex / --max-rounds 20）
+# 既定: --adopt / relay 側の既定（--stop [AIPAIR_REVIEW_OK] / --stop-side codex / --max-rounds 20）
 #
 # 点火は《確認してから》成功を返す: bridge の copy-mode を解除し打ちかけの入力行を破棄 → 送信直前に
 # bridge が idle シェルか再確認 → 投入後、relay のバナーが新しく出るまで待つ。確認できない／起動直後に
