@@ -712,4 +712,5 @@ cli の既定が env を読まない）→ いずれも該当テストが FAIL�
 - [x] `bash tests/run-all.sh` 12 系統全緑（doc-sync 31 → 32）。setup スキルの終端は当初「終端 [AIPAIR_ALL_DONE]・…」と書いて
   既存の旧契約検査（`tests/broadcast-blocks.sh`：「終端は ALL_DONE だけ」と読める形を禁止）に掛かったため、
   「終端 2 種: 全完了 `[AIPAIR_ALL_DONE]`・人間対応待ち `[AIPAIR_HUMAN_REQUIRED]`」と 2 種であることが明確な形にした。
-- 記録のみ（範囲外・未修正）: `nightly.yml` L161 の「`AIPAIR_STOP_SIDE=claude` below」は、実際には上（L117）にある。
+- [x] **Codex レビュー反映（relay-id:522171b8）**: `nightly.yml` L161 のコメントが `AIPAIR_STOP_SIDE=claude` を「below」と
+  指していたが、設定は上（L117）にある → 「above」へ。同じ PR で書き換えている文の中の誤りなので、この PR で直した。

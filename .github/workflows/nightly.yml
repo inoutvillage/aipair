@@ -158,7 +158,7 @@ jobs:
           #      empty task_complete — so an invalid OPENAI_API_KEY could clear (3) but never (2).
           #  (3) the relay POKED CLAUDE BACK: a `relay-id:<hex>` appears in claude's own rollout.
           #      claude's first turn is our injected prompt (no relay-id), so any relay-id there is
-          #      unambiguously the return hop. (AIPAIR_STOP_SIDE=claude below keeps codex's
+          #      unambiguously the return hop. (AIPAIR_STOP_SIDE=claude above keeps codex's
           #      approving "[AIPAIR_REVIEW_OK]" from ending the relay before that hop.)
           claude_echoed() {
             python3 - "$SID" "$NONCE" <<'PY' 2>/dev/null
