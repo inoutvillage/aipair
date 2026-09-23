@@ -653,3 +653,36 @@ cli の既定が env を読まない）→ いずれも該当テストが FAIL�
   `--print` を通り、relay の argparse で落ちた）＋回帰テスト 4 件（受理した形は実物の relay parser に通して確認）。
   README の「env が各ペインに残り、直接再起動にも継承される」を実測（私設 tmux: ペインの env はサーバーを起動した
   クライアントのもの）に合わせて是正し、再点火では設定を指定し直す旨を明記。
+
+## 追記: 版ゲートの検証済み版を claude 2.1.280 / codex 0.156.0 へ更新（2026-09-23）
+
+> 稼働ペアの relay バナーが `⚠ claude 版 2.1.280 は検証済み 2.1.268 と異なる（ペインで実行中）` / `⚠ codex 版 0.156.0 は
+> 検証済み 0.154.0 と異なる（ペインで実行中）` を出し、プラン承認・質問リレーの自動操作が OFF に落ちていた。導入版は
+> npm-global の claude 2.1.280 / codex 0.156.0（ペインの実体 `/proc/<pid>/exe` も同じ npm-global。PATH 後方の
+> `/usr/bin/claude` は 2025-06 の旧 system npm で、前方の npm-global に隠れて使われない）。前回同様、実 CLI で全依存を実測してから bump。
+
+- [x] **実 TUI / 実ログ検証**（ローカル専用の検証ツール〈repo 外・非公開〉・私設 socket `-L aipair-livecheck-<pid>`・
+  scratch dir で完結・既定 tmux server 不使用。実行前に、ツールが呼ぶ本番関数の tmux 呼び出しがすべて私設 socket へ
+  差し替わることを #164〜#167 後のコードで確認）: **30 / 30 PASS**
+  - claude 2.1.280 プラン承認: `detect_plan_dialog` → `{tell:3, yes:1, yes_label:"Yes, and use auto mode"}`＋プランパス抽出、
+    `send_plan_feedback(approve=False)` 差し戻し → 再プラン → `approve=True` の Shift+Tab 承認 →
+    **承認後にプランが実際に実行された**（`hello.py` 追記を確認）。
+  - claude 2.1.280 質問リレー: 単問・複数問（`←  ☐ … ✔ Submit  →`）とも `detect_question_dialog` → `{chat:4}`、
+    `scrape_questions` が 2 問収集、「Chat about this」経由の `send_question_answer` 配達成立。
+  - ログ schema: `schema_probe` が claude 新規セッション 2 本・codex 0.156.0 rollout とも `ok`。
+    codex 実行中バッジ `esc to interrupt` を確認。
+  - 採取した実画面（プラン・単問・複数問）のダイアログ部分は 2.1.268 の採取画面と**完全一致**（プランファイル名と
+    罫線幅だけ正規化して比較）→ `tests/relay-parsers.py` の `PLAN_SCREEN` 等は据え置き。
+- [x] **検証ツール側の追従（repo 外・ローカルのみ）**: codex 0.156.0 で初回の「このフォルダを信頼するか」ダイアログの文言が
+  `› 1. Trust and continue` / `2. Quit` に変わり（0.154.0 は `› 1. Yes, continue`）、ツールの判定が一致せず codex の起動待ちで
+  止まった。**この回は私設 socket の codex ペインへ Enter を 1 回だけ手動で送って続行**（信頼を与えた先はツールが作った空の
+  scratch dir のみ。人手はこの 1 回だけで、30 項目の操作と判定はすべてツールが自動で実行）。ツールの判定に `Trust and continue` を追加し、実画面を
+  含む 7 ケース（codex 0.156.0 / 0.154.0・claude 2.1.268 の既定 `No, exit`・ダイアログ無し・行中の言及）でオフライン確認。
+  **修正後の判定がライブで自動確定するのは次回の実行が初回**。aipair 本体（`bin/`・installer・templates・`.claude`）は
+  信頼ダイアログを操作しないので製品コードへの影響は無い（grep で確認）。
+- [x] **bump**: `corelib.TESTED_VERSIONS` と README「必要環境」表（実測日 2026-09-23）を更新。CHANGELOG の版行、
+  README プランレビュー節・`relay.py` docstring の承認肢の版注記に 2.1.280 を追加。
+- [x] `bash tests/run-all.sh` 12 系統全緑（relay-parsers 235 / doc-sync 31 / launch-cmds 79 / install-upgrade 56 ほか。
+  shellcheck はローカル未導入のため skip＝CI で実行）
+- 申し送り: 反映（PR・マージ・`./aipair-install.sh` 再実行・再点火）はユーザー判断。稼働中の relay は起動時に読んだ
+  旧 `TESTED_VERSIONS` のままなので、警告が消えるのは install 後の再点火（`aipair-relay-here` / VS Code タスク）以降。
