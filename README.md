@@ -64,12 +64,12 @@
 
 ## 必要環境
 
-| 必要 | 最小 | 検証済みバージョン（2026-09-23 実測） | 備考 |
+| 必要 | 最小 | 検証済みバージョン（2026-09-24 実測） | 備考 |
 |---|---|---|---|
 | `tmux` | **≥ 3.1** | 3.2a | `split-window -l 30%`（割合指定）が 3.1 から。Ubuntu 20.04 の 3.0a は不可 |
 | `python3` | **≥ 3.8** | 3.9.25 | `peer-log` / `aipair-relay` の本体。**標準ライブラリのみ**（pip 不要） |
-| `claude` | — | 2.1.280 | Claude Code CLI（`npm install -g @anthropic-ai/claude-code`、要ログイン） |
-| `codex` | — | 0.156.0 | OpenAI Codex CLI（`npm install -g @openai/codex`、要ログイン） |
+| `claude` | — | 2.1.281 | Claude Code CLI（`npm install -g @anthropic-ai/claude-code`、要ログイン） |
+| `codex` | — | 0.156.1 | OpenAI Codex CLI（`npm install -g @openai/codex`、要ログイン） |
 | ロケール | UTF-8 | `en_US.UTF-8` | 停止ワード（日本語）や罫線を扱うため。非 UTF-8 だとインストーラが `[warn]` |
 
 - 検証した OS: **WSL2（AlmaLinux 9.7 / dnf）**、**Ubuntu 24.04 コンテナ（apt）**、**Arch Linux コンテナ（pacman）**。

@@ -727,3 +727,8 @@ cli の既定が env を読まない）→ いずれも該当テストが FAIL�
   ダイアログ画面の《構造》を前回合格時と比較（LLM の文面は無視・UI の文言と並びだけ）→ `tests/run-all.sh` → PR → CI 待ち → マージ →
   install と一致確認 → このペアの relay を元の引数で再点火（`--allow-untested-dialogs` は外す）。赤ならその段で止まる
 - [x] 検証ツールの信頼ダイアログ判定を文言一覧から「番号/カーソル付き選択肢行の先頭語が肯定か」へ（CLI 更新のたびに止まっていた）
+
+## 追記: 版ゲートの検証済み版を claude 2.1.281 / codex 0.156.1 へ更新（2026-09-24・aipair-bump）
+
+- [x] 実機検証 30 / 30 PASS（ローカル検証ツール・私設 tmux socket）。ダイアログ画面: 前回（claude-2.1.280_codex-0.156.0）と同一構造
+- [x] `corelib.TESTED_VERSIONS` と README「必要環境」表を更新、`bash tests/run-all.sh` 全緑
