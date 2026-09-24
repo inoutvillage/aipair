@@ -247,6 +247,11 @@ peer-log codex --full      # セッション全体
 4. 2–3 を繰り返し、**Codex の最終回答が先頭行に停止 sentinel `[AIPAIR_REVIEW_OK]` を単独で出したら自動停止**（最大 20 往復で打ち切り）
    - 判定はターンの**最終メッセージの先頭行が sentinel と完全一致**した時のみ（ターン途中の進捗ナレーションは見ない。
      制御信号は専用 sentinel に分離し、否定文・引用・文中言及での誤停止を防ぐ）
+5. **人間の判断待ちで止まる**: 残る指摘が人間の判断事項（仕様・方針の選択、ユーザーが裁定済みの事項、本番操作・課金など）で
+   コード修正では解決しない時は、Claude / Codex のどちらかが先頭行に `[AIPAIR_HUMAN_REQUIRED]` を単独で出し、relay は **exit 8**
+   で停止する（判断を伝えてから `aipair-relay-here` で再点火）。合図が出なくても、**合格が出ないまま repo（HEAD と作業ツリー）が
+   `--stall-rounds`（既定 3）往復続けて変わらなければ exit 8（進捗なし）**で止まる（git 管理外の dir では働かない。`0` で無効）。
+   以前は「ユーザー判断待ち・修正なし」↔「未修正」が合格も停止もできず、上限往復まで空回りしていた
 
 ### 日本語の既定値と変更方法
 
@@ -262,7 +267,7 @@ peer-log codex --full      # セッション全体
 | `AIPAIR_TASK_LIST` | `tasks/todo.md` | 連続モードの次タスクの根拠ファイル |
 | `AIPAIR_NEXT_ASK` | `[AIPAIR_NEXT]` | 連続モード: Claude の手持ちが尽きた合図 sentinel（先頭行に単独で） |
 | `AIPAIR_ALL_DONE` | `[AIPAIR_ALL_DONE]` | 連続モード: Codex の終端 sentinel（分類 ALL_DONE 時のみ・exit 0。先頭行に単独で） |
-| `AIPAIR_HUMAN_REQUIRED` | `[AIPAIR_HUMAN_REQUIRED]` | 連続モード: 人間対応の `[!]` のみ残存を Codex が宣言する終端 sentinel（分類 BLOCKED 時のみ・exit 8。先頭行に単独で） |
+| `AIPAIR_HUMAN_REQUIRED` | `[AIPAIR_HUMAN_REQUIRED]` | 人間待ちの sentinel（先頭行に単独で・exit 8）。通常のレビュー往復: Claude / Codex のどちらかが「残りは人間の判断事項」と宣言。連続モード: 人間対応の `[!]` のみ残存を Codex が宣言する終端（分類 BLOCKED 時のみ） |
 | `AIPAIR_UNSAFE` | （未設定＝安全） | `1`/`--unsafe` で権限バイパス起動（`aipair loop` は必須）。既定は通常の許可プロンプト |
 | `AIPAIR_CLAUDE_FLAGS` / `AIPAIR_CODEX_FLAGS` | （安全＝無し／`--unsafe`＝`--dangerously-…`） | 起動フラグ。明示指定は最優先。**ペイン内のシェルが解釈するシェル断片**（`"--model opus"` は 2 引数、`'--append-system-prompt "a b"'` の引用符も有効）。空文字でフラグ無し。**ただし `aipair loop` では危険フラグが必ず付与される**（空/カスタム指定にも追記。relay が許可プロンプトに答えられないため） |
 | `AIPAIR_DRY_RUN` | （未設定＝off） | `1` で各ペインに打ち込む起動行を表示するだけで何も起動しない（設定確認・テスト用）。真偽値の読み方は `AIPAIR_ENDLESS` と同じ |
@@ -431,7 +436,7 @@ Codex のレビュー配達時（通常ループ）も、Claude が質問ダイ�
 | 5 | プランレビュー/質問リレーの上限到達・選択肢欠落・操作できないダイアログで停止（自動操作 OFF／版の再判定で不可。画面は触らない） |
 | 6 | 停止ゲート（`--gate`）が `--gate-rounds` 回失敗 |
 | 7 | ログ JSONL schema がコア relay の依存キーと不一致（**fail-closed**。`--allow-untested-schema` で継続） |
-| 8 | 連続モードで**実行可能タスクが尽き、人間対応の `[!]` のみ残存（HUMAN_REQUIRED）／または同一タスクで進捗停止（no-progress）**。max-rounds とは別扱い。人間対応後に再開 |
+| 8 | **人間の判断待ち・進捗なし**。通常のレビュー往復: Claude / Codex が `[AIPAIR_HUMAN_REQUIRED]` を宣言／合格が出ないまま repo が `--stall-rounds` 往復変わらない。連続モード: 実行可能タスクが尽き人間対応の `[!]` のみ残存（HUMAN_REQUIRED）／同一タスクで進捗停止（no-progress）。max-rounds とは別扱い。人間対応後に再開 |
 | 130 | Ctrl-C 中断 |
 
 ---

@@ -1245,6 +1245,115 @@ class VersionGuardWiring(unittest.TestCase):
         self.assertIn('back == "poke"', lines[branch], "the Claude poke lives only in the no-dialog branch")
 
 
+class ReviewLoopExits(unittest.TestCase):
+    """Regression (2026-09-24, maroari): in the normal review loop Claude said "needs the user's decision /
+    already decided by the user — no change" and Codex answered "still unfixed" / "no diff, can't judge";
+    neither could emit the only stop sentinel ([AIPAIR_REVIEW_OK]) so the relay spun to max-rounds (115
+    Claude turns). Now (1) both review prompts offer [AIPAIR_HUMAN_REQUIRED], honoured by run() as exit 8,
+    and (2) a mechanical stall guard stops when no review passes while the repo stays unchanged."""
+    HR = "[AIPAIR_HUMAN_REQUIRED]"
+
+    def test_prompts_offer_the_human_required_exit_only_when_given(self):
+        rp = relay.review_protocol
+        self.assertIn(self.HR, rp.default_poke_codex("[AIPAIR_REVIEW_OK]", self.HR))
+        self.assertIn("人間の判断事項", rp.default_poke_codex("[AIPAIR_REVIEW_OK]", self.HR))
+        self.assertIn("コードで直すべき点が残る場合は使わない", rp.default_poke_codex("[AIPAIR_REVIEW_OK]", self.HR))
+        self.assertNotIn(self.HR, rp.default_poke_codex("[AIPAIR_REVIEW_OK]"))
+        self.assertIn(self.HR, rp.default_poke_claude(self.HR))
+        self.assertEqual(rp.default_poke_claude(None), rp.DEFAULT_POKE_CLAUDE)
+
+    def test_relay_offers_it_in_the_review_loop_but_not_in_endless(self):
+        src = inspect.getsource(relay.main)
+        self.assertIn("review_hr = human_required_phrases[0] if (human_required_phrases and not a.endless) else None", src)
+        self.assertIn("default_poke_claude(review_hr)", src)
+
+    def test_advance_stall(self):
+        adv = relay.state_machine.advance_stall
+        self.assertEqual(adv(None, "A"), ("A", 0))
+        self.assertEqual(adv(("A", 0), "A"), ("A", 1))
+        self.assertEqual(adv(("A", 2), "B"), ("B", 0), "any repo change restarts the count")
+        self.assertIsNone(adv(("A", 2), None), "no fingerprint (not a git repo) never counts")
+
+    def test_repo_fingerprint_tracks_head_worktree_and_untracked(self):
+        fp = relay.state_machine.repo_fingerprint
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(fp(d), "not a git repo → None (guard off)")
+            g = lambda *a: subprocess.run(["git", "-C", d] + list(a), check=True, capture_output=True)
+            g("init", "-q"); g("config", "user.email", "t@t"); g("config", "user.name", "t")
+            open(os.path.join(d, "a.txt"), "w").write("1\n"); g("add", "a.txt"); g("commit", "-qm", "c1")
+            base = fp(d)
+            self.assertEqual(fp(d), base, "same state → same fingerprint")
+            open(os.path.join(d, "a.txt"), "w").write("2\n")
+            edited = fp(d)
+            self.assertNotEqual(edited, base, "a tracked edit changes it")
+            open(os.path.join(d, "new.txt"), "w").write("x\n")
+            self.assertNotEqual(fp(d), edited, "a new untracked file changes it")
+            g("add", "-A"); g("commit", "-qm", "c2")
+            self.assertNotEqual(fp(d), base, "a commit changes it")
+
+    # --- the real run() ------------------------------------------------------------------ #
+    def _run(self, texts_for, fingerprints=None, stall_rounds=3, max_rounds=20, hr=("[AIPAIR_HUMAN_REQUIRED]",)):
+        sm = relay.state_machine
+        a = types.SimpleNamespace(start_side="claude", settle=0, poll=0, max_rounds=max_rounds, endless=False,
+                                  stop_side="codex", no_plan_review=True, no_question_relay=True,
+                                  plan_rounds=5, question_rounds=5, plan_ok="[AIPAIR_PLAN_APPROVED]",
+                                  gate=None, gate_timeout=600, gate_rounds=3, stall_rounds=stall_rounds)
+        rg = types.SimpleNamespace(response_done=lambda who, path, done: done, noshow=lambda who: False,
+                                   arm=lambda nonce: None, clear=lambda: None, probe=None, probe_ts_cache=0.0)
+        machine = sm.StateMachine(
+            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x",
+            tracked={"claude": "c.jsonl", "codex": "x.jsonl"}, claude_seen=set(), codex_seen=set(),
+            baseline=0.0, sg=types.SimpleNamespace(guard=lambda: False), rg=rg,
+            vg=types.SimpleNamespace(dialog_ok=lambda: True), bw=60,
+            poke_codex="PC", poke_codex_next="PCN", poke_claude="PCL", poke_claude_pass="PCP",
+            poke_claude_next="PCX", stop_phrases=["[AIPAIR_REVIEW_OK]"], next_ask_phrases=["[AIPAIR_NEXT]"],
+            all_done_phrases=["[AIPAIR_ALL_DONE]"], human_required_phrases=list(hr))
+        fps = iter(fingerprints or [])
+        with mock.patch.object(sm, "set_pane_title"), \
+             mock.patch.object(sm, "claude_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "codex_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "claude_matches_pane", return_value=True), \
+             mock.patch.object(sm, "turn_texts", side_effect=lambda who, *r: texts_for(who)), \
+             mock.patch.object(sm, "detect_plan_dialog", return_value=None), \
+             mock.patch.object(sm, "detect_question_dialog", return_value=None), \
+             mock.patch.object(sm, "repo_fingerprint", side_effect=lambda cwd: next(fps, "SAME")), \
+             mock.patch.object(sm, "poke", return_value="nonce") as poke_mock, \
+             mock.patch("time.sleep"), mock.patch("builtins.print"):
+            code = machine.run()
+        return code, [c.args[0] for c in poke_mock.call_args_list], machine
+
+    def test_codex_human_required_stops_with_exit_8(self):
+        code, pokes, _ = self._run(lambda who: ["修正あり"] if who == "claude" else [self.HR + "\nD1: 仕様の選択"])
+        self.assertEqual(code, 8)
+        self.assertEqual(pokes, ["%2"], "Codex's HUMAN_REQUIRED is not relayed back to Claude")
+
+    def test_claude_human_required_stops_before_asking_codex(self):
+        code, pokes, _ = self._run(lambda who: [self.HR + "\nユーザー判断待ち"] if who == "claude" else ["x"])
+        self.assertEqual(code, 8)
+        self.assertEqual(pokes, [], "Claude's HUMAN_REQUIRED stops before any review request")
+
+    def test_an_inline_mention_does_not_stop(self):
+        # head-line-only contract: a mention inside the text is not a declaration
+        code, _, _ = self._run(lambda who: ["なお " + self.HR + " は使わない"], stall_rounds=0, max_rounds=3)
+        self.assertEqual(code, 3, "runs to the max-rounds cap")
+
+    def test_stall_stops_after_n_unchanged_unapproved_reviews(self):
+        code, pokes, _ = self._run(lambda who: ["同一2点、修正なし"] if who == "claude" else ["2点とも未修正"])
+        self.assertEqual(code, 8)
+        # reviews 1..4: baseline + 3 unchanged → stop at the 4th review, before poking Claude again
+        self.assertEqual(pokes, ["%2", "%1"] * 3 + ["%2"])
+
+    def test_a_changing_repo_is_not_a_stall(self):
+        code, _, _ = self._run(lambda who: ["直した"] if who == "claude" else ["まだ1点"],
+                               fingerprints=["A", "B", "C", "D", "E", "F"], max_rounds=6)
+        self.assertEqual(code, 3, "progress every round → only the max-rounds cap stops it")
+
+    def test_stall_guard_can_be_disabled_and_hr_emptied(self):
+        code, _, _ = self._run(lambda who: ["x"] if who == "claude" else [self.HR], stall_rounds=0,
+                               max_rounds=3, hr=())
+        self.assertEqual(code, 3, "--stall-rounds 0 and an empty --human-required → old behaviour")
+
+
 class StalePlanDialogIsNeverOperated(unittest.TestCase):
     """Regression (Codex review 2026-09-12): codex_plan used `detect_plan_dialog(...) or plan_dialog`, so a
     plan dialog that vanished while Codex was reviewing (a human handled it) was still 'answered' from the

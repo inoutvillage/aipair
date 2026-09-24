@@ -7,7 +7,9 @@ Watches both agents' session logs for turn completion, and relays a short
     Claude implements ──end_turn──▶ poke Codex: "read with `peer`, review"
     Codex reviews   ──task_complete──▶ poke Claude: "read with `peer`, fix"
     … repeat until Codex's review leads with the stop sentinel (default [AIPAIR_REVIEW_OK]),
-      or the max-round safety cap is hit.
+      or the max-round safety cap is hit. When what is left needs a human decision, either side
+      leads with [AIPAIR_HUMAN_REQUIRED] and the relay stops (exit 8); without it, N unapproved
+      reviews in a row over an unchanged repo also stop it (exit 8, --stall-rounds, default 3).
 
 Plan mode (auto plan review):
   If Claude stops at the plan-approval dialog ("Would you like to proceed?"),
@@ -124,7 +126,7 @@ from .cli import build_parser
 from .log_lock import (claude_glob, codex_all, codex_cwd_matches, claude_matches_pane, lock_claude,
                        read_codex_since, codex_fallback, lock_codex, refresh_codex_lock,
                        refresh_claude_lock)
-from .review_protocol import (DEFAULT_POKE_CLAUDE, default_poke_codex, plan_poke_codex,
+from .review_protocol import (DEFAULT_POKE_CLAUDE, default_poke_codex, default_poke_claude, plan_poke_codex,
                               question_poke_codex, endless_poke_claude_pass, endless_poke_codex_next,
                               endless_poke_claude_next, plan_extra_comment)
 from .logs import c, log, dim, configure
@@ -300,6 +302,9 @@ def main():
         if val < 1:
             print(f"aipair-relay: {name} は 1 以上で指定してください（実際の値: {val!r}）", file=sys.stderr)
             return 2
+    if a.stall_rounds < 0:
+        print(f"aipair-relay: --stall-rounds は 0 以上で指定してください（実際の値: {a.stall_rounds!r}）", file=sys.stderr)
+        return 2
     if a.no_endless:
         a.endless = False
 
@@ -308,11 +313,15 @@ def main():
     cwd = os.path.realpath(os.path.expanduser(a.dir))
     stop_phrases = [s for s in a.stop.split("||") if s]
 
-    poke_codex = a.poke_codex or default_poke_codex(stop_phrases[0] if stop_phrases else "[AIPAIR_REVIEW_OK]")
-    poke_claude = a.poke_claude
     next_ask_phrases = [s for s in a.next_ask.split("||") if s]
     all_done_phrases = [s for s in a.all_done.split("||") if s]
     human_required_phrases = [s for s in a.human_required.split("||") if s]
+    # 通常のレビュー往復だけ《人間待ち》出口を案内する（endless の HUMAN_REQUIRED は task-list 分類が権威で
+    # 意味が違うので、レビュー文面では案内しない）。--human-required を空にすれば案内も検出もしない。
+    review_hr = human_required_phrases[0] if (human_required_phrases and not a.endless) else None
+    poke_codex = a.poke_codex or default_poke_codex(stop_phrases[0] if stop_phrases else "[AIPAIR_REVIEW_OK]",
+                                                    review_hr)
+    poke_claude = a.poke_claude or default_poke_claude(review_hr)
     poke_claude_pass = endless_poke_claude_pass(a.task_list, next_ask_phrases[0] if next_ask_phrases
                                                 else "[AIPAIR_NEXT]")
     poke_codex_next = endless_poke_codex_next(a.task_list,

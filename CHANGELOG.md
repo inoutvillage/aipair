@@ -77,6 +77,14 @@ task makes no progress across rounds) instead of guessing or spinning.
   approve edits" (no "bypass" wording), so the picker selects the first `Yes…` option.
 
 ### Fixed
+- **The normal review loop can stop for a human instead of spinning to the cap** — when the remaining review
+  points needed a human decision, Claude answered "waiting for the user's decision / already decided by the
+  user — no change" and Codex "still unfixed" / "no diff, can't judge"; neither could emit the only stop
+  sentinel, so the relay ran to max-rounds (measured: 115 Claude turns in one pair). Both review prompts now
+  offer `[AIPAIR_HUMAN_REQUIRED]` (not in endless mode, whose HUMAN_REQUIRED is decided by the task-list), and
+  either side declaring it stops the relay with exit 8. As a mechanical backstop, `--stall-rounds N`
+  (default 3, `0` = off) stops with exit 8 when N reviews in a row pass without approval while the repo
+  (HEAD, worktree diff, untracked files) stays unchanged; it is off outside a git repository.
 - **The skills and `aipair-relay-here -h` name the relay's real default sentinels** — they still gave the
   old Japanese defaults (「完了です」 to stop, 「次のタスクをください」 to ask for the next task, 「全タスク完了」 /
   「人間対応待ち」 as the terminals) although the code defaults are `[AIPAIR_REVIEW_OK]` / `[AIPAIR_NEXT]` /
