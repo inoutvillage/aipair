@@ -714,3 +714,16 @@ cli の既定が env を読まない）→ いずれも該当テストが FAIL�
   「終端 2 種: 全完了 `[AIPAIR_ALL_DONE]`・人間対応待ち `[AIPAIR_HUMAN_REQUIRED]`」と 2 種であることが明確な形にした。
 - [x] **Codex レビュー反映（relay-id:522171b8）**: `nightly.yml` L161 のコメントが `AIPAIR_STOP_SIDE=claude` を「below」と
   指していたが、設定は上（L117）にある → 「above」へ。同じ PR で書き換えている文の中の誤りなので、この PR で直した。
+
+## 追記: 版更新の簡略化（2026-09-24）
+
+> claude / codex の更新が頻繁（2.1.280 → 2.1.281 が翌日）で、版ゲートの追従に毎回多くの手作業が要っていた。
+> 方針（社長判断）: 実機検証はパッチ版でも毎回回す／全段が緑ならマージ・install まで自動で進める。
+
+- [x] 版ごとに書き足していた注記（CHANGELOG・README プランレビュー節・`relay.py` docstring の「2.1.247・2.1.268・2.1.280 では」）を
+  版に依存しない書き方へ。bump で書き換わるのは `corelib.TESTED_VERSIONS` と README「必要環境」表だけになった（どちらも検証ツールの
+  `--bump` が書き、`tests/doc-sync.py` が一致を強制する）
+- [x] 一括コマンド `aipair-bump`（repo 外・ローカル専用。検証ツールと同じ `~/.local/share/aipair-local/`）: 事前確認 → 実機検証＋bump →
+  ダイアログ画面の《構造》を前回合格時と比較（LLM の文面は無視・UI の文言と並びだけ）→ `tests/run-all.sh` → PR → CI 待ち → マージ →
+  install と一致確認 → このペアの relay を元の引数で再点火（`--allow-untested-dialogs` は外す）。赤ならその段で止まる
+- [x] 検証ツールの信頼ダイアログ判定を文言一覧から「番号/カーソル付き選択肢行の先頭語が肯定か」へ（CLI 更新のたびに止まっていた）

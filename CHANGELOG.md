@@ -68,13 +68,13 @@ task makes no progress across rounds) instead of guessing or spinning.
   terminal sentinel (`[AIPAIR_ALL_DONE]` / `[AIPAIR_HUMAN_REQUIRED]`) ends the run only when the
   classification agrees; a sentinel the classification does not support does not terminate the loop.
   Startup classification acts immediately (`ALL_DONE` → exit 0, `BLOCKED` → exit 8, `READY` → run).
-- **Tested CLI versions bumped to claude `2.1.280` / codex `0.156.0`** (`corelib.TESTED_VERSIONS`,
-  README「必要環境」) — verified against the real TUIs and transcripts, not bumped blind: the
+- **Tested CLI versions are raised only after a live check** (current pins: `corelib.TESTED_VERSIONS`,
+  README「必要環境」) — each bump is verified against the real TUIs and transcripts, not blind: the
   plan-approval and AskUserQuestion dialogs are detected and driven end-to-end (feedback → replan →
   shift+tab approval → the plan actually runs; multi-question tab scraping and the "Chat about this"
-  delivery), and `schema_probe` reads `ok` on a fresh claude session jsonl and codex rollout. On
-  claude 2.1.247, 2.1.268 and 2.1.280 the plan dialog's approve options are "Yes, and use auto mode" /
-  "Yes, manually approve edits" (no "bypass" wording), so the picker selects the first `Yes…` option.
+  delivery), and `schema_probe` reads `ok` on a fresh claude session jsonl and codex rollout. Since
+  claude 2.1.247 the plan dialog's approve options are "Yes, and use auto mode" / "Yes, manually
+  approve edits" (no "bypass" wording), so the picker selects the first `Yes…` option.
 
 ### Fixed
 - **The skills and `aipair-relay-here -h` name the relay's real default sentinels** — they still gave the
