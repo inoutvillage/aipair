@@ -72,9 +72,13 @@ def build_parser(description=""):
                     help="endless: Codex 側が残タスク無しを宣言する終端 sentinel（default [AIPAIR_ALL_DONE] / env AIPAIR_ALL_DONE）")
     ap.add_argument("--human-required",
                     default=_env_str("AIPAIR_HUMAN_REQUIRED", "[AIPAIR_HUMAN_REQUIRED]"),
-                    help="endless: Codex 側が『残りは人間対応・外部依存の [!] のみ』を宣言する終端 sentinel。"
-                         "relay の task-list 分類が BLOCKED の時のみ honor し exit 8 で停止する"
+                    help="人間待ちの sentinel。endless: Codex 側が『残りは人間対応・外部依存の [!] のみ』を宣言する"
+                         "終端（task-list 分類が BLOCKED の時のみ honor）。通常のレビュー往復: Claude / Codex の"
+                         "どちらかが『残りは人間の判断事項』と宣言すると exit 8 で停止。質問リレーでも使う"
                          "（default [AIPAIR_HUMAN_REQUIRED] / env AIPAIR_HUMAN_REQUIRED）")
+    ap.add_argument("--stall-rounds", type=int, default=3,
+                    help="通常のレビュー往復: 合格が出ないまま repo（HEAD と作業ツリー）が N 往復続けて変わらなければ"
+                         " exit 8（進捗なし）で停止。git 管理外の dir では働かない。0 で無効（既定 3）")
     ap.add_argument("--task-list", default=_env_str("AIPAIR_TASK_LIST", "tasks/todo.md"),
                     help="endless: 次タスクの唯一の根拠にするタスクリスト（default tasks/todo.md / env AIPAIR_TASK_LIST）")
     ap.add_argument("--gate", default=_env_str("AIPAIR_GATE", None),
@@ -91,7 +95,8 @@ def build_parser(description=""):
     ap.add_argument("--busy-wait", type=int, default=90,
                     help="poke 前に相手ペインのアイドルを待つ上限秒。超過後は中止せず注入を続行する（既定90）")
     ap.add_argument("--settle", type=float, default=1.2, help="settle seconds before relaying")
-    ap.add_argument("--poke-claude", default=DEFAULT_POKE_CLAUDE)
+    ap.add_argument("--poke-claude", default=None,
+                    help="default: レビュー対応の依頼（人間待ち sentinel の案内付き）")
     ap.add_argument("--poke-codex", default=None, help="default references the stop phrase")
     ap.add_argument("--plan-rounds", type=int, default=5,
                     help="max plan-review rounds per plan (default 5)")

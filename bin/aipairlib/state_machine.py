@@ -27,6 +27,7 @@ P2-1 は relay の巨大な状態機械を《state 単位》へ分割し、relay
 「未配達を確定して停止すべきか」を bool で返す（True の直前に warn 済み）。
 """
 import os
+import hashlib
 import subprocess
 import time
 
@@ -59,6 +60,60 @@ BLOCKED_HR_REASON = "人間対応待ち（HUMAN_REQUIRED）"
 BLOCKED_NOPROGRESS_REASON = "進捗なし（BLOCKED / no-progress）"
 QUESTION_HR_REASON = "質問に人間判断が必要（HUMAN_REQUIRED）"    # P1-2: AskUserQuestion 経路の exit 8
 QUESTION_OVERSIZE_REASON = "質問が自動中継上限超過（HUMAN_REQUIRED）"    # P1-3: truncate せず停止
+# 通常のレビュー往復の停止理由（2026-09-24 maroari 実障害: 「ユーザー判断待ち」↔「未修正」の空回り）
+REVIEW_HR_REASON = "レビューの残りが人間判断（HUMAN_REQUIRED）"
+REVIEW_STALL_REASON = "レビュー往復が停滞（進捗なし）"
+
+
+def repo_fingerprint(cwd):
+    """repo の状態の指紋（HEAD・変更/未追跡ファイルの一覧・差分本文・未追跡ファイルの大きさと時刻）。
+    git 管理外・git が失敗した時は None（＝停滞検出を働かせない。推測で止めない）。"""
+    def git(*args):
+        return subprocess.run(["git", "-C", cwd] + list(args), capture_output=True, timeout=30)
+    try:
+        head = git("rev-parse", "HEAD")
+        status = git("status", "--porcelain=v1", "-uall", "-z")
+        diff = git("diff", "HEAD", "--binary")
+        untracked = git("ls-files", "-o", "--exclude-standard", "-z")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if any(r.returncode != 0 for r in (head, status, diff, untracked)):
+        return None
+    h = hashlib.sha1(head.stdout + b"\0" + status.stdout + b"\0" + diff.stdout)
+    for name in untracked.stdout.split(b"\0"):
+        if name:
+            try:
+                st = os.stat(os.path.join(cwd, os.fsdecode(name)))
+                h.update(name + b"%d:%d" % (st.st_size, st.st_mtime_ns))
+            except OSError:
+                h.update(name + b"?")
+    return h.hexdigest()
+
+
+def advance_stall(prev, fp):
+    """合格が出なかったレビュー 1 回ごとの停滞ストリーク（純関数）。prev=(指紋, 回数) or None。
+    指紋が前回と同じなら +1、変われば 0 から数え直す。指紋が取れない（None）なら数えない。"""
+    if fp is None:
+        return None
+    if prev and prev[0] == fp:
+        return (fp, prev[1] + 1)
+    return (fp, 0)
+
+
+def review_hr_banner_lines(who, text, rounds, exit_code):
+    return [(None, ""),
+            ("warn", "│ ■ 自動処理を停止しました"),
+            ("warn", f"│   理由: {who} が『残りは人間の判断事項』と宣言（HUMAN_REQUIRED・exit {exit_code}・{rounds} 往復）"),
+            ("warn", "│   " + oneline(text)[:300]),
+            ("warn", "│   判断を伝えてから relay を再点火してください（aipair-relay-here）。")]
+
+
+def review_stall_banner_lines(streak, rounds, exit_code):
+    return [(None, ""),
+            ("warn", "│ ■ 自動処理を停止しました"),
+            ("warn", f"│   理由: 合格が出ないまま repo（HEAD と作業ツリー）が {streak} 往復続けて変わっていません"
+                     f"（進捗なし・exit {exit_code}・{rounds} 往復）"),
+            ("warn", "│   Claude と Codex の見解が平行線か、人間の判断待ちの可能性があります。peer-log both で確認してください。")]
 
 
 class ResponseGate:
@@ -414,6 +469,7 @@ class StateMachine:
         all_done_hit = False
         blocked_reason = None          # code==8 のサブ理由（BLOCKED_HR_REASON / BLOCKED_NOPROGRESS_REASON）
         np_state = None                # no-progress guard の (id, hash, streak)。Codex 次タスク指示ごとに更新
+        stall = None                   # 通常レビューの停滞ストリーク (repo 指紋, 回数)。合格しなかったレビューごとに更新
         # 起動時分類が権威（社長指示 §2）: 既に ALL_DONE なら 1 度も poke せず即 exit 0、BLOCKED（[!] のみ）
         # なら即 exit 8。READY の時だけループを開始する。
         if _startup_state == tasklist.ALL_DONE:
@@ -471,6 +527,11 @@ class StateMachine:
                         if text:
                             dim(c("claude", "claude") + ": " + oneline(text))
                         gate_msg = None
+                        # 通常のレビュー往復: Claude が『残りは人間の判断事項』と宣言したら Codex へ回さず止める
+                        if (not a.endless) and human_required_phrases and hit_stop(texts, human_required_phrases):
+                            blocked_reason = REVIEW_HR_REASON
+                            code = EXIT_BLOCKED
+                            print_banner(review_hr_banner_lines("Claude", text, rounds, EXIT_BLOCKED)); break
                         if (not a.endless) and a.stop_side in ("claude", "both") and hit_stop(texts, stop_phrases):
                             ok_gate, gate_msg = gate_or_message(a, gate_state, cwd)
                             if ok_gate:
@@ -739,6 +800,19 @@ class StateMachine:
                             if gate_msg is None:
                                 code = 6; break
                             msg_claude = back_text = gate_msg          # review passed, gate did not → back to Claude
+                        # 通常のレビュー往復で合格が出なかった時: 人間待ちの宣言か、repo が進まない停滞なら止める。
+                        # （合格＋ゲート失敗の差し戻しは Claude に直す点があるので数えない）
+                        if (not a.endless) and msg_claude is poke_claude:
+                            if human_required_phrases and hit_stop(texts, human_required_phrases):
+                                blocked_reason = REVIEW_HR_REASON
+                                code = EXIT_BLOCKED
+                                print_banner(review_hr_banner_lines("Codex", text, rounds, EXIT_BLOCKED)); break
+                            if getattr(a, "stall_rounds", 0):
+                                stall = advance_stall(stall, repo_fingerprint(cwd))
+                                if stall and stall[1] >= a.stall_rounds:
+                                    blocked_reason = REVIEW_STALL_REASON
+                                    code = EXIT_BLOCKED
+                                    print_banner(review_stall_banner_lines(stall[1], rounds, EXIT_BLOCKED)); break
                         # 連続モードの終端は task-list 分類が権威（社長指示 2026-08-24 §2）。Codex の終端
                         # sentinel（[AIPAIR_ALL_DONE]/[AIPAIR_HUMAN_REQUIRED]）は分類が一致した時だけ honor し、
                         # 着手可 [ ] が残る（READY）なら sentinel を無視して継続する（誤 sentinel で止めない）。

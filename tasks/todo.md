@@ -732,3 +732,15 @@ cli の既定が env を読まない）→ いずれも該当テストが FAIL�
 
 - [x] 実機検証 30 / 30 PASS（ローカル検証ツール・私設 tmux socket）。ダイアログ画面: 前回（claude-2.1.280_codex-0.156.0）と同一構造
 - [x] `corelib.TESTED_VERSIONS` と README「必要環境」表を更新、`bash tests/run-all.sh` 全緑
+
+## 追記: 通常のレビュー往復が「ユーザー判断待ち」↔「未修正」で空回りする（2026-09-24）
+
+> 実障害（maroari ペア）: Claude「ユーザー判断待ち／裁定済み・修正なし」↔ Codex「同じ 2 点が未修正／差分なしで判定不能」が、
+> 合格 sentinel も停止手段も無いまま上限往復まで空回り（1 セッションで Claude 115 ターン・Codex 80 ターン）。原因: 通常モードの
+> 出口が Codex の `[AIPAIR_REVIEW_OK]` と max-rounds だけ（HUMAN_REQUIRED と no-progress は endless 専用）。方針（社長判断）: 両方入れる。
+
+- [x] 合図: 通常モードの Codex / Claude 両方の依頼文に `[AIPAIR_HUMAN_REQUIRED]` の出口を案内（コードで直す点が残る時は使わせない）。
+  relay は Claude 完了時（Codex へ回さず）・Codex 完了時（合格でない時）に先頭行一致で exit 8。endless のレビュー文面には出さない
+- [x] 機械的な止め: `--stall-rounds N`（既定 3・0 で無効）— 合格が出ないレビューが続く間、repo の指紋（HEAD・`git diff HEAD`・
+  status・未追跡ファイルの大きさ/時刻）が N 回続けて変わらなければ exit 8（進捗なし）。git 管理外では働かない
+- [x] テスト `ReviewLoopExits`（10 件・実 `run()` を駆動する 6 件を含む）。修正前の state_machine では 3 件が落ちる

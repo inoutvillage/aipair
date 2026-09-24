@@ -61,12 +61,32 @@ def plan_extra_comment(texts, plan_ok):
     return texts[-1].replace(plan_ok, "", 1).strip(" 。、！!\n\t「」")
 
 
-def default_poke_codex(stop):
+# 通常のレビュー往復の《人間待ち》出口（2026-09-24 maroari 実障害: Claude「ユーザー判断待ち/裁定済み・修正なし」
+# ↔ Codex「未修正/差分なしで判定不能」が合格も停止もできず 100 ターン超空回りした）。残りが人間の判断事項なら、
+# どちらの側も先頭行の sentinel で relay を exit 8 に止められる。コードで直すべき点が残る時は使わせない。
+def _review_hr_codex(human_required):
+    return (f" ただし、残る指摘がすべて《人間の判断事項》（仕様・方針の選択、ユーザーが既に裁定した事項、"
+            f"本番操作・課金・契約など）で Claude のコード修正では解決しない場合、または Claude が人間の回答待ちで"
+            f"レビューすべき新しい変更が無い場合は、最終回答の【1行目】に {human_required} を単独で出力し、"
+            f"人間に判断してほしい点を簡潔に列挙してください（relay は人間の判断待ちとして停止します）。"
+            f"コードで直すべき点が残る場合は使わないこと。") if human_required else ""
+
+
+def default_poke_codex(stop, human_required=None):
     return (f"【自動レビューループ】Claudeが実装/修正を更新しました。`peer` でClaudeの最新の発言を読み、"
             f"コードをレビューしてください。あなたの返答は自動でClaudeに共有されます—人間に伝言を頼まないでください。"
             f"修正が必要なら具体的に指摘してください（その場合は下記の合格シグナルを書かないこと）。"
             f"これ以上直す点が無い場合のみ、最終回答の【1行目】に {stop} を単独で"
-            f"（同じ行に他の文字を書かず）出力してください。否定文・引用・説明の中に書いても合格にはなりません。")
+            f"（同じ行に他の文字を書かず）出力してください。否定文・引用・説明の中に書いても合格にはなりません。"
+            + _review_hr_codex(human_required))
+
+
+def default_poke_claude(human_required=None):
+    hr = (f" ただし、指摘への対応に人間の判断が必要でコードを変えない場合（仕様・方針の決定待ち、ユーザー裁定済みの"
+          f"事項で Codex と見解が分かれる等）は、最終回答の【1行目】に {human_required} を単独で出力し、"
+          f"人間に判断してほしい点を簡潔に列挙してターンを終えてください（relay は人間の判断待ちとして停止します）。"
+          ) if human_required else ""
+    return DEFAULT_POKE_CLAUDE + hr
 
 
 # --- endless mode の poke 文面 ---------------------------------------------- #
