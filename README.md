@@ -372,7 +372,7 @@ Claude がプランモードで **「Would you like to proceed?」の承認待�
 1. ダイアログからプランファイルのパス（`~/.claude/plans/*.md`）を読み取り、**Codex にレビュー依頼**
 2. Codex の返答で分岐:
    - **修正要求** → 「Tell Claude what to change」を選択し、レビュー本文をペーストして **Enter**（Claude がプラン修正 → 再度ダイアログ → 繰り返し）
-   - **承認**（先頭行に `[AIPAIR_PLAN_APPROVED]` を単独で）→ 先頭の「Yes…」（claude 2.1.247・2.1.268・2.1.280 では「Yes, and use auto mode」。旧 UI の「Yes, and bypass permissions」が出る版ではそちらを優先）を選択して実装開始
+   - **承認**（先頭行に `[AIPAIR_PLAN_APPROVED]` を単独で）→ 先頭の「Yes…」（claude 2.1.247 以降の検証済み版では「Yes, and use auto mode」。旧 UI の「Yes, and bypass permissions」が出る版ではそちらを優先）を選択して実装開始
    - **承認＋付帯コメント** → feedback をペーストして **shift+tab**（feedback 付き承認）
 3. プランレビューは 1 プランにつき最大 5 回（`--plan-rounds`）。超過時はベルを鳴らして人間に委ねる
 
