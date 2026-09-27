@@ -262,8 +262,9 @@ peer-log codex --full      # セッション全体
 | `AIPAIR_STOP` | `[AIPAIR_REVIEW_OK]` | 停止 sentinel（`\|\|` 区切りで複数可）。**最終回答の先頭行に単独で置かれた時のみ成立**（否定文・引用・文中言及では不成立）。例: `AIPAIR_STOP="LGTM\|\|[AIPAIR_REVIEW_OK]"` |
 | `AIPAIR_STOP_SIDE` | `codex` | どちらの発言で止めるか（`codex` / `claude` / `both`） |
 | `AIPAIR_START_SIDE` | `claude` | relay が**最初に完了を待つ相手**（`claude` / `codex`）。`codex` は Codex の完了を先に待ち、その結果を Claude へ渡して通常の往復に入る（**役割交換ではない**）。`aipair loop`（`--start-side codex` でも可）と `aipair-relay-here` が読む。**起動ごとの指定で保存はされない**（再点火でも指定し直す） |
-| `AIPAIR_MAX_ROUNDS` | `20` | 最大往復数（暴走防止） |
+| `AIPAIR_MAX_ROUNDS` | `20`（autopilot では未設定＝上限なし） | 最大往復数（暴走防止）。`--autopilot` では明示した時だけ効く |
 | `AIPAIR_ENDLESS` | （未設定＝off） | `1` で連続モード（→ 次節） |
+| `AIPAIR_AUTOPILOT` | （未設定＝off） | `1`（または `aipair loop --autopilot`）で完全自走モード: 人間の判断待ちで止めず Codex が代理判断（→「完全自走モード」） |
 | `AIPAIR_TASK_LIST` | `tasks/todo.md` | 連続モードの次タスクの根拠ファイル |
 | `AIPAIR_NEXT_ASK` | `[AIPAIR_NEXT]` | 連続モード: Claude の手持ちが尽きた合図 sentinel（先頭行に単独で） |
 | `AIPAIR_ALL_DONE` | `[AIPAIR_ALL_DONE]` | 連続モード: Codex の終端 sentinel（分類 ALL_DONE 時のみ・exit 0。先頭行に単独で） |
@@ -308,6 +309,7 @@ peer-log codex --full      # セッション全体
   |---|---|
   | 通常モード | `relay ● 1タスク / max 20 / 停止 [AIPAIR_REVIEW_OK] / Ctrl-C で停止` |
   | 連続モード | `relay ● endless / max 100 / 終端 DONE/HUMAN / Ctrl-C で停止` |
+  | 完全自走モード | `relay ● autopilot 1タスク / max ∞ / …`（endless と併用なら `autopilot endless / …`） |
   | 終了後 | `relay ■ 終了(全タスク完了) / 3往復` ／ `■ 終了(人間対応待ち)` ／ `■ 終了(キャップ到達)` ／ `■ 終了(配達失敗)` ／ `■ 終了(停止ゲート失敗)` ／ `■ 中断` |
 
 ### 連続モード（endless）— 全タスクが尽きるまで止めない
@@ -344,6 +346,34 @@ Claude 実装 ──▶ Codex レビュー
   単独で置かれた時だけ効きます。`[AIPAIR_ALL_DONE]` / `[AIPAIR_HUMAN_REQUIRED]` は **relay の task-list 分類が
   それぞれ ALL_DONE / BLOCKED に一致した時のみ**成立します（不一致＝着手可が残るなら無視して継続）。
   窓内に偶発的に書かれると誤検知しますが、いずれも**早く止まる/次に進む方向**に倒れます。
+
+### 完全自走モード（autopilot）— 人間の判断待ちで止めない
+
+**`aipair loop --unsafe --autopilot`**（または `AIPAIR_AUTOPILOT=1`・`aipair-relay-here --autopilot`）にすると、
+relay は人間の判断待ちで止まらず、**Codex が人間（依頼者）の代理として答えて**最後まで走り切ります。連続モード
+（`--endless`）と併用できます（「1 回指示したら todo が尽きるまで止まらない」）。
+
+- **人間待ちの sentinel を案内しない**。Claude / Codex が `[AIPAIR_HUMAN_REQUIRED]` を出しても停止せず、Codex に代理判断させる。
+  Codex へのレビュー依頼には「Claude の発言に含まれる人間への質問・確認は、すべて列挙して 1 つずつ代理で回答」を入れる。
+- **取り返しのつかない操作は実行させない**: 本番デプロイ・課金・公開 push・データ削除などは、ステージング・dry-run・
+  実行を見送る等の**元に戻せる選択肢を選んで先へ進める**（人間の確認は待たない）。
+- **秘密情報は推測・入力させない**: API キー・パスワード・トークン等が要る作業は、秘密を要しない選択肢（スキップ・後回し・
+  モック）で代替して保留として残し、次へ進む。
+- **上限で止めず《収束の段》で必ず前へ進める**（無限ループの防止）:
+
+  | 現象 | 段 |
+  |---|---|
+  | プランレビュー（`--plan-rounds` 既定 5） | 5 回までは通常 → 6 回目は「致命的でなければ承認し、残りは付帯コメントに」 → 7 回目以降は relay が **Codex の指摘を付帯コメントにして承認** |
+  | 質問リレー（`--question-rounds` 既定 5） | 5 回までは通常 → 6 回目は「全問決め切り、以後は質問せず進めるよう Claude に明記」 → 7 回目以降は relay が**安全側の固定回答**（元に戻せる選択肢を優先・全肢が不可逆なら実行しない／dry-run・それ以外は Recommended、無ければ 1 番）を配達 |
+  | レビュー停滞（`--stall-rounds` 既定 3） | 合格が出ないまま repo が 3 往復不変 → Codex に**膠着打破**（具体的な差分指示か、許容して合格か）→ その指示を Claude へ → まだ不変なら Codex に**合格を最終依頼** → それでも出なければ relay が**強制合格**（残課題＝Codex の最後の指摘を banner とログに残す。exit 0・タイトル「強制合格」） |
+  | 連続モードの no-progress（同一タスクが進捗なく 3 回選択） | Claude にそのタスクを `- [!]`＋`blocker:` にするよう依頼 → 同じタスクで再発したら relay が task-list を直接 `[!]` 化して Codex に次を選ばせる |
+  | 質問が自動中継上限（3000 字）を超える | 全文を `~/.cache/aipair/questions/` に所有者だけが読める権限（0600）で書き出し、Codex にはそのパスを渡す（truncate しない）。回答後に削除 |
+
+- `--max-rounds` は**明示した時だけ**効く（既定は上限なし）。
+- 残る停止は**技術的に安全に操作できない**時だけ: poke 配達失敗（4）・ダイアログを安全に操作できない／版の不一致で自動操作 OFF（5）・
+  停止ゲートの連続失敗（6）・ログ schema 不一致（7）・連続モードで AI では実行不能な `[!]` だけが残った正当な終端（8）。
+  連続モードの no-progress で**どのタスクか同定できないまま 2 度続いた**場合だけは relay が保留化できないので 8 で止まる。
+- 使うのは**ユーザーが明示的に選んだ時だけ**（Claude / Codex が勝手に付けない）。
 
 ### relay の再点火（`aipair-relay-here`）
 
@@ -392,7 +422,10 @@ Claude が **AskUserQuestion（選択式の質問ダイアログ）** で停止�
 3. **Codex へ 1 往復で依頼**: 全質問を poke に畳んで送信（「N 問目: 選択肢 M（ラベル）」形式で回答指示）
 4. **「Chat about this」経由で配達**: chat 押下でダイアログは「User declined to answer questions」として解決しコンポーザへ戻る →
    Codex の回答本文を後追いメッセージとしてペースト送信。Claude は回答を読んで続行する
-5. 連続上限 `--question-rounds` 回（Claude のターン完了でリセット）。超過・poke 失敗はベルを鳴らして停止し人間に委ねる
+5. **全問回答の照合**: 回答に「N問目」が無い問があれば、その問だけ Codex に 1 回追加で聞き、先の回答とまとめて配達する
+   （それでも欠けたら、その問は「元に戻せる安全な選択肢を優先 → Recommended」で決めるよう注記して配達）
+6. 連続上限 `--question-rounds` 回（Claude のターン完了でリセット）。超過・poke 失敗はベルを鳴らして停止し人間に委ねる
+   （`--autopilot` では停止せず収束の段へ）
 
 Codex のレビュー配達時（通常ループ）も、Claude が質問ダイアログ表示中なら poke ではなく
 「Chat about this」経由で配達する（poke の nonce 数字が選択として誤解釈されるリスクの根本遮断）。
@@ -431,9 +464,9 @@ Codex のレビュー配達時（通常ループ）も、Claude が質問ダイ�
 |---|---|
 | 0 | 停止 sentinel 検知（正常完了）。連続モードでは分類 ALL_DONE ＋ Codex の `[AIPAIR_ALL_DONE]` 宣言（起動時点で ALL_DONE なら 1 度も駆動せず即時 exit 0） |
 | 2 | 起動エラー（session/pane 不明等）・env の不正値 |
-| 3 | 最大往復キャップ到達 |
+| 3 | 最大往復キャップ到達（`--autopilot` では `--max-rounds` を明示した時だけ） |
 | 4 | poke 配達失敗 |
-| 5 | プランレビュー/質問リレーの上限到達・選択肢欠落・操作できないダイアログで停止（自動操作 OFF／版の再判定で不可。画面は触らない） |
+| 5 | プランレビュー/質問リレーの上限到達（`--autopilot` では起きない）・選択肢欠落・操作できないダイアログで停止（自動操作 OFF／版の再判定で不可。画面は触らない） |
 | 6 | 停止ゲート（`--gate`）が `--gate-rounds` 回失敗 |
 | 7 | ログ JSONL schema がコア relay の依存キーと不一致（**fail-closed**。`--allow-untested-schema` で継続） |
 | 8 | **人間の判断待ち・進捗なし**。通常のレビュー往復: Claude / Codex が `[AIPAIR_HUMAN_REQUIRED]` を宣言／合格が出ないまま repo が `--stall-rounds` 往復変わらない。連続モード: 実行可能タスクが尽き人間対応の `[!]` のみ残存（HUMAN_REQUIRED）／同一タスクで進捗停止（no-progress）。max-rounds とは別扱い。人間対応後に再開 |

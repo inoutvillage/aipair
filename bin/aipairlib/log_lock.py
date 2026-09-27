@@ -61,6 +61,33 @@ def _last_assistant_entry(path):
     return last
 
 
+_SESSION_UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def pane_session_id(pane):
+    """ペインで今動いている claude プロセスの cmdline から `--session-id` / `--resume`（`-r`）の UUID を返す。
+    aipair は Claude を `--session-id <uuid>` で起動するので、ログ `<uuid>.jsonl` をプロセスから一意に
+    特定できる（画面の文字列照合に頼らない）。/proc が無い・プロセス不明・UUID でない時は None。"""
+    ident = peerlog.cli_process(pane, "claude")
+    if not ident:
+        return None
+    try:
+        with open("/proc/%d/cmdline" % ident[0], "rb") as fh:
+            args = [a.decode("utf-8", "replace") for a in fh.read().split(b"\0")]
+    except OSError:
+        return None
+    for i, arg in enumerate(args):
+        for flag in ("--session-id", "--resume", "-r"):
+            val = None
+            if arg == flag and i + 1 < len(args):
+                val = args[i + 1]
+            elif arg.startswith(flag + "="):
+                val = arg.split("=", 1)[1]
+            if val and _SESSION_UUID.match(val):
+                return val
+    return None
+
+
 def claude_matches_pane(path, pane):
     """候補 jsonl がそのペインのセッションか、画面内容との突き合わせで照合する。
     同一プロジェクト dir に複数の Claude セッション（ワーカー + 別ペインのアシスタント会話等）が
@@ -71,7 +98,15 @@ def claude_matches_pane(path, pane):
        スクロールバックが無いため、可視画面 = 直近の transcript）
     2) プランダイアログ表示中: 画面はダイアログに占有され transcript が見えないため、
        「最後の assistant エントリが ExitPlanMode の tool_use で終わっている」=
-       承認待ち状態のペインと整合するログか、で照合する"""
+       承認待ち状態のペインと整合するログか、で照合する
+
+    0) 最優先: ペインの claude プロセスの `--session-id` がログのファイル名と一致すれば一致（pane_session_id）。
+       2026-09-25 実障害: Claude Code の画面表示がログの発言と文面が異なる（言い換えて表示される）ことがあり、
+       1) の断片照合が正しいログでも失敗し続けて relay が「誤ピン疑い→強制 re-lock」を繰り返し、Claude の完了を
+       Codex へ渡せなかった。ID が一致しない時（/clear 等でセッションが切り替わった後）は従来の 1) 2) に回す。"""
+    sid = pane_session_id(pane)
+    if sid and os.path.basename(path) == sid + ".jsonl":
+        return True
     try:
         cap = tmux("capture-pane", "-p", "-t", pane, "-S", "-300", capture=True).stdout
     except subprocess.CalledProcessError:

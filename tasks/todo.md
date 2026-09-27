@@ -744,3 +744,71 @@ cli の既定が env を読まない）→ いずれも該当テストが FAIL�
 - [x] 機械的な止め: `--stall-rounds N`（既定 3・0 で無効）— 合格が出ないレビューが続く間、repo の指紋（HEAD・`git diff HEAD`・
   status・未追跡ファイルの大きさ/時刻）が N 回続けて変わらなければ exit 8（進捗なし）。git 管理外では働かない
 - [x] テスト `ReviewLoopExits`（10 件・実 `run()` を駆動する 6 件を含む）。修正前の state_machine では 3 件が落ちる
+
+## 実装: 完全自走モード `--autopilot`（2026-09-25・社長確認済み: 不可逆は安全側で続行／max-rounds は明示時のみ／停滞は強制合格あり）
+
+> 要望: 人間の判断待ちで relay を止めず、Codex が人間の代理として答えて完成まで走り切るモードを引数で起動したい。
+> プランレビュー／質問リレーは「上限で停止」ではなく「ループにならない答え方へ段階的に寄せる」ブロッカーで収束させる。
+> 質問リレーは全問を抽出し、全問に答えたことを relay が確かめる。
+> 起動: `aipair loop --autopilot` / `aipair-relay-here --autopilot` / `AIPAIR_AUTOPILOT=1`。未指定なら現行挙動のまま（既存テスト不変）。
+
+人間待ちで止まる箇所 → autopilot での置き換え（止める代わりに「収束の階段」を上がる）:
+
+| 現行の停止 | autopilot |
+|---|---|
+| レビュー: どちらかが `[AIPAIR_HUMAN_REQUIRED]`（exit 8） | 文面で案内しない。Codex に「人間の代わりにあなたが決めて Claude に指示」。Claude が出したら Codex へ代理判断を依頼 |
+| レビュー: 停滞 N 往復（exit 8） | 段1: Codex に膠着打破を依頼（具体的な差分指示か、許容して合格か二択）→ 段2: 合格を指示 → 段3: relay が強制合格（残課題を banner とログに残す） |
+| プラン: `--plan-rounds` 到達（exit 5） | 段1: 「致命的でなければ feedback 付き承認」→ 段2: relay が Codex の返答を feedback として付けて承認（必ず前に進む） |
+| 質問: `--question-rounds` 到達（exit 5） | 段1: Codex に「全問決め切り、以後は質問せず推奨案で進めるよう Claude に明記」→ 段2: relay が固定文を配達「元に戻せる安全な選択肢を優先（不可逆操作を含む肢は選ばない／全肢が不可逆なら実行しない・dry-run）、それ以外は Recommended（無ければ 1 番）。以後質問禁止」 |
+| 質問: Codex が HUMAN_REQUIRED（exit 8） | 案内しない。出たら代理回答を再依頼 |
+| 質問: 3000 字超（exit 8） | 全文をファイルへ書き出し、Codex にはパスを渡す（truncate しない） |
+| endless: 同一タスクの no-progress（exit 8） | Codex に「そのタスクを `[!]`＋blocker にして次へ」を依頼 → 分類が進んで収束 |
+| max-rounds（exit 3） | 明示指定が無ければ適用しない（収束の階段が代わり） |
+
+質問の全問回答:
+- [x] 全問（タブ全部・選択肢込み）を番号付きで Codex へ渡し、回答を「N問目:」で全問書くよう指定
+- [x] relay が回答の「N問目」を照合し、欠けた問があれば欠けた番号だけ Codex に追加回答を依頼してから配達（再依頼は 1 回、それでも欠けたら欠けた問は「安全な選択肢優先→推奨案」で決めるよう明記して配達）
+- [x] 通常レビューでも: Claude の発言に人間への質問が含まれていたら、Codex が全部列挙して代理回答する旨を文面に入れる
+
+変えないもの（技術的な fail-closed。人間の判断ではなく「安全に操作できない」停止）:
+- 配達失敗 4 / ダイアログ操作不能・版不一致 5 / 停止ゲート失敗 6 / schema 不一致 7 / endless の BLOCKED（AI では実行不能な `[!]` だけ残る＝やれることは全部終わった）
+
+作業:
+- [x] `cli.py`: `--autopilot`（env `AIPAIR_AUTOPILOT`）。`aipair` / `aipair-relay-here` の env 転送と bridge 引数
+- [x] `review_protocol.py`: autopilot 用の文面（代理判断・収束段・全問回答）
+- [x] `autopilot_flow.py`（新・純関数）: 収束の段の判定・回答の問番号照合。state_machine は結果を適用するだけ（P2-5 の流儀）
+- [x] `state_machine.py`: 上表の各停止点で autopilot なら段へ分岐
+- [x] テスト: 純関数の単体＋実 `run()` を駆動する（プラン段2の強制承認／質問の欠番再依頼／停滞→強制合格／HR を代理判断へ）
+- [x] README・スキル・周知ブロック・CHANGELOG
+
+- [x] Codex レビュー（relay-id:6ade3474）対応: force 段の固定回答・欠番注記を「Recommended/1 番」から
+  「元に戻せる安全な選択肢を優先（全肢が不可逆なら実行しない・dry-run）→ それ以外は Recommended」へ
+- [x] endless の autopilot: タスク内のレビュー往復にも停滞の段を適用／no-progress は Claude に `[!]` 化を依頼 →
+  同じタスクで再発したら relay が `tasklist.mark_blocked` で直接保留化（唯一の残る停止: タスクを同定できないまま 2 度 = exit 8）
+
+- [x] Codex レビュー（relay-id:7cdfc4da）対応: (P1) プラン最終段で空の返答（no_text）が続くと再依頼が際限なく続く →
+  ダイアログが画面にあり承認肢があれば承認。(P1) git 管理外で停滞の段が働かない → autopilot だけ `dir_fingerprint`
+  （作業ツリーのパス・大きさ・時刻、node_modules 等は除外・上限 2 万件）で代替
+
+- [x] Codex レビュー（relay-id:09df4422）対応: (P1) 秘密情報・認証情報は推測・捏造・入力させず、要る作業は秘密不要の肢
+  （スキップ・後回し・モック）で代替して保留 — 固定回答・欠番注記・Codex/Claude への文面すべてに。(P2) `dir_fingerprint` は
+  上限超過なら部分指紋を返さず None → autopilot は `NO_FINGERPRINT` として数え、収束の段は stall_rounds×3 往復から。
+  (P2) 質問の書き出しはディレクトリ 0700・ファイル 0600（O_EXCL）で作り、回答配達・再依頼・停止・中断の時点で削除
+
+### レビュー（結果）
+- `bash tests/run-all.sh` 全緑（relay-parsers 274・当初 264・launch-cmds 90・env-forward 37 ほか）。新規: `AutopilotMode` 18 件
+  （うち実 `run()` 駆動 10 件）＋ endless の no-progress 保留化 1 件＋ launcher/relay-here の引数・env 転送
+- 未検証: 実ペア（tmux・実 CLI）での autopilot 走行。既定モードの挙動は変えていない（質問の全問照合のみ全モード共通で追加）
+
+## 追記: Claude の完了が Codex へ渡らない（2026-09-25・実障害）
+
+> 症状: Codex のレビューは Claude へ配達できたが、Claude のターン完了後に relay が「完了検知したが追跡ログがペイン照合に
+> 不一致（誤ピン疑い）→ 強制 re-lock」を繰り返し、round 2 へ進まなかった。
+> 原因: `claude_matches_pane` は「ログの直近発言の先頭/末尾 40 字が画面に見えるか」で照合するが、Claude Code の画面には
+> ログと**文面の異なる言い換え**が表示されていた（例: ログ「原因が見えました。Codex のレビューは Claude に届いていて…」／
+> 画面「原因がわかりました。Codexのレビューは届いているものの…」）。正しいログでも照合に失敗していた。
+
+- [x] `log_lock.pane_session_id`: ペインの claude プロセスの cmdline（`/proc`）から `--session-id` / `--resume` の UUID を取得。
+  `claude_matches_pane` はこれがログのファイル名と一致すれば画面を見ずに一致とする（不一致・取得不可は従来の画面照合）
+- [x] 回帰テスト `ClaudePaneIdentityBySessionId`（3 件）。`bash tests/run-all.sh` 全緑（relay-parsers 267）
+- [ ] 反映: インストール（`aipair-install.sh`）→ このペアの relay を再点火（未実施・社長確認待ち）

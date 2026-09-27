@@ -15,6 +15,9 @@
 #   --start-side claude|codex (or AIPAIR_START_SIDE; `aipair loop` only): which agent the
 #   relay waits on first (default claude). codex = wait for Codex to finish, then hand its
 #   result to Claude and continue as usual — NOT a role swap.
+#   --autopilot (or AIPAIR_AUTOPILOT=1; `aipair loop` only): fully autonomous relay — never stops
+#   for a human decision; Codex answers as the human's proxy (irreversible operations are not run,
+#   a reversible option is chosen instead). No round cap unless AIPAIR_MAX_ROUNDS is set.
 #
 # Layout:
 #   ┌───────────────┬───────────────┐
@@ -53,11 +56,13 @@ case " ${AIPAIR_UNSAFE:-} " in *" 1 "*|*" true "*|*" yes "*|*" on "*) UNSAFE=1 ;
 # (`aipair loop` only). Its SYNTAX is checked here, before anything touches tmux: a missing value,
 # an empty `--start-side=`, anything but claude|codex, or two different values all exit 2.
 START_SIDE_FLAG=""
+AUTOPILOT_FLAG=0
 _args=()
 while [ $# -gt 0 ]; do
   _a="$1"; shift
   case "$_a" in
     --unsafe) UNSAFE=1 ;;
+    --autopilot) AUTOPILOT_FLAG=1 ;;
     --start-side|--start-side=*)
       if [ "$_a" = --start-side ]; then
         [ $# -gt 0 ] || { echo "aipair: --start-side needs a value (claude|codex)" >&2; exit 2; }
@@ -180,6 +185,9 @@ esac
 # right here — before any tmux query, and long before `stop`'s kill-session or `attach`.
 if [ -n "$START_SIDE_FLAG" ] && [ "$cmd" != loop ]; then
   echo "aipair: --start-side is only valid with 'aipair loop' (got: aipair $cmd)" >&2; exit 2
+fi
+if [ "$AUTOPILOT_FLAG" = 1 ] && [ "$cmd" != loop ]; then
+  echo "aipair: --autopilot is only valid with 'aipair loop' (got: aipair $cmd)" >&2; exit 2
 fi
 # Effective start side for `loop`: flag > AIPAIR_START_SIDE > the relay's default (claude). The
 # environment is read ONLY for `loop`: start / attach / status / stop / name never look at it, so an
@@ -316,14 +324,27 @@ fi
 # Everything else from the environment travels as ONE argument each, whatever it
 # contains (apostrophes, spaces, $, ;), thanks to cmdline.
 if [ "$cmd" = loop ]; then
-  bridge=(aipair-relay --max-rounds "${AIPAIR_MAX_ROUNDS:-20}"
-          --stop "${AIPAIR_STOP:-[AIPAIR_REVIEW_OK]}" --stop-side "${AIPAIR_STOP_SIDE:-codex}")
+  # --autopilot / AIPAIR_AUTOPILOT: no round cap unless AIPAIR_MAX_ROUNDS is set (convergence stages
+  # replace it); otherwise the default command line stays exactly as it was.
+  if [ "$AUTOPILOT_FLAG" = 1 ] || env_on "${AIPAIR_AUTOPILOT:-}"; then
+    AIPAIR_AUTOPILOT=1   # the relay's env pin (RELAY_ENV_VARS) carries the effective value
+    bridge=(aipair-relay --autopilot)
+    [ -n "${AIPAIR_MAX_ROUNDS:-}" ] && bridge+=(--max-rounds "$AIPAIR_MAX_ROUNDS")
+    bridge+=(--stop "${AIPAIR_STOP:-[AIPAIR_REVIEW_OK]}" --stop-side "${AIPAIR_STOP_SIDE:-codex}")
+    AP_TITLE="autopilot "
+    MAX_TITLE="${AIPAIR_MAX_ROUNDS:-∞}"
+  else
+    bridge=(aipair-relay --max-rounds "${AIPAIR_MAX_ROUNDS:-20}"
+            --stop "${AIPAIR_STOP:-[AIPAIR_REVIEW_OK]}" --stop-side "${AIPAIR_STOP_SIDE:-codex}")
+    AP_TITLE=""
+    MAX_TITLE="${AIPAIR_MAX_ROUNDS:-20}"
+  fi
   # Codex-first (--start-side / AIPAIR_START_SIDE, resolved and validated right after the subcommand):
   # the relay waits on Codex's completion first, then hands it to Claude as usual. Added only when
   # set, so the default command line stays exactly as it was.
   [ -n "$START_SIDE" ] && bridge+=(--start-side "$START_SIDE")
   # 起動直後の暫定タイトル。relay 本体が起動後に実際の設定で名乗り直す
-  BRIDGE_TITLE="relay ● 1タスク / max ${AIPAIR_MAX_ROUNDS:-20} / Ctrl-C で停止"
+  BRIDGE_TITLE="relay ● ${AP_TITLE}1タスク / max ${MAX_TITLE} / Ctrl-C で停止"
   # AIPAIR_ENDLESS=1: 停止ワードで終わらず「次のタスクへ」を促し続ける連続モード。
   # 終端は relay の task-list 分類（READY/BLOCKED/ALL_DONE）が権威で 2 つ: AIPAIR_ALL_DONE（exit 0）
   # と AIPAIR_HUMAN_REQUIRED（exit 8・人間対応の [!] のみ残存）。分類が一致した時だけ honor（詳細は
@@ -335,7 +356,7 @@ if [ "$cmd" = loop ]; then
              --next-ask "${AIPAIR_NEXT_ASK:-[AIPAIR_NEXT]}"
              --all-done "${AIPAIR_ALL_DONE:-[AIPAIR_ALL_DONE]}"
              --human-required "${AIPAIR_HUMAN_REQUIRED:-[AIPAIR_HUMAN_REQUIRED]}")
-    BRIDGE_TITLE="relay ● endless / max ${AIPAIR_MAX_ROUNDS:-20} / 終端 DONE/HUMAN / Ctrl-C で停止"
+    BRIDGE_TITLE="relay ● ${AP_TITLE}endless / max ${MAX_TITLE} / 終端 DONE/HUMAN / Ctrl-C で停止"
   fi
   # A pre-existing tmux server does NOT pass this process's env to the new session, so
   # every AIPAIR_* the relay reads from the environment must be expanded onto its argv.
@@ -383,7 +404,7 @@ CODEX_LINE="clear; env AI_SELF=codex AI_PEER=claude $PAIR_PINS codex $CODEX_FLAG
 # the relay's own command. A pre-existing tmux server may hold a stale value from an
 # earlier run; without pinning, `AIPAIR_GATE= aipair loop` could still run yesterday's
 # gate, and a stale invalid int would make the relay exit 2 before argparse even ran.
-RELAY_ENV_VARS=(AIPAIR_STOP AIPAIR_STOP_SIDE AIPAIR_START_SIDE AIPAIR_MAX_ROUNDS AIPAIR_ENDLESS
+RELAY_ENV_VARS=(AIPAIR_STOP AIPAIR_STOP_SIDE AIPAIR_START_SIDE AIPAIR_MAX_ROUNDS AIPAIR_ENDLESS AIPAIR_AUTOPILOT
                 AIPAIR_TASK_LIST AIPAIR_NEXT_ASK AIPAIR_ALL_DONE AIPAIR_HUMAN_REQUIRED
                 AIPAIR_GATE AIPAIR_GATE_TIMEOUT AIPAIR_GATE_ROUNDS
                 AIPAIR_ALLOW_UNTESTED_DIALOGS AIPAIR_NO_VERSION_GATE

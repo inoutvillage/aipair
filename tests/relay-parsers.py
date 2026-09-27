@@ -1218,7 +1218,8 @@ class VersionGuardWiring(unittest.TestCase):
     def test_every_dialog_operation_is_preceded_by_allowed_and_an_exit5_stop(self):
         lines = self._loop()
         ops = [i for i, l in enumerate(lines) if any(o in l for o in self.OPS)]
-        self.assertEqual(len(ops), 6, "plan approve/feedback x3 + question answer + delivery-back x2")
+        self.assertEqual(len(ops), 7, "plan approve/feedback x3 + question answer x2 (Codex / autopilot force)"
+                                      " + delivery-back x2")
         for i in ops:
             hdr = max(k for k in range(i) if lines[k].strip().startswith(self.STATE_HDR))
             guards = [k for k in range(hdr, i) if "allowed(" in lines[k]]
@@ -2293,7 +2294,7 @@ class StateMachineWiring(unittest.TestCase):
         # 上書きしていたのを是正。endless タイトルは両終端（DONE/HUMAN）を示し、旧『終端「{a.all_done}」』は使わない。
         with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
             src = fh.read()
-        self.assertIn("relay ● endless / max {a.max_rounds} / 終端 DONE/HUMAN", src)
+        self.assertIn("endless / max {max_label} / 終端 DONE/HUMAN", src)
         self.assertNotIn('終端「{a.all_done}」', src)
 
     def _run_startup(self, state):
@@ -3162,7 +3163,7 @@ class EndlessScenarios(unittest.TestCase):
     def _cls(self, body):
         return relay.state_machine.tasklist.classify(body)
 
-    def _drive(self, start_side, startup_cls, turns):
+    def _drive(self, start_side, startup_cls, turns, autopilot=False, extra_patches=()):
         """turns = [(agent, [texts], cls_or_None), ...] を順に処理。cls はその Codex ターンの分類呼び出しが
         返す値（None は据え置き）。startup 分類は startup_cls。run() の code と poke の (pane, msg) 履歴を返す。"""
         import types
@@ -3170,7 +3171,7 @@ class EndlessScenarios(unittest.TestCase):
         a = types.SimpleNamespace(start_side=start_side, settle=0, poll=0, max_rounds=20, endless=True,
                                   task_list="tasks/todo.md", stop_side="codex", no_plan_review=True,
                                   no_question_relay=True, plan_rounds=5, question_rounds=5, plan_ok="[P]",
-                                  gate=None, gate_timeout=600, gate_rounds=3)
+                                  gate=None, gate_timeout=600, gate_rounds=3, autopilot=autopilot)
         rg = types.SimpleNamespace(response_done=lambda who, path, done: done, noshow=lambda who: False,
                                    arm=lambda nonce: None, probe=None, probe_ts_cache=0.0)
         sg = types.SimpleNamespace(guard=lambda: False)
@@ -3199,7 +3200,13 @@ class EndlessScenarios(unittest.TestCase):
              mock.patch.object(sm, "turn_texts", side_effect=_turn_texts), \
              mock.patch.object(sm, "poke", return_value=object()) as poke_mock, \
              mock.patch("time.sleep"):
-            code = machine.run()
+            for pt in extra_patches:
+                pt.start()
+            try:
+                code = machine.run()
+            finally:
+                for pt in extra_patches:
+                    pt.stop()
         pokes = [(c.args[0], c.args[1]) for c in poke_mock.call_args_list]
         return code, pokes
 
@@ -3264,6 +3271,25 @@ class EndlessScenarios(unittest.TestCase):
         self.assertEqual(pokes, [self.TO_CODEX_NEXT, self.TO_CLAUDE_NEXT,
                                  self.TO_CODEX_NEXT, self.TO_CLAUDE_NEXT,
                                  self.TO_CODEX_NEXT])
+
+    def test_autopilot_no_progress_blocks_the_task_instead_of_stopping(self):
+        # --autopilot: 同じタスクの停滞は exit 8 にせず、1 回目は Claude に `[!]` 化を依頼、同じタスクで
+        # 2 回目は relay が task-list を直接保留化して Codex に次を選ばせる（ループしない）。
+        ready = self._cls("- [ ] A\n- [x] b\n")
+        marked = []
+        mb = mock.patch.object(relay.state_machine.tasklist, "mark_blocked",
+                               side_effect=lambda tl, cwd, line, why: marked.append(line) or True)
+        same = [("claude", ["[AIPAIR_NEXT]"], None), ("codex", ["- [ ] A"], ready)]
+        # 保留化の後は [!] しか残らない＝正当な終端（BLOCKED + HUMAN_REQUIRED）。no-progress の exit 8 ではない。
+        code, pokes = self._drive("claude", ready, same * 6 + [
+            ("codex", ["[AIPAIR_HUMAN_REQUIRED]"], self._cls("- [!] A\n  blocker: x\n- [x] b\n"))],
+            autopilot=True, extra_patches=[mb])
+        self.assertEqual(code, relay.state_machine.EXIT_BLOCKED)
+        self.assertEqual(marked, ["- [ ] A"], "the relay blocked the stuck task on the 2nd escalation")
+        esc = [m for p, m in pokes if p == "%1" and "停滞" in m]
+        self.assertEqual(len(esc), 1, "Claude was asked once to mark it [!]")
+        self.assertIn("- [ ] A", esc[0])
+        self.assertEqual(pokes[-1], self.TO_CODEX_NEXT, "after the relay blocked it, Codex picks the next")
 
     def test_p0_1_case_b_review_ng_sends_normal_poke_not_pass(self):
         # P0-1 Case B（Codex relay-id:806af357）: レビュー NG（[AIPAIR_REVIEW_OK] 無し）は通常の
@@ -3405,6 +3431,392 @@ class EndlessScenarios(unittest.TestCase):
         sqa.assert_called_once()
         self.assertEqual(sqa.call_args.args[2], "1問目: 選択肢1（Postgres）で")   # 配達本文 = payload
 
+
+
+class ClaudePaneIdentityBySessionId(unittest.TestCase):
+    """Regression (2026-09-25, aipair pair): Claude Code showed a PARAPHRASE of the logged reply on screen,
+    so claude_matches_pane's text-fragment check failed for the correct log; the relay logged
+    '誤ピン疑い → 強制 re-lock' forever and never handed Claude's completion to Codex. The pane's claude
+    process --session-id (aipair launches it with one) now identifies its log without scraping."""
+    SID = "7d3f1a2e-4b5c-4d6e-8f90-a1b2c3d4e5f6"
+
+    def _cmdline(self, args):
+        d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(d, "4242"))
+        with open(os.path.join(d, "4242", "cmdline"), "wb") as fh:
+            fh.write(b"\0".join(a.encode() for a in args) + b"\0")
+        return d
+
+    def _sid(self, args):
+        ll = relay.log_lock
+        d = self._cmdline(args)
+        real_open = open
+
+        def fake_open(path, *a, **k):
+            if isinstance(path, str) and path.startswith("/proc/4242/"):
+                path = os.path.join(d, path[len("/proc/"):])
+            return real_open(path, *a, **k)
+        with mock.patch.object(ll.peerlog, "cli_process", return_value=(4242, 1, (1, 1))), \
+             mock.patch("builtins.open", side_effect=fake_open):
+            return ll.pane_session_id("%1")
+
+    def test_session_id_is_read_from_the_running_process(self):
+        self.assertEqual(self._sid(["claude", "--session-id", self.SID, "--dangerously-skip-permissions"]), self.SID)
+        self.assertEqual(self._sid(["claude", "--resume=" + self.SID]), self.SID)
+        self.assertEqual(self._sid(["claude", "-r", self.SID]), self.SID)
+        self.assertIsNone(self._sid(["claude"]), "no pin → None (screen fallback)")
+        self.assertIsNone(self._sid(["claude", "--session-id", "not-a-uuid"]))
+
+    def test_matching_session_id_wins_even_when_the_screen_shows_a_paraphrase(self):
+        ll = relay.log_lock
+        with mock.patch.object(ll, "pane_session_id", return_value=self.SID), \
+             mock.patch.object(ll, "tmux") as tm:
+            tm.return_value.stdout = "● 言い換えられた表示（ログの文面とは違う）\n"
+            self.assertTrue(ll.claude_matches_pane("/x/%s.jsonl" % self.SID, "%1"))
+            tm.assert_not_called()
+
+    def test_another_session_falls_back_to_the_screen_check(self):
+        ll = relay.log_lock
+        with mock.patch.object(ll, "pane_session_id", return_value=self.SID), \
+             mock.patch.object(ll, "tmux") as tm, \
+             mock.patch.object(ll.peerlog, "parse_claude", return_value=[(0, "assistant", "x" * 30)]):
+            tm.return_value.stdout = "nothing matching\n"
+            self.assertFalse(ll.claude_matches_pane("/x/other-session.jsonl", "%1"))
+            tm.assert_called()
+
+class AutopilotMode(unittest.TestCase):
+    """--autopilot（社長指示 2026-09-25）: 人間の判断待ちで止めず Codex が代理で答え、プラン／質問／停滞は
+    上限で止めずに《収束の段》で必ず前へ進める。質問は全問に答えたことを relay が照合する。
+    純関数の単体＋実 run() を tmux/ログを mock して駆動する。"""
+    HR = "[AIPAIR_HUMAN_REQUIRED]"
+    OK = "[AIPAIR_REVIEW_OK]"
+    PLAN = {"tell": "3", "yes": "1", "yes_label": "Yes, and use auto mode", "plan": "/tmp/p.md"}
+    QD = {"chat": "4"}
+
+    class _Stop(Exception):
+        pass
+
+    # --- pure helpers ------------------------------------------------------------------ #
+    def test_stage_ladder(self):
+        from aipairlib import autopilot_flow as ap
+        self.assertEqual([ap.stage(n, 2) for n in (1, 2, 3, 4, 9)],
+                         ["normal", "normal", "converge", "force", "force"])
+        self.assertEqual([ap.stall_action(k, 3) for k in (2, 3, 4, 5, 6, 9)],
+                         ["forward", "break", "forward", "final", "force", "force"])
+
+    def test_missing_answers(self):
+        from aipairlib import autopilot_flow as ap
+        self.assertEqual(ap.missing_answers("1問目: A\n3問目: C", 3), [2])
+        self.assertEqual(ap.missing_answers("１問目: A ２ 問目: B", 2), [], "full-width digits / spaces")
+        self.assertEqual(ap.missing_answers("11問目: x", 2), [1, 2], "'11問目' is not '1問目'")
+        self.assertEqual(ap.missing_answers("anything", 1), [], "a single question is never checked")
+
+    def test_force_plan_decision_approves_with_the_review_as_feedback(self):
+        from aipairlib import autopilot_flow as ap
+        from aipairlib.plan_flow import PlanDecision
+        d = ap.force_plan_decision(PlanDecision("changes", "直して"), self.PLAN)
+        self.assertEqual(d.action, "approve_feedback")
+        self.assertTrue(d.payload.startswith(ap.FORCE_PLAN_NOTE) and d.payload.endswith("直して"))
+        self.assertEqual(ap.force_plan_decision(PlanDecision("no_tell_option", None), self.PLAN).action, "approve")
+        for keep in ("no_dialog", "approve"):     # no_text は下の空返答テストで扱う
+            self.assertEqual(ap.force_plan_decision(PlanDecision(keep, None), self.PLAN).action, keep,
+                             "a vanished dialog is never operated, even at the force stage")
+
+    def test_force_plan_approves_an_empty_reply_while_the_dialog_is_up(self):
+        # Codex レビュー P1: 最終段で空の返答（no_text）が続くとプランレビューの再依頼が際限なく続いた
+        from aipairlib import autopilot_flow as ap
+        from aipairlib.plan_flow import PlanDecision
+        self.assertEqual(ap.force_plan_decision(PlanDecision("no_text", None), self.PLAN).action, "approve")
+        self.assertEqual(ap.force_plan_decision(PlanDecision("no_text", None), None).action, "no_text",
+                         "no dialog on screen → nothing is pressed")
+        no_yes = dict(self.PLAN, yes=None)
+        self.assertEqual(ap.force_plan_decision(PlanDecision("no_text", None), no_yes).action, "no_text")
+
+    def test_dir_fingerprint_tracks_edits_outside_git(self):
+        sm = relay.state_machine
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "a.txt"), "w") as fh:
+                fh.write("1")
+            os.makedirs(os.path.join(d, "node_modules"))
+            base = sm.dir_fingerprint(d)
+            self.assertEqual(sm.dir_fingerprint(d), base)
+            with open(os.path.join(d, "node_modules", "x.js"), "w") as fh:
+                fh.write("x")
+            self.assertEqual(sm.dir_fingerprint(d), base, "skipped dirs do not count")
+            with open(os.path.join(d, "a.txt"), "w") as fh:
+                fh.write("22")
+            self.assertNotEqual(sm.dir_fingerprint(d), base)
+            self.assertIsNone(sm.progress_fingerprint(d), "outside git, the normal mode keeps the guard off")
+            self.assertIsNotNone(sm.progress_fingerprint(d, autopilot=True))
+
+    def test_stall_ladder_works_outside_git(self):
+        # Codex レビュー P1: git 管理外（repo_fingerprint=None）でも autopilot は収束する
+        sm = relay.state_machine
+        with mock.patch.object(sm, "dir_fingerprint", return_value="D"):
+            code, rec = self._run(lambda who, r: ["修正なし"] if who == "claude" else ["未修正"], fps=[None] * 50)
+        self.assertEqual(code, 0, "forced pass")
+
+    def test_secrets_are_never_guessed(self):
+        # Codex レビュー P1: 代理回答が API キー等を推測・入力しない
+        from aipairlib import autopilot_flow as ap
+        rp = relay.review_protocol
+        for t in (ap.FORCE_QUESTION_ANSWER, ap.missing_note([1]), rp.AUTOPILOT_PROXY, rp.autopilot_poke_claude()):
+            self.assertIn("捏造", t)
+            self.assertIn("保留", t)
+
+    def test_dir_fingerprint_over_the_limit_is_not_partial(self):
+        # Codex レビュー P2: 上限で打ち切った部分指紋は使わない → 代替（猶予の長い段）へ
+        sm = relay.state_machine
+        with tempfile.TemporaryDirectory() as d:
+            for i in range(3):
+                with open(os.path.join(d, "f%d" % i), "w") as fh:
+                    fh.write("x")
+            self.assertIsNotNone(sm.dir_fingerprint(d, limit=3))
+            self.assertIsNone(sm.dir_fingerprint(d, limit=2))
+            with mock.patch.object(sm, "dir_fingerprint", return_value=None):
+                self.assertEqual(sm.progress_fingerprint(d, autopilot=True), sm.NO_FINGERPRINT)
+
+    def test_no_fingerprint_starts_the_ladder_later(self):
+        sm = relay.state_machine
+        with mock.patch.object(sm, "dir_fingerprint", return_value=None):
+            code, rec = self._run(lambda who, r: ["修正なし"] if who == "claude" else ["未修正"], fps=[None] * 80)
+        self.assertEqual(code, 0)
+        panes = [p for p, _ in rec["pokes"]]
+        # 9 回（stall_rounds 3 × 3）までは通常どおり Claude へ渡し、その後に打破 → … → 強制合格
+        self.assertEqual(panes[:20], ["%2", "%1"] * 9 + ["%2", "%2"])
+
+    def test_question_file_is_private_and_removed_after_the_answer(self):
+        sm = relay.state_machine
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"XDG_CACHE_HOME": d}):
+            old = os.umask(0)
+            try:
+                path = sm.write_question_file(["secret question"])
+            finally:
+                os.umask(old)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(os.path.dirname(path)).st_mode & 0o777, 0o700)
+            self.assertIsNone(sm.discard_question_file(path))
+            self.assertFalse(os.path.exists(path))
+            code, rec = self._run(lambda who, r: ["1問目: A"], claude_done=None, qdlg=self.QD,
+                                  questions=["x" * 4000], stop_when=lambda r: bool(r["answers"]))
+            left = [f for _, _, fs in os.walk(d) for f in fs]
+            self.assertEqual(left, [], "the question file is deleted once the answer is delivered")
+
+    def test_force_question_answer_prefers_reversible_options(self):
+        # Codex レビュー 2026-09-25: Recommended/1 番を機械的に選ぶと不可逆な肢を選びうる
+        from aipairlib import autopilot_flow as ap
+        for t in (ap.FORCE_QUESTION_ANSWER, ap.missing_note([2])):
+            self.assertIn("元に戻せる安全な選択肢を優先", t)
+            self.assertIn("dry-run", t)
+
+    def test_prompts(self):
+        rp = relay.review_protocol
+        self.assertNotIn(self.HR, rp.autopilot_poke_codex(self.OK), "no human-wait exit is offered")
+        self.assertIn("すべて列挙して1つずつ代理で", rp.autopilot_poke_codex(self.OK))
+        self.assertNotIn(self.HR, rp.autopilot_poke_claude())
+        q = rp.question_poke_codex(["a", "b", "c"], None)
+        self.assertIn("全 3 問すべてに", q)
+        self.assertIn("/tmp/q.md", rp.question_poke_codex(["x" * 5000], None, qfile="/tmp/q.md"))
+        self.assertNotIn("x" * 5000, rp.question_poke_codex(["x" * 5000], None, qfile="/tmp/q.md"))
+        fill = rp.question_fill_poke([2], ["Q1", "Q2", "Q3"])
+        self.assertIn("2問目", fill); self.assertIn("Q2", fill); self.assertNotIn("Q1", fill)
+
+    def test_cli_max_rounds_default(self):
+        cli = relay.cli
+        with mock.patch.dict(os.environ, {"AIPAIR_MAX_ROUNDS": "", "AIPAIR_AUTOPILOT": ""}):
+            p = cli.build_parser()
+            self.assertEqual(cli.apply_autopilot_defaults(p.parse_args([])).max_rounds, 20)
+            self.assertIsNone(cli.apply_autopilot_defaults(p.parse_args(["--autopilot"])).max_rounds)
+            self.assertEqual(cli.apply_autopilot_defaults(p.parse_args(["--autopilot", "--max-rounds", "7"])).max_rounds, 7)
+            a = cli.apply_autopilot_defaults(p.parse_args(["--autopilot", "--no-autopilot"]))
+            self.assertEqual((a.autopilot, a.max_rounds), (False, 20))
+
+    def test_mark_blocked(self):
+        from aipairlib import tasklist
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "todo.md")
+            def write(text):
+                with open(path, "w", encoding="utf-8", newline="") as fh:
+                    fh.write(text)
+
+            def read():
+                with open(path, encoding="utf-8", newline="") as fh:
+                    return fh.read()
+            write("- [x] a\r\n  - [ ] b\r\n- [ ] c\r\n")
+            self.assertTrue(tasklist.mark_blocked("todo.md", d, "  - [ ] b", "stuck\nhere"))
+            self.assertEqual(read(),
+                             "- [x] a\r\n  - [!] b\r\n    blocker: stuck here\r\n- [ ] c\r\n")
+            self.assertEqual(tasklist.load("todo.md", d)["ready"], ["- [ ] c"])
+            self.assertFalse(tasklist.mark_blocked("todo.md", d, "- [ ] zzz", "r"), "absent line → untouched")
+            write("- [ ] d\n- [ ] d\n")
+            self.assertFalse(tasklist.mark_blocked("todo.md", d, "- [ ] d", "r"), "ambiguous → untouched")
+
+    # --- the real run() ---------------------------------------------------------------- #
+    def _run(self, texts_for, *, claude_done=100.0, plan=None, qdlg=None, questions=(), fps=None,
+             autopilot=True, stall_rounds=3, max_rounds=None, plan_rounds=5, question_rounds=5,
+             stop_when=None):
+        sm = relay.state_machine
+        a = types.SimpleNamespace(start_side="claude", settle=0, poll=0, max_rounds=max_rounds, endless=False,
+                                  stop_side="codex", no_plan_review=plan is None, no_question_relay=qdlg is None,
+                                  plan_rounds=plan_rounds, question_rounds=question_rounds,
+                                  plan_ok="[AIPAIR_PLAN_APPROVED]", gate=None, gate_timeout=600, gate_rounds=3,
+                                  stall_rounds=stall_rounds, autopilot=autopilot)
+        rg = types.SimpleNamespace(response_done=lambda who, path, done: done, noshow=lambda who: False,
+                                   arm=lambda nonce: None, clear=lambda: None, probe=None, probe_ts_cache=0.0)
+        rec = {"pokes": [], "plan": [], "answers": [], "stop": False}
+
+        def guard():
+            if rec["stop"]:
+                raise self._Stop()
+            return False
+
+        def poke(pane, text, **kw):
+            rec["pokes"].append((pane, text))
+            return "nonce"
+
+        def plan_fb(pane, dialog, text, approve, watch=None):
+            rec["plan"].append((approve, text))
+            if stop_when and stop_when(rec):
+                rec["stop"] = True
+            return True
+
+        def answer(pane, q, text, watch=None):
+            rec["answers"].append(text)
+            if stop_when and stop_when(rec):
+                rec["stop"] = True
+            return True
+
+        machine = sm.StateMachine(
+            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x",
+            tracked={"claude": "c.jsonl", "codex": "x.jsonl"}, claude_seen=set(), codex_seen=set(),
+            baseline=0.0, sg=types.SimpleNamespace(guard=guard), rg=rg,
+            vg=types.SimpleNamespace(dialog_ok=lambda: True), bw=60,
+            poke_codex="PC", poke_codex_next="PCN", poke_claude="PCL", poke_claude_pass="PCP",
+            poke_claude_next="PCX", stop_phrases=[self.OK], next_ask_phrases=["[AIPAIR_NEXT]"],
+            all_done_phrases=["[AIPAIR_ALL_DONE]"], human_required_phrases=[self.HR])
+        fp = iter(fps or [])
+        code = None
+        with mock.patch.object(sm, "set_pane_title"), \
+             mock.patch.object(sm, "claude_done_ts", return_value=claude_done), \
+             mock.patch.object(sm, "codex_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "claude_matches_pane", return_value=True), \
+             mock.patch.object(sm, "turn_texts", side_effect=lambda who, *r: texts_for(who, rec)), \
+             mock.patch.object(sm, "detect_plan_dialog", return_value=plan), \
+             mock.patch.object(sm, "detect_question_dialog", return_value=qdlg), \
+             mock.patch.object(sm, "scrape_questions", return_value=list(questions)), \
+             mock.patch.object(sm, "send_plan_feedback", side_effect=plan_fb), \
+             mock.patch.object(sm, "send_question_answer", side_effect=answer), \
+             mock.patch.object(sm, "press"), \
+             mock.patch.object(sm, "approval_took_effect", return_value=True), \
+             mock.patch.object(sm, "repo_fingerprint", side_effect=lambda cwd: next(fp, "SAME")), \
+             mock.patch.object(sm, "poke", side_effect=poke), \
+             mock.patch("time.sleep"), mock.patch("builtins.print"):
+            try:
+                code = machine.run()
+            except self._Stop:
+                pass
+        return code, rec
+
+    def test_human_required_never_stops_the_review_loop(self):
+        # Claude と Codex の両方が HUMAN_REQUIRED を出しても止まらず、Codex の代理判断で往復が続く
+        code, rec = self._run(lambda who, r: [self.HR + "\n判断待ち"], stall_rounds=0, max_rounds=3)
+        self.assertEqual(code, 3, "only the explicit --max-rounds cap ends it")
+        self.assertEqual([p for p, _ in rec["pokes"]], ["%2", "%1", "%2", "%1", "%2"])
+
+    def test_the_same_run_without_autopilot_stops_with_exit_8(self):
+        code, _ = self._run(lambda who, r: [self.HR + "\n判断待ち"], autopilot=False, max_rounds=20)
+        self.assertEqual(code, 8)
+
+    def test_stall_ladder_ends_in_a_forced_pass(self):
+        code, rec = self._run(lambda who, r: ["同じ2点、修正なし"] if who == "claude" else ["2点とも未修正"])
+        self.assertEqual(code, 0, "forced pass (exit 0), never exit 8")
+        panes = [p for p, _ in rec["pokes"]]
+        # reviews 1-3 forward; 4th: break → Codex; its reply forwards to Claude; next review: final → Codex;
+        # its reply: force pass
+        self.assertEqual(panes, ["%2", "%1"] * 3 + ["%2", "%2", "%1", "%2", "%2"])
+        self.assertIn("膠着打破", rec["pokes"][7][1])
+        self.assertIn("最終", rec["pokes"][10][1])
+
+    def test_stall_ladder_stops_as_soon_as_codex_passes(self):
+        def texts(who, r):
+            if who == "claude":
+                return ["修正なし"]
+            return [self.OK] if any("膠着打破" in t for _, t in r["pokes"]) else ["未修正"]
+        code, rec = self._run(texts)
+        self.assertEqual(code, 0)
+        self.assertEqual([p for p, _ in rec["pokes"]], ["%2", "%1"] * 3 + ["%2", "%2"])
+
+    def test_plan_review_converges_then_force_approves(self):
+        code, rec = self._run(lambda who, r: ["ここを直して"], claude_done=None, plan=self.PLAN, plan_rounds=1,
+                              stop_when=lambda r: any(ap for ap, _ in r["plan"]))
+        self.assertEqual([ap for ap, _ in rec["plan"]], [False, False, True],
+                         "normal → converge → force approve with feedback")
+        self.assertIn("ここを直して", rec["plan"][-1][1])
+        self.assertIn("収束", rec["pokes"][1][1])
+        self.assertIn("内容にかかわらず", rec["pokes"][2][1])
+
+    def test_plan_review_cap_still_stops_without_autopilot(self):
+        code, rec = self._run(lambda who, r: ["ここを直して"], claude_done=None, plan=self.PLAN, plan_rounds=1,
+                              autopilot=False, max_rounds=20)
+        self.assertEqual(code, 5)
+
+    def test_every_question_is_answered(self):
+        # 3 問中 2 問目を飛ばした回答 → その問だけ追加で聞き、両方をまとめて配達する（autopilot 無しでも）
+        for ap in (False, True):
+            answers = iter([["1問目: 選択肢1（A）\n3問目: 選択肢2（C）"], ["2問目: 選択肢1（B）"]])
+            code, rec = self._run(lambda who, r: next(answers), claude_done=None, qdlg=self.QD,
+                                  questions=["Q1", "Q2", "Q3"], autopilot=ap, max_rounds=20,
+                                  stop_when=lambda r: bool(r["answers"]))
+            self.assertEqual(len(rec["pokes"]), 2, "question request + one fill request")
+            self.assertIn("2問目", rec["pokes"][1][1]); self.assertIn("Q2", rec["pokes"][1][1])
+            sent = rec["answers"][0]
+            for n in (1, 2, 3):
+                self.assertIn(f"{n}問目", sent)
+            self.assertEqual("autopilot" in sent, ap)
+
+    def test_question_still_missing_after_the_fill_is_delivered_with_the_safe_rule(self):
+        code, rec = self._run(lambda who, r: ["1問目: A"], claude_done=None, qdlg=self.QD,
+                              questions=["Q1", "Q2"], stop_when=lambda r: bool(r["answers"]))
+        self.assertIn("2問目 への回答がありません", rec["answers"][0])
+        self.assertIn("元に戻せる安全な選択肢を優先", rec["answers"][0])
+
+    def test_question_ladder_ends_in_the_relays_own_safe_answer(self):
+        from aipairlib import autopilot_flow as apf
+        code, rec = self._run(lambda who, r: ["1問目: A\n2問目: B"], claude_done=None, qdlg=self.QD,
+                              questions=["Q1", "Q2"], question_rounds=1,
+                              stop_when=lambda r: len(r["answers"]) >= 3)
+        self.assertEqual(len(rec["pokes"]), 2, "normal + converge go to Codex; force does not")
+        self.assertIn("収束", rec["pokes"][1][1])
+        self.assertEqual(rec["answers"][2], apf.FORCE_QUESTION_ANSWER)
+
+    def test_codex_human_required_on_a_question_is_re_asked_not_stopped(self):
+        seq = iter([[self.HR], ["1問目: A\n2問目: B"]])
+        code, rec = self._run(lambda who, r: next(seq), claude_done=None, qdlg=self.QD,
+                              questions=["Q1", "Q2"], stop_when=lambda r: bool(r["answers"]))
+        self.assertIsNone(code, "never exit 8")
+        self.assertEqual(len(rec["pokes"]), 2, "asked again")
+        self.assertNotIn(self.HR, rec["pokes"][0][1], "the human-wait sentinel is not offered")
+        self.assertNotIn(self.HR, rec["answers"][0])
+
+    def test_oversize_question_goes_through_a_file(self):
+        sm = relay.state_machine
+        real_write = sm.write_question_file
+        seen = {}
+
+        def write(blocks):
+            path = real_write(blocks)
+            with open(path, encoding="utf-8") as fh:
+                seen["path"], seen["body"] = path, fh.read()
+            return path
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"XDG_CACHE_HOME": d}), \
+             mock.patch.object(sm, "write_question_file", side_effect=write):
+            big = "x" * 4000
+            code, rec = self._run(lambda who, r: ["1問目: A"], claude_done=None, qdlg=self.QD,
+                                  questions=[big], stop_when=lambda r: bool(r["answers"]))
+            self.assertIsNone(code, "not exit 8 under autopilot")
+            self.assertIn(big, seen["body"])
+            self.assertIn(seen["path"], rec["pokes"][0][1])
+            self.assertNotIn(big, rec["pokes"][0][1])
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

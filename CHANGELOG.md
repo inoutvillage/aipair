@@ -24,6 +24,17 @@ tasks left, Codex declares `[AIPAIR_HUMAN_REQUIRED]`, a question is too large to
 task makes no progress across rounds) instead of guessing or spinning.
 
 ### Added
+- **Fully autonomous relay (`--autopilot`)** — `aipair loop --unsafe --autopilot` (or `AIPAIR_AUTOPILOT=1`,
+  `aipair-relay-here --autopilot`) never stops for a human decision: the human-wait sentinel is not offered,
+  and Codex answers as the human's proxy (irreversible operations — production deploys, billing, public
+  pushes, data deletion — are not run; a reversible option is chosen instead). Plan review, the question
+  relay and a stalled review no longer stop at a cap; they climb a convergence ladder that always moves on
+  (plan: approve with Codex's remaining points as feedback; questions: the relay's own safe-choice answer;
+  stall: breakout request → final pass request → forced pass with the remaining points in the banner). In
+  endless mode a task that makes no progress is turned into `[!]` (by Claude, then by the relay). Oversized
+  questions go to Codex through a file instead of stopping. `--max-rounds` applies only when given.
+- **Every question is answered** — the question relay now asks Codex to answer all N questions and checks
+  the reply for each "N問目"; missing ones are asked once more and delivered together (in every mode).
 - **Codex-first start (`--start-side codex`)** — `aipair loop --unsafe --start-side codex` (or
   `AIPAIR_START_SIDE=codex`) and `aipair-relay-here --start-side codex` make the relay wait for **Codex's**
   first completion instead of Claude's. It is not a role swap: once Codex finishes, its result goes to

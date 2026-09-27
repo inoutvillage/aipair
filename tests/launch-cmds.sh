@@ -195,5 +195,17 @@ chk "$(env AIPAIR_START_SIDE=typo aipair name "$W/proj" 2>&1)" "$(aipair name "$
 out="$(env AIPAIR_START_SIDE=typo AIPAIR_DRY_RUN=1 aipair start "$W/proj" 2>&1 || true)"
 chk "$(printf '%s\n' "$out" | grep -c '^session: ' || true)/$(printf '%s\n' "$out" | grep -c 'start-side\|START_SIDE' || true)" "1/0" "AIPAIR_START_SIDE=typo: 'aipair start' still runs (dry run) and mentions no start side"
 
+echo "# [9] --autopilot / AIPAIR_AUTOPILOT (fully autonomous: no human-decision stops, no round cap by default)"
+WANT_AP="cmd=aipair-relay self=bridge peer=${J}[--autopilot]${J}[--stop]${J}[[AIPAIR_REVIEW_OK]]${J}[--stop-side]${J}[codex]"
+chk "$(argrun bridge aipair loop --autopilot "$W/proj")" "$WANT_AP" "--autopilot → relay gets --autopilot and NO --max-rounds"
+chk "$(argrun bridge AIPAIR_AUTOPILOT=1 aipair loop "$W/proj")" "$WANT_AP" "AIPAIR_AUTOPILOT=1 → same"
+chk "$(argrun bridge AIPAIR_AUTOPILOT=1 AIPAIR_MAX_ROUNDS=50 aipair loop "$W/proj" | sed -n '3,4p' | paste -sd' ')" "[--max-rounds] [50]" "an explicit AIPAIR_MAX_ROUNDS still applies under autopilot"
+chk "$(run loop bridge 'AIPAIR_AUTOPILOT=0' | grep -c -- '--autopilot' || true)" "0" "AIPAIR_AUTOPILOT=0 → off (the default line is unchanged)"
+chk "$(argline bridge aipair loop --autopilot "$W/proj" | grep -o 'AIPAIR_AUTOPILOT=[^ ]*')" "AIPAIR_AUTOPILOT=1" "the relay's env pin carries the effective value"
+for sub in "" start attach stop name status; do
+  rc=0; out="$(env AIPAIR_UNSAFE=1 AIPAIR_DRY_RUN=1 aipair ${sub:+"$sub"} --autopilot "$W/proj" 2>&1)" || rc=$?; n=$((n+1))
+  if [ "$rc" = 2 ] && printf '%s' "$out" | grep -q 'autopilot'; then echo "ok   aipair ${sub:-(no subcommand)} --autopilot → exit 2 (loop only)"; else echo "FAIL aipair ${sub:-(no subcommand)} --autopilot: rc=$rc out=$out"; fail=1; fi
+done
+
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED)"
 exit $fail

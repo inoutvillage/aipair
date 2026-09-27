@@ -88,6 +88,15 @@ Endless mode (--endless, opt-in; 既定は従来どおり停止ワードで終�
   --gate CMD（env AIPAIR_GATE）: 停止ワード検知後に CMD を --dir で実行し、exit 0 の時だけ停止／次タスクへ。
   失敗は出力の末尾を添えて Claude に差し戻す（--gate-rounds 回（既定 3）で exit 6）。未指定なら従来どおり。
 
+Autopilot (--autopilot / AIPAIR_AUTOPILOT, opt-in):
+  Never stops for a human decision. The human-wait sentinel is not offered; Codex answers as the
+  human's proxy (irreversible operations are not run — a reversible option is chosen instead).
+  Plan review / the question relay / a stalled review climb a convergence ladder instead of stopping
+  at a cap (autopilot_flow): normal → converge → the relay itself moves on (plan: approve with
+  Codex's points as feedback; questions: a fixed safe-choice answer; stall: breakout → final pass
+  request → forced pass). In endless mode a no-progress task becomes `[!]`. --max-rounds applies only
+  when given. Technical fail-closed stops (4/5/6/7) remain.
+
 Turn detection (verified against real logs):
   • Claude: latest `assistant` entry whose stop_reason != "tool_use"  → turn done
   • Codex : latest task_* event is `task_complete`                    → turn done
@@ -128,7 +137,8 @@ from .log_lock import (claude_glob, codex_all, codex_cwd_matches, claude_matches
                        refresh_claude_lock)
 from .review_protocol import (DEFAULT_POKE_CLAUDE, default_poke_codex, default_poke_claude, plan_poke_codex,
                               question_poke_codex, endless_poke_claude_pass, endless_poke_codex_next,
-                              endless_poke_claude_next, plan_extra_comment)
+                              endless_poke_claude_next, plan_extra_comment, autopilot_poke_codex,
+                              autopilot_poke_claude, AUTOPILOT_ENDLESS_NOTE)
 from .logs import c, log, dim, configure
 
 # corelib (pure helpers)
@@ -299,7 +309,7 @@ def main():
     for name, val in (("--gate-timeout", a.gate_timeout), ("--gate-rounds", a.gate_rounds),
                       ("--max-rounds", a.max_rounds), ("--plan-rounds", a.plan_rounds),
                       ("--question-rounds", a.question_rounds)):
-        if val < 1:
+        if val is not None and val < 1:
             print(f"aipair-relay: {name} は 1 以上で指定してください（実際の値: {val!r}）", file=sys.stderr)
             return 2
     if a.stall_rounds < 0:
@@ -307,6 +317,7 @@ def main():
         return 2
     if a.no_endless:
         a.endless = False
+    cli.apply_autopilot_defaults(a)
 
     configure((not a.no_color) and sys.stdout.isatty())
     bw = max(60, a.busy_wait)   # idle budget passed explicitly to poke()
@@ -318,10 +329,15 @@ def main():
     human_required_phrases = [s for s in a.human_required.split("||") if s]
     # 通常のレビュー往復だけ《人間待ち》出口を案内する（endless の HUMAN_REQUIRED は task-list 分類が権威で
     # 意味が違うので、レビュー文面では案内しない）。--human-required を空にすれば案内も検出もしない。
+    # --autopilot では人間待ちの出口を案内せず、Codex が人間の代理として判断する文面にする。
     review_hr = human_required_phrases[0] if (human_required_phrases and not a.endless) else None
-    poke_codex = a.poke_codex or default_poke_codex(stop_phrases[0] if stop_phrases else "[AIPAIR_REVIEW_OK]",
-                                                    review_hr)
-    poke_claude = a.poke_claude or default_poke_claude(review_hr)
+    stop0 = stop_phrases[0] if stop_phrases else "[AIPAIR_REVIEW_OK]"
+    if a.autopilot:
+        poke_codex = a.poke_codex or autopilot_poke_codex(stop0)
+        poke_claude = a.poke_claude or autopilot_poke_claude()
+    else:
+        poke_codex = a.poke_codex or default_poke_codex(stop0, review_hr)
+        poke_claude = a.poke_claude or default_poke_claude(review_hr)
     poke_claude_pass = endless_poke_claude_pass(a.task_list, next_ask_phrases[0] if next_ask_phrases
                                                 else "[AIPAIR_NEXT]")
     poke_codex_next = endless_poke_codex_next(a.task_list,
@@ -330,6 +346,9 @@ def main():
                                               else "[AIPAIR_HUMAN_REQUIRED]")
     poke_claude_next = endless_poke_claude_next(a.task_list,
                                                 next_ask_phrases[0] if next_ask_phrases else "[AIPAIR_NEXT]")
+    if a.autopilot:
+        poke_claude_pass += AUTOPILOT_ENDLESS_NOTE
+        poke_claude_next += AUTOPILOT_ENDLESS_NOTE
     # endless の 2 終端（ALL_DONE / HUMAN_REQUIRED）はどちらも sentinel が必須。空だとプロンプトは既定
     # sentinel を出すのに検出リストが空になり、その終端へ遷移しても認識できず max-rounds まで続く
     # （prompt と検出の食い違い）→ fail-closed で拒否する。
@@ -380,9 +399,11 @@ def main():
 
     # ペインタイトルで「今どのモードで・何往復まで」が一目で分かるようにする
     own = own_pane(session)
-    set_pane_title(own, (f"relay ● endless / max {a.max_rounds} / 終端 DONE/HUMAN / Ctrl-C で停止"
-                         if a.endless else
-                         f"relay ● 1タスク / max {a.max_rounds} / 停止「{a.stop}」/ Ctrl-C で停止"))
+    max_label = a.max_rounds if a.max_rounds is not None else "∞"
+    set_pane_title(own, ("relay ● " + ("autopilot " if a.autopilot else "")
+                         + (f"endless / max {max_label} / 終端 DONE/HUMAN / Ctrl-C で停止"
+                            if a.endless else
+                            f"1タスク / max {max_label} / 停止「{a.stop}」/ Ctrl-C で停止")))
 
     print(c("relay", "┌─ aipair-relay ───────────────────────────────────────────────"))
     log(f"session={session}  dir={cwd}")
@@ -390,7 +411,12 @@ def main():
         # env を読んだ事実を必ず見せる（「指定したのに効いていない/効きすぎている」を防ぐ）
         log(c("dim", "env 由来の既定値: " + "  ".join(ENV_USED)
               + ("  ※ CLI フラグが渡された項目はそちらが優先" if len(sys.argv) > 1 else "")))
-    log(f"停止={'/'.join(stop_phrases)}（{a.stop_side}側）  最大={a.max_rounds}往復  panes={panes['claude']}/{panes['codex']}")
+    log(f"停止={'/'.join(stop_phrases)}（{a.stop_side}側）  最大={max_label}往復  panes={panes['claude']}/{panes['codex']}")
+    if a.autopilot:
+        log(c("ok", "完全自走モード=on") + "（人間待ちで止めず Codex が代理判断。不可逆操作は実行させず安全側で続行）")
+        log(f"  収束の段: プラン {a.plan_rounds} 回超→承認を促す→付帯コメント付きで承認 / 質問 {a.question_rounds} 回超"
+            "→決め切りを促す→relay が安全側の固定回答"
+            + (f" / レビュー停滞 {a.stall_rounds} 往復→打破依頼→合格指示→強制合格" if a.stall_rounds else ""))
     if a.gate:
         log(f"停止ゲート={a.gate}（timeout {a.gate_timeout}s / 差し戻し上限 {a.gate_rounds} 回）")
     for name, det, tst, status in vrows:
@@ -435,12 +461,15 @@ def main():
         if a.stop_side != "codex":
             log(c("warn", f"  ⚠ --stop-side {a.stop_side} は連続モードでは終了になりません"
                           "（連続モードの終端 sentinel ALL_DONE/HUMAN_REQUIRED は Codex 側）"))
-        if a.max_rounds == 20:
+        if a.max_rounds == 20 and not a.autopilot:
             log(c("dim", "  ヒント: 連続モードは往復が伸びます。--max-rounds を大きめに（例 100）"))
     log("プランレビュー=" + ("off" if a.no_plan_review
-        else f"on（上限{a.plan_rounds}回・承認ワード「{a.plan_ok}」）"))
+        else f"on（{'収束の段' if a.autopilot else '上限'}{a.plan_rounds}回・承認ワード「{a.plan_ok}」）"))
     log("質問リレー=" + ("off" if a.no_question_relay
-        else f"on（連続上限{a.question_rounds}回・Chat about this 経由で回答）"))
+        else f"on（{'収束の段' if a.autopilot else '連続上限'}{a.question_rounds}回・Chat about this 経由で回答）"))
+    if a.autopilot and (a.no_plan_review or a.no_question_relay or (vbad and not a.allow_untested_dialogs)):
+        log(c("warn", "  ⚠ autopilot でもダイアログ自動操作が OFF の間は、Claude がプラン承認・質問ダイアログで"
+                      "止まると relay は画面に触れず停止します（exit 5）"))
     log(c("ok", f"▶ {a.start_side} ペインに最初の依頼を入力してください。完了を検知したら自動でリレーします。"))
     log(c("dim", "  （停止: このペインで Ctrl-C ／ `aipair stop`）"))
     print(c("relay", "└──────────────────────────────────────────────────────────────"))
