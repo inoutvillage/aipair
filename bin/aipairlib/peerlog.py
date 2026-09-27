@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 
 HOME = os.path.expanduser("~")
 CLAUDE_PROJECTS = os.path.join(HOME, ".claude", "projects")
+CLAUDE_SESSIONS = os.path.join(HOME, ".claude", "sessions")   # Claude Code が <pid>.json に現在の sessionId を書く
 CODEX_SESSIONS = os.path.join(HOME, ".codex", "sessions")
 # Pin validation — identical in spirit to the launcher (bin/aipair): a caller-supplied
 # pin is trusted only when it is a canonical UUID / a finite non-negative number.
@@ -60,6 +61,14 @@ def claude_file(cwd):
     Otherwise: newest .jsonl in cwd's project dir. Claude Code のプロジェクトdir名は
     非英数字をすべて '-' に置換する（日本語・'_' を含むパスで空振りするバグの修正。
     aipair-relay.claude_glob() と同一ロジックに統一）。"""
+    # 最優先: ペアの Claude ペインで今動いている claude の《現在の》セッション（/resume 後もこちらが正）。
+    # 起動時の pin（--session-id）は会話を再開すると実際のログと食い違い、pin だけでは peer が Claude を
+    # 読めなくなる（2026-09-27 Codex レビュー P1）。
+    live = claude_pane_session()
+    if live:
+        hits = glob.glob(os.path.join(CLAUDE_PROJECTS, "*", live + ".jsonl"))
+        if hits:
+            return hits[0]
     pin = os.environ.get("AIPAIR_CLAUDE_SESSION")
     if pin:                                     # a pin is set (aipair always sets a uuid)
         if _UUID_RE.match(pin):                 # strict UUID only (also blocks path/glob metachars)
@@ -526,6 +535,41 @@ def cli_process(pane, name):
         if st and st[0] not in ("Z", "X"):
             return (pid, st[1], _exe_id(pid))
     return None
+
+
+def claude_live_session(pid):
+    """claude プロセス `pid` の《現在の》セッション ID。Claude Code が書く `~/.claude/sessions/<pid>.json` の
+    sessionId を、pid と procStart（/proc/<pid>/stat の starttime）が今のプロセスと一致する時だけ採る
+    （pid の使い回しで別プロセスの記録を読まない）。`--session-id X` で起動して別の会話を再開すると、ログは
+    再開した会話の <sessionId>.jsonl に書かれ、cmdline の X とは食い違う — こちらが正。読めない・不一致は None。"""
+    try:
+        with open(os.path.join(CLAUDE_SESSIONS, "%d.json" % pid), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("pid") != pid:
+        return None
+    st = _proc_stat(pid)
+    if not st or data.get("procStart") is None or str(data.get("procStart")) != str(st[1]):
+        return None
+    sid = data.get("sessionId")
+    return sid if isinstance(sid, str) and _UUID_RE.match(sid) else None
+
+
+def claude_pane_session(pane=None):
+    """ペアの Claude ペインで今動いている claude の現在のセッション ID（claude_live_session）。
+    pane=None（peer）は、このペインのセッションの @aipair-claude-pane から解決する。Linux+tmux のみ。"""
+    if not proc_available():
+        return None
+    if pane is None:
+        if not os.environ.get("TMUX"):
+            return None
+        sess = _tmux("display-message", "-p", "#{session_name}")
+        pane = _tmux("show-options", "-t", sess, "-qv", "@aipair-claude-pane") if sess else None
+        if not pane:
+            return None
+    ident = cli_process(pane, "claude")
+    return claude_live_session(ident[0]) if ident else None
 
 
 def same_process(ident):

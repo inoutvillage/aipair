@@ -71,6 +71,11 @@ def pane_session_id(pane):
     ident = peerlog.cli_process(pane, "claude")
     if not ident:
         return None
+    # 現在のセッション（~/.claude/sessions/<pid>.json）が最優先。会話を再開すると cmdline の --session-id は
+    # 起動時の ID のまま実際のログと食い違う（2026-09-27 Codex レビュー P1）。取れない時だけ cmdline。
+    live = peerlog.claude_live_session(ident[0])
+    if live:
+        return live
     try:
         with open("/proc/%d/cmdline" % ident[0], "rb") as fh:
             args = [a.decode("utf-8", "replace") for a in fh.read().split(b"\0")]
