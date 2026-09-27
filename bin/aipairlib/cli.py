@@ -59,8 +59,15 @@ def build_parser(description=""):
     ap.add_argument("--stop-side", default=_env_str("AIPAIR_STOP_SIDE", "codex"),
                     choices=["codex", "claude", "both"],
                     help="whose message ends the loop (default codex / env AIPAIR_STOP_SIDE)")
-    ap.add_argument("--max-rounds", type=int, default=_env_int("AIPAIR_MAX_ROUNDS", 20),
-                    help="safety cap (default 20 / env AIPAIR_MAX_ROUNDS)")
+    ap.add_argument("--max-rounds", type=int, default=_env_int("AIPAIR_MAX_ROUNDS", None),
+                    help="safety cap (default 20 / env AIPAIR_MAX_ROUNDS)。--autopilot では明示した時だけ効く"
+                         "（既定は上限なし）")
+    ap.add_argument("--autopilot", action="store_true", default=_env_bool("AIPAIR_AUTOPILOT"),
+                    help="完全自走モード: 人間の判断待ちで止めず Codex が人間の代理として答える。プランレビュー／"
+                         "質問リレー／レビュー停滞は上限で止めず《収束の段》で必ず前へ進める（不可逆操作は実行させず"
+                         "元に戻せる選択肢で続行）。endless と併用可（env AIPAIR_AUTOPILOT）")
+    ap.add_argument("--no-autopilot", action="store_true",
+                    help="AIPAIR_AUTOPILOT が効いている環境で、この1本だけ完全自走モードを切る")
     ap.add_argument("--endless", action="store_true", default=_env_bool("AIPAIR_ENDLESS"),
                     help="停止ワードで終了せず「次のタスクへ」を促し続ける連続モード。"
                          "終端は Codex の --all-done 宣言のみ（env AIPAIR_ENDLESS）")
@@ -99,7 +106,7 @@ def build_parser(description=""):
                     help="default: レビュー対応の依頼（人間待ち sentinel の案内付き）")
     ap.add_argument("--poke-codex", default=None, help="default references the stop phrase")
     ap.add_argument("--plan-rounds", type=int, default=5,
-                    help="max plan-review rounds per plan (default 5)")
+                    help="max plan-review rounds per plan (default 5)。--autopilot では停止せず、超えたら収束→承認へ")
     ap.add_argument("--plan-ok", default=_env_str("AIPAIR_PLAN_OK", "[AIPAIR_PLAN_APPROVED]"),
                     help="Codex のプラン承認 sentinel。先頭行完全一致でのみ承認（default [AIPAIR_PLAN_APPROVED] / env AIPAIR_PLAN_OK）")
     ap.add_argument("--allow-untested-dialogs", action="store_true",
@@ -118,7 +125,8 @@ def build_parser(description=""):
     ap.add_argument("--no-plan-review", action="store_true",
                     help="ignore the plan-approval dialog (pre-existing behavior)")
     ap.add_argument("--question-rounds", type=int, default=5,
-                    help="連続質問リレーの上限（Claudeのターン完了でリセット、default 5）")
+                    help="連続質問リレーの上限（Claudeのターン完了でリセット、default 5）。"
+                         "--autopilot では停止せず、超えたら収束→relay の安全側固定回答へ")
     ap.add_argument("--no-question-relay", action="store_true",
                     help="AskUserQuestionダイアログの自動リレーを無効化")
     ap.add_argument("--claude-log", help="pin Claude session jsonl (adopt an existing session)")
@@ -129,3 +137,14 @@ def build_parser(description=""):
                          "確実に指定したい場合は --claude-log/--codex-log で明示ピン）")
     ap.add_argument("--no-color", action="store_true")
     return ap
+
+
+def apply_autopilot_defaults(a):
+    """--no-autopilot を反映し、--max-rounds の未指定（None）を解決する。通常は既定 20、--autopilot では
+    明示（フラグ / AIPAIR_MAX_ROUNDS）した時だけ効き、既定は上限なし（None）— ループ防止は収束の段が担う
+    （社長判断 2026-09-25）。"""
+    if a.no_autopilot:
+        a.autopilot = False
+    if a.max_rounds is None and not a.autopilot:
+        a.max_rounds = 20
+    return a

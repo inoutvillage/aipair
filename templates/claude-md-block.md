@@ -30,6 +30,11 @@ it ends when Codex declares `[AIPAIR_ALL_DONE]` and nothing is left (exit 0), **
 when only human-blocked `- [!]` items remain (exit 8 — waiting for you). Mark a task only a human can
 unblock as `- [!]` with a `blocker:` reason under it. `--max-rounds` is just a safety cap — set it high.
 
+**Autopilot** (`--autopilot` / `AIPAIR_AUTOPILOT=1`, opt-in only): the relay never stops for a human
+decision — Codex answers as the human's proxy. Don't end a turn waiting for human approval: pick the
+recommended option (never an irreversible one — prefer staging / dry-run) or ask, and Codex answers.
+Plan review, questions and stalled reviews converge instead of stopping; no round cap unless given.
+
 After a relay has ended and the back-and-forth has stopped, a new round can be started on demand
 with **`aipair-relay-here`** (from the claude or codex pane; it adopts the running pair with
 `--adopt` and refuses to double-start). From Claude this is also available as the `aipair-relay`

@@ -176,3 +176,32 @@ def load_or_exit(task_list, base_dir, emit=None):
         (emit or (lambda m: print(m, file=sys.stderr)))(
             "aipair-relay: task-list を読めません（fail-closed・exit 2）: %s" % e)
         sys.exit(2)
+
+
+def mark_blocked(task_list, base_dir, line, reason):
+    """autopilot の最終手段: 着手可の verbatim 行 `line`（classify()['ready'] の要素）を `[!]` にし、
+    直下に `blocker: reason` を差し込む。同じ行がファイル内に丁度1つある時だけ書き換えて True。
+    0 件・複数件・読み書き失敗は何も変えず False（推測で別の行を書き換えない）。改行コードは保持する。"""
+    path = resolve_path(task_list, base_dir)
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            raw = fh.read()
+    except (OSError, UnicodeDecodeError):
+        return False
+    lines = raw.splitlines(keepends=True)
+    hits = [i for i, ln in enumerate(lines) if ln.rstrip("\r\n") == line]
+    if len(hits) != 1:
+        return False
+    i = hits[0]
+    m = _ITEM.match(line)
+    if not m or m.group("mark") != " ":
+        return False
+    eol = lines[i][len(line):] or "\n"
+    lines[i] = line.replace("[ ]", "[!]", 1) + eol
+    lines.insert(i + 1, "%s  blocker: %s%s" % (m.group("indent"), " ".join(reason.split()), eol))
+    try:
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write("".join(lines))
+    except OSError:
+        return False
+    return True

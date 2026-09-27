@@ -25,6 +25,7 @@
 #   AIPAIR_MAX_ROUNDS  最大往復数        AIPAIR_STOP / AIPAIR_STOP_SIDE  停止ワードと判定側
 #   AIPAIR_START_SIDE  最初に完了を待つ相手（claude|codex・既定 claude。codex でも役割交換ではない）
 #   AIPAIR_ENDLESS     連続モード(1でon)  AIPAIR_TASK_LIST / AIPAIR_NEXT_ASK / AIPAIR_ALL_DONE
+#   AIPAIR_AUTOPILOT   完全自走モード(1でon)。人間待ちで止めず Codex が代理判断（--autopilot と同じ）
 #   AIPAIR_HUMAN_REQUIRED  人間対応待ち終端 sentinel（分類 BLOCKED 時のみ honor）
 #   AIPAIR_GATE / AIPAIR_GATE_TIMEOUT / AIPAIR_GATE_ROUNDS  停止ゲート
 #   AIPAIR_ALLOW_UNTESTED_DIALOGS / AIPAIR_NO_VERSION_GATE  版ゲート
@@ -271,6 +272,12 @@ if ! has_extra --endless && ! has_extra --no-endless; then
     *)                 ENV_ARGS+=(--endless) ;;
   esac
 fi
+if ! has_extra --autopilot && ! has_extra --no-autopilot; then
+  case "$(printf '%s' "${AIPAIR_AUTOPILOT:-}" | tr '[:upper:]' '[:lower:]')" in
+    ""|0|false|no|off) : ;;
+    *)                 ENV_ARGS+=(--autopilot) ;;
+  esac
+fi
 if [ -n "${AIPAIR_TASK_LIST:-}" ] && ! has_extra --task-list; then
   ENV_ARGS+=(--task-list "$AIPAIR_TASK_LIST")
 fi
@@ -304,7 +311,7 @@ if [ -n "${AIPAIR_GATE_ROUNDS:-}" ]  && ! has_extra --gate-rounds;  then ENV_ARG
 # value left in the bridge pane's environment cannot leak into the relay (same reason as
 # bin/aipair; see there). Then append the flag translations and any explicit EXTRA flags.
 RELAY_ENV=()
-for v in AIPAIR_STOP AIPAIR_STOP_SIDE AIPAIR_START_SIDE AIPAIR_MAX_ROUNDS AIPAIR_ENDLESS \
+for v in AIPAIR_STOP AIPAIR_STOP_SIDE AIPAIR_START_SIDE AIPAIR_MAX_ROUNDS AIPAIR_ENDLESS AIPAIR_AUTOPILOT \
          AIPAIR_TASK_LIST AIPAIR_NEXT_ASK AIPAIR_ALL_DONE AIPAIR_HUMAN_REQUIRED \
          AIPAIR_GATE AIPAIR_GATE_TIMEOUT AIPAIR_GATE_ROUNDS \
          AIPAIR_ALLOW_UNTESTED_DIALOGS AIPAIR_NO_VERSION_GATE \

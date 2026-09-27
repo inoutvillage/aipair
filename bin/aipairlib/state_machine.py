@@ -42,7 +42,10 @@ from .dialoglib import (detect_plan_dialog, detect_question_dialog, scrape_quest
 from .deliverylib import press, poke
 from .gate import gate_or_message
 from .corelib import hit_stop, oneline
-from .review_protocol import plan_poke_codex, question_poke_codex
+from .review_protocol import (plan_poke_codex, question_poke_codex, question_fill_poke, autopilot_plan_extra,
+                              autopilot_question_extra, autopilot_stall_poke_codex,
+                              autopilot_no_progress_poke_claude)
+from . import autopilot_flow
 from .plan_flow import decide_plan_action
 from .question_flow import decide_question_action, handle_question_answer, decide_question_relay
 from .endless_flow import (decide_endless_terminal, resolve_task_identity, advance_no_progress,  # noqa: F401
@@ -63,6 +66,41 @@ QUESTION_OVERSIZE_REASON = "質問が自動中継上限超過（HUMAN_REQUIRED�
 # 通常のレビュー往復の停止理由（2026-09-24 maroari 実障害: 「ユーザー判断待ち」↔「未修正」の空回り）
 REVIEW_HR_REASON = "レビューの残りが人間判断（HUMAN_REQUIRED）"
 REVIEW_STALL_REASON = "レビュー往復が停滞（進捗なし）"
+
+
+def write_question_file(blocks):
+    """autopilot: 自動中継上限を超える質問の全文を書き出し、そのパスを返す（Codex が読む）。
+    失敗は None（呼び出し側は本文をそのまま渡す — truncate はしない）。"""
+    # 質問文は秘密を含みうる → ディレクトリ 0700・ファイル 0600（umask に依らず）で作り、回答後に削除する
+    # （discard_question_file。Codex レビュー 2026-09-25 P2）。
+    base = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "aipair", "questions")
+    try:
+        os.makedirs(base, mode=0o700, exist_ok=True)
+        os.chmod(base, 0o700)
+        path = os.path.join(base, "q-%d-%d.md" % (os.getpid(), int(time.time() * 1000)))
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("".join("◆%d問目:\n%s\n\n" % (i, b) for i, b in enumerate(blocks, 1)))
+        return path
+    except OSError:
+        return None
+
+
+def discard_question_file(path):
+    """write_question_file の書き出しを消す（無い・消せないは無視）。常に None を返す（呼び出し側の変数を空に）。"""
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return None
+
+
+def force_pass_banner_lines(text, rounds):
+    return [(None, ""),
+            ("warn", "│ ◆ autopilot: レビューの膠着が解けないため relay が合格として扱いました"
+                     f"（{rounds} 往復）"),
+            ("warn", "│   残課題（Codex の最後の指摘）: " + oneline(text)[:400])]
 
 
 def repo_fingerprint(cwd):
@@ -88,6 +126,51 @@ def repo_fingerprint(cwd):
             except OSError:
                 h.update(name + b"?")
     return h.hexdigest()
+
+
+# git 管理外で autopilot の停滞検出に使う作業ツリーの指紋（走査の上限・除外ディレクトリ）
+DIR_FP_LIMIT = 20000
+DIR_FP_SKIP = {".git", "node_modules", "__pycache__", ".venv", "venv", ".next", "dist", "build"}
+
+
+def dir_fingerprint(cwd, limit=DIR_FP_LIMIT):
+    """git 管理外の作業ツリーの指紋（各ファイルの相対パス・大きさ・更新時刻）。autopilot 専用の代替 —
+    git が無いと repo_fingerprint が None になり停滞の段が働かず、上限なしの autopilot が同じレビューを
+    無期限に繰り返せるため（Codex レビュー 2026-09-25 P1）。走査は上限 limit 件（超過分は数えない）。
+    読めない時は None。"""
+    h = hashlib.sha1()
+    n = 0
+    try:
+        for root, dirs, files in os.walk(cwd):
+            dirs[:] = sorted(d for d in dirs if d not in DIR_FP_SKIP)
+            for name in sorted(files):
+                p = os.path.join(root, name)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                h.update(os.fsencode(os.path.relpath(p, cwd)) + b"%d:%d\0" % (st.st_size, st.st_mtime_ns))
+                n += 1
+                if n > limit:
+                    return None      # 部分的な指紋は使わない（未走査のファイルだけが変わる進捗を見逃すため）
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+# 指紋が取れない（git 管理外かつ大きすぎる・読めない）時の autopilot の代替: どのレビューも「進捗不明」として数え、
+# 収束の段は通常の NO_FP_FACTOR 倍の往復でだけ始める（進捗を見分けられない代わりに猶予を長く取る）。
+NO_FINGERPRINT = "NO_FINGERPRINT"
+NO_FP_FACTOR = 3
+
+
+def progress_fingerprint(cwd, autopilot=False):
+    """停滞検出に使う指紋。通常は repo_fingerprint（git 管理外なら None＝検出しない）。autopilot だけは
+    git 管理外でも dir_fingerprint で代替し、収束の段を必ず働かせる。"""
+    fp = repo_fingerprint(cwd)
+    if fp is None and autopilot:
+        fp = dir_fingerprint(cwd) or NO_FINGERPRINT
+    return fp
 
 
 def advance_stall(prev, fp):
@@ -407,6 +490,10 @@ class StateMachine:
         # P1-2: 質問リレーで Codex に HUMAN_REQUIRED を宣言させる際に表示する sentinel トークン。
         # 通常モードで --human-required を空にした場合は None（質問 HR 経路を案内しない）。
         hr_token = human_required_phrases[0] if human_required_phrases else None
+        # --autopilot（完全自走）: 人間待ちで止めず、プラン/質問/停滞は autopilot_flow の《収束の段》で前へ進める。
+        ap = bool(getattr(a, "autopilot", False))
+        stop0 = stop_phrases[0] if stop_phrases else "[AIPAIR_REVIEW_OK]"
+        max_rounds = getattr(a, "max_rounds", None)     # autopilot の既定は None＝上限なし
 
         def classify_tasklist():
             """endless: task-list を分類（唯一の権威）。読めない/解析不能は exit 2 で fail-closed。"""
@@ -437,7 +524,13 @@ class StateMachine:
         rounds = 0
         plan_rounds = 0
         plan_dialog = None
+        plan_stage = "normal"      # autopilot: 今回のプランレビューの段（normal / converge / force）
         question_rounds = 0        # 連続質問リレー回数（Claude のターン完了でリセット）
+        q_acc = ""                 # 欠番の追加回答を待つ間の、先の回答本文
+        q_fill_asked = False       # この質問に欠番の追加回答を既に頼んだか（1 回まで）
+        q_file = None              # autopilot: 上限超過の質問を書き出したファイル
+        forced_pass = False        # autopilot: 停滞の最終段で relay が合格扱いにした
+        np_escalated = None        # autopilot endless: no-progress で保留化を頼んだタスク（2 回目は relay が保留化）
         qs_blocks = []             # 直近に検知した質問ブロック（HUMAN_REQUIRED banner 表示用・P1-2）
         q_unconfirmed_warned = False  # 「画面は質問ダイアログだがログ照合できず」の警告を1回に抑制
         last_activity = time.time()
@@ -460,6 +553,28 @@ class StateMachine:
         def claude_poke_confirm():
             w = LogWatch(tracked["claude"])
             return lambda p: w.claude_input(p)
+
+        def stall_step(st):
+            """autopilot: レビュー停滞の段を 1 つ適用する。"forward"（Claude へ通常どおり渡す）/ "force"
+            （relay が合格扱い）/ "repoked"（Codex に打破・最終依頼を送った＝呼び出し側は continue）/
+            "failed"（その poke の配達失敗）を返す。"""
+            nonlocal since, state, last_activity, pending_kind
+            limit = a.stall_rounds * (NO_FP_FACTOR if st and st[0] == NO_FINGERPRINT else 1)
+            if not st or st[1] < limit:
+                return "forward"
+            act = autopilot_flow.stall_action(st[1], limit)
+            if act in ("break", "final"):
+                log(c("warn", f"◆ autopilot: レビューが {st[1]} 往復停滞 → Codex に"
+                              + ("膠着打破を依頼" if act == "break" else "合格を最終依頼")))
+                sent = poke(panes["codex"], autopilot_stall_poke_codex(act, stop0, st[1]),
+                            confirm=codex_poke_confirm(), busy_wait=bw)
+                if not sent:
+                    return "failed"
+                pending_kind = "review"
+                rg.arm(sent)
+                since = time.time(); state = "codex"; last_activity = time.time()
+                return "repoked"
+            return act
 
         # 終了理由を exit code で区別する（外部 orchestrator が成否を判別できるように）:
         #   0=停止ワード検知（正常完了） 3=最大往復キャップ 4=poke配達失敗
@@ -528,7 +643,8 @@ class StateMachine:
                             dim(c("claude", "claude") + ": " + oneline(text))
                         gate_msg = None
                         # 通常のレビュー往復: Claude が『残りは人間の判断事項』と宣言したら Codex へ回さず止める
-                        if (not a.endless) and human_required_phrases and hit_stop(texts, human_required_phrases):
+                        # autopilot では止めず、そのまま Codex へ回す（Codex が代理で判断する文面）。
+                        if (not a.endless) and (not ap) and human_required_phrases and hit_stop(texts, human_required_phrases):
                             blocked_reason = REVIEW_HR_REASON
                             code = EXIT_BLOCKED
                             print_banner(review_hr_banner_lines("Claude", text, rounds, EXIT_BLOCKED)); break
@@ -555,18 +671,22 @@ class StateMachine:
                     # ダイアログを検知した時だけ、ペインで今動いている claude の版を再判定する（毎 poll の
                     # /proc 走査を避ける）。不可なら分岐に入らず画面に触れない＝起動時から OFF と同じ経路。
                     elif (not a.no_plan_review) and (plan_dialog := detect_plan_dialog(panes["claude"])) and vg.dialog_ok():
-                        if plan_rounds >= a.plan_rounds:
+                        if plan_rounds >= a.plan_rounds and not ap:
                             print(c("warn", f"│ ■ プランレビュー上限 {a.plan_rounds} 回に到達。"
                                             f"人間の判断が必要です（ダイアログはそのまま）。停止します。"), flush=True)
                             print("\a", end="", flush=True)
                             code = 5
                             break
                         plan_rounds += 1
+                        plan_stage = autopilot_flow.stage(plan_rounds, a.plan_rounds) if ap else "normal"
                         log("◆ " + c("claude", "プラン承認ダイアログ検知")
-                            + f"（{plan_rounds}/{a.plan_rounds}回目）→ Codex にプランレビュー依頼")
+                            + f"（{plan_rounds}/{a.plan_rounds}回目"
+                            + (f"・autopilot {plan_stage}" if ap else "") + "）→ Codex にプランレビュー依頼")
                         dim(f"plan: {plan_dialog['plan'] or '(パス不明)'}")
-                        sent = poke(panes["codex"], plan_poke_codex(plan_dialog["plan"], a.plan_ok),
-                                    confirm=codex_poke_confirm(), busy_wait=bw)
+                        plan_msg = plan_poke_codex(plan_dialog["plan"], a.plan_ok)
+                        if ap:
+                            plan_msg += autopilot_plan_extra(plan_stage, a.plan_ok, plan_rounds)
+                        sent = poke(panes["codex"], plan_msg, confirm=codex_poke_confirm(), busy_wait=bw)
                         if not sent:
                             print(c("warn", "│ ■ Codex へのプランレビュー依頼を配達できず（poke失敗）。"
                                             "状態遷移せず停止します（ダイアログはそのまま）。"), flush=True)
@@ -576,7 +696,7 @@ class StateMachine:
                         rg.arm(sent)
                         since = time.time(); state = "codex_plan"; last_activity = time.time()
                     elif (not a.no_question_relay) and detect_question_dialog(panes["claude"]) and vg.dialog_ok():
-                        if question_rounds >= a.question_rounds:
+                        if question_rounds >= a.question_rounds and not ap:
                             print(c("warn", f"│ ■ 質問リレー上限 {a.question_rounds} 回に到達。"
                                             f"人間の判断が必要です（ダイアログはそのまま）。停止します。"), flush=True)
                             print("\a", end="", flush=True)
@@ -591,7 +711,7 @@ class StateMachine:
                             if tracked["claude"]:
                                 tracked["claude"] = refresh_claude_lock(tracked["claude"], cwd, panes["claude"])
                             wait_heartbeat("Claude")
-                        elif (relay_decision := decide_question_relay(qs_blocks)).kind == "human_required":
+                        elif (not ap) and (relay_decision := decide_question_relay(qs_blocks)).kind == "human_required":
                             # P1-3: 質問本文が自動中継上限を超過 → truncate せず人間確認待ちで停止（exit 8）。
                             # 不完全な質問を Codex に渡して推測回答させない（判定/banner は question_flow）。
                             log(c(relay_decision.level, relay_decision.log))
@@ -601,18 +721,50 @@ class StateMachine:
                             break
                         else:
                             question_rounds += 1
-                            log("◆ " + c("claude", "質問ダイアログ検知")
-                                + f"（{question_rounds}/{a.question_rounds}回目・{len(qs_blocks)}問）→ Codex に回答依頼")
-                            sent = poke(panes["codex"], question_poke_codex(qs_blocks, hr_token),
-                                        confirm=codex_poke_confirm(), busy_wait=bw)
-                            if not sent:
-                                print(c("warn", "│ ■ Codex への回答依頼を配達できず（poke失敗）。"
-                                                "状態遷移せず停止します（ダイアログはそのまま）。"), flush=True)
-                                print("\a", end="", flush=True)
-                                code = 4
-                                break
-                            rg.arm(sent)
-                            since = time.time(); state = "codex_question"; last_activity = time.time()
+                            q_stage = autopilot_flow.stage(question_rounds, a.question_rounds) if ap else "normal"
+                            q_acc, q_fill_asked, q_file = "", False, discard_question_file(q_file)
+                            if q_stage == "force":
+                                # autopilot 最終段: Codex に聞かず、relay が安全側の固定回答を配達する。
+                                # scrape のタブ移動で「Chat about this」の番号が変わりうるので今の画面で取り直す。
+                                log("◆ " + c("claude", "質問ダイアログ検知")
+                                    + f"（{question_rounds}回目・autopilot force）→ relay が安全側の固定回答を配達")
+                                qdlg_now = detect_question_dialog(panes["claude"])
+                                if qdlg_now:
+                                    if not allowed("question"):
+                                        print(c("warn", "│ ■ 質問ダイアログへの回答送信直前の再判定で自動操作が不可。"
+                                                        "画面には触れず停止します（ダイアログはそのまま）。"), flush=True)
+                                        print("\a", end="", flush=True)
+                                        code = 5
+                                        break
+                                    if not send_question_answer(panes["claude"], qdlg_now,
+                                                                autopilot_flow.FORCE_QUESTION_ANSWER,
+                                                                watch=claude_watch()):
+                                        print(c("warn", "│ ■ 質問回答の送信を確認できず（Enter失敗）。"
+                                                        "状態遷移せず停止します。回答はコンポーザに残っています。"), flush=True)
+                                        print("\a", end="", flush=True)
+                                        code = 4
+                                        break
+                                rg.clear()
+                                since = time.time(); state = "claude"; last_activity = time.time()
+                            else:
+                                if ap and decide_question_relay(qs_blocks).kind == "human_required":
+                                    q_file = write_question_file(qs_blocks)   # 上限超過: truncate せずファイルで渡す
+                                    dim(f"質問が自動中継上限を超過 → 全文を書き出して渡す: {q_file or '(書き出し失敗・本文を直接渡す)'}")
+                                q_msg = question_poke_codex(qs_blocks, None if ap else hr_token, qfile=q_file)
+                                if ap:
+                                    q_msg += autopilot_question_extra(q_stage, question_rounds)
+                                log("◆ " + c("claude", "質問ダイアログ検知")
+                                    + f"（{question_rounds}/{a.question_rounds}回目・{len(qs_blocks)}問"
+                                    + (f"・autopilot {q_stage}" if ap else "") + "）→ Codex に回答依頼")
+                                sent = poke(panes["codex"], q_msg, confirm=codex_poke_confirm(), busy_wait=bw)
+                                if not sent:
+                                    print(c("warn", "│ ■ Codex への回答依頼を配達できず（poke失敗）。"
+                                                    "状態遷移せず停止します（ダイアログはそのまま）。"), flush=True)
+                                    print("\a", end="", flush=True)
+                                    code = 4
+                                    break
+                                rg.arm(sent)
+                                since = time.time(); state = "codex_question"; last_activity = time.time()
                     else:
                         if tracked["claude"]:
                             tracked["claude"] = refresh_claude_lock(tracked["claude"], cwd, panes["claude"])
@@ -649,6 +801,12 @@ class StateMachine:
                         # state_machine.decide_plan_action の純粋関数へ切り出した（P2-1・plan_flow）。
                         # ここは「決定 → 副作用（press/send/log/code）」の実行のみ。
                         decision = decide_plan_action(texts, a.plan_ok, dialog)
+                        if ap and plan_stage == "force":
+                            # autopilot 最終段: 修正要求でも付帯コメント付きで承認（必ず前へ進む）
+                            forced = autopilot_flow.force_plan_decision(decision, dialog)
+                            if forced is not decision:
+                                log(c("warn", "◆ autopilot: プランレビューが収束しないため Codex の指摘を付帯コメントにして承認します"))
+                            decision = forced
                         # 送信直前の再判定（Codex の応答中にペインで Claude が再起動した・schema で OFF になった等）。
                         # 画面を操作するアクションで不可なら、一切触れず停止する（exit 5・ダイアログはそのまま）。
                         if decision.action not in ("no_text", "no_dialog", "no_tell_option") and not allowed("plan"):
@@ -734,6 +892,39 @@ class StateMachine:
                         # （P2-5: state_machine へ分岐・banner を直書きしない）。run() は outcome を適用するだけ。
                         outcome = handle_question_answer(texts, qdlg, human_required_phrases,
                                                          qs_blocks, question_rounds, EXIT_BLOCKED)
+                        if ap and outcome.kind == "human_required":
+                            # autopilot: 人間は不在なので止めない。ダイアログ検知からやり直す（段が 1 つ上がり、
+                            # 収束 → relay の安全側固定回答へ必ず進む）。回答は Claude へ送らない。
+                            log(c("warn", "◆ autopilot: Codex が人間待ちを宣言 → 人間は不在のため段を上げて代理回答を再依頼します"))
+                            q_file = discard_question_file(q_file)
+                            rg.clear()
+                            since = time.time(); state = "claude"; last_activity = time.time()
+                            continue
+                        answer = outcome.payload
+                        if outcome.kind == "deliver":
+                            # 全問回答の照合: 「N問目」が無い問があれば、その問だけ Codex に 1 回追加で聞く
+                            answer = (q_acc + "\n\n" + outcome.payload) if q_acc else outcome.payload
+                            missing = autopilot_flow.missing_answers(answer, len(qs_blocks))
+                            if missing and not q_fill_asked:
+                                log(c("warn", "◆ 回答に欠番（" + "・".join(f"{i}問目" for i in missing)
+                                      + "）→ Codex にその問だけ追加回答を依頼"))
+                                sent = poke(panes["codex"], question_fill_poke(missing, qs_blocks, q_file),
+                                            confirm=codex_poke_confirm(), busy_wait=bw)
+                                if not sent:
+                                    print(c("warn", "│ ■ Codex への追加回答依頼を配達できず（poke失敗）。"
+                                                    "状態遷移せず停止します（ダイアログはそのまま）。"), flush=True)
+                                    print("\a", end="", flush=True)
+                                    code = 4
+                                    break
+                                q_acc, q_fill_asked = answer, True
+                                rg.arm(sent)
+                                since = time.time(); last_activity = time.time()
+                                continue
+                            if missing:
+                                log(c("warn", "◆ 追加依頼後も欠番あり → 安全側の選び方を注記して配達"))
+                                answer += autopilot_flow.missing_note(missing)
+                            if ap:
+                                answer += autopilot_flow.AUTOPILOT_ANSWER_FOOTER
                         log(c(outcome.level, outcome.log))
                         if outcome.kind == "human_required":
                             # P1-2: Codex が「この質問は人間判断が必要」と宣言 → Claude へ回答を送らず
@@ -752,7 +943,7 @@ class StateMachine:
                                 print("\a", end="", flush=True)
                                 code = 5
                                 break
-                            if not send_question_answer(panes["claude"], qdlg, outcome.payload,
+                            if not send_question_answer(panes["claude"], qdlg, answer,
                                                         watch=claude_watch()):
                                 # ダイアログは chat 押下で既に閉じており、未送信のまま state を
                                 # 進めると永久停止する（Codex レビュー指摘）→ 明示停止
@@ -762,6 +953,7 @@ class StateMachine:
                                 code = 4
                                 break
                         # retry_detect / back_to_wait / deliver 成功 → claude state へ戻す
+                        q_file = discard_question_file(q_file)
                         rg.clear()    # ダイアログ経由の配達に nonce は無い（帰属ゲート不使用）
                         since = time.time(); state = "claude"; last_activity = time.time()
                     else:
@@ -803,16 +995,32 @@ class StateMachine:
                         # 通常のレビュー往復で合格が出なかった時: 人間待ちの宣言か、repo が進まない停滞なら止める。
                         # （合格＋ゲート失敗の差し戻しは Claude に直す点があるので数えない）
                         if (not a.endless) and msg_claude is poke_claude:
-                            if human_required_phrases and hit_stop(texts, human_required_phrases):
+                            if (not ap) and human_required_phrases and hit_stop(texts, human_required_phrases):
                                 blocked_reason = REVIEW_HR_REASON
                                 code = EXIT_BLOCKED
                                 print_banner(review_hr_banner_lines("Codex", text, rounds, EXIT_BLOCKED)); break
                             if getattr(a, "stall_rounds", 0):
-                                stall = advance_stall(stall, repo_fingerprint(cwd))
-                                if stall and stall[1] >= a.stall_rounds:
+                                stall = advance_stall(stall, progress_fingerprint(cwd, ap))
+                                if stall and stall[1] >= a.stall_rounds and not ap:
                                     blocked_reason = REVIEW_STALL_REASON
                                     code = EXIT_BLOCKED
                                     print_banner(review_stall_banner_lines(stall[1], rounds, EXIT_BLOCKED)); break
+                                act = stall_step(stall) if ap else "forward"
+                                if act == "repoked":
+                                    continue
+                                if act == "failed":
+                                    print(c("warn", "│ ■ Codex への膠着打破の依頼を配達できず（poke失敗）。停止します。"), flush=True)
+                                    print("\a", end="", flush=True); code = 4; break
+                                if act == "force":
+                                    print_banner(force_pass_banner_lines(text, rounds))
+                                    stall = None
+                                    ok_gate, gate_msg = gate_or_message(a, gate_state, cwd)
+                                    if ok_gate:
+                                        forced_pass = True
+                                        done_banner(rounds, "codex"); break
+                                    if gate_msg is None:
+                                        code = 6; break
+                                    msg_claude = back_text = gate_msg
                         # 連続モードの終端は task-list 分類が権威（社長指示 2026-08-24 §2）。Codex の終端
                         # sentinel（[AIPAIR_ALL_DONE]/[AIPAIR_HUMAN_REQUIRED]）は分類が一致した時だけ honor し、
                         # 着手可 [ ] が残る（READY）なら sentinel を無視して継続する（誤 sentinel で止めない）。
@@ -830,7 +1038,37 @@ class StateMachine:
                             if eo.kind == "all_done":
                                 all_done_hit = True
                                 done_banner(rounds, "codex", all_done=True); break
-                            if eo.kind in ("human_required", "no_progress"):
+                            if ap and eo.kind == "no_progress":
+                                # autopilot: 止めずに、停滞したタスクを `[!]` へ（1 回目は Claude に依頼、同じタスクで
+                                # 2 回目は relay が task-list を直接保留化）→ 分類が進むのでループしない。
+                                ident = eo.np_state[0]
+                                np_state = None
+                                if ident != UNRESOLVED and ident == np_escalated and tasklist.mark_blocked(
+                                        a.task_list, cwd, ident,
+                                        "autopilot: 進捗の無いまま繰り返し選ばれたため relay が保留化"):
+                                    log(c("warn", f"◆ autopilot: relay が保留化しました → {ident.strip()}"))
+                                    np_escalated = None
+                                    sent = poke(panes["codex"], poke_codex_next,
+                                                confirm=codex_poke_confirm(), busy_wait=bw)
+                                    if not sent:
+                                        print(c("warn", "│ ■ Codex への次タスク依頼を配達できず（poke失敗）。停止します。"),
+                                              flush=True)
+                                        print("\a", end="", flush=True); code = 4; break
+                                    pending_kind = "next"
+                                    rg.arm(sent)
+                                    since = time.time(); state = "codex"; last_activity = time.time()
+                                    continue
+                                if ident == UNRESOLVED and np_escalated == UNRESOLVED:
+                                    # どのタスクか同定できないまま 2 度目 → relay では保留化できない唯一の停止
+                                    blocked_reason = eo.reason
+                                    code = EXIT_BLOCKED
+                                    print_banner(eo.banner); break
+                                log(c("warn", "◆ autopilot: 停滞したタスクを `[!]` にするよう Claude に依頼"))
+                                np_escalated = ident
+                                msg_claude = autopilot_no_progress_poke_claude(
+                                    None if ident == UNRESOLVED else ident,
+                                    next_ask_phrases[0] if next_ask_phrases else "[AIPAIR_NEXT]")
+                            elif eo.kind in ("human_required", "no_progress"):
                                 blocked_reason = eo.reason
                                 code = EXIT_BLOCKED
                                 print_banner(eo.banner); break
@@ -850,6 +1088,7 @@ class StateMachine:
                             if eo.kind == "advance_next":
                                 msg_claude = poke_claude_next
                             elif eo.kind == "review" and a.stop_side in ("codex", "both") and hit_stop(texts, stop_phrases):
+                                stall = None
                                 ok_gate, gate_msg = gate_or_message(a, gate_state, cwd)
                                 if ok_gate:
                                     log("◆ " + c("ok", "Codex がレビュー合格") + " → Claude に次のタスクを促す")
@@ -858,8 +1097,28 @@ class StateMachine:
                                     code = 6; break
                                 else:
                                     msg_claude = back_text = gate_msg
-                        if rounds >= a.max_rounds:
-                            print(c("warn", f"│ ■ 最大 {a.max_rounds} 往復に到達。安全のため停止します。"), flush=True)
+                            elif eo.kind == "review" and ap and getattr(a, "stall_rounds", 0):
+                                # autopilot endless: タスク内のレビュー往復にも停滞の段を効かせる（通常モードと同じ）
+                                stall = advance_stall(stall, progress_fingerprint(cwd, ap))
+                                act = stall_step(stall)
+                                if act == "repoked":
+                                    continue
+                                if act == "failed":
+                                    print(c("warn", "│ ■ Codex への膠着打破の依頼を配達できず（poke失敗）。停止します。"), flush=True)
+                                    print("\a", end="", flush=True); code = 4; break
+                                if act == "force":
+                                    print_banner(force_pass_banner_lines(text, rounds))
+                                    stall = None
+                                    ok_gate, gate_msg = gate_or_message(a, gate_state, cwd)
+                                    if ok_gate:
+                                        log("◆ autopilot: 強制合格 → Claude に次のタスクを促す")
+                                        msg_claude = poke_claude_pass
+                                    elif gate_msg is None:
+                                        code = 6; break
+                                    else:
+                                        msg_claude = back_text = gate_msg
+                        if max_rounds is not None and rounds >= max_rounds:
+                            print(c("warn", f"│ ■ 最大 {max_rounds} 往復に到達。安全のため停止します。"), flush=True)
                             print("\a", end="", flush=True)
                             code = 3
                             break
@@ -928,12 +1187,14 @@ class StateMachine:
                         wait_heartbeat("Codex")
                 time.sleep(a.poll)
         except KeyboardInterrupt:
+            discard_question_file(q_file)
             print("\n" + c("warn", f"│ ■ 中断しました（{rounds} 往復）。"), flush=True)
             set_pane_title(own, f"relay ■ 中断 / {rounds}往復")
             return 130
+        discard_question_file(q_file)     # 回答前に停止した時も書き出しを残さない
         # 終了後もタイトルで結果が分かるようにする（走行中と区別がつかないと、
         # 何時間も前に終わった relay を「まだ回っている」と誤読する）
-        reason = {0: "全タスク完了" if all_done_hit else "停止ワード", 3: "キャップ到達",
+        reason = {0: "全タスク完了" if all_done_hit else ("強制合格" if forced_pass else "停止ワード"), 3: "キャップ到達",
                   4: "配達失敗", 5: "上限到達", 6: "停止ゲート失敗", 7: "schema不一致",
                   8: blocked_reason or BLOCKED_HR_REASON}.get(code, f"exit={code}")
         set_pane_title(own, f"relay ■ 終了({reason}) / {rounds}往復")

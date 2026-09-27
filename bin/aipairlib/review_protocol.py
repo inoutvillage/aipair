@@ -27,10 +27,12 @@ def question_payload_text(blocks):
     return " ".join(f"◆{i}問目: {b}" for i, b in enumerate(blocks, 1))
 
 
-def question_poke_codex(blocks, human_required):
+def question_poke_codex(blocks, human_required, qfile=None):
     # P1-3: ここでは truncate しない。上限超過は呼び出し前に decide_question_relay が human_required へ
     # 倒す（不完全な質問を Codex に渡して推測回答させない）。この文面は「上限内」の質問だけに使う。
-    qtext = question_payload_text(blocks)
+    # autopilot だけは上限超過でも止めず、全文を qfile に書き出してパスを渡す（本文は載せない）。
+    qtext = (f"質問（全 {len(blocks)} 問・選択肢込み）は長いためファイルに書き出しました。`{qfile}` を読んで"
+             "回答してください。" if qfile else question_payload_text(blocks))
     # P1-2: human_required（sentinel トークン）が与えられた時だけ HUMAN_REQUIRED 経路を案内する。
     # 通常モードで --human-required を空にした場合は None が来る → その場合は案内しない。
     hr = ("⚠ ただし、人間の承認・権限・意思決定・秘密情報の入力・課金・契約・本番操作・不可逆操作が"
@@ -39,9 +41,108 @@ def question_poke_codex(blocks, human_required):
           "人間の回答待ちとして停止します）。 " if human_required else "")
     return ("【自動質問応答】Claudeが選択式の質問ダイアログで停止しています。必要なら `peer` で"
             "直近の文脈を確認し、以下の各質問に回答してください。あなたの返答はそのままClaudeへ"
-            "送信されます—人間に伝言を頼まないでください。各質問について「N問目: 選択肢M（ラベル）」"
+            "送信されます—人間に伝言を頼まないでください。"
+            f"全 {len(blocks)} 問すべてに（最後の1問だけでなく、1問も飛ばさずに）回答してください。"
+            "各質問について「N問目: 選択肢M（ラベル）」"
             "の形で選択を明示し、根拠を一言添えてください。どの選択肢も不適切なら、その旨と"
             "代替案を明記してください。" + hr + qtext)
+
+
+def question_fill_poke(missing, blocks, qfile=None):
+    """回答に欠番（「N問目」が無い問）があった時の追加回答依頼。欠けた問だけを再掲する。"""
+    nums = "・".join(f"{i}問目" for i in missing)
+    if qfile:
+        body = f"質問の全文は `{qfile}` にあります。"
+    else:
+        body = " ".join(f"◆{i}問目: {blocks[i - 1]}" for i in missing)
+    return ("【自動質問応答・追加】先ほどの回答に " + nums + " への回答がありませんでした。"
+            "次の問に「N問目: 選択肢M（ラベル）」の形で回答してください（回答済みの問は繰り返さなくてよい。"
+            "あなたの返答は先ほどの回答とまとめて Claude へ送られます—人間に伝言を頼まないでください）。" + body)
+
+
+# --- autopilot（--autopilot）の文面 ------------------------------------------ #
+# 人間は不在で、Codex が人間（依頼者）の代理として判断する。人間待ちの sentinel は案内しない。
+# 不可逆な操作は実行させず、元に戻せる選択肢で先へ進める（社長判断 2026-09-25）。
+
+AUTOPILOT_PROXY = ("【autopilot】人間は不在です。あなたが人間（依頼者）の代理として判断してください"
+                   "（人間の判断待ち・承認待ちで止めることはできません）。本番デプロイ・課金・公開 push・"
+                   "データ削除のような取り返しのつかない操作は実行させず、ステージング・dry-run・実行を見送る等の"
+                   "元に戻せる選択肢を選んで先へ進めてください。API キー・パスワード・トークン等の秘密情報や認証情報は"
+                   "推測・捏造・入力させず、それが無いと進められない作業は秘密を要しない選択肢（スキップ・後回し・"
+                   "モック）で代替して保留として残し、次へ進めてください。")
+
+
+def autopilot_poke_codex(stop):
+    return (f"【自動レビューループ】Claudeが実装/修正を更新しました。`peer` でClaudeの最新の発言を読み、"
+            f"コードをレビューしてください。あなたの返答は自動でClaudeに共有されます。" + AUTOPILOT_PROXY +
+            "Claude の発言に人間への質問・確認・判断の依頼が含まれていたら、すべて列挙して1つずつ代理で"
+            "回答してください（最後の1つだけに答えない）。"
+            f"修正が必要なら具体的に指摘してください（その場合は下記の合格シグナルを書かないこと）。"
+            f"これ以上直す点が無い場合のみ、最終回答の【1行目】に {stop} を単独で"
+            f"（同じ行に他の文字を書かず）出力してください。否定文・引用・説明の中に書いても合格にはなりません。")
+
+
+AUTOPILOT_CLAUDE_NOTE = (" 【autopilot】人間は不在です。人間の確認・承認待ちでターンを終えないでください。"
+                         "判断が必要な点は推奨案を自分で選んで進めるか、質問として明記すれば Codex が代理で答えます。"
+                         "取り返しのつかない操作（本番デプロイ・課金・公開 push・データ削除）は実行せず、"
+                         "元に戻せる形で進めてください。秘密情報・認証情報は推測・捏造・入力せず、それが要る作業は"
+                         "保留として残して次へ進んでください。")
+
+
+def autopilot_poke_claude():
+    return DEFAULT_POKE_CLAUDE + AUTOPILOT_CLAUDE_NOTE
+
+
+# endless の `[!]`: autopilot では人間の承認・意思決定は Codex が代理するので `[!]` の理由にしない。
+AUTOPILOT_ENDLESS_NOTE = (" 【autopilot】人間の承認・意思決定・方針選択は Codex が代理で行うので、それを理由に"
+                          "`- [!]` にしないでください。`- [!]` にするのは、認証情報が無い・実機が要る・外部の反映待ち等、"
+                          "AI には物理的に実行できない時だけです。取り返しのつかない操作は実行せず、元に戻せる形で進めてください。")
+
+
+def autopilot_plan_extra(stage, ok, n):
+    """autopilot のプランレビュー依頼に足す文（段ごと）。"""
+    if stage == "converge":
+        return (f" 【autopilot・収束】このプランのレビューは {n} 回目です。致命的な欠陥（データ消失・"
+                f"セキュリティ・要件の取り違え）が無い限り、最終回答の【1行目】に {ok} を出して承認し、"
+                "残りの指摘は同じ返答に付帯コメントとして書いてください（承認と一緒に Claude へ渡ります）。"
+                + AUTOPILOT_PROXY)
+    if stage == "force":
+        return (f" 【autopilot・最終】このプランのレビューは {n} 回目です。この返答は内容にかかわらず、relay が"
+                "付帯コメントとして添えてプランを承認します。残る指摘を簡潔に書いてください。" + AUTOPILOT_PROXY)
+    return " " + AUTOPILOT_PROXY
+
+
+def autopilot_question_extra(stage, n):
+    """autopilot の質問回答依頼に足す文（段ごと）。"""
+    extra = " " + AUTOPILOT_PROXY + " 人間待ちの sentinel は使えません。必ず全問に代理で回答してください。"
+    if stage == "converge":
+        extra += (f" 【autopilot・収束】Claude が質問を続けています（{n} 回目）。今回で全問を決め切り、"
+                  "回答の最後に『以後は質問せず、判断が要る点は自分で決めて作業を最後まで進めてください』と"
+                  "明記してください。")
+    return extra
+
+
+def autopilot_stall_poke_codex(action, stop, streak):
+    """レビュー停滞時の Codex への依頼（action = break / final）。"""
+    if action == "break":
+        return (f"【autopilot・膠着打破】合格が出ないまま repo（HEAD と作業ツリー）が {streak} 往復変わっていません。"
+                "同じ指摘の往復になっています。`peer` で経緯を読み、次のどちらかに決めてください: "
+                "(a) 指摘が本当に必要なら、Claude が迷わず実行できる具体的な変更（ファイル・箇所・内容）を指示する"
+                "（前回と同じ言い回しの繰り返しは禁止）。"
+                f"(b) 許容できる、または人間の判断事項なら、代理で許容と決め、最終回答の【1行目】に {stop} を"
+                "単独で出力し、残課題を箇条書きで添える。" + AUTOPILOT_PROXY)
+    return (f"【autopilot・最終】膠着が続いています（{streak} 往復 repo 不変）。この返答で最終回答の【1行目】に "
+            f"{stop} を単独で出力し、未解決の指摘は残課題として箇条書きにしてください。"
+            "次の往復でも合格が出なければ relay が合格として扱い、先へ進めます。")
+
+
+def autopilot_no_progress_poke_claude(task, next_ask):
+    """endless: 同じタスクが進捗なく繰り返し選ばれた時、Claude にそのタスクを保留化させる依頼。"""
+    what = f"`{task.strip()}`" if task else "直近に指示されたタスク"
+    return ("【autopilot・停滞】" + what + " が進捗の無いまま繰り返し選ばれています。この項目を task-list で "
+            "**`- [!]`** に変え、**直下に `blocker: 理由` を併記**してください（何が足りず進められないのかを具体的に）。"
+            f"その後、他に着手可な `- [ ]` があれば着手し、無ければ最終回答の【1行目】に {next_ask} を単独で"
+            "出力してターンを終えてください。")
 
 
 # --------------------------------------------------------------------------- #
