@@ -812,3 +812,8 @@ cli の既定が env を読まない）→ いずれも該当テストが FAIL�
   `claude_matches_pane` はこれがログのファイル名と一致すれば画面を見ずに一致とする（不一致・取得不可は従来の画面照合）
 - [x] 回帰テスト `ClaudePaneIdentityBySessionId`（3 件）。`bash tests/run-all.sh` 全緑（relay-parsers 267）
 - [ ] 反映: インストール（`aipair-install.sh`）→ このペアの relay を再点火（未実施・社長確認待ち）
+
+## 追記: 版ゲートの検証済み版を claude 2.1.283 / codex 0.157.1 へ更新（2026-09-27・aipair-bump）
+
+- [x] 実機検証 30 / 30 PASS（ローカル検証ツール・私設 tmux socket）。ダイアログ画面: 前回（claude-2.1.281_codex-0.156.1）と同一構造
+- [x] `corelib.TESTED_VERSIONS` と README「必要環境」表を更新、`bash tests/run-all.sh` 全緑
