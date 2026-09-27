@@ -3447,7 +3447,7 @@ class ClaudePaneIdentityBySessionId(unittest.TestCase):
             fh.write(b"\0".join(a.encode() for a in args) + b"\0")
         return d
 
-    def _sid(self, args):
+    def _sid(self, args, live=None):
         ll = relay.log_lock
         d = self._cmdline(args)
         real_open = open
@@ -3457,6 +3457,7 @@ class ClaudePaneIdentityBySessionId(unittest.TestCase):
                 path = os.path.join(d, path[len("/proc/"):])
             return real_open(path, *a, **k)
         with mock.patch.object(ll.peerlog, "cli_process", return_value=(4242, 1, (1, 1))), \
+             mock.patch.object(ll.peerlog, "claude_live_session", return_value=live), \
              mock.patch("builtins.open", side_effect=fake_open):
             return ll.pane_session_id("%1")
 
@@ -3466,6 +3467,45 @@ class ClaudePaneIdentityBySessionId(unittest.TestCase):
         self.assertEqual(self._sid(["claude", "-r", self.SID]), self.SID)
         self.assertIsNone(self._sid(["claude"]), "no pin → None (screen fallback)")
         self.assertIsNone(self._sid(["claude", "--session-id", "not-a-uuid"]))
+
+    LIVE = "11111111-2222-4333-8444-555555555555"
+
+    def _sessions(self, record):
+        d = tempfile.mkdtemp()
+        with open(os.path.join(d, "4242.json"), "w", encoding="utf-8") as fh:
+            json.dump(record, fh)
+        return d
+
+    def test_live_session_is_read_from_claude_sessions_and_checked_against_proc(self):
+        # Codex レビュー 2026-09-27 P1: --session-id X で起動して別の会話を再開するとログは再開側に書かれる
+        pl = relay.log_lock.peerlog
+        good = {"pid": 4242, "procStart": "777", "sessionId": self.LIVE}
+        cases = [(good, self.LIVE),
+                 (dict(good, pid=4243), None),              # 別 pid の記録
+                 (dict(good, procStart="778"), None),       # pid 使い回し（起動時刻が違う）
+                 ({"pid": 4242, "sessionId": self.LIVE}, None),   # procStart 無し → 信用しない
+                 (dict(good, sessionId="../x"), None)]
+        for record, want in cases:
+            with mock.patch.object(pl, "CLAUDE_SESSIONS", self._sessions(record)), \
+                 mock.patch.object(pl, "_proc_stat", return_value=("S", 777)):
+                self.assertEqual(pl.claude_live_session(4242), want, record)
+
+    def test_pane_session_id_prefers_the_resumed_session_over_the_launch_arg(self):
+        self.assertEqual(self._sid(["claude", "--session-id", self.SID], live=self.LIVE), self.LIVE)
+        self.assertEqual(self._sid(["claude", "--session-id", self.SID]), self.SID, "fallback: cmdline")
+
+    def test_peer_reads_the_resumed_session_even_with_a_stale_pin(self):
+        pl = relay.log_lock.peerlog
+        root = tempfile.mkdtemp()
+        os.makedirs(os.path.join(root, "proj"))
+        live_log = os.path.join(root, "proj", self.LIVE + ".jsonl")
+        open(live_log, "w").close()
+        with mock.patch.object(pl, "CLAUDE_PROJECTS", root), \
+             mock.patch.dict(os.environ, {"AIPAIR_CLAUDE_SESSION": self.SID}):
+            with mock.patch.object(pl, "claude_pane_session", return_value=self.LIVE):
+                self.assertEqual(pl.claude_file("/any"), live_log)
+            with mock.patch.object(pl, "claude_pane_session", return_value=None):
+                self.assertIsNone(pl.claude_file("/any"), "no live session → the pin rule as before")
 
     def test_matching_session_id_wins_even_when_the_screen_shows_a_paraphrase(self):
         ll = relay.log_lock

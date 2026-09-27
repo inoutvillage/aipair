@@ -817,3 +817,16 @@ cli の既定が env を読まない）→ いずれも該当テストが FAIL�
 
 - [x] 実機検証 30 / 30 PASS（ローカル検証ツール・私設 tmux socket）。ダイアログ画面: 前回（claude-2.1.281_codex-0.156.1）と同一構造
 - [x] `corelib.TESTED_VERSIONS` と README「必要環境」表を更新、`bash tests/run-all.sh` 全緑
+
+## 追記: 会話を再開した Claude のログを peer / relay が見失う（2026-09-27・Codex レビュー P1）
+
+> 症状: ペインの Claude を `--session-id X…` で起動した後に別の会話 `Y…` を再開すると、ログは再開側に
+> 書かれ、起動時の pin（`AIPAIR_CLAUDE_SESSION` / cmdline）と食い違う。`peer` は「Claude session がない」、relay は
+> 画面照合が外れると正しいログを特定できない。
+> 根拠: Claude Code が `~/.claude/sessions/<pid>.json` に現在の `sessionId` と `procStart`（/proc の starttime）を書いている。
+
+- [x] `peerlog.claude_live_session(pid)`: sessions/<pid>.json の sessionId を、pid と procStart が今のプロセスと一致する時だけ採る
+- [x] `peerlog.claude_pane_session(pane)`: ペアの Claude ペイン（@aipair-claude-pane）の claude の現在のセッション
+- [x] `peerlog.claude_file`: 現在のセッションのログがあれば pin より優先。`log_lock.pane_session_id`: 現在のセッション → cmdline の順
+- [x] テスト 3 件追加（procStart / pid 不一致は不採用・再開側を優先・現在のセッション無しは従来どおり）。run-all 全緑（relay-parsers 277）
+- [x] 実機: ずれた pin（X…）でも `peer-log claude` が再開後のログ（Y…）を読めることを確認
