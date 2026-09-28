@@ -38,6 +38,19 @@ chk "grep 'aipair-relay-here' templates/vscode-tasks.json | grep -q -- '--endles
 chk "! grep -q 'aipair name' templates/vscode-tasks.json" "vscode: force-reignite does not embed \$(aipair name) (auto-resolves from cwd)"
 # 非endless の再点火タスク: --no-endless（環境変数に依らず確実に非endless）+ --allow-untested-dialogs（版差でも dialog ON）
 chk "grep 'aipair-relay-here' templates/vscode-tasks.json | grep -q -- '--no-endless --allow-untested-dialogs'" "vscode: non-endless reignite uses --no-endless + --allow-untested-dialogs"
+# Every task is ONE `command` string, never `command` + `args`: editors that read .vscode/tasks.json
+# but join command and args unquoted (Zed) would hand `bash -ic` only the first word — the stop task
+# then runs a plain `aipair` (start / re-attach) without any error (2026-09-29). The inner command
+# must also survive PowerShell's single quotes untouched, so it may not contain ' " $ ` or \.
+chk "python3 - templates/vscode-tasks.json <<'PY'
+import json, re, sys
+tasks = json.load(open(sys.argv[1], encoding='utf-8'))['tasks']
+assert tasks
+for t in tasks:
+    assert t['type'] == 'shell' and 'args' not in t, t['label']
+    assert t.get('options') == {'cwd': '\${workspaceFolder}'}, t['label']
+    assert re.fullmatch(r\"wsl\\.exe -e bash -ic '[^'\\\"\$\`\\\\\\\\]+'\", t['command']), t['command']
+PY" "vscode: every task is a single command string + options.cwd (no args)"
 
 # endless 新契約（社長指示 2026-08-24 §11 Phase 6）: 旧契約「終端は ALL_DONE のみ」を配布ドキュメントへ
 # 再発させない＋新契約（HUMAN_REQUIRED）が存在すること。ドキュメントが実装から drift しないよう固定する。

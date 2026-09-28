@@ -139,10 +139,16 @@ claude / codex / python3 が無い場合は導入手順を案内して終了す�
 
 Windows の VS Code（Remote-WSL でない、Windows フォルダとして開く運用）から起動するには、
 `templates/vscode-tasks.json` をプロジェクトの `.vscode/tasks.json` に置く（`--vscode-tasks <dir>` で配置できる）。
-タスクは `wsl.exe --cd "${workspaceFolder}" bash -ic …` の形で、**wsl.exe 自身が Windows パスを WSL の作業ディレクトリに変換**するため、
-無修正で他プロジェクトに流用できる。
+タスクは `"command": "wsl.exe -e bash -ic '…'"` ＋ `"options": { "cwd": "${workspaceFolder}" }` の形で、
+**wsl.exe が起動元の作業フォルダ（Windows パス）を WSL の作業ディレクトリに変換**するため、無修正で他プロジェクトに流用できる
+（空白・日本語を含むパスでも可）。
 （`type:shell` は **PowerShell 経由**で実行されるため、`$(wslpath …)` のような入れ子引用符・`$()`・バックスラッシュ Windows パスは PowerShell に壊される。
-`--cd` 方式はそれらを一切使わず回避する。）Linux ネイティブ / macOS で VS Code から使う場合は `wsl.exe --cd … bash -ic` の部分を `bash -ic` に書き換える。
+この形はそれらを一切使わず回避する。）Linux ネイティブ / macOS で VS Code から使う場合は `wsl.exe -e bash -ic` の部分を `bash -ic` に書き換える。
+
+`args` を使わず `command` 1 本の文字列にしているのは、**`.vscode/tasks.json` を読み込む他のエディタ（Zed など）でも同じコマンドが走るようにするため**。
+Zed は `command` と `args` を引用符なしで連結して PowerShell に渡すので、`args` に `"aipair loop --unsafe"` と書くと bash には `aipair` だけが渡り、
+**エラーにならずに別の動作をする**（例: 停止タスクが起動 / 再アタッチになる）。タスクを足す時も同じ形で書き、
+内側のコマンドに `'` `"` `$` を含めない（含める場合は PowerShell の引用規則に合わせる）。
 
 ---
 
@@ -160,7 +166,7 @@ Windows の VS Code（Remote-WSL でない、Windows フォルダとして開く
 | `~/.claude/skills/aipair-relay/` | Claude から relay をオンデマンド点火するスキル |
 | `~/.claude/CLAUDE.md` | 末尾に周知ブロック。Claude に `peer` の使い方を周知（全セッションで読まれる） |
 | `~/.codex/AGENTS.md` | Codex に同様に周知（グローバル読込） |
-| `<project>/.vscode/tasks.json` | VS Code「Tasks: Run Task」から起動（WSL2 向けテンプレ）。**無修正で全プロジェクト共通** |
+| `<project>/.vscode/tasks.json` | VS Code「Tasks: Run Task」から起動（WSL2 向けテンプレ。Zed も同じファイルを読む）。**無修正で全プロジェクト共通** |
 
 🔒 **配置先は `~/.local/bin` 固定**: `aipair-relay-here` が `$HOME/.local/bin/aipair-relay` を参照し、
 `aipair-relay`・`peer-log` は薄い entrypoint で、**同じディレクトリの `aipairlib/` パッケージ**（`relay`／`peerlog`／`corelib`／`loglib`／`tmuxlib`／`deliverylib`／`dialoglib`／共有 `logs`）を通常 import する（#7 で `SourceFileLoader`＋属性注入から通常 package へ移行）。
