@@ -830,3 +830,8 @@ cli の既定が env を読まない）→ いずれも該当テストが FAIL�
 - [x] `peerlog.claude_file`: 現在のセッションのログがあれば pin より優先。`log_lock.pane_session_id`: 現在のセッション → cmdline の順
 - [x] テスト 3 件追加（procStart / pid 不一致は不採用・再開側を優先・現在のセッション無しは従来どおり）。run-all 全緑（relay-parsers 277）
 - [x] 実機: ずれた pin（X…）でも `peer-log claude` が再開後のログ（Y…）を読めることを確認
+
+## 追記: 版ゲートの検証済み版を claude 2.1.284 / codex 0.158.0 へ更新（2026-09-29・aipair-bump）
+
+- [x] 実機検証 30 / 30 PASS（ローカル検証ツール・私設 tmux socket）。ダイアログ画面: 前回（claude-2.1.283_codex-0.157.1）と同一構造
+- [x] `corelib.TESTED_VERSIONS` と README「必要環境」表を更新、`bash tests/run-all.sh` 全緑
