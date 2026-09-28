@@ -187,7 +187,7 @@ echo "exit=$?"
 
 ## OS 差異の扱い
 
-- `os=wsl2`: VS Code の Tasks は `wsl.exe --cd … bash -ic …` 形式（`templates/vscode-tasks.json`）。`--vscode-tasks` を提案する
+- `os=wsl2`: VS Code の Tasks は `wsl.exe -e bash -ic '…'` ＋ `options.cwd` 形式（`templates/vscode-tasks.json`）。`--vscode-tasks` を提案する
 - `os=linux`: そのまま。VS Code を使うなら tasks.json の `wsl.exe` 部分をユーザー側で書き換える必要がある旨を添える
 - `os=macos`: **未検証**（実機での検証なし）と必ず明記する。`brew install tmux` は sudo 不要。GNU 固有のコマンドは使っていないが、問題が出たら README のトラブルシュートへ
 

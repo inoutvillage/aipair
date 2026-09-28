@@ -69,6 +69,14 @@ task makes no progress across rounds) instead of guessing or spinning.
   narrower. Pairs that are already running keep their layout (the sizes are applied only when a
   session is created). To get the old layout back, edit the two `split-window -l` values in `aipair`
   (README「カスタマイズ」).
+- **`templates/vscode-tasks.json`: every task is now one `command` string** —
+  `"command": "wsl.exe -e bash -ic '<command>'"` with `"options": { "cwd": "${workspaceFolder}" }`, instead of
+  `"command": "wsl.exe"` plus an `args` array with `--cd`. The commands the tasks run are unchanged, and
+  VS Code runs them as before. The reason is editors that read `.vscode/tasks.json` but join `command` and
+  `args` without quoting (Zed): there `bash -ic` received only the first word, so e.g. the stop task ran a
+  plain `aipair` (start / re-attach) **without any error**. `aipair-install.sh --vscode-tasks` never
+  overwrites an existing `tasks.json`, so **projects that already have the old template keep it** — replace
+  the file by hand to pick up the new form.
 - **no-progress の同一性照合を「見えない差」に依存させない**（P2-1・案B）— `resolve_task_identity` /
   `advance_no_progress` の比較を `canonical_task_key`（NFC → 前後の空白除去 → checkbox 記法の正規化）
   経由にした。Codex のエコーが行頭インデントを落とす・Markdown の hard-break を付け外しする・bullet を

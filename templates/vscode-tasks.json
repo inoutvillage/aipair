@@ -4,11 +4,8 @@
     {
       "label": "🤝【AI Pair】起動 / 再アタッチ（claude ┃ codex ／ 下段 bridge）",
       "type": "shell",
-      "command": "wsl.exe",
-      "args": [
-        "--cd", "${workspaceFolder}",
-        "bash", "-ic", "aipair"
-      ],
+      "command": "wsl.exe -e bash -ic 'aipair'",
+      "options": { "cwd": "${workspaceFolder}" },
       "presentation": {
         "reveal": "always",
         "panel": "dedicated",
@@ -21,11 +18,8 @@
     {
       "label": "🔁【AI Pair】相互レビュー・ループ（自走 / Codexが [AIPAIR_REVIEW_OK] で停止）",
       "type": "shell",
-      "command": "wsl.exe",
-      "args": [
-        "--cd", "${workspaceFolder}",
-        "bash", "-ic", "aipair loop --unsafe"
-      ],
+      "command": "wsl.exe -e bash -ic 'aipair loop --unsafe'",
+      "options": { "cwd": "${workspaceFolder}" },
       "presentation": {
         "reveal": "always",
         "panel": "dedicated",
@@ -37,11 +31,8 @@
     {
       "label": "⚡【AI Pair】relay 強制再点火（endless / max100 / 版無視）",
       "type": "shell",
-      "command": "wsl.exe",
-      "args": [
-        "--cd", "${workspaceFolder}",
-        "bash", "-ic", "aipair-relay-here --endless --max-rounds 100 --allow-untested-dialogs"
-      ],
+      "command": "wsl.exe -e bash -ic 'aipair-relay-here --endless --max-rounds 100 --allow-untested-dialogs'",
+      "options": { "cwd": "${workspaceFolder}" },
       "presentation": {
         "reveal": "always",
         "panel": "dedicated",
@@ -53,11 +44,8 @@
     {
       "label": "🔄【AI Pair】relay 再点火（非endless / プラン+質問ON・版無視）",
       "type": "shell",
-      "command": "wsl.exe",
-      "args": [
-        "--cd", "${workspaceFolder}",
-        "bash", "-ic", "aipair-relay-here --no-endless --allow-untested-dialogs"
-      ],
+      "command": "wsl.exe -e bash -ic 'aipair-relay-here --no-endless --allow-untested-dialogs'",
+      "options": { "cwd": "${workspaceFolder}" },
       "presentation": {
         "reveal": "always",
         "panel": "dedicated",
@@ -69,11 +57,8 @@
     {
       "label": "📜【AI Pair】統合ログ（bridge）だけ表示",
       "type": "shell",
-      "command": "wsl.exe",
-      "args": [
-        "--cd", "${workspaceFolder}",
-        "bash", "-ic", "peer-log both --watch"
-      ],
+      "command": "wsl.exe -e bash -ic 'peer-log both --watch'",
+      "options": { "cwd": "${workspaceFolder}" },
       "presentation": {
         "reveal": "always",
         "panel": "dedicated"
@@ -83,11 +68,8 @@
     {
       "label": "🛑【AI Pair】停止（tmux セッション kill）",
       "type": "shell",
-      "command": "wsl.exe",
-      "args": [
-        "--cd", "${workspaceFolder}",
-        "bash", "-ic", "aipair stop"
-      ],
+      "command": "wsl.exe -e bash -ic 'aipair stop'",
+      "options": { "cwd": "${workspaceFolder}" },
       "presentation": {
         "reveal": "always",
         "panel": "shared"
@@ -97,11 +79,8 @@
     {
       "label": "🤖 claude 単体起動（peer 参照可）",
       "type": "shell",
-      "command": "wsl.exe",
-      "args": [
-        "--cd", "${workspaceFolder}",
-        "bash", "-ic", "export AI_SELF=claude AI_PEER=codex && claude"
-      ],
+      "command": "wsl.exe -e bash -ic 'export AI_SELF=claude AI_PEER=codex && claude'",
+      "options": { "cwd": "${workspaceFolder}" },
       "presentation": {
         "reveal": "always",
         "panel": "dedicated",
@@ -112,11 +91,8 @@
     {
       "label": "🤖 codex 単体起動（peer 参照可）",
       "type": "shell",
-      "command": "wsl.exe",
-      "args": [
-        "--cd", "${workspaceFolder}",
-        "bash", "-ic", "export AI_SELF=codex AI_PEER=claude && codex"
-      ],
+      "command": "wsl.exe -e bash -ic 'export AI_SELF=codex AI_PEER=claude && codex'",
+      "options": { "cwd": "${workspaceFolder}" },
       "presentation": {
         "reveal": "always",
         "panel": "dedicated",
