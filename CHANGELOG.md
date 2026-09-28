@@ -63,6 +63,12 @@ task makes no progress across rounds) instead of guessing or spinning.
   (naming the blocking item or the question) so it is clear why the loop stopped and what to do.
 
 ### Changed
+- **Default pane layout: bridge 17% high, Codex 28% wide** (was 30% / 50%) — `aipair` now splits the
+  window so the Claude pane gets most of the space. **This changes how a newly started pair looks**
+  for everyone who upgrades: the bottom bridge pane is shorter and the right-hand Codex pane is
+  narrower. Pairs that are already running keep their layout (the sizes are applied only when a
+  session is created). To get the old layout back, edit the two `split-window -l` values in `aipair`
+  (README「カスタマイズ」).
 - **no-progress の同一性照合を「見えない差」に依存させない**（P2-1・案B）— `resolve_task_identity` /
   `advance_no_progress` の比較を `canonical_task_key`（NFC → 前後の空白除去 → checkbox 記法の正規化）
   経由にした。Codex のエコーが行頭インデントを落とす・Markdown の hard-break を付け外しする・bullet を

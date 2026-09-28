@@ -446,8 +446,8 @@ fi
 tmux new-session -d -s "$NAME" -c "$DIR"
 trap 'tmux kill-session -t "=$NAME" 2>/dev/null || true' EXIT   # EXIT keeps the triggering exit code
 CLAUDE=$(tmux list-panes -t "=$NAME" -F '#{pane_id}' | head -1)
-BRIDGE=$(tmux split-window -v -l 30% -t "$CLAUDE" -c "$DIR" -P -F '#{pane_id}')
-CODEX=$(tmux split-window -h -l 50% -t "$CLAUDE" -c "$DIR" -P -F '#{pane_id}')
+BRIDGE=$(tmux split-window -v -l 17% -t "$CLAUDE" -c "$DIR" -P -F '#{pane_id}')
+CODEX=$(tmux split-window -h -l 28% -t "$CLAUDE" -c "$DIR" -P -F '#{pane_id}')
 
 # Session options via the pane id: set-option (tmux 3.2a) rejects the "=" exact
 # form, and a bare name could prefix-match another session (see running()).
