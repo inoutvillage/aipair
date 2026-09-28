@@ -594,7 +594,7 @@ aipair-relay --gate 'pytest -q' --gate-rounds 2              # フラグ
 ## カスタマイズ
 
 - **コマンド名を変える**: `~/.local/bin/aipair` をリネーム（PATH 上にあれば何でも可。他の 5 本はリネームしない）。
-- **bridge の高さ / 左右比**: `aipair` 内の `split-window -l 30%`（下段の高さ）と `-l 50%`（codex の幅）を編集。
+- **bridge の高さ / 左右比**: `aipair` 内の `split-window -l 17%`（下段の高さ）と `-l 28%`（codex の幅）を編集。
 - **bridge の初期表示件数**: `aipair` 内の `peer-log both --watch --last 15` の数値。
 - **起動フラグ / 安全モード**: 既定（安全）は**フラグ無し＝通常の許可プロンプト**。`--unsafe` か `AIPAIR_UNSAFE=1` を付けると
   `claude --dangerously-skip-permissions` / `codex --dangerously-bypass-approvals-and-sandbox` で起動する（`aipair loop` は必須）。
