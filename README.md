@@ -601,6 +601,10 @@ aipair-relay --gate 'pytest -q' --gate-rounds 2              # フラグ
 
 - **コマンド名を変える**: `~/.local/bin/aipair` をリネーム（PATH 上にあれば何でも可。他の 5 本はリネームしない）。
 - **bridge の高さ / 左右比**: `aipair` 内の `split-window -l 17%`（下段の高さ）と `-l 28%`（codex の幅）を編集。
+  - この比率になるのは**起動時**。`aipair` は分割の直前に、ウィンドウを起動元の端末の大きさ（tmux のステータス行を除く）へ合わせてから分割する
+    （tmux の版や、同じ tmux サーバにつながっている他の端末の大きさに左右されない）。行数・列数は tmux が端数を切り捨てる（例: 184x46 の端末で bridge 7 行 / codex 51 列）。
+  - **起動後に端末の大きさを変えると、比率は保たれない**（tmux は増減分を各ペインに配分する）。合わせ直すにはペインの境界をドラッグするか、`aipair stop` → `aipair` で起動し直す。
+  - 端末が無い起動（cron・CI・標準入力が端末でない場合）は大きさを取れないので、tmux の既定の大きさのまま分割する。
 - **bridge の初期表示件数**: `aipair` 内の `peer-log both --watch --last 15` の数値。
 - **起動フラグ / 安全モード**: 既定（安全）は**フラグ無し＝通常の許可プロンプト**。`--unsafe` か `AIPAIR_UNSAFE=1` を付けると
   `claude --dangerously-skip-permissions` / `codex --dangerously-bypass-approvals-and-sandbox` で起動する（`aipair loop` は必須）。
@@ -620,6 +624,7 @@ bash tests/run-all.sh        # shebang で判別した全 bash/python3 スクリ
 | テスト | 対象 | 方式 |
 |---|---|---|
 | `tests/session-name.sh` | `aipair name` / `stop` / 実起動のセッション名解決（衝突・旧名引き継ぎ・大小文字・collision） | 専用ソケット `tmux -L` の隔離サーバー。本番ペアには触れない |
+| `tests/pane-layout.py` | 起動直後のペイン比率（端末 2 サイズ・他の端末が接続中・ステータス行 0 / 2 行・tmux 内からの起動・端末なし・起動後の端末サイズ変更への追従） | 専用ソケット `tmux -L` の隔離サーバーに、大きさを指定した擬似端末から実起動して `list-panes` を読む |
 | `tests/launch-cmds.sh` | 各ペインに打ち込む起動行（クォート・`AIPAIR_*` の真偽値・シェル断片のフラグ） | `AIPAIR_DRY_RUN=1` の出力を実際にシェルで評価し、シムが受け取った argv を比較 |
 | `tests/codex-follow.py` | Codex rollout の探索・追従・増分インデックス | 一時ディレクトリの fixture。`~/.codex` は読まない |
 | `tests/relay-parsers.py` | 停止ワード判定・env 解析・ペイン特定・プラン/質問ダイアログ検出・ターン完了検出・transcript パーサ | `tmux` / 画面キャプチャをモック |

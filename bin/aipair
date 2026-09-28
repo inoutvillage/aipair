@@ -244,6 +244,21 @@ attach_session() {
   if [ -n "${TMUX:-}" ]; then exec tmux switch-client -t "=$NAME"
   else exec tmux attach -t "=$NAME"; fi
 }
+# pair_window_size PANE → "cols rows" the pair's window will have once it is shown on the terminal
+# `aipair` was started from (the terminal, minus tmux's status lines). Fails — printing nothing —
+# whenever that is not known for certain: no terminal, an unreadable size, an unknown `status` value.
+pair_window_size() {
+  local s cols rows st
+  if [ -n "${TMUX:-}" ]; then s=$(tmux display-message -p '#{client_width} #{client_height}' 2>/dev/null) || return 1
+  elif [ -t 0 ]; then s=$(stty size 2>/dev/null) || return 1; s="${s#* } ${s% *}"   # stty prints "rows cols"
+  else return 1; fi
+  [[ "$s" =~ ^([1-9][0-9]*)\ ([1-9][0-9]*)$ ]] || return 1
+  cols=${BASH_REMATCH[1]}; rows=${BASH_REMATCH[2]}
+  st=$(tmux display-message -p -t "$1" '#{status}' 2>/dev/null) || return 1
+  case "$st" in off) st=0 ;; on) st=1 ;; [2-5]) ;; *) return 1 ;; esac
+  rows=$((rows - st)); [ "$rows" -ge 1 ] || return 1
+  printf '%s %s\n' "$cols" "$rows"
+}
 
 case "$cmd" in
   name)
@@ -446,8 +461,20 @@ fi
 tmux new-session -d -s "$NAME" -c "$DIR"
 trap 'tmux kill-session -t "=$NAME" 2>/dev/null || true' EXIT   # EXIT keeps the triggering exit code
 CLAUDE=$(tmux list-panes -t "=$NAME" -F '#{pane_id}' | head -1)
+# The two splits below are percentages, and tmux applies a percentage to the window AS IT IS NOW.
+# `new-session -d` does not size that window after the terminal that is about to show it: depending
+# on the tmux version it is 80x24, the size of whichever OTHER terminal is attached to the server,
+# or (run from inside tmux) the size of the pane `aipair` was typed in — and when the window is then
+# stretched to the real terminal tmux does not keep the proportions (2026-09-29: 28% came out as
+# 20%..40%). So give the window its final size first. resize-window pins the window to that size
+# (window-size manual); the pin is dropped right after the splits so the window follows the
+# terminal again. No terminal (installer smoke test, cron, CI) → nothing is done, as before.
+SIZED=0
+if WSIZE=$(pair_window_size "$CLAUDE") \
+   && tmux resize-window -t "$CLAUDE" -x "${WSIZE% *}" -y "${WSIZE#* }" 2>/dev/null; then SIZED=1; fi
 BRIDGE=$(tmux split-window -v -l 17% -t "$CLAUDE" -c "$DIR" -P -F '#{pane_id}')
 CODEX=$(tmux split-window -h -l 28% -t "$CLAUDE" -c "$DIR" -P -F '#{pane_id}')
+[ "$SIZED" = 0 ] || tmux set-window-option -u -t "$CLAUDE" window-size 2>/dev/null || true
 
 # Session options via the pane id: set-option (tmux 3.2a) rejects the "=" exact
 # form, and a bare name could prefix-match another session (see running()).
