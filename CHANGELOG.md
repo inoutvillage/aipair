@@ -69,6 +69,15 @@ task makes no progress across rounds) instead of guessing or spinning.
   narrower. Pairs that are already running keep their layout (the sizes are applied only when a
   session is created). To get the old layout back, edit the two `split-window -l` values in `aipair`
   (README「カスタマイズ」).
+- **The pane layout no longer depends on the tmux version or on other terminals** — the 17% / 28% split
+  was applied to whatever size `new-session -d` had given the window (80x24, the size of another terminal
+  attached to the same tmux server, or the pane `aipair` was typed in), and tmux does not keep proportions
+  when the window is then stretched to the real terminal; on a 184-column terminal the Codex pane came out
+  anywhere from 37 to 74 columns. `aipair` now sizes the window to the terminal it was started from (minus
+  tmux's status lines) **before** splitting, so a new pair starts at 17% / 28% (tmux rounds down: bridge
+  7 rows / Codex 51 columns on 184x46). This holds **at start-up only** — resizing the terminal afterwards
+  still redistributes the space, as tmux always did. Without a terminal (cron, CI, the installer's smoke
+  test) nothing is resized and the behaviour is unchanged. New test: `tests/pane-layout.py`.
 - **`templates/vscode-tasks.json`: every task is now one `command` string** —
   `"command": "wsl.exe -e bash -ic '<command>'"` with `"options": { "cwd": "${workspaceFolder}" }`, instead of
   `"command": "wsl.exe"` plus an `args` array with `--cd`. The commands the tasks run are unchanged, and
