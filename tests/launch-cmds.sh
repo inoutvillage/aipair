@@ -217,6 +217,12 @@ chk "$(run loop codex "$ND")" "cmd=codex self=codex peer=claude${J}[--no-daemon]
 chk "$(env "$ND" AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^codex:  *//p')" "clear; env AI_SELF=codex AI_PEER=claude $P codex --no-daemon" "interactive (safe default, no --unsafe): --no-daemon only"
 chk "$(run loop codex "$ND" 'AIPAIR_CODEX_FLAGS=-q --no-daemon')" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]${J}[-q]${J}[--no-daemon]" "already in AIPAIR_CODEX_FLAGS → not added twice"
 chk "$(run loop codex "$ND" 'AIPAIR_CODEX_FLAGS=-q # x')" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]${J}[-q]" "a '#' in the user fragment cannot comment it out (it is prepended)"
+# "already there" = the shell would really pass it (Codex review 2026-09-29): a comment or a quoted text is not
+chk "$(run loop codex "$ND" 'AIPAIR_CODEX_FLAGS=-q # --no-daemon')" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]${J}[-q]" "'# --no-daemon' is a comment → still added"
+chk "$(run loop codex "$ND" 'AIPAIR_CODEX_FLAGS=--append-system-prompt "use --no-daemon"')" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]${J}[--append-system-prompt]${J}[use --no-daemon]" "inside a quoted text → still added"
+chk "$(run loop codex "$ND" "AIPAIR_CODEX_FLAGS='--no-daemon'")" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]${J}[--no-daemon]" "a quoted but real argument → not added twice"
+chk "$(run loop codex "$ND" 'AIPAIR_CODEX_FLAGS=a#b --no-daemon')" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]${J}[a#b]${J}[--no-daemon]" "'#' inside a word is not a comment (bash rule) → not added twice"
+chk "$(run loop codex "$ND" 'AIPAIR_CODEX_FLAGS=-q; echo --no-daemon')" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]${J}[-q]${J}--no-daemon" "after ';' it is another command's argument → still added"
 chk "$(run loop claude "$ND")" "cmd=claude self=claude peer=codex${J}[--session-id]${J}[$S]${J}[--dangerously-skip-permissions]" "claude's line is untouched"
 chk "$(run loop codex)" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]" "a codex without --no-daemon: not added (older codex rejects unknown flags)"
 

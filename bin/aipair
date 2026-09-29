@@ -341,15 +341,57 @@ fi
 # pair's Codex log (it never saw Codex finish), and Codex's `peer` read the AI_*/AIPAIR_* pins of that
 # other, possibly long-gone, pair (2026-09-29). --no-daemon keeps the TUI self-contained. Added only
 # when this codex offers it (older ones reject unknown flags), in FRONT of the user's fragment like the
-# bypass flag, and never twice. The help text is captured first: `| grep -q` under pipefail can fail
-# on the SIGPIPE it sends codex.
+# bypass flag, and never twice (codex rejects a repeated --no-daemon). The help text is captured
+# first: `| grep -q` under pipefail can fail on the SIGPIPE it sends codex.
+# "Already there" means the pane's shell would pass --no-daemon to codex as an argument — not a
+# substring match, which a comment (`# --no-daemon`) or a quoted text would fool (Codex review
+# 2026-09-29). The fragment is split with bash's own rules, WITHOUT running anything: a comment starts
+# only where a word would; '…', "…" and \ quote; an unquoted ; & | or newline ends codex's command.
+# Expansions ($VAR, $(…)) are not evaluated, so a flag that only appears through one is not seen.
+flags_pass_arg() {   # flags_pass_arg FRAGMENT WORD → 0 when the shell would pass WORD to codex
+  python3 - "$1" "$2" <<'PY'
+import sys
+s, want = sys.argv[1], sys.argv[2]
+words, cur, have, i, n = [], [], False, 0, len(s)
+while i < n:
+    ch = s[i]
+    if ch in " \t":
+        if have:
+            words.append("".join(cur)); cur, have = [], False
+        i += 1
+    elif ch in ";&|\n":
+        break
+    elif ch == "#" and not have:
+        break
+    elif ch == "\\":
+        have = True
+        cur.append(s[i + 1] if i + 1 < n else ""); i += 2
+    elif ch == "'":
+        j = s.find("'", i + 1)
+        if j < 0:
+            sys.exit(1)                  # unbalanced: the pane's shell would fail too — not "there"
+        have = True; cur.append(s[i + 1:j]); i = j + 1
+    elif ch == '"':
+        have = True; i += 1
+        while i < n and s[i] != '"':
+            if s[i] == "\\" and i + 1 < n and s[i + 1] in '\\"$`':
+                cur.append(s[i + 1]); i += 2
+            else:
+                cur.append(s[i]); i += 1
+        if i >= n:
+            sys.exit(1)
+        i += 1
+    else:
+        have = True; cur.append(ch); i += 1
+if have:
+    words.append("".join(cur))
+sys.exit(0 if want in words else 1)
+PY
+}
 codex_help="$(codex --help 2>/dev/null || true)"
 case "$codex_help" in
   *--no-daemon*)
-    case " $CODEX_FLAGS " in
-      *" --no-daemon "*) : ;;
-      *) CODEX_FLAGS="--no-daemon${CODEX_FLAGS:+ $CODEX_FLAGS}" ;;
-    esac ;;
+    flags_pass_arg "$CODEX_FLAGS" --no-daemon || CODEX_FLAGS="--no-daemon${CODEX_FLAGS:+ $CODEX_FLAGS}" ;;
 esac
 
 # Everything else from the environment travels as ONE argument each, whatever it
