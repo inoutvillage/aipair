@@ -223,6 +223,10 @@ chk "$(run loop codex "$ND" 'AIPAIR_CODEX_FLAGS=--append-system-prompt "use --no
 chk "$(run loop codex "$ND" "AIPAIR_CODEX_FLAGS='--no-daemon'")" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]${J}[--no-daemon]" "a quoted but real argument → not added twice"
 chk "$(run loop codex "$ND" 'AIPAIR_CODEX_FLAGS=a#b --no-daemon')" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]${J}[a#b]${J}[--no-daemon]" "'#' inside a word is not a comment (bash rule) → not added twice"
 chk "$(run loop codex "$ND" 'AIPAIR_CODEX_FLAGS=-q; echo --no-daemon')" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]${J}[-q]${J}--no-daemon" "after ';' it is another command's argument → still added"
+# An expansion whose text mentions --no-daemon: the final argv is unknowable → refuse clearly instead of a duplicate
+rc=0; out="$(env "$ND" AIPAIR_UNSAFE=1 AIPAIR_DRY_RUN=1 'AIPAIR_CODEX_FLAGS=$(printf %s --no-daemon)' aipair loop "$W/proj" 2>&1)" || rc=$?; n=$((n+1))
+if [ "$rc" = 2 ] && printf '%s' "$out" | grep -q -- '--no-daemon' && ! printf '%s' "$out" | grep -q '^codex:'; then echo "ok   an expansion that may yield --no-daemon → exit 2 with the reason"; else echo "FAIL expansion + --no-daemon: rc=$rc out=$out"; fail=1; fi
+chk "$(env "$ND" AIPAIR_UNSAFE=1 AIPAIR_DRY_RUN=1 'AIPAIR_CODEX_FLAGS=--model $M' aipair loop "$W/proj" | sed -n 's/^codex:  *//p')" "clear; env AI_SELF=codex AI_PEER=claude $P codex --no-daemon --dangerously-bypass-approvals-and-sandbox --model \$M" "an unrelated expansion still works (--no-daemon added)"
 chk "$(run loop claude "$ND")" "cmd=claude self=claude peer=codex${J}[--session-id]${J}[$S]${J}[--dangerously-skip-permissions]" "claude's line is untouched"
 chk "$(run loop codex)" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]" "a codex without --no-daemon: not added (older codex rejects unknown flags)"
 
