@@ -46,7 +46,7 @@ PY_MIN="3.8";   PY_MIN_MAJOR=3;   PY_MIN_MINOR=8
 # Executables (top-level) + the aipairlib package modules (#7: relay/peer-log are thin
 # entrypoints; the shared code is a normal importable package). Package files go under
 # aipairlib/ and are NOT chmod +x (they are imported, not run).
-FILES=(aipair aipair-relay aipair-relay-here peer peer-log
+FILES=(aipair aipair-codex aipair-relay aipair-relay-here peer peer-log
        aipairlib/__init__.py aipairlib/logs.py aipairlib/peerlog.py aipairlib/corelib.py
        aipairlib/loglib.py aipairlib/tmuxlib.py aipairlib/deliverylib.py aipairlib/dialoglib.py
        aipairlib/schema_guard.py aipairlib/review_protocol.py aipairlib/gate.py aipairlib/log_lock.py aipairlib/cli.py aipairlib/state_machine.py aipairlib/plan_flow.py aipairlib/question_flow.py aipairlib/endless_flow.py aipairlib/autopilot_flow.py aipairlib/tasklist.py aipairlib/relay.py)
@@ -104,7 +104,7 @@ done
 # missing templates/codex-agents-block.md would surface only AFTER CLAUDE.md was
 # already rewritten, as a Python traceback (PM review #2).
 _missing=""
-for _f in bin/aipair bin/aipair-relay bin/aipair-relay-here bin/peer bin/peer-log \
+for _f in bin/aipair bin/aipair-codex bin/aipair-relay bin/aipair-relay-here bin/peer bin/peer-log \
           bin/aipairlib/__init__.py bin/aipairlib/relay.py bin/aipairlib/peerlog.py bin/aipairlib/logs.py \
           bin/aipairlib/corelib.py bin/aipairlib/loglib.py bin/aipairlib/tmuxlib.py bin/aipairlib/deliverylib.py bin/aipairlib/dialoglib.py bin/aipairlib/schema_guard.py bin/aipairlib/review_protocol.py bin/aipairlib/gate.py bin/aipairlib/log_lock.py bin/aipairlib/cli.py bin/aipairlib/state_machine.py bin/aipairlib/plan_flow.py bin/aipairlib/question_flow.py bin/aipairlib/endless_flow.py bin/aipairlib/autopilot_flow.py bin/aipairlib/tasklist.py \
           templates/vscode-tasks.json templates/claude-md-block.md templates/codex-agents-block.md \
@@ -498,7 +498,7 @@ if [ "$PKG_NEEDS" -eq 1 ] || [ "${#EP_CHANGED[@]}" -gt 0 ]; then
   if ! AIPAIR_STAGE="$STAGE" python3 -c "import os, sys; sys.path.insert(0, os.environ['AIPAIR_STAGE']); import aipairlib.relay, aipairlib.peerlog" 2>/dev/null; then
     _stage_cleanup; fail "the new aipairlib package failed to import — kept the previous install unchanged"; exit 1
   fi
-  for f in aipair aipair-relay-here peer; do
+  for f in aipair aipair-codex aipair-relay-here peer; do
     bash -n "$STAGE/$f" 2>/dev/null || { _stage_cleanup; fail "staged $f has a shell syntax error — kept the previous install unchanged"; exit 1; }
   done
   for f in aipair-relay peer-log; do

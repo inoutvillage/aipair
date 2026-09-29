@@ -40,6 +40,7 @@ S=11111111-1111-1111-1111-111111111111   # a valid fixed UUID (aipair now valida
 K=1700000000                             # a valid fixed epoch (aipair validates it is numeric)
 export AIPAIR_CLAUDE_SESSION="$S" AIPAIR_CODEX_SINCE="$K"
 P="AIPAIR_CLAUDE_SESSION=$S AIPAIR_CODEX_SINCE=$K"   # the two env pins on every pane line
+CX="$REPO/bin/aipair-codex"                            # the Codex pane runs codex through this (adds --no-daemon)
 mkdir -p "$W/zdot" "$W/xdg"     # empty rc dirs so zsh/fish run without the user's config
 
 fail=0; n=0
@@ -61,7 +62,7 @@ chk "$(line loop session)" "$(aipair name "$W/proj")" "session line = aipair nam
 echo "# [1b] D1: safe by default, permission-bypass only with --unsafe"
 # safe default (no --unsafe): agents get NO flags (their normal permission prompts)
 chk "$(env AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id $S " "interactive: peer pins + --session-id, no bypass flag by default"
-chk "$(env AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^codex:  *//p')" "clear; env AI_SELF=codex AI_PEER=claude $P codex " "interactive: codex peer pins, no bypass flag by default"
+chk "$(env AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^codex:  *//p')" "clear; env AI_SELF=codex AI_PEER=claude $P $CX " "interactive: codex peer pins, no bypass flag by default"
 # --unsafe adds the bypass flags
 chk "$(env AIPAIR_UNSAFE=1 AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id $S --dangerously-skip-permissions" "AIPAIR_UNSAFE=1: bypass flag added"
 # explicit flags win even in safe mode
@@ -71,7 +72,7 @@ n=$((n+1)); rc=0; out="$(AIPAIR_DRY_RUN=1 aipair loop "$W/proj" 2>/dev/null)" ||
 if [ "$rc" = 2 ] && [ -z "$out" ]; then echo "ok   loop without --unsafe → exit 2, no launch"; else echo "FAIL loop refuse: rc=$rc out=$out"; fail=1; fi
 # loop ALWAYS carries the bypass flag under --unsafe, even if the user blanks/customises flags
 chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CLAUDE_FLAGS= AIPAIR_CODEX_FLAGS= AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id $S --dangerously-skip-permissions" "loop: empty AIPAIR_CLAUDE_FLAGS still gets the bypass"
-chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CODEX_FLAGS= AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^codex:  *//p')" "clear; env AI_SELF=codex AI_PEER=claude $P codex --dangerously-bypass-approvals-and-sandbox" "loop: empty AIPAIR_CODEX_FLAGS still gets the bypass"
+chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CODEX_FLAGS= AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^codex:  *//p')" "clear; env AI_SELF=codex AI_PEER=claude $P $CX --dangerously-bypass-approvals-and-sandbox" "loop: empty AIPAIR_CODEX_FLAGS still gets the bypass"
 chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CLAUDE_FLAGS='--model opus' AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id $S --dangerously-skip-permissions --model opus" "loop: bypass is prepended, custom flags follow"
 # the bypass is a FIXED token BEFORE the fragment, so a '#' in the fragment can't comment it out
 chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CLAUDE_FLAGS='--model opus # --dangerously-skip-permissions' AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id $S --dangerously-skip-permissions --model opus # --dangerously-skip-permissions" "loop: a '#' in the fragment cannot comment out the bypass (it is prepended)"
@@ -207,31 +208,27 @@ for sub in "" start attach stop name status; do
   if [ "$rc" = 2 ] && printf '%s' "$out" | grep -q 'autopilot'; then echo "ok   aipair ${sub:-(no subcommand)} --autopilot → exit 2 (loop only)"; else echo "FAIL aipair ${sub:-(no subcommand)} --autopilot: rc=$rc out=$out"; fail=1; fi
 done
 
-echo "# [10] codex --no-daemon (codex 0.158+: keep the TUI off the shared background server)"
-# A codex whose --help offers --no-daemon (the default shim above does not → the lines stay as they were).
+echo "# [10] codex --no-daemon via aipair-codex (codex 0.158+: keep the TUI off the shared background server)"
+# aipair-codex decides in the PANE, on the argv the pane's shell has already expanded. A codex whose --help offers
+# --no-daemon (the default shim above does not → nothing is added, the lines above stay as they were).
 mkdir -p "$W/bin-nd"
 printf '#!/usr/bin/env bash\nif [ "${1:-}" = --help ]; then printf "      --no-daemon\\n          Run without the shared background server\\n"; exit 0; fi\nexec %q "$@"\n' "$W/bin/codex" > "$W/bin-nd/codex"
 chmod +x "$W/bin-nd/codex"
 ND="PATH=$W/bin-nd:$PATH"
-chk "$(run loop codex "$ND")" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]" "loop: --no-daemon first, then the bypass flag"
-chk "$(env "$ND" AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^codex:  *//p')" "clear; env AI_SELF=codex AI_PEER=claude $P codex --no-daemon" "interactive (safe default, no --unsafe): --no-daemon only"
-chk "$(run loop codex "$ND" 'AIPAIR_CODEX_FLAGS=-q --no-daemon')" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]${J}[-q]${J}[--no-daemon]" "already in AIPAIR_CODEX_FLAGS → not added twice"
-chk "$(run loop codex "$ND" 'AIPAIR_CODEX_FLAGS=-q # x')" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]${J}[-q]" "a '#' in the user fragment cannot comment it out (it is prepended)"
-# "already there" = the shell would really pass it (Codex review 2026-09-29): a comment or a quoted text is not
-chk "$(run loop codex "$ND" 'AIPAIR_CODEX_FLAGS=-q # --no-daemon')" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]${J}[-q]" "'# --no-daemon' is a comment → still added"
-chk "$(run loop codex "$ND" 'AIPAIR_CODEX_FLAGS=--append-system-prompt "use --no-daemon"')" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]${J}[--append-system-prompt]${J}[use --no-daemon]" "inside a quoted text → still added"
-chk "$(run loop codex "$ND" "AIPAIR_CODEX_FLAGS='--no-daemon'")" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]${J}[--no-daemon]" "a quoted but real argument → not added twice"
-chk "$(run loop codex "$ND" 'AIPAIR_CODEX_FLAGS=a#b --no-daemon')" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]${J}[a#b]${J}[--no-daemon]" "'#' inside a word is not a comment (bash rule) → not added twice"
-chk "$(run loop codex "$ND" 'AIPAIR_CODEX_FLAGS=-q; echo --no-daemon')" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]${J}[-q]${J}--no-daemon" "after ';' it is another command's argument → still added"
-# An expansion whose text mentions --no-daemon: the final argv is unknowable → refuse clearly instead of a duplicate
-rc=0; out="$(env "$ND" AIPAIR_UNSAFE=1 AIPAIR_DRY_RUN=1 'AIPAIR_CODEX_FLAGS=$(printf %s --no-daemon)' aipair loop "$W/proj" 2>&1)" || rc=$?; n=$((n+1))
-if [ "$rc" = 2 ] && printf '%s' "$out" | grep -q -- '--no-daemon' && ! printf '%s' "$out" | grep -q '^codex:'; then echo "ok   an expansion that may yield --no-daemon → exit 2 with the reason"; else echo "FAIL expansion + --no-daemon: rc=$rc out=$out"; fail=1; fi
-chk "$(env "$ND" AIPAIR_UNSAFE=1 AIPAIR_DRY_RUN=1 'AIPAIR_CODEX_FLAGS=--model $M' aipair loop "$W/proj" | sed -n 's/^codex:  *//p')" "clear; env AI_SELF=codex AI_PEER=claude $P codex --no-daemon --dangerously-bypass-approvals-and-sandbox --model \$M" "an unrelated expansion still works (--no-daemon added)"
-# Only the text INSIDE an expansion counts — a quoted value or a comment next to an expansion does not (Codex review)
-chk "$(env "$ND" AIPAIR_UNSAFE=1 AIPAIR_DRY_RUN=1 'AIPAIR_CODEX_FLAGS=--model $M --append-system-prompt "use --no-daemon"' aipair loop "$W/proj" | sed -n 's/^codex:  *//p')" "clear; env AI_SELF=codex AI_PEER=claude $P codex --no-daemon --dangerously-bypass-approvals-and-sandbox --model \$M --append-system-prompt \"use --no-daemon\"" "an expansion + a quoted value mentioning it → not refused"
-chk "$(env "$ND" AIPAIR_UNSAFE=1 AIPAIR_DRY_RUN=1 'AIPAIR_CODEX_FLAGS=--model $(cat m) # --no-daemon' aipair loop "$W/proj" | sed -n 's/^codex:  *//p')" "clear; env AI_SELF=codex AI_PEER=claude $P codex --no-daemon --dangerously-bypass-approvals-and-sandbox --model \$(cat m) # --no-daemon" "an expansion + a comment mentioning it → not refused"
-chk "$(run loop claude "$ND")" "cmd=claude self=claude peer=codex${J}[--session-id]${J}[$S]${J}[--dangerously-skip-permissions]" "claude's line is untouched"
-chk "$(run loop codex)" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]" "a codex without --no-daemon: not added (older codex rejects unknown flags)"
+ndrun() { env "$ND" bash -c "$(line "$@")"; }   # the pane (bash -c) sees the --no-daemon-capable codex
+chk "$(run loop codex | head -1)" "cmd=codex self=codex peer=claude" "the pane runs codex through aipair-codex (still AI_SELF/AI_PEER)"
+chk "$(line loop codex | sed 's/.* \([^ ]*aipair-codex\) .*/\1/')" "$CX" "the line names aipair-codex by its absolute path (pane PATH not needed)"
+chk "$(ndrun loop codex)" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]" "loop: --no-daemon first, then the bypass flag"
+chk "$(env "$ND" bash -c "$(env AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^codex:  *//p')")" "cmd=codex self=codex peer=claude${J}[--no-daemon]" "interactive (safe default, no --unsafe): --no-daemon only"
+chk "$(ndrun loop codex 'AIPAIR_CODEX_FLAGS=-q --no-daemon')" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]${J}[-q]${J}[--no-daemon]" "already given → not added twice"
+chk "$(ndrun loop codex 'AIPAIR_CODEX_FLAGS=-q # --no-daemon')" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]${J}[-q]" "'# --no-daemon' is a comment → still added"
+chk "$(ndrun loop codex 'AIPAIR_CODEX_FLAGS=--append-system-prompt "use --no-daemon"')" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]${J}[--append-system-prompt]${J}[use --no-daemon]" "inside a quoted text → still added"
+# Expansions are decided on their RESULT (Codex review 2026-09-29): no duplicate, whatever they expand to
+chk "$(ndrun loop codex 'AIPAIR_CODEX_FLAGS=$(printf %s --no-daemon)')" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]${J}[--no-daemon]" "\$(…) yielding --no-daemon → not added twice"
+chk "$(env CODEX_EXTRA=--no-daemon "$ND" bash -c "$(line loop codex 'AIPAIR_CODEX_FLAGS=$CODEX_EXTRA')")" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]${J}[--no-daemon]" "\$VAR holding --no-daemon → not added twice"
+chk "$(env M=gpt "$ND" bash -c "$(line loop codex 'AIPAIR_CODEX_FLAGS=--model $M')")" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]${J}[--model]${J}[gpt]" "an unrelated expansion → added"
+chk "$(ndrun loop codex 'AIPAIR_CODEX_FLAGS=-- --no-daemon')" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]${J}[--]${J}[--no-daemon]" "after a lone -- it is not an option → still added"
+chk "$(ndrun loop claude)" "cmd=claude self=claude peer=codex${J}[--session-id]${J}[$S]${J}[--dangerously-skip-permissions]" "claude's line is untouched"
 
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED)"
 exit $fail
