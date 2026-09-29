@@ -157,6 +157,7 @@ Zed は `command` と `args` を引用符なしで連結して PowerShell に渡
 | パス | 役割 |
 |---|---|
 | `~/.local/bin/aipair` | tmux 3 ペイン起動ランチャ（サブコマンドあり） |
+| `~/.local/bin/aipair-codex` | Codex ペインで codex を起動する薄いラッパー（codex 0.158+ で `--no-daemon` を付ける。下の「仕組み」） |
 | `~/.local/bin/peer-log` | 指定 cwd の Claude/Codex セッションを抽出・整形・ライブ追従（既定は最新。aipair 起動時は環境の pin でそのペアのセッションに固定） |
 | `~/.local/bin/peer` | `$AI_PEER` を見て *相手* のログを表示する短縮版（aipair 起動時は起動したペアの相手セッションに固定＝同じ cwd に別セッションがいても混線しない） |
 | `~/.local/bin/aipair-relay` | 自走ループの Watcher（ターン完了を検知 → 相手ペインへ自動ポーク） |
@@ -567,10 +568,11 @@ aipair-relay --gate 'pytest -q' --gate-rounds 2              # フラグ
   `~/.claude/CLAUDE.md` と `~/.codex/AGENTS.md` の周知ブロックで「`peer` で相手ログを読める」と教えているので、
   両エージェントは必要時に自発的に相手を参照できる（読み取り専用。相手への送信は relay か人間が行う）。
 - **ターン完了の検知**（relay）… Claude: 最新の `assistant` エントリの `stop_reason != "tool_use"`。Codex: 最新の `task_*` イベントが `task_complete`。
-- **Codex は `--no-daemon` で起動する**（その codex が対応していれば）… codex 0.158 以降は既定で全 TUI を 1 つの共有
-  バックグラウンドサーバ経由で動かし、ログを持つのもコマンドを実行するのもそのサーバ（環境変数は最初に起動したペインのもの）に
-  なる。すると relay がペアの Codex のログを特定できず、Codex の `peer` も別のペアを読んでしまうため、ペアの Codex はサーバを
-  使わせない。この修正より前に起動したペアは、Codex を起動し直すまで共有サーバのまま。
+- **Codex は `aipair-codex` 経由で `--no-daemon` 付きで起動する**（その codex が対応していれば）… codex 0.158 以降は既定で
+  全 TUI を 1 つの共有バックグラウンドサーバ経由で動かし、ログを持つのもコマンドを実行するのもそのサーバ（環境変数は最初に起動した
+  ペインのもの）になる。すると relay がペアの Codex のログを特定できず、Codex の `peer` も別のペアを読んでしまうため、ペアの Codex は
+  サーバを使わせない。`aipair-codex` はペインのシェルが `AIPAIR_CODEX_FLAGS` を展開し終えた後の引数を見て、`--no-daemon` が
+  無い時だけ付けてから codex に置き換わる（codex は重複指定を拒否する）。この修正より前に起動したペアは、Codex を起動し直すまで共有サーバのまま。
 
 ---
 
