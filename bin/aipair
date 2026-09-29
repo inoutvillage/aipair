@@ -347,16 +347,56 @@ fi
 # substring match, which a comment (`# --no-daemon`) or a quoted text would fool (Codex review
 # 2026-09-29). The fragment is split with bash's own rules, WITHOUT running anything: a comment starts
 # only where a word would; '…', "…" and \ quote; an unquoted ; & | or newline ends codex's command.
-# Expansions ($VAR, $(…), `…`) are NOT evaluated (that would run the user's commands here). When one is
-# present and the fragment's text mentions --no-daemon, the argv the pane would build is unknowable:
-# refuse (exit 2) rather than risk the duplicate codex rejects (Codex review 2026-09-29). A value that
-# only a variable holds (its text absent from the fragment) is still not seen — write the flag plainly.
+# Expansions ($VAR, $(…), ${…}, `…`) are NOT evaluated (that would run the user's commands here). When
+# the text INSIDE a $(…) / ${…} / `…` mentions --no-daemon, the argv the pane would build is unknowable:
+# refuse (exit 2) rather than risk the duplicate codex rejects (Codex review 2026-09-29). A comment or a
+# quoted value that merely mentions it does not count. A value that only a variable holds ($VAR) is
+# still not seen — write the flag plainly.
 flags_pass_arg() {   # flags_pass_arg FRAGMENT WORD → 0 passed / 1 not passed / 2 unknowable (expansion)
   python3 - "$1" "$2" <<'PY'
 import sys
 s, want = sys.argv[1], sys.argv[2]
-words, cur, have, i, n = [], [], False, 0, len(s)
-expands = False                          # an unquoted / double-quoted $ or ` the pane's shell would expand
+n = len(s)
+
+
+def expansion_end(i):
+    """s[i:] starts $( / ${ / ` — the index just past its closer (nesting and inner quotes honoured)."""
+    if s[i] == "`":
+        j = i + 1
+        while j < n and s[j] != "`":
+            j += 2 if s[j] == "\\" else 1
+        return min(j + 1, n)
+    opener, closer = ("(", ")") if s[i + 1] == "(" else ("{", "}")
+    depth, j, quote = 0, i + 1, None
+    while j < n:
+        c = s[j]
+        if quote:
+            if c == "\\" and quote == '"':
+                j += 2
+                continue
+            if c == quote:
+                quote = None
+        elif c in "'\"":
+            quote = c
+        elif c == "\\":
+            j += 2
+            continue
+        elif c == opener:
+            depth += 1
+        elif c == closer:
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        j += 1
+    return n
+
+
+def starts_expansion(i):
+    return s[i] == "`" or (s[i] == "$" and i + 1 < n and s[i + 1] in "({")
+
+
+words, cur, have, i = [], [], False, 0
+expansions = []                          # the text of each $(…) / ${…} / `…` the pane's shell would expand
 while i < n:
     ch = s[i]
     if ch in " \t":
@@ -367,6 +407,9 @@ while i < n:
         break
     elif ch == "#" and not have:
         break
+    elif starts_expansion(i):
+        j = expansion_end(i)
+        expansions.append(s[i:j]); cur.append(s[i:j]); have = True; i = j
     elif ch == "\\":
         have = True
         cur.append(s[i + 1] if i + 1 < n else ""); i += 2
@@ -380,20 +423,21 @@ while i < n:
         while i < n and s[i] != '"':
             if s[i] == "\\" and i + 1 < n and s[i + 1] in '\\"$`':
                 cur.append(s[i + 1]); i += 2
+            elif starts_expansion(i):
+                j = expansion_end(i)
+                expansions.append(s[i:j]); cur.append(s[i:j]); i = j
             else:
-                expands = expands or s[i] in "$`"
                 cur.append(s[i]); i += 1
         if i >= n:
             sys.exit(1)
         i += 1
     else:
-        expands = expands or ch in "$`"
         have = True; cur.append(ch); i += 1
 if have:
     words.append("".join(cur))
 if want in words:
     sys.exit(0)
-sys.exit(2 if (expands and want in s) else 1)
+sys.exit(2 if any(want in e for e in expansions) else 1)
 PY
 }
 codex_help="$(codex --help 2>/dev/null || true)"
