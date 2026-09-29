@@ -111,6 +111,13 @@ task makes no progress across rounds) instead of guessing or spinning.
   approve edits" (no "bypass" wording), so the picker selects the first `Yes…` option.
 
 ### Fixed
+- **Codex 0.158+ no longer runs the pair's Codex on the shared background server** — codex 0.158 routes
+  every TUI through one shared app-server daemon by default. The daemon, not the pane's TUI, then held the
+  session log and ran Codex's shell commands with the environment of whichever pane first started it: the
+  relay could not find the pair's Codex log (it never saw Codex finish) and Codex's `peer` read another,
+  long-gone pair's pins ("no claude session found"). `aipair` now launches Codex with `--no-daemon` when the
+  installed codex offers it (never twice, in front of `AIPAIR_CODEX_FLAGS`). Pairs started before this fix
+  keep the daemon until their Codex is restarted.
 - **The normal review loop can stop for a human instead of spinning to the cap** — when the remaining review
   points needed a human decision, Claude answered "waiting for the user's decision / already decided by the
   user — no change" and Codex "still unfixed" / "no diff, can't judge"; neither could emit the only stop

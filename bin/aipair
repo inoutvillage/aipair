@@ -335,6 +335,22 @@ else
   CLAUDE_FLAGS="${AIPAIR_CLAUDE_FLAGS-}"
   CODEX_FLAGS="${AIPAIR_CODEX_FLAGS-}"
 fi
+# codex 0.158+ runs every TUI through ONE shared background server by default (daemon_auto_start).
+# That server — not this pane's TUI — then holds the session log and runs Codex's shell commands with
+# ITS OWN environment, i.e. whichever pane happened to start it. The relay could no longer find this
+# pair's Codex log (it never saw Codex finish), and Codex's `peer` read the AI_*/AIPAIR_* pins of that
+# other, possibly long-gone, pair (2026-09-29). --no-daemon keeps the TUI self-contained. Added only
+# when this codex offers it (older ones reject unknown flags), in FRONT of the user's fragment like the
+# bypass flag, and never twice. The help text is captured first: `| grep -q` under pipefail can fail
+# on the SIGPIPE it sends codex.
+codex_help="$(codex --help 2>/dev/null || true)"
+case "$codex_help" in
+  *--no-daemon*)
+    case " $CODEX_FLAGS " in
+      *" --no-daemon "*) : ;;
+      *) CODEX_FLAGS="--no-daemon${CODEX_FLAGS:+ $CODEX_FLAGS}" ;;
+    esac ;;
+esac
 
 # Everything else from the environment travels as ONE argument each, whatever it
 # contains (apostrophes, spaces, $, ;), thanks to cmdline.

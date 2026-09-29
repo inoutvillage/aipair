@@ -207,5 +207,18 @@ for sub in "" start attach stop name status; do
   if [ "$rc" = 2 ] && printf '%s' "$out" | grep -q 'autopilot'; then echo "ok   aipair ${sub:-(no subcommand)} --autopilot → exit 2 (loop only)"; else echo "FAIL aipair ${sub:-(no subcommand)} --autopilot: rc=$rc out=$out"; fail=1; fi
 done
 
+echo "# [10] codex --no-daemon (codex 0.158+: keep the TUI off the shared background server)"
+# A codex whose --help offers --no-daemon (the default shim above does not → the lines stay as they were).
+mkdir -p "$W/bin-nd"
+printf '#!/usr/bin/env bash\nif [ "${1:-}" = --help ]; then printf "      --no-daemon\\n          Run without the shared background server\\n"; exit 0; fi\nexec %q "$@"\n' "$W/bin/codex" > "$W/bin-nd/codex"
+chmod +x "$W/bin-nd/codex"
+ND="PATH=$W/bin-nd:$PATH"
+chk "$(run loop codex "$ND")" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]" "loop: --no-daemon first, then the bypass flag"
+chk "$(env "$ND" AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^codex:  *//p')" "clear; env AI_SELF=codex AI_PEER=claude $P codex --no-daemon" "interactive (safe default, no --unsafe): --no-daemon only"
+chk "$(run loop codex "$ND" 'AIPAIR_CODEX_FLAGS=-q --no-daemon')" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]${J}[-q]${J}[--no-daemon]" "already in AIPAIR_CODEX_FLAGS → not added twice"
+chk "$(run loop codex "$ND" 'AIPAIR_CODEX_FLAGS=-q # x')" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]${J}[-q]" "a '#' in the user fragment cannot comment it out (it is prepended)"
+chk "$(run loop claude "$ND")" "cmd=claude self=claude peer=codex${J}[--session-id]${J}[$S]${J}[--dangerously-skip-permissions]" "claude's line is untouched"
+chk "$(run loop codex)" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]" "a codex without --no-daemon: not added (older codex rejects unknown flags)"
+
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED)"
 exit $fail
