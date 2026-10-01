@@ -835,3 +835,8 @@ cli の既定が env を読まない）→ いずれも該当テストが FAIL�
 
 - [x] 実機検証 30 / 30 PASS（ローカル検証ツール・私設 tmux socket）。ダイアログ画面: 前回（claude-2.1.283_codex-0.157.1）と同一構造
 - [x] `corelib.TESTED_VERSIONS` と README「必要環境」表を更新、`bash tests/run-all.sh` 全緑
+
+## 追記: 版ゲートの検証済み版を claude 2.1.286 / codex 0.159.3 へ更新（2026-10-02・aipair-bump）
+
+- [x] 実機検証 34 / 34 PASS（ローカル検証ツール・私設 tmux socket）。ダイアログ画面: 前回（claude-2.1.284_codex-0.158.0）と同一構造
+- [x] `corelib.TESTED_VERSIONS` と README「必要環境」表を更新、`bash tests/run-all.sh` 全緑
