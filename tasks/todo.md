@@ -906,7 +906,8 @@ env-forward.sh が main でも 4 件落ちる（上の「スコープ外の検�
 
 - [x] テストの間だけ HOME を使い捨てのディレクトリにする（他のテストと同じ流儀）。私設 server も利用者の `~/.tmux.conf` を読まなくなる
 - [x] 修正前のこのマシンで 4 件落ち（19 件で止まる）・修正後に 37/37（CI と同数）、を確認。`bash tests/run-all.sh` 全緑（ALL CHECKS PASSED）
-- [ ] PR → CI → マージ → install → `aipair-bump`（実機検証 → bump の PR → マージ → install → relay 再点火）
+- [x] PR #187（CI 6/6・CI でも env-forward 37 件）→ マージ → `aipair-bump` が全段 ok で通った: 実機検証 34/34・画面構造は前回と同一・
+      run-all 全緑 → PR #188 → CI 6/6 → マージ → install（28 ファイル一致）→ このペアの relay を再点火（バナーは claude / codex とも検証済み）
 
 ## 追記: 版ゲートの検証済み版を claude 2.1.295 / codex 0.162.0 へ更新（2026-10-10・aipair-bump）
 
