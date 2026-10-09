@@ -230,5 +230,77 @@ chk "$(env M=gpt "$ND" bash -c "$(line loop codex 'AIPAIR_CODEX_FLAGS=--model $M
 chk "$(ndrun loop codex 'AIPAIR_CODEX_FLAGS=-- --no-daemon')" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]${J}[--]${J}[--no-daemon]" "after a lone -- it is not an option → still added"
 chk "$(ndrun loop claude)" "cmd=claude self=claude peer=codex${J}[--session-id]${J}[$S]${J}[--dangerously-skip-permissions]" "claude's line is untouched"
 
+echo "# [11] start choices: resume the latest conversation (Claude / Codex) and Remote Control"
+# A fake HOME holding both CLIs' histories. For the project dir the newest INTERACTIVE conversation must win:
+# Claude: a newer `claude -p` one (entrypoint sdk-cli) and a newer one of another dir (same project folder —
+# folder names can collide) are skipped. Codex: a newer `codex exec` one (source exec) is skipped.
+H="$W/home"; PD="$(cd "$W/proj" && pwd -P)"
+mkdir -p "$H/.claude/projects/-fixture" "$H/.codex/sessions/2026/10/09"
+CA=aaaaaaaa-0000-4000-8000-000000000001; CB=bbbbbbbb-0000-4000-8000-000000000002
+CC=cccccccc-0000-4000-8000-000000000003; CD=dddddddd-0000-4000-8000-000000000004
+XA=01a11f00-0000-7000-8000-00000000000a; XB=01a11f00-0000-7000-8000-00000000000b; XC=01a11f00-0000-7000-8000-00000000000c
+cl() { printf '{"type":"mode"}\n{"type":"user","cwd":"%s","entrypoint":"%s","sessionId":"%s"}\n' "$2" "$3" "$1" > "$H/.claude/projects/-fixture/$1.jsonl"; touch -d "$4" "$H/.claude/projects/-fixture/$1.jsonl"; }
+cx() { local f="$H/.codex/sessions/2026/10/09/rollout-2026-10-09T00-00-00-$1.jsonl"
+       printf '{"timestamp":"%s","type":"session_meta","payload":{"id":"%s","cwd":"%s","source":"%s","timestamp":"%s"}}\n' "$3" "$1" "$PD" "$2" "$3" > "$f"; touch -d "$4" "$f"; }
+cl "$CA" "$PD" cli "2026-10-09 10:00"; cl "$CB" "$PD" cli "2026-10-09 11:00"
+cl "$CC" "$PD" sdk-cli "2026-10-09 12:00"; cl "$CD" "$W/elsewhere" cli "2026-10-09 13:00"
+cx "$XA" cli "2026-10-09T01:00:00.000Z" "2026-10-09 10:00"; cx "$XB" cli "2026-10-09T02:30:00.250Z" "2026-10-09 11:00"
+cx "$XC" exec "2026-10-09T03:00:00.000Z" "2026-10-09 12:00"
+XB_SINCE="$(python3 -c 'from datetime import datetime; print(repr(datetime.fromisoformat("2026-10-09T02:30:00.250+00:00").timestamp()))')"
+# rline [VAR=value ...] → `aipair loop` dry run with the fake HOME and NO caller pins (stdin: /dev/null)
+rline() { env -u AIPAIR_CLAUDE_SESSION -u AIPAIR_CODEX_SINCE HOME="$H" AIPAIR_UNSAFE=1 "$@" AIPAIR_DRY_RUN=1 aipair loop "$W/proj" </dev/null; }
+pane() { sed -n "s/^$1:  *//p"; }
+chk "$(bash -c "$(rline AIPAIR_CLAUDE_RESUME=last | pane claude)")" "cmd=claude self=claude peer=codex${J}[--resume]${J}[$CB]${J}[--dangerously-skip-permissions]" "claude last: --resume the newest interactive conversation of this dir (not -p, not another dir)"
+chk "$(rline AIPAIR_CLAUDE_RESUME=last | pane claude | sed -n 's/.*AIPAIR_CLAUDE_SESSION=\([^ ]*\).*/\1/p')" "$CB" "claude last: the pin follows the resumed conversation"
+chk "$(bash -c "$(rline AIPAIR_CODEX_RESUME=last | pane codex)")" "cmd=codex self=codex peer=claude${J}[resume]${J}[$XB]${J}[--dangerously-bypass-approvals-and-sandbox]" "codex last: resume <id> of the newest interactive session (not exec)"
+chk "$(rline AIPAIR_CODEX_RESUME=last | pane codex | sed -n 's/.*AIPAIR_CODEX_SINCE=\([^ ]*\).*/\1/p')" "$XB_SINCE" "codex last: AIPAIR_CODEX_SINCE = that rollout's own start (non-/proc pick)"
+chk "$(env "$ND" bash -c "$(rline AIPAIR_CODEX_RESUME=last | pane codex)")" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[resume]${J}[$XB]${J}[--dangerously-bypass-approvals-and-sandbox]" "codex last through aipair-codex: --no-daemon first, then resume"
+chk "$(bash -c "$(rline AIPAIR_CLAUDE_RESUME=new AIPAIR_CODEX_RESUME=new | pane codex)")" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]" "new: codex line as before"
+chk "$(bash -c "$(rline AIPAIR_REMOTE_CONTROL=on | pane claude)" | sed -n '2,3p' | paste -sd' ')" "[--remote-control] [--session-id]" "remote control on, name left to Claude: --remote-control right before --session-id"
+chk "$(bash -c "$(rline AIPAIR_REMOTE_CONTROL=on "AIPAIR_REMOTE_CONTROL_NAME=it's my pair" AIPAIR_CLAUDE_RESUME=last | pane claude)")" "cmd=claude self=claude peer=codex${J}[--remote-control]${J}[it's my pair]${J}[--resume]${J}[$CB]${J}[--dangerously-skip-permissions]" "remote control with a name (one argument, quotes intact) + resume"
+chk "$(bash -c "$(rline AIPAIR_REMOTE_CONTROL=on 'AIPAIR_CLAUDE_FLAGS=--model opus # x' | pane claude)" | sed -n '2p')" "[--remote-control]" "a '#' in the user's fragment cannot comment out --remote-control"
+# last with no history: a warning, then a new conversation (never a silent pick of something else)
+EH="$W/emptyhome"; mkdir -p "$EH"
+n=$((n+1)); out="$(env -u AIPAIR_CLAUDE_SESSION -u AIPAIR_CODEX_SINCE HOME="$EH" AIPAIR_UNSAFE=1 AIPAIR_CLAUDE_RESUME=last AIPAIR_CODEX_RESUME=last AIPAIR_DRY_RUN=1 aipair loop "$W/proj" </dev/null 2>"$W/err")"
+if printf '%s' "$out" | pane claude | grep -q -- '--session-id ' && ! printf '%s' "$out" | pane codex | grep -q ' resume ' \
+   && grep -q 'Claude の再開できる会話' "$W/err" && grep -q 'Codex の再開できる会話' "$W/err"; then echo "ok   last without history → warned, new conversations"
+else echo "FAIL last without history"; cat "$W/err"; fail=1; fi
+# invalid / contradictory settings: exit 2 and nothing printed
+for bad in AIPAIR_CLAUDE_RESUME=yes AIPAIR_CODEX_RESUME=latest AIPAIR_REMOTE_CONTROL=1 AIPAIR_REMOTE_CONTROL_NAME=x \
+           "AIPAIR_REMOTE_CONTROL=off AIPAIR_REMOTE_CONTROL_NAME=x" "AIPAIR_REMOTE_CONTROL=on AIPAIR_REMOTE_CONTROL_NAME=-x"; do
+  n=$((n+1)); rc=0; out="$(env HOME="$H" $bad AIPAIR_DRY_RUN=1 aipair "$W/proj" 2>/dev/null </dev/null)" || rc=$?   # $bad: word-split on purpose
+  if [ "$rc" = 2 ] && [ -z "$out" ]; then echo "ok   $bad → refused (exit 2)"; else echo "FAIL $bad not refused: rc=$rc"; fail=1; fi
+done
+for bad in AIPAIR_CLAUDE_RESUME=last AIPAIR_CODEX_RESUME=last; do   # with the caller's pins S / K still set
+  n=$((n+1)); rc=0; out="$(env HOME="$H" "$bad" AIPAIR_DRY_RUN=1 aipair "$W/proj" 2>/dev/null </dev/null)" || rc=$?
+  if [ "$rc" = 2 ] && [ -z "$out" ]; then echo "ok   $bad + a caller pin → refused (exit 2)"; else echo "FAIL $bad + pin not refused: rc=$rc"; fail=1; fi
+done
+# The questions (AIPAIR_TEST_ASK=1: asked in a dry run, answers from stdin)
+ask() { local in="$1"; shift; printf '%b' "$in" | env -u AIPAIR_CLAUDE_SESSION -u AIPAIR_CODEX_SINCE HOME="$H" AIPAIR_UNSAFE=1 AIPAIR_TEST_ASK=1 "$@" AIPAIR_DRY_RUN=1 aipair loop "$W/proj" 2>"$W/err"; }
+out="$(ask '2\n2\n3\n  my rc  \n')"
+chk "$(bash -c "$(printf '%s' "$out" | pane claude)")" "cmd=claude self=claude peer=codex${J}[--remote-control]${J}[my rc]${J}[--resume]${J}[$CB]${J}[--dangerously-skip-permissions]" "asked: resume Claude, Remote Control with a typed name (trimmed)"
+chk "$(bash -c "$(printf '%s' "$out" | pane codex)" | sed -n '2,3p' | paste -sd' ')" "[resume] [$XB]" "asked: resume Codex"
+n=$((n+1)); if grep -q "Claude: 1) 新しい会話  2) 最新の会話を再開（10/09 11:00）" "$W/err" && grep -q "Codex:  1) 新しい会話  2) 最新の会話を再開（10/09 11:00）" "$W/err"; then echo "ok   the questions show when the latest conversation was last used"; else echo "FAIL question text"; cat "$W/err"; fail=1; fi
+out="$(ask '\n\n\n')"
+n=$((n+1)); if printf '%s' "$out" | pane claude | grep -q -- ' --session-id ' && ! printf '%s' "$out" | pane claude | grep -q -- '--remote-control' && ! printf '%s' "$out" | pane codex | grep -q ' resume '; then echo "ok   Enter everywhere → new / new / off"; else echo "FAIL defaults: $out"; fail=1; fi
+out="$(ask '9\n2\n1\n2\n')"
+n=$((n+1)); if printf '%s' "$out" | pane claude | grep -q -- "--remote-control --resume $CB " && ! printf '%s' "$out" | pane codex | grep -q ' resume ' && grep -q 'のどれかを入力' "$W/err"; then echo "ok   an invalid answer is asked again"; else echo "FAIL re-ask: $out"; cat "$W/err"; fail=1; fi
+out="$(ask '1\n1\n3\n-x\nok\n')"
+chk "$(bash -c "$(printf '%s' "$out" | pane claude)" | sed -n '2,3p' | paste -sd' ')" "[--remote-control] [ok]" "a name starting with '-' is asked again"
+out="$(ask '2\n1\n' AIPAIR_CLAUDE_RESUME=new)"
+n=$((n+1)); if printf '%s' "$out" | pane claude | grep -q -- ' --session-id ' && printf '%s' "$out" | pane codex | grep -q " resume $XB " && ! grep -q 'Claude: 1)' "$W/err"; then echo "ok   a side set in the environment is not asked"; else echo "FAIL env side asked: $out"; cat "$W/err"; fail=1; fi
+n=$((n+1)); rc=0; out="$(ask '2\n')" || rc=$?
+if [ "$rc" = 1 ] && [ -z "$out" ] && grep -q '起動を中止' "$W/err"; then echo "ok   input that ends midway → launch stopped (exit 1), nothing printed"; else echo "FAIL EOF: rc=$rc out=$out"; fail=1; fi
+out="$(printf '1\n' | env -u AIPAIR_CLAUDE_SESSION -u AIPAIR_CODEX_SINCE HOME="$EH" AIPAIR_UNSAFE=1 AIPAIR_TEST_ASK=1 AIPAIR_DRY_RUN=1 aipair loop "$W/proj" 2>"$W/err")"
+n=$((n+1)); if [ "$(grep -c '再開できる会話なし' "$W/err")" = 2 ] && grep -q 'Remote Control' "$W/err" && printf '%s' "$out" | pane claude | grep -q -- ' --session-id '; then echo "ok   no history → only Remote Control is asked"; else echo "FAIL no-history questions"; cat "$W/err"; fail=1; fi
+# pins in the environment (e.g. aipair typed in a pair's own pane) fix the sides: said, not silently skipped
+n=$((n+1)); out="$(printf '1\n' | env HOME="$H" AIPAIR_UNSAFE=1 AIPAIR_TEST_ASK=1 AIPAIR_DRY_RUN=1 aipair loop "$W/proj" 2>"$W/err")"
+if grep -q 'AIPAIR_CLAUDE_SESSION が設定済み' "$W/err" && grep -q 'AIPAIR_CODEX_SINCE が設定済み' "$W/err" && ! grep -q '最新の会話を再開' "$W/err" \
+   && printf '%s' "$out" | pane claude | grep -q -- "--session-id $S "; then echo "ok   caller pins → the resume questions are skipped with a note"
+else echo "FAIL pinned sides: $out"; cat "$W/err"; fail=1; fi
+# never asked without AIPAIR_TEST_ASK in a dry run (live-version-check and these tests read the lines unattended)
+n=$((n+1)); out="$(printf '2\n2\n2\n' | env -u AIPAIR_CLAUDE_SESSION -u AIPAIR_CODEX_SINCE HOME="$H" AIPAIR_UNSAFE=1 AIPAIR_DRY_RUN=1 aipair loop "$W/proj" 2>"$W/err")"
+if ! grep -q '起動のしかた' "$W/err" && ! printf '%s' "$out" | pane claude | grep -q -- '--resume'; then echo "ok   a plain dry run never asks"; else echo "FAIL dry run asked"; fail=1; fi
+
 echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED)"
 exit $fail

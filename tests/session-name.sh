@@ -21,6 +21,9 @@ mkdir -p "$W/bin" "$W/a/api" "$W/b/api" "$W/Case" "$W/case"
 printf '#!/usr/bin/env bash\n%q -L %q start-server 2>/dev/null || true\n%q -L %q set-option -g exit-empty off 2>/dev/null || true\nexec %q -L %q "$@"\n' \
   "$REAL_TMUX" "$SOCKET" "$REAL_TMUX" "$SOCKET" "$REAL_TMUX" "$SOCKET" > "$W/bin/tmux"; chmod +x "$W/bin/tmux"
 export PATH="$W/bin:$REPO/bin:$PATH"; unset TMUX
+# These start real pairs under a pty (`script`), where aipair would ask how each agent starts; answer
+# up front (the launch aipair always made) so nothing waits for input.
+export AIPAIR_CLAUDE_RESUME=new AIPAIR_CODEX_RESUME=new AIPAIR_REMOTE_CONTROL=off
 "$REAL_TMUX" -L "$SOCKET" new-session -d -s shim-probe            # a server with no session exits at once
 want="$("$REAL_TMUX" -L "$SOCKET" display-message -p -t shim-probe '#{socket_path}')"
 got="$(tmux display-message -p -t shim-probe '#{socket_path}')"     # through the shim
@@ -151,6 +154,25 @@ if command -v script >/dev/null; then
   chk "$(aipair name "$W/a/api")" "$NA" "a/api still owns its session (no false 'hash collision')"
   chk "$(aipair name "$W/b/api")" "$NB" "b/api is not fooled by the rewritten session_path"
   chk "$(aipair stop "$W/a/api")" "aipair: stopped $NA" "stop a/api still works"
+
+  echo "# [9b] on a terminal a NEW pair asks how each agent starts, and is built with the answers"
+  # A fake HOME whose only history is a Codex session of b/api: Claude has nothing to resume (not asked),
+  # Codex is asked (2 = resume the latest), Remote Control is asked (1 = off). The pair must come up with
+  # the Codex pin moved to that session's own start (what the relay / peer use where /proc is missing).
+  FH="$W/fakehome"; BD="$(cd "$W/b/api" && pwd -P)"; mkdir -p "$FH/.codex/sessions/2026/10/09"
+  XID=01a11f00-0000-7000-8000-0000000000b9
+  printf '{"timestamp":"2026-10-09T02:30:00.250Z","type":"session_meta","payload":{"id":"%s","cwd":"%s","source":"cli","timestamp":"2026-10-09T02:30:00.250Z"}}\n' \
+    "$XID" "$BD" > "$FH/.codex/sessions/2026/10/09/rollout-2026-10-09T02-30-00-$XID.jsonl"
+  want_since="$(python3 -c 'from datetime import datetime; print(repr(datetime.fromisoformat("2026-10-09T02:30:00.250+00:00").timestamp()))')"
+  { sleep 1; printf '2\n'; sleep 1; printf '1\n'; sleep 2; } \
+    | env -u AIPAIR_CLAUDE_RESUME -u AIPAIR_CODEX_RESUME -u AIPAIR_REMOTE_CONTROL -u AIPAIR_CLAUDE_SESSION -u AIPAIR_CODEX_SINCE HOME="$FH" \
+        AIPAIR_CLAUDE_FLAGS=--version AIPAIR_CODEX_FLAGS=--version timeout 6 script -qec "aipair '$W/b/api'" /dev/null >"$W/ask-out" 2>&1 || true
+  if grep -q 'Codex:  1) 新しい会話  2) 最新の会話を再開' "$W/ask-out" && grep -q 'Claude: 再開できる会話なし' "$W/ask-out"; then
+    pass "the questions are asked on the terminal (Claude: nothing to resume → not asked)"
+  else flunk "questions not shown: $(tr -d '\r' < "$W/ask-out" | tail -5)"; fi
+  if alive "$NB"; then pass "the pair is built after the answers"; else flunk "no pair after answering"; fi
+  chk "$(tmux show -t "$NB" -v @aipair-codex-since 2>/dev/null || true)" "$want_since" "Codex resumed: @aipair-codex-since = that session's own start"
+  aipair stop "$W/b/api" >/dev/null 2>&1 || true
 else echo "skip real-start tests (\`script\` not available)"; fi
 
 # [10] tmux 3.1 has neither `list-sessions -f` nor #{session_path} (both are 3.2+).

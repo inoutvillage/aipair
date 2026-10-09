@@ -294,6 +294,36 @@ esac
 
 # cmd == start|loop.
 
+# ---- How each agent starts: a new conversation or the latest one, Remote Control ------------
+# Each side starts a NEW conversation (as always) or RESUMES its latest one for this directory — the
+# newest by last update, not a picker (aipairlib/resume.py) — and Claude can start with Remote Control
+# on. Asked on a terminal when a NEW pair is built (after the re-attach / already-running checks,
+# before anything is created). The environment answers instead, and skips that question:
+#   AIPAIR_CLAUDE_RESUME / AIPAIR_CODEX_RESUME = new|last, AIPAIR_REMOTE_CONTROL = off|on,
+#   AIPAIR_REMOTE_CONTROL_NAME = the Remote Control session's name (needs ..._CONTROL=on; unset: the
+#   name Claude Code picks). Never asked for a dry run or without a terminal: unset then means
+#   new / new / off — the launch aipair always made. All checked here, before a session is built.
+CLAUDE_RESUME="${AIPAIR_CLAUDE_RESUME:-}"
+CODEX_RESUME="${AIPAIR_CODEX_RESUME:-}"
+RC="${AIPAIR_REMOTE_CONTROL:-}"
+RC_NAME="${AIPAIR_REMOTE_CONTROL_NAME:-}"
+case "$CLAUDE_RESUME" in ""|new|last) ;; *) echo "aipair: AIPAIR_CLAUDE_RESUME must be new or last (got '$CLAUDE_RESUME')" >&2; exit 2 ;; esac
+case "$CODEX_RESUME" in ""|new|last) ;; *) echo "aipair: AIPAIR_CODEX_RESUME must be new or last (got '$CODEX_RESUME')" >&2; exit 2 ;; esac
+case "$RC" in ""|off|on) ;; *) echo "aipair: AIPAIR_REMOTE_CONTROL must be off or on (got '$RC')" >&2; exit 2 ;; esac
+# A name starting with '-' would be read by claude as an option, not as the name.
+rc_name_ok() { case "$1" in -*|*$'\n'*) return 1 ;; *) return 0 ;; esac; }
+if [ -n "$RC_NAME" ]; then
+  [ "$RC" = on ] || { echo "aipair: AIPAIR_REMOTE_CONTROL_NAME needs AIPAIR_REMOTE_CONTROL=on" >&2; exit 2; }
+  rc_name_ok "$RC_NAME" || { echo "aipair: AIPAIR_REMOTE_CONTROL_NAME must be one line not starting with '-' (got '$RC_NAME')" >&2; exit 2; }
+fi
+# The pins below name the conversation to read; resuming names another, so the two cannot be combined.
+if [ "$CLAUDE_RESUME" = last ] && [ -n "${AIPAIR_CLAUDE_SESSION:-}" ]; then
+  echo "aipair: AIPAIR_CLAUDE_RESUME=last cannot be combined with AIPAIR_CLAUDE_SESSION" >&2; exit 2
+fi
+if [ "$CODEX_RESUME" = last ] && [ -n "${AIPAIR_CODEX_SINCE:-}" ]; then
+  echo "aipair: AIPAIR_CODEX_RESUME=last cannot be combined with AIPAIR_CODEX_SINCE" >&2; exit 2
+fi
+
 # ---- What gets typed into each pane ------------------------------------------
 # Quote one word for the pane's shell: 'it'\''s'. Single quotes are the one form
 # sh/bash/zsh/fish all read alike, and they keep non-ASCII readable (printf %q
@@ -414,12 +444,6 @@ PAIR_SINCE="${AIPAIR_CODEX_SINCE:-$(python3 -c 'import time; print(time.time())'
 if ! [[ "$PAIR_SINCE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
   echo "aipair: AIPAIR_CODEX_SINCE must be a number (got '$PAIR_SINCE')" >&2; exit 2
 fi
-PAIR_PINS="AIPAIR_CLAUDE_SESSION=$(q "$PAIR_SID") AIPAIR_CODEX_SINCE=$(q "$PAIR_SINCE")"
-# AI_SELF / AI_PEER let each agent's `peer` command target the other. They are
-# passed with `env` rather than `export …;` because that is the one spelling
-# sh, bash, zsh and fish all accept (fish has no `export`).
-CLAUDE_LINE="clear; env AI_SELF=claude AI_PEER=codex $PAIR_PINS claude --session-id $(q "$PAIR_SID") $CLAUDE_FLAGS"
-CODEX_LINE="clear; env AI_SELF=codex AI_PEER=claude $PAIR_PINS $(q "$AIPAIR_CODEX_BIN") $CODEX_FLAGS"
 # Every AIPAIR_* the relay reads is pinned to THIS process's value (empty where unset) on
 # the relay's own command. A pre-existing tmux server may hold a stale value from an
 # earlier run; without pinning, `AIPAIR_GATE= aipair loop` could still run yesterday's
@@ -429,16 +453,137 @@ RELAY_ENV_VARS=(AIPAIR_STOP AIPAIR_STOP_SIDE AIPAIR_START_SIDE AIPAIR_MAX_ROUNDS
                 AIPAIR_GATE AIPAIR_GATE_TIMEOUT AIPAIR_GATE_ROUNDS
                 AIPAIR_ALLOW_UNTESTED_DIALOGS AIPAIR_NO_VERSION_GATE
                 AIPAIR_ALLOW_UNTESTED_SCHEMA AIPAIR_NO_SCHEMA_PROBE)
-if [ "$cmd" = loop ]; then
-  bridge_env=(AI_SELF=bridge)
-  for v in "${RELAY_ENV_VARS[@]}"; do bridge_env+=("$v=${!v-}"); done
-  BRIDGE_LINE="clear; env $(cmdline "${bridge_env[@]}") $(cmdline "${bridge[@]}")"
-else
-  BRIDGE_LINE="clear; env AI_SELF=bridge $PAIR_PINS $(cmdline "${bridge[@]}")"   # pins let peer-log both --watch track THIS pair
-fi
+
+# latest_conversation claude|codex → "<id>\t<start epoch>\t<last update, for display>" of the newest
+# conversation for $DIR that no running process holds, or nothing (aipairlib/resume.py).
+latest_conversation() {
+  python3 - "$0" "$1" "$DIR" <<'PY'
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(sys.argv[1])))
+from aipairlib import resume
+sys.exit(resume.main(sys.argv[2:]))
+PY
+}
+# ask_choice PROMPT DEFAULT ANSWER... → CHOICE. Asks again until one of the answers (Enter = DEFAULT).
+# Input that ends (Ctrl-D) stops the launch: nothing has been created yet, and no answer is guessed.
+ask_choice() {
+  local prompt="$1" def="$2" a; shift 2
+  while :; do
+    printf '%s' "$prompt" >&2
+    IFS= read -r a || { echo >&2; echo "aipair: 入力が終わったので起動を中止しました（何も作っていません）" >&2; exit 1; }
+    a="${a:-$def}"
+    case " $* " in *" $a "*) CHOICE="$a"; return 0 ;; esac
+    echo "    → $* のどれかを入力してください" >&2
+  done
+}
+# resolve_start: settle CLAUDE_RESUME / CODEX_RESUME / RC / RC_NAME — from the environment, else by asking
+# (only where allowed, see above) — and point the pins at a resumed conversation. AIPAIR_TEST_ASK=1 asks
+# even for a dry run and reads plain stdin (tests/launch-cmds.sh).
+resolve_start() {
+  local ask=0 hit hid hstart hlabel name
+  if env_on "${AIPAIR_TEST_ASK:-}"; then ask=1
+  elif ! env_on "${AIPAIR_DRY_RUN:-}" && [ -t 0 ] && [ -t 2 ]; then ask=1; fi
+  if [ "$ask" = 1 ] && { [ -z "$CLAUDE_RESUME$CODEX_RESUME" ] || [ -z "$RC" ]; }; then
+    echo "aipair: 起動のしかたを選んでください（Enter で [ ] 内の既定）" >&2
+    # A pin in the environment (e.g. inherited from a pair's own pane) fixes that side; say so, never skip silently.
+    [ -z "$CLAUDE_RESUME" ] && [ -n "${AIPAIR_CLAUDE_SESSION:-}" ] && echo "  Claude: AIPAIR_CLAUDE_SESSION が設定済み → その ID の新しい会話（再開は聞かない）" >&2
+    [ -z "$CODEX_RESUME" ] && [ -n "${AIPAIR_CODEX_SINCE:-}" ] && echo "  Codex:  AIPAIR_CODEX_SINCE が設定済み → 新しい会話（再開は聞かない）" >&2
+  fi
+  # Claude. A caller-pinned session (AIPAIR_CLAUDE_SESSION) is a new conversation with that id.
+  if [ -z "${AIPAIR_CLAUDE_SESSION:-}" ] && { [ "$CLAUDE_RESUME" = last ] || { [ -z "$CLAUDE_RESUME" ] && [ "$ask" = 1 ]; }; }; then
+    hit="$(latest_conversation claude)"
+    if [ -z "$hit" ]; then
+      if [ "$CLAUDE_RESUME" = last ]; then echo "aipair: Claude の再開できる会話がこのディレクトリに無いので、新しい会話で起動します" >&2
+      else echo "  Claude: 再開できる会話なし → 新しい会話" >&2; fi
+      CLAUDE_RESUME=new
+    else
+      IFS=$'\t' read -r hid hstart hlabel <<<"$hit"
+      if [ -z "$CLAUDE_RESUME" ]; then
+        ask_choice "  Claude: 1) 新しい会話  2) 最新の会話を再開（${hlabel}） [1]: " 1 1 2
+        if [ "$CHOICE" = 2 ]; then CLAUDE_RESUME=last; else CLAUDE_RESUME=new; fi
+      fi
+      if [ "$CLAUDE_RESUME" = last ]; then
+        [[ "$hid" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] \
+          || { echo "aipair: 再開する Claude の会話 ID が UUID ではありません（'$hid'）" >&2; exit 1; }
+        PAIR_SID="$hid"
+      fi
+    fi
+  fi
+  [ -n "$CLAUDE_RESUME" ] || CLAUDE_RESUME=new
+  # Codex. A caller-pinned launch epoch (AIPAIR_CODEX_SINCE) is a new conversation.
+  CODEX_SID=""
+  if [ -z "${AIPAIR_CODEX_SINCE:-}" ] && { [ "$CODEX_RESUME" = last ] || { [ -z "$CODEX_RESUME" ] && [ "$ask" = 1 ]; }; }; then
+    hit="$(latest_conversation codex)"
+    if [ -z "$hit" ]; then
+      if [ "$CODEX_RESUME" = last ]; then echo "aipair: Codex の再開できる会話がこのディレクトリに無いので、新しい会話で起動します" >&2
+      else echo "  Codex:  再開できる会話なし → 新しい会話" >&2; fi
+      CODEX_RESUME=new
+    else
+      IFS=$'\t' read -r hid hstart hlabel <<<"$hit"
+      if [ -z "$CODEX_RESUME" ]; then
+        ask_choice "  Codex:  1) 新しい会話  2) 最新の会話を再開（${hlabel}） [1]: " 1 1 2
+        if [ "$CHOICE" = 2 ]; then CODEX_RESUME=last; else CODEX_RESUME=new; fi
+      fi
+      if [ "$CODEX_RESUME" = last ]; then
+        [[ "$hid" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] \
+          && [[ "$hstart" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
+          || { echo "aipair: 再開する Codex の会話の ID / 開始時刻が不正です（'$hid' / '$hstart'）" >&2; exit 1; }
+        # Without /proc, peer and the relay find the pair's Codex as the earliest rollout for the dir that
+        # started at/after AIPAIR_CODEX_SINCE — for a resumed one that is its own start, not the launch.
+        CODEX_SID="$hid"; PAIR_SINCE="$hstart"
+      fi
+    fi
+  fi
+  [ -n "$CODEX_RESUME" ] || CODEX_RESUME=new
+  # Remote Control (Claude only).
+  if [ -z "$RC" ] && [ "$ask" = 1 ]; then
+    ask_choice "  Remote Control（Claude）: 1) オフ  2) オン（名前は自動）  3) オン（名前を入力） [1]: " 1 1 2 3
+    case "$CHOICE" in
+      1) RC=off ;;
+      2) RC=on ;;
+      3) RC=on
+         while :; do
+           printf '%s' "    名前（空なら自動）: " >&2
+           IFS= read -r name || { echo >&2; echo "aipair: 入力が終わったので起動を中止しました（何も作っていません）" >&2; exit 1; }
+           name="${name#"${name%%[![:space:]]*}"}"; name="${name%"${name##*[![:space:]]}"}"
+           if rc_name_ok "$name"; then RC_NAME="$name"; break; fi
+           echo "    → '-' で始まる名前は使えません" >&2
+         done ;;
+    esac
+  fi
+  [ -n "$RC" ] || RC=off
+}
+
+# build_lines: the command typed into each pane, from the settled choices and pins.
+build_lines() {
+  local claude_start codex_start="" rc_args=""
+  PAIR_PINS="AIPAIR_CLAUDE_SESSION=$(q "$PAIR_SID") AIPAIR_CODEX_SINCE=$(q "$PAIR_SINCE")"
+  if [ "$CLAUDE_RESUME" = last ]; then claude_start="--resume $(q "$PAIR_SID")"
+  else claude_start="--session-id $(q "$PAIR_SID")"; fi
+  [ "$CODEX_RESUME" = last ] && codex_start="resume $(q "$CODEX_SID") "
+  # --remote-control takes an OPTIONAL name, so it goes right before --session-id / --resume: what follows it
+  # is then always an option (never taken for the name), and a '#' in the user's fragment cannot comment it out.
+  if [ "$RC" = on ]; then
+    if [ -n "$RC_NAME" ]; then rc_args="--remote-control $(q "$RC_NAME") "; else rc_args="--remote-control "; fi
+  fi
+  # AI_SELF / AI_PEER let each agent's `peer` command target the other. They are
+  # passed with `env` rather than `export …;` because that is the one spelling
+  # sh, bash, zsh and fish all accept (fish has no `export`).
+  CLAUDE_LINE="clear; env AI_SELF=claude AI_PEER=codex $PAIR_PINS claude ${rc_args}${claude_start} $CLAUDE_FLAGS"
+  CODEX_LINE="clear; env AI_SELF=codex AI_PEER=claude $PAIR_PINS $(q "$AIPAIR_CODEX_BIN") ${codex_start}$CODEX_FLAGS"
+  if [ "$cmd" = loop ]; then
+    bridge_env=(AI_SELF=bridge)
+    for v in "${RELAY_ENV_VARS[@]}"; do bridge_env+=("$v=${!v-}"); done
+    BRIDGE_LINE="clear; env $(cmdline "${bridge_env[@]}") $(cmdline "${bridge[@]}")"
+  else
+    BRIDGE_LINE="clear; env AI_SELF=bridge $PAIR_PINS $(cmdline "${bridge[@]}")"   # pins let peer-log both --watch track THIS pair
+  fi
+}
 
 # AIPAIR_DRY_RUN=1: print the lines and stop — nothing is started (tests/launch-cmds.sh).
 if env_on "${AIPAIR_DRY_RUN:-}"; then
+  resolve_start
+  build_lines
   printf 'session: %s\nclaude:  %s\ncodex:   %s\nbridge:  %s\ntitle:   %s\n' \
     "$NAME" "$CLAUDE_LINE" "$CODEX_LINE" "$BRIDGE_LINE" "$BRIDGE_TITLE"
   exit 0
@@ -458,6 +603,10 @@ if running; then
   fi
   attach_session
 fi
+
+# A NEW pair from here on: settle how each agent starts (asking on a terminal) before anything is created.
+resolve_start
+build_lines
 
 # #4 transactional build: the session is assembled step by step under `set -e`. If any step
 # fails partway, the half-built session must NOT survive — otherwise the next `aipair` would

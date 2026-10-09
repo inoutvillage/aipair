@@ -24,6 +24,15 @@ tasks left, Codex declares `[AIPAIR_HUMAN_REQUIRED]`, a question is too large to
 task makes no progress across rounds) instead of guessing or spinning.
 
 ### Added
+- **Start choices: resume the latest conversation, Remote Control** — when `aipair` / `aipair loop` builds a
+  new pair on a terminal, it asks whether Claude and Codex each start a new conversation or resume the
+  latest one for the directory (the newest by last update; non-interactive `claude -p` / `codex exec`
+  conversations and ones a running process holds are skipped), and whether Claude starts with Remote
+  Control (off / on with Claude's name / on with a typed name). Resuming uses `claude --resume <id>` /
+  `codex resume <id>` (still through `aipair-codex`, so `--no-daemon` stays) and points the `peer` / relay
+  pins at the resumed conversation. `AIPAIR_CLAUDE_RESUME` / `AIPAIR_CODEX_RESUME` (`new|last`) and
+  `AIPAIR_REMOTE_CONTROL` (`off|on`) + `AIPAIR_REMOTE_CONTROL_NAME` answer instead and skip the question;
+  without a terminal (or for a dry run) nothing is asked and the launch is as before.
 - **Fully autonomous relay (`--autopilot`)** — `aipair loop --unsafe --autopilot` (or `AIPAIR_AUTOPILOT=1`,
   `aipair-relay-here --autopilot`) never stops for a human decision: the human-wait sentinel is not offered,
   and Codex answers as the human's proxy (irreversible operations — production deploys, billing, public
