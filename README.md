@@ -200,6 +200,22 @@ aipair name   [dir]    # tmux セッション名を表示
 > **許可確認なしでコマンド実行・ファイル編集**を行う。信頼できる作業ディレクトリでだけ使うこと。
 > 素の `aipair`（既定）は通常の許可プロンプト付きなので、この注意は当てはまらない。
 
+#### 起動時の選択（会話の再開・Remote Control）
+
+`aipair` / `aipair loop` が**新しくペアを作る時**は、端末で次を聞いてから起動する（Enter は `[ ]` 内の既定＝今までと同じ起動）。
+
+```text
+aipair: 起動のしかたを選んでください（Enter で [ ] 内の既定）
+  Claude: 1) 新しい会話  2) 最新の会話を再開（10/09 17:40） [1]:
+  Codex:  1) 新しい会話  2) 最新の会話を再開（10/09 17:37） [1]:
+  Remote Control（Claude）: 1) オフ  2) オン（名前は自動）  3) オン（名前を入力） [1]:
+```
+
+- **最新の会話** = そのディレクトリの会話のうち最終更新が一番新しいもの（履歴を選ぶ機能ではない）。非対話のもの（`claude -p` / `codex exec`）と、**今ほかのプロセスが使っている会話**は除く（後者は `/proc` のある環境だけ）。再開できる会話が無い側は聞かずに新しい会話で起動する。
+- 再開は Claude が `claude --resume <id>`、Codex が `codex resume <id>`（`aipair-codex` 経由なので `--no-daemon` も付く）。どちらも同じログに追記されるので、`peer` と relay はそのまま追跡する。
+- Remote Control は Claude を `--remote-control [名前]` 付きで起動する（claude.ai へのログインが必要。Codex には無い機能）。`-` で始まる名前は使えない。
+- 聞くのは**標準入力と標準エラーが端末の時だけ**。再アタッチ・`AIPAIR_DRY_RUN`・端末の無い起動では聞かず、下の環境変数（未設定なら 新しい会話 / 新しい会話 / オフ）で決まる。環境変数で決めた項目は聞かない。入力が途中で終わったら（Ctrl-D）何も作らずに中止する。
+
 ### 2. VS Code / Cursor / Antigravity から（WSL2）
 
 `Ctrl+Shift+P` →「**Tasks: Run Task**」→ タスクを選択。
@@ -278,6 +294,8 @@ peer-log codex --full      # セッション全体
 | `AIPAIR_HUMAN_REQUIRED` | `[AIPAIR_HUMAN_REQUIRED]` | 人間待ちの sentinel（先頭行に単独で・exit 8）。通常のレビュー往復: Claude / Codex のどちらかが「残りは人間の判断事項」と宣言。連続モード: 人間対応の `[!]` のみ残存を Codex が宣言する終端（分類 BLOCKED 時のみ） |
 | `AIPAIR_UNSAFE` | （未設定＝安全） | `1`/`--unsafe` で権限バイパス起動（`aipair loop` は必須）。既定は通常の許可プロンプト |
 | `AIPAIR_CLAUDE_FLAGS` / `AIPAIR_CODEX_FLAGS` | （安全＝無し／`--unsafe`＝`--dangerously-…`） | 起動フラグ。明示指定は最優先。**ペイン内のシェルが解釈するシェル断片**（`"--model opus"` は 2 引数、`'--append-system-prompt "a b"'` の引用符も有効）。空文字でフラグ無し。**ただし `aipair loop` では危険フラグが必ず付与される**（空/カスタム指定にも追記。relay が許可プロンプトに答えられないため） |
+| `AIPAIR_CLAUDE_RESUME` / `AIPAIR_CODEX_RESUME` | （未設定＝端末なら質問・それ以外は `new`） | `new`＝新しい会話、`last`＝そのディレクトリの最新の会話を再開（→「起動時の選択」）。`last` で再開できる会話が無ければ警告して新しい会話。他の値は exit 2。`AIPAIR_CLAUDE_SESSION` / `AIPAIR_CODEX_SINCE` を自分で指定しつつ `last` は exit 2 |
+| `AIPAIR_REMOTE_CONTROL` / `AIPAIR_REMOTE_CONTROL_NAME` | （未設定＝端末なら質問・それ以外は `off`） | `on` で Claude を `--remote-control` 付きで起動。名前は `AIPAIR_REMOTE_CONTROL_NAME`（未設定＝Claude が付ける名前。`on` の時だけ指定可・`-` で始まる名前は不可）。他の値は exit 2 |
 | `AIPAIR_DRY_RUN` | （未設定＝off） | `1` で各ペインに打ち込む起動行を表示するだけで何も起動しない（設定確認・テスト用）。真偽値の読み方は `AIPAIR_ENDLESS` と同じ |
 | `AIPAIR_GATE` | （未設定＝無し） | **停止ゲート**: 停止ワード検出後に実行するシェルコマンド（例 `npm test`）。成功した時だけ停止／次タスクへ。失敗は出力を添えて Claude に差し戻す（→ 下の「停止ゲート」） |
 | `AIPAIR_GATE_TIMEOUT` / `AIPAIR_GATE_ROUNDS` | `600` / `3` | ゲートのタイムアウト秒／差し戻しの上限回数（到達で relay は exit 6） |

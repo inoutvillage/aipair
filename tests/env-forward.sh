@@ -28,6 +28,9 @@ cat > "$W/bin/aipair-relay" <<SHIM
 SHIM
 chmod +x "$W"/bin/*
 export PATH="$W/bin:$REPO/bin:$PATH"; unset TMUX
+# These start real pairs under a pty (`script`), where aipair would ask how each agent starts; answer
+# up front (the launch aipair always made) so nothing waits for input.
+export AIPAIR_CLAUDE_RESUME=new AIPAIR_CODEX_RESUME=new AIPAIR_REMOTE_CONTROL=off
 # Preflight: prove the tmux shim provably targets the PRIVATE socket before anything runs, so a
 # broken shim can never touch the user's default server (guardrail; same as the other tmux tests).
 "$REAL_TMUX" -L "$SOCKET" new-session -d -s probe 2>/dev/null

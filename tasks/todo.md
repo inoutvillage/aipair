@@ -840,3 +840,57 @@ cli の既定が env を読まない）→ いずれも該当テストが FAIL�
 
 - [x] 実機検証 34 / 34 PASS（ローカル検証ツール・私設 tmux socket）。ダイアログ画面: 前回（claude-2.1.284_codex-0.158.0）と同一構造
 - [x] `corelib.TESTED_VERSIONS` と README「必要環境」表を更新、`bash tests/run-all.sh` 全緑
+
+## 実装: 起動時に「最新の会話を再開」と Remote Control を選ぶ（2026-10-09・社長指示）
+
+社長指示: aipair でペアを作る時に、Claude / Codex それぞれ「新しい会話」か「最新の会話を再開」かを選べる
+（履歴を選ぶ機能ではなく、一番新しいもの）。Claude は Remote Control を オフ / オン（名前は自動）/
+オン（名前を入力）から選べる。Claude 画面内のダイアログ（mod）案は、relay の質問リレーが起動直後から
+Claude の質問ダイアログを Codex へ中継する（state_machine.py:698）ため不採用。aipair が起動前に聞く。
+
+実機で確認済み（2026-10-09・私設 tmux socket・claude 2.1.295 / codex 0.162.0）:
+- `aipair-codex resume <id> --dangerously-bypass-approvals-and-sandbox` → `codex --no-daemon resume <id> …` で起動し、
+  **新しいファイルを作らず元の rollout に追記**（ペイン配下のプロセスが開く → relay の /proc 追跡がそのまま効く）
+- `claude --resume <id> --remote-control [<name>] --dangerously-skip-permissions` → sessionId は <id> のまま
+  （新しい jsonl を作らない）・`/remote-control is active`。名前を省略しても後ろの `--…` を名前として取り込まない
+
+仕様:
+- 聞くのは `aipair` / `aipair loop` で**新しくペアを作る時だけ**（再アタッチ・`loop` の既存ペア拒否より後、
+  `tmux new-session` より前）。標準入力と標準エラーが端末の時だけ。dry-run では聞かない。Enter は既定
+  （新しい会話 / 新しい会話 / オフ）＝今までと同じ起動。入力が途中で終わったら（Ctrl-D）何も作らず中止
+- 環境変数で質問を飛ばせる: `AIPAIR_CLAUDE_RESUME` / `AIPAIR_CODEX_RESUME`（new|last）、`AIPAIR_REMOTE_CONTROL`
+  （off|on）、`AIPAIR_REMOTE_CONTROL_NAME`（空 = Claude が自動で付ける名前）。不正値は tmux に触れる前に exit 2
+- 「最新」= その dir の会話のうち最終更新が一番新しいもの。Claude は `~/.claude/projects/*/<uuid>.jsonl` を
+  記録内の `cwd` で照合（dir 名の符号化は衝突しうるので推測しない）。Codex は rollout の `session_meta.cwd` で
+  照合し、`codex exec`（source=exec）は除く（`codex resume --last` と同じ）。**今ほかのプロセスが使っている
+  会話は除く**（Linux: Claude は `~/.claude/sessions/<pid>.json`、Codex は開いている fd。/proc が無い環境では除外なし）
+- 履歴が無い側は質問しない（「新しい会話で起動」と表示）。環境変数で last を指定して履歴が無い時は警告して新しい会話
+- 再開時の pin: Claude は `--session-id` の代わりに `--resume <id>`、`AIPAIR_CLAUDE_SESSION=<id>`。Codex は
+  `aipair-codex resume <id>`、`AIPAIR_CODEX_SINCE`＝その rollout の開始時刻（/proc の無い環境の codex_since が
+  それを選ぶ）。`AIPAIR_CLAUDE_SESSION` / `AIPAIR_CODEX_SINCE` を自分で指定しつつ last を指定したら exit 2
+- Remote Control: `--remote-control [<name>]` を `--session-id` / `--resume` の**前**に置く（後ろが必ず `--…` に
+  なるので省略時も名前を取り違えない・ユーザーのフラグ断片の `#` でも消えない）。`-` で始まる名前は拒否
+- 確認用のテスト専用フック `AIPAIR_TEST_ASK=1`: dry-run でも質問を出し、端末でなくても標準入力から読む
+
+- [x] `bin/aipairlib/resume.py`（最新の会話の特定）＋ `tests/resume-latest.py`（15 件。使用中除外のテストは除外を外すと落ちることを確認）
+- [x] `bin/aipair`: 選択の検証・質問・起動行への反映
+- [x] `tests/launch-cmds.sh`: 起動行・不正値・pin との衝突・質問の流れ（[11] 28 件・計 130 件）
+- [x] README・CHANGELOG
+- [x] インストーラのファイル列挙（2 か所）に `resume.py` を追加。`tests/install-upgrade.sh` に「`bin/aipairlib/*.py` が全部インストールされる」確認を追加（列挙漏れの再発防止）
+- [x] 疑似端末（`script`）で本物の aipair を起動する既存テスト 3 本（session-name / env-forward / pane-layout）が質問で止まった → 質問を飛ばす環境変数を渡す。`tests/session-name.sh` [9b] に、実端末経路で質問 → 回答 → ペア作成 → Codex pin が再開した会話の開始時刻、を確かめる確認を追加
+- [x] 環境の pin（`AIPAIR_CLAUDE_SESSION` / `AIPAIR_CODEX_SINCE`）で再開の質問を飛ばす時は、その旨を表示（黙って飛ばさない）
+- [x] `bash tests/run-all.sh`: env-forward.sh 以外すべて緑（pane-layout は構文修正後に単体で 9/9）。env-forward.sh は**main（origin/main 1f9b06c）でも同じ 4 件が失敗**＝この環境固有（下記スコープ外）
+- [x] 実機（私設 socket・ブランチの `aipair loop --unsafe`）: 質問 → 両方「最新を再開」→ Claude は
+      `claude --remote-control aipair-e2e --resume <id>`（sessionId 不変・`/remote-control is active`）、Codex は
+      `codex --no-daemon resume <id>`（同じ rollout を開く）、`@aipair-codex-since` = その rollout の開始時刻。
+      Claude に 1 依頼 → relay が Codex へ配達 → 再開した rollout をロック → 完了検知 → 停止ワードで終了（1 往復）。
+      名前を自動（`--remote-control --resume <id>`）でも Remote Control が有効になることを確認
+
+### スコープ外の検出（未対応・記録のみ）
+- `tests/env-forward.sh` がこのマシンでは main でも失敗する（relay never launched）。ペインの対話 bash が `~/.bashrc:30` の`export PATH="$HOME/.local/bin:$PATH"` で PATH の先頭にインストール済みの `aipair-relay` を置き、テストの shim より先に本物が起動するため（relay ペインに本物のバナーが出ることを確認）。CI では起きない想定・未対応
+- aipair のペインの中で `aipair <別dir>` を打つと、ペインの環境の pin（`AIPAIR_CLAUDE_SESSION` 等）を引き継ぎ、**動いているペアと同じ ID で** `claude --session-id` を起動する（dry-run で確認・main でも同じ）。今回は質問を飛ばす旨の表示だけ追加し、pin の引き継ぎ自体は変えていない
+- 幅の狭い Codex ペイン（実機確認時、クライアント未接続で 80x24 → Codex ペイン幅 22）では、relay の**最初の**
+  Codex への配達確認が失敗して exit 4 になった（Codex には届いて応答も完了していた）。最初の配達時点では
+  Codex のログが未ロックで、確認が画面の `esc to interrupt` 頼みになり、狭い幅で読めないためと推定（仮説。
+  新しい会話でも同じかは未確認）。ウィンドウを 200x50 にすると同じ構成で 1 往復が通った。再開時はログが
+  最初から在るので、配達前にロックすればログで確認できる（改善案・未実装）

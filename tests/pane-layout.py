@@ -69,7 +69,9 @@ class Server:
                     if k not in ("TMUX", "TMUX_PANE", "AI_SELF", "AI_PEER", "BASH_ENV", "ENV")
                     and not k.startswith("AIPAIR_")}
         self.env.update(PATH=shim_dir + os.pathsep + os.path.join(REPO, "bin") + os.pathsep + self.env["PATH"],
-                        TERM="xterm-256color", AIPAIR_CLAUDE_FLAGS="--version", AIPAIR_CODEX_FLAGS="--version")
+                        TERM="xterm-256color", AIPAIR_CLAUDE_FLAGS="--version", AIPAIR_CODEX_FLAGS="--version",
+                        # answered up front: on a terminal aipair would otherwise ask how each agent starts
+                        AIPAIR_CLAUDE_RESUME="new", AIPAIR_CODEX_RESUME="new", AIPAIR_REMOTE_CONTROL="off")
         self.fds = []
         self.pids = []
         # Guardrail: prove the shim reaches the PRIVATE socket before anything else runs.
@@ -245,8 +247,9 @@ class PaneLayout(unittest.TestCase):
         s.terminal(s.base + ["new-session", "-s", "host", "-c", s.work], 184, 46)
         s.wait(lambda: s.window("host") is not None, "the host session")
         s.tmux("split-window", "-h", "-t", "host")        # the pane aipair is typed in is NOT the terminal's size
-        line = "env 'PATH=%s' AIPAIR_CLAUDE_FLAGS=--version AIPAIR_CODEX_FLAGS=--version '%s' '%s'" % (
-            s.env["PATH"], AIPAIR, s.proj)
+        line = ("env 'PATH=%s' AIPAIR_CLAUDE_FLAGS=--version AIPAIR_CODEX_FLAGS=--version "
+                "AIPAIR_CLAUDE_RESUME=new AIPAIR_CODEX_RESUME=new AIPAIR_REMOTE_CONTROL=off '%s' '%s'" % (
+                    s.env["PATH"], AIPAIR, s.proj))
         s.tmux("send-keys", "-t", "host", line, "C-m")
         s.wait(lambda: s.pair_is_up() and s.attached(), "the pair to come up and the client to switch to it")
         self.assert_layout(s, 184, 46)

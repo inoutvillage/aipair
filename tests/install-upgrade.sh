@@ -47,6 +47,11 @@ for lib in "${FLATLIBS[@]}"; do
 done
 chk "[ -f '$TH/.local/bin/aipairlib/corelib.py' ]" "aipairlib package installed (corelib.py)"
 chk "[ -f '$TH/.local/bin/aipairlib/relay.py' ]" "aipairlib package installed (relay.py)"
+# The installer lists its files by hand: a module added to the package but not to that list would be
+# missing from an install and fail only when imported (aipair's start choices import resume.py).
+for mod in "$REPO"/bin/aipairlib/*.py; do
+  chk "[ -f '$TH/.local/bin/aipairlib/$(basename "$mod")' ]" "every package module is installed ($(basename "$mod"))"
+done
 echo "$out" | grep -q "retired" && retired=1 || retired=0
 chk "[ $retired -eq 1 ]" "installer reports the retirement"
 chk "env -u TMUX HOME='$TH' '$TH/.local/bin/aipair-relay' --help >/dev/null 2>&1" "installed relay imports the aipairlib package (--help ok)"
