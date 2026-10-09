@@ -28,6 +28,10 @@ cat > "$W/bin/aipair-relay" <<SHIM
 SHIM
 chmod +x "$W"/bin/*
 export PATH="$W/bin:$REPO/bin:$PATH"; unset TMUX
+# The panes run a login shell, which reads the user's ~/.bash_profile / ~/.bashrc; a PATH line there
+# (e.g. ~/.local/bin first) would start the INSTALLED aipair-relay/claude ahead of the shims above.
+# A throwaway HOME keeps the user's dotfiles (and ~/.tmux.conf) out of the private server.
+mkdir -p "$W/home"; export HOME="$W/home"
 # These start real pairs under a pty (`script`), where aipair would ask how each agent starts; answer
 # up front (the launch aipair always made) so nothing waits for input.
 export AIPAIR_CLAUDE_RESUME=new AIPAIR_CODEX_RESUME=new AIPAIR_REMOTE_CONTROL=off

@@ -887,10 +887,23 @@ Claude の質問ダイアログを Codex へ中継する（state_machine.py:698�
       名前を自動（`--remote-control --resume <id>`）でも Remote Control が有効になることを確認
 
 ### スコープ外の検出（未対応・記録のみ）
-- `tests/env-forward.sh` がこのマシンでは main でも失敗する（relay never launched）。ペインの対話 bash が `~/.bashrc:30` の`export PATH="$HOME/.local/bin:$PATH"` で PATH の先頭にインストール済みの `aipair-relay` を置き、テストの shim より先に本物が起動するため（relay ペインに本物のバナーが出ることを確認）。CI では起きない想定・未対応
+- `tests/env-forward.sh` がこのマシンでは main でも失敗する（relay never launched）。ペインの対話 bash が `~/.bashrc:30` の`export PATH="$HOME/.local/bin:$PATH"` で PATH の先頭にインストール済みの `aipair-relay` を置き、テストの shim より先に本物が起動するため（relay ペインに本物のバナーが出ることを確認）。CI では起きない想定 → 2026-10-10 対応済み（下の「修正: `tests/env-forward.sh` を…」）
 - aipair のペインの中で `aipair <別dir>` を打つと、ペインの環境の pin（`AIPAIR_CLAUDE_SESSION` 等）を引き継ぎ、**動いているペアと同じ ID で** `claude --session-id` を起動する（dry-run で確認・main でも同じ）。今回は質問を飛ばす旨の表示だけ追加し、pin の引き継ぎ自体は変えていない
 - 幅の狭い Codex ペイン（実機確認時、クライアント未接続で 80x24 → Codex ペイン幅 22）では、relay の**最初の**
   Codex への配達確認が失敗して exit 4 になった（Codex には届いて応答も完了していた）。最初の配達時点では
   Codex のログが未ロックで、確認が画面の `esc to interrupt` 頼みになり、狭い幅で読めないためと推定（仮説。
   新しい会話でも同じかは未確認）。ウィンドウを 200x50 にすると同じ構成で 1 往復が通った。再開時はログが
   最初から在るので、配達前にロックすればログで確認できる（改善案・未実装）
+
+## 修正: `tests/env-forward.sh` を利用者の dotfiles から切り離す（2026-10-10・社長指示）
+
+背景: claude 2.1.295 / codex 0.162.0 への `aipair-bump` は全テスト緑が前提だが、このマシンでは
+env-forward.sh が main でも 4 件落ちる（上の「スコープ外の検出」）。bump の前に先に直す（社長判断）。
+
+原因: テストの私設 tmux のペインはログインシェルで、利用者の `~/.bash_profile` → `~/.bashrc` を読む。
+そこで `~/.local/bin` が PATH の先頭に来ると、テストの shim より先にインストール済みの `aipair-relay`
+（と本物の `claude` 等）が起動する。ペインの PATH が利用者の dotfiles 次第になっているのが根本。
+
+- [x] テストの間だけ HOME を使い捨てのディレクトリにする（他のテストと同じ流儀）。私設 server も利用者の `~/.tmux.conf` を読まなくなる
+- [x] 修正前のこのマシンで 4 件落ち（19 件で止まる）・修正後に 37/37（CI と同数）、を確認。`bash tests/run-all.sh` 全緑（ALL CHECKS PASSED）
+- [ ] PR → CI → マージ → install → `aipair-bump`（実機検証 → bump の PR → マージ → install → relay 再点火）
