@@ -913,3 +913,8 @@ env-forward.sh が main でも 4 件落ちる（上の「スコープ外の検�
 
 - [x] 実機検証 34 / 34 PASS（ローカル検証ツール・私設 tmux socket）。ダイアログ画面: 前回（claude-2.1.286_codex-0.159.3）と同一構造
 - [x] `corelib.TESTED_VERSIONS` と README「必要環境」表を更新、`bash tests/run-all.sh` 全緑
+
+## 追記: 版ゲートの検証済み版を claude 2.1.296 / codex 0.162.0 へ更新（2026-10-11・aipair-bump）
+
+- [x] 実機検証 34 / 34 PASS（ローカル検証ツール・私設 tmux socket）。ダイアログ画面: 前回（claude-2.1.295_codex-0.162.0）と同一構造
+- [x] `corelib.TESTED_VERSIONS` と README「必要環境」表を更新、`bash tests/run-all.sh` 全緑
