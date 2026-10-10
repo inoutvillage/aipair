@@ -12,7 +12,7 @@ import unicodedata
 # --- version gate ----------------------------------------------------------- #
 # The plan-approval / question dialogs are read by scraping the CLIs' TUI, so they are
 # tied to specific claude/codex versions. Keep this in sync with README「検証済みバージョン」.
-TESTED_VERSIONS = {"claude": "2.1.295", "codex": "0.162.0"}
+TESTED_VERSIONS = {"claude": "2.1.296", "codex": "0.162.0"}
 
 
 def parse_version(text):
