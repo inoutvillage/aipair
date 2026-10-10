@@ -39,8 +39,19 @@ flunk() { n=$((n+1)); echo "FAIL $1"; fail=1; }
 alive() { tmux has-session -t "=$1" 2>/dev/null; }
 pane_of() { tmux list-panes -s -t "=$1" -F '#{pane_id}' | head -1; }   # send-keys rejects "=name"
 start_pair() {  # headless real start: --version makes the agent panes exit at once (no TUI)
+  # aipair ends by attaching, which never returns under `script`. Stop it once a client is attached
+  # (= the pair is fully built) rather than after a fixed time: a fixed 3s cut the start short on a
+  # loaded machine, and every check after it failed with "no session".
+  local name pid end
+  name="$(aipair name "$1")"
   AIPAIR_CLAUDE_FLAGS=--version AIPAIR_CODEX_FLAGS=--version \
-    timeout 3 script -qec "aipair $1" /dev/null >/dev/null 2>&1 || true
+    timeout 60 script -qec "aipair $1" /dev/null >/dev/null 2>&1 &
+  pid=$!; end=$((SECONDS + 60))
+  while [ "$SECONDS" -lt "$end" ] && kill -0 "$pid" 2>/dev/null; do
+    [ -n "$(tmux list-clients -t "=$name" 2>/dev/null)" ] && break
+    sleep 0.1
+  done
+  kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
 }
 swapcase_last() { python3 -c 'import os,sys; d,b=os.path.split(sys.argv[1]); print(os.path.join(d,b.swapcase()))' "$1"; }
 
