@@ -918,3 +918,12 @@ env-forward.sh が main でも 4 件落ちる（上の「スコープ外の検�
 
 - [x] 実機検証 34 / 34 PASS（ローカル検証ツール・私設 tmux socket）。ダイアログ画面: 前回（claude-2.1.295_codex-0.162.0）と同一構造
 - [x] `corelib.TESTED_VERSIONS` と README「必要環境」表を更新、`bash tests/run-all.sh` 全緑
+
+### スコープ外の検出（未対応・記録のみ・2026-10-11）
+- Codex は、導入版より新しい版が出ていると起動時に「Update available」ダイアログを出す（0.162.0 に 0.162.1 が出た時に確認。
+  既定カーソルは `› 1. Update now (runs npm install -g @openai/codex)`、フッターは `enter continue · esc skip`）。
+  ペアの Codex ペインがこの画面のまま relay が最初の依頼を配達した場合、relay は nonce が画面に出たことを確かめてから
+  Enter を押すので Enter は送られない見込み（配達できずに止まる）。ただし、貼り付けた本文や nonce の文字（数字）を
+  ダイアログがどう扱うかは未確認（仮説。数字キーで選択肢が確定するなら利用者の CLI が更新される）。
+  改善案（未実装）: 配達の前にこの画面を検知して人に知らせる／配達を待つ。ローカルの実機検証ツールは Esc で見送る
+  ようにした（Enter を使わない）。
