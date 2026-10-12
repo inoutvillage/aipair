@@ -101,6 +101,10 @@ def build_parser(description=""):
     ap.add_argument("--poll", type=float, default=3.0, help="poll seconds (default 3)")
     ap.add_argument("--busy-wait", type=int, default=90,
                     help="poke 前に相手ペインのアイドルを待つ上限秒。超過後は中止せず注入を続行する（既定90）")
+    ap.add_argument("--subagent-wait", type=int, default=3600,
+                    help="Claude がバックグラウンドのサブエージェント（Agent / Workflow）の完了待ちでターンを終えた時、"
+                         "完了通知で Claude が再開するまでターン完了とみなさない（Codex へ渡さない）。起動からこの秒数を"
+                         "過ぎたサブエージェントは待たない。0 で無効＝従来どおり（既定 3600）")
     ap.add_argument("--settle", type=float, default=1.2, help="settle seconds before relaying")
     ap.add_argument("--poke-claude", default=None,
                     help="default: レビュー対応の依頼（人間待ち sentinel の案内付き）")

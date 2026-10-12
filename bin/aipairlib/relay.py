@@ -99,6 +99,10 @@ Autopilot (--autopilot / AIPAIR_AUTOPILOT, opt-in):
 
 Turn detection (verified against real logs):
   • Claude: latest `assistant` entry whose stop_reason != "tool_use"  → turn done
+            — unless a background subagent (Agent / Workflow) launched since the relay started is
+            still unsettled: Claude ended the turn only to wait for it and resumes by itself on the
+            completion notification, so that end_turn is not a completed turn (loglib.ClaudeTurn;
+            capped per subagent by --subagent-wait, default 3600 s from its launch; 0 = off)
   • Codex : latest task_* event is `task_complete`                    → turn done
 
 Injection uses a proven tmux incantation:
@@ -314,6 +318,9 @@ def main():
             return 2
     if a.stall_rounds < 0:
         print(f"aipair-relay: --stall-rounds は 0 以上で指定してください（実際の値: {a.stall_rounds!r}）", file=sys.stderr)
+        return 2
+    if a.subagent_wait < 0:
+        print(f"aipair-relay: --subagent-wait は 0 以上で指定してください（実際の値: {a.subagent_wait!r}）", file=sys.stderr)
         return 2
     if a.no_endless:
         a.endless = False

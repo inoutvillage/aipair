@@ -932,3 +932,69 @@ env-forward.sh が main でも 4 件落ちる（上の「スコープ外の検�
 
 - [x] 実機検証 34 / 34 PASS（ローカル検証ツール・私設 tmux socket）。ダイアログ画面: 前回（claude-2.1.296_codex-0.162.0）と同一構造
 - [x] `corelib.TESTED_VERSIONS` と README「必要環境」表を更新、`bash tests/run-all.sh` 全緑
+
+## 修正: サブエージェントの完了待ちで終えたターンを Codex へ渡してしまう（2026-10-12・社長指摘）
+
+症状: Claude がサブエージェントを起動して「結果を待ちます」とターンを終えると、relay がそれをターン完了と受け取り
+Codex にレビューを頼む。Codex は「レビューする対象がありません」と返し、往復が無駄になる。
+
+原因: `loglib.claude_done_ts` は「最新 assistant の `stop_reason != "tool_use"`」だけで完了と判定していた。
+サブエージェント（Agent / Workflow）はバックグラウンドで走り、Claude は起動後に `end_turn` で待ちに入って
+完了通知で自分で再開する。実ログ（claude 2.1.266〜2.1.296・直近 40 日・139 本）では非同期起動 125 件のうち
+107 件が通知より先に `end_turn` していた（例外ではなく通常経路）。
+
+- [x] 実ログで記録の形を確定（推測で書かない）: 起動 = tool_result 行の `toolUseResult.status == "async_launched"`
+      ＋ `agentId` / `taskId`、再開 = `resumedAgentId`。終端通知の配達 = `origin.kind == "task-notification"` の
+      user 行 / `queued_command` の attachment 行 / `queue-operation remove` 行。起動 126 件すべてに配達の行があり、
+      その後に assistant 行が続いていた
+- [x] `loglib.ClaudeTurn`（行単位）＋ `claude_done_ts(path, since, subagent_wait=0, on_subagents=None, now=None)`:
+      待ちの間に起動したサブエージェントが未決着なら完了と数えない。決着 = 配達の《後》に assistant 行が出た時
+      （通知の enqueue では決着にしない。通知から再開ターンの最初の assistant 行まで中央値 5 秒・90% 点 39 秒あり、
+      その間の最新 assistant は「待ちます」のまま。enqueue の後に遅れて書かれる「待ちます」の end_turn も実在した）
+- [x] 上限 `--subagent-wait`（既定 3600・0 で無効）: 起動からの秒数。実測の最長は 2393 秒。通知が来ない事故で
+      relay が止まり続けないため。relay の起動（baseline）より前の起動は数えない（落ちた Claude が残した未完了で
+      毎ターン止まらない）
+- [x] `state_machine`: 完了判定 3 箇所に上限を渡す。待っている理由を件数が変わった時だけ表示、上限切れは警告
+- [x] テスト: `tests/relay-parsers.py` に 17 件（ログの形 12・CLI 境界 1・本物の `run()` を回すもの 4）。relay-parsers 294 件緑
+- [x] 実ログの再生で確認（本番と同じ `ClaudeTurn` を 1 行ずつ）: サブエージェントを使っていない 116 本は新旧の
+      完了判定が完全一致。使っている 23 本では、新判定が完了とした end_turn はすべて旧判定でも完了（新だけが完了と
+      する例 0）、見送りは待ちの end_turn のみ、見送りの最長 2436 秒、読み終えた時点で見送り中のログ 0
+- [x] 実ログの一場面を本物の `StateMachine.run()` と本物の `claude_done_ts` に 1 行ずつ流して確認: 旧（0）は
+      「待ちます」の直後に Codex へ渡し、新（3600）は完了通知後の最終 end_turn で渡した
+- [ ] 反映: インストール（`aipair-install.sh`）→ relay を再点火 → 実機のペアで、サブエージェントを使う依頼を 1 回
+      relay で回して確認（未実施・社長確認待ち。稼働中の relay は入れ直すまで従来の判定のまま）
+
+### Codex レビュー 1 巡目（2026-10-12）— [P2] 2 件、どちらも本物の状態機械とパーサで再現された
+- [x] `settle` 後の再確認が未完了でも、`or done` が最初の完了値を復活させて Codex へ渡していた。再確認が未完了なら
+      渡さず監視へ戻す（往復数も数えない）。回帰テスト `SubagentWaitInTheLoop` の settle の 1 本
+- [x] サブエージェントを数え始める時刻に `since` を使っていたが、`since` はプラン承認・質問回答をダイアログで
+      配達した時にも進む（同じターンの途中）。「起動 → 質問回答の配達 → 待ちの end_turn」で起動済みの分が待ちから
+      外れた。数え始めを `subagent_since`（relay は起動時刻 baseline を渡す）に分けた。回帰テストは質問リレーを
+      本物の `run()` と本物のパーサ・実ファイルで通す 1 本と、`loglib` の 1 本
+- [x] 2 本の回帰テストは、それぞれの修正を一時的に戻すと落ちることを確認した
+
+### Codex レビュー 2 巡目（2026-10-12）— `[AIPAIR_REVIEW_OK]`
+- 1 巡目の 2 件は解消、追加の指摘なし。Codex は前回の再現手順（`settle` 中の再開・プラン承認後）でも、完了通知の後に
+  Claude が処理を終えるまでレビュー送信を待つことを確認した
+- Codex の環境では全体ゲートで `tests/pane-layout.py` の「tmux 内から起動する」1 件がタイムアウトした。変更前の HEAD
+  でも同じ失敗を再現したとの報告（今回の変更とは無関係）。Claude 側の環境では同じゲートを 2 回流して 2 回とも 9 件通過
+
+### スコープ外の検出（未対応・記録のみ）
+- **Codex の会話を切り替えると relay と `peer` が Codex のログを見失う（2026-10-12・このペアで実発生）**。
+  Codex の TUI で新しい会話に切り替えた後の rollout は、`session_meta.cwd` が全部小文字で記録されていた
+  （例: 実際のパスが `/mnt/d/Work-Dir/Proj` なら `/mnt/d/work-dir/proj`。切り替え前の rollout は実際の表記どおり）。
+  `/mnt/d` は大文字小文字を区別しない（`os.path.samefile` は True）が、`peerlog.codex_via_pane` は
+  `codex_cwd(roll) == _norm(cwd)` の文字列一致で照合するので、Codex のプロセスが開いている rollout を見つけても
+  捨てる（導入済みコードで `codex_via_pane` = None を再現）。identity が使える環境なので別の探し方にも落ちず、
+  relay は「cwd一致の Codex rollout が見つからず → 新規セッションの出現待ち」のまま Codex の完了を検知できない
+  （レビューは終わっているのに「Codex の応答待ち」。コード上は `ResponseGate.POKE_NOSHOW`＝1800 秒で nonce 未着と
+  して exit 4 になるはずだが、そこまでは実機で見ていない）。`peer` も
+  切り替え前の rollout を読み続ける。回避: relay を止めて `--codex-log <rollout>` で明示指定して起こし直す。
+  直すなら cwd の照合箇所すべて（`codex_via_pane` のほか cwd で引く索引・`codex_since` など）を洗う必要がある
+- バックグラウンドの Bash（`run_in_background`）の完了待ちでターンを終えた場合も同じ空回りが起きるが、対象外に
+  した。開発サーバのように終わらないものと、テスト実行のように終わるものをログから区別できないため
+  （待つと毎ターン上限まで止まる）。区別する手掛かりが見つかれば別途
+- relay を途中から起こした時（`aipair-relay-here`）に既に走っていたサブエージェントは数えない（relay の起動より
+  前の起動）。その回だけ従来どおり早く渡る
+- ローカルの実機検証ツール（`aipair-bump`・repo 外）の検証項目に、このログの形（非同期起動と完了通知の配達）は
+  入っていない。形が変わると待ちが効かなくなる（従来動作に戻る）か上限まで待つので、項目に足す価値がある

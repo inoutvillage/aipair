@@ -542,6 +542,24 @@ class StateMachine:
                 dim(f"… {who} の応答待ち")
                 last_activity = None
 
+        # サブエージェントは relay の起動（baseline）より後に起動した分を数える。since は使わない:
+        # プラン承認・質問回答をダイアログで配達した時にも進むので、同じターンの中で起動済みの分が外れる。
+        sub_wait = getattr(a, "subagent_wait", 0)
+        sub_shown = (0, 0)         # 表示済みの (待っているサブエージェント数, 上限切れで待たない数)
+
+        def note_subagents(waiting, expired):
+            """Claude がサブエージェントの完了待ちでターンを終えている間、Codex へ渡さず待っている理由を
+            見せる（件数が変わった時だけ）。上限切れで待つのをやめた分は警告する。"""
+            nonlocal sub_shown
+            if (waiting, expired) == sub_shown:
+                return
+            if expired > sub_shown[1]:
+                log(c("warn", f"◆ サブエージェント {expired} 件は起動から {sub_wait} 秒を過ぎても完了通知が無い"
+                              " → 待たずに進める（--subagent-wait）"))
+            if waiting and waiting != sub_shown[0]:
+                dim(f"Claude はサブエージェント {waiting} 件の完了待ち → ターン継続中とみなし、Codex へはまだ渡さない")
+            sub_shown = (waiting, expired)
+
         def claude_watch():
             """Claude 宛配達の直前に作る LogWatch（ログ未特定なら None → 画面フォールバック）。"""
             return LogWatch(tracked["claude"]) if tracked["claude"] else None
@@ -609,14 +627,17 @@ class StateMachine:
                     if tracked["claude"] and sg.guard():
                         code = 7
                         break
-                    done = claude_done_ts(tracked["claude"], since) if tracked["claude"] else None
+                    done = (claude_done_ts(tracked["claude"], since, sub_wait, note_subagents,
+                                           subagent_since=baseline)
+                            if tracked["claude"] else None)
                     if done and not claude_matches_pane(tracked["claude"], panes["claude"]):
                         # 誤ピン先の end_turn を「Claude 完了」と誤認しない（2026-07-21 Codex レビュー）:
                         # ペイン照合に失敗した完了は採用せず、mtime 条件なしの強制 re-lock で
                         # ペイン一致ログへ乗り換えてから判定をやり直す（一致ログが無ければ保留）
                         dim("完了検知したが追跡ログがペイン照合に不一致（誤ピン疑い）→ 強制 re-lock")
                         relocked = refresh_claude_lock(tracked["claude"], cwd, panes["claude"], force=True)
-                        done = claude_done_ts(relocked, since) if relocked != tracked["claude"] else None
+                        done = (claude_done_ts(relocked, since, sub_wait, subagent_since=baseline)
+                                if relocked != tracked["claude"] else None)
                         tracked["claude"] = relocked
                         # 強制 re-lock で新 path へ乗り換えた → response_done（レビュー依頼/停止判定）の
                         # 前に必ず新ログを再 probe。malformed な新ログでは poke せず exit 7（P1-4/Codex）。
@@ -626,8 +647,12 @@ class StateMachine:
                     done = rg.response_done("claude", tracked["claude"], done)
                     if done:
                         time.sleep(a.settle)
+                        # settle の間に Claude が再開していたら（新しい入力・サブエージェントの完了待ち）、
+                        # 最初の完了値はもう古い。再確認が未完了なら渡さず監視へ戻る（往復数も数えない）。
                         done = rg.response_done("claude", tracked["claude"],
-                                             claude_done_ts(tracked["claude"], since)) or done
+                                                claude_done_ts(tracked["claude"], since, sub_wait,
+                                                               subagent_since=baseline))
+                    if done:
                         rounds += 1
                         question_rounds = 0
                         q_unconfirmed_warned = False
