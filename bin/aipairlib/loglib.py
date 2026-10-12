@@ -3,6 +3,9 @@
 パーサ（parse_claude / parse_codex / _ts_key）だけを使う。aipair-relay が SourceFileLoader で
 読み込み、名前を自分の名前空間に束ねて使う。tests/relay-parsers.py で被覆されている。
 """
+import re
+import time
+
 from . import peerlog   # normal package import (was a SourceFileLoader-by-path)
 
 
@@ -41,9 +44,113 @@ def read_records(path, tail_lines=800, tail_bytes=1_000_000):
 
 
 # --- turn-completion detection --------------------------------------------- #
-def claude_done_ts(path, since):
-    """Epoch of the latest completed Claude turn after `since`, else None."""
-    last_ts = last_sr = None
+# バックグラウンドのサブエージェント（Agent / Workflow）。起動するとツールは即座に返り、Claude は
+# 「完了を待ちます」と end_turn でターンを終える。完了すると Claude Code が <task-notification> を
+# 入力として配達し、Claude は自分で再開する。だからその間の end_turn は「実装完了」ではない
+# （2026-10-12 実ログ計測・claude 2.1.266〜2.1.296: 非同期起動 125 件のうち 107 件が通知より先に
+# end_turn していた＝例外ではなく通常経路）。ログ上の形（同じ計測で全件一致）:
+#   起動 : type=="user" の tool_result 行の toolUseResult.status=="async_launched"
+#          ＋ agentId（Agent）/ taskId（Workflow）。SendMessage での再開は toolUseResult.resumedAgentId
+#   配達 : 終端通知（<status> を持つ <task-notification>）の <task-id> が次のいずれかに載る
+#          - type=="user" ＋ origin.kind=="task-notification"（アイドル中: 次ターンの入力になる）
+#          - type=="attachment" の attachment.type=="queued_command" の prompt（実行中: ターン内注入）
+#          - type=="queue-operation" operation=="remove" の content（同上・キューからの取り出し）
+#   決着 : 配達の《後》に assistant 行が出た時（= Claude がその通知を読んで動いた）
+# 通知の enqueue だけでは決着にしない: 通知が届いてから再開ターンの最初の assistant 行が書かれるまで
+# 数秒〜数十秒あり（実測の中央値 5 秒・90% 点 39 秒）、その間の最新 assistant は「待ちます」の end_turn の
+# ままだから。バックグラウンドの Bash（backgroundTaskId）は対象外: 開発サーバのように終わらないものが
+# あり、完了を待つと毎ターン上限まで止まる。
+_TASK_NOTIFICATION = re.compile(r"<task-notification>(.*?)</task-notification>", re.S)
+_TASK_ID = re.compile(r"<task-id>([^<]*)</task-id>")
+
+
+def _terminal_task_ids(text):
+    """`text` に載っている終端通知（<status> を持つ <task-notification>）の task-id 群。
+    進捗イベント（<event> だけで <status> の無い通知）は終端ではないので数えない。"""
+    if not isinstance(text, str) or "<task-notification>" not in text:
+        return []
+    ids = []
+    for body in _TASK_NOTIFICATION.findall(text):
+        if "<status>" in body:
+            ids += _TASK_ID.findall(body)
+    return ids
+
+
+class ClaudeTurn:
+    """Claude の jsonl を 1 行ずつ feed して、最新 assistant の完了と未決着のサブエージェントを追う。
+    claude_done_ts の実体（行単位に分けてあるのは、実ログを時系列に再生して判定を検証できるように）。"""
+
+    def __init__(self):
+        self.last_ts = self.last_sr = None
+        self.open = {}            # task id -> [起動 epoch, 終端通知を配達済みか]
+
+    def feed(self, d):
+        t = d.get("type")
+        if t == "assistant":
+            self.last_ts = d.get("timestamp")
+            self.last_sr = (d.get("message") or {}).get("stop_reason")
+            for tid in [k for k, v in self.open.items() if v[1]]:
+                del self.open[tid]          # 配達の後に Claude が動いた → 決着
+        elif t == "user":
+            tur = d.get("toolUseResult")
+            if isinstance(tur, dict):
+                tid = ((tur.get("agentId") or tur.get("taskId")) if tur.get("status") == "async_launched"
+                       else tur.get("resumedAgentId"))
+                if isinstance(tid, str) and tid:
+                    ts = d.get("timestamp")
+                    self.open[tid] = [peerlog._ts_key(ts if isinstance(ts, str) else None), False]
+            origin, msg = d.get("origin"), d.get("message")
+            if isinstance(origin, dict) and origin.get("kind") == "task-notification" and isinstance(msg, dict):
+                self._delivered(msg.get("content"))
+        elif t == "queue-operation":
+            if d.get("operation") == "remove":
+                self._delivered(d.get("content"))
+        elif t == "attachment":
+            att = d.get("attachment")
+            if isinstance(att, dict) and att.get("type") == "queued_command":
+                self._delivered(att.get("prompt"))
+
+    def _delivered(self, text):
+        for tid in _terminal_task_ids(text):
+            if tid in self.open:
+                self.open[tid][1] = True
+
+    def done(self, since, subagent_wait=0, now=None, subagent_since=None):
+        """(完了 epoch or None, 待っているサブエージェント数, 上限切れで待たないサブエージェント数)。
+        件数は「`since` より後に完了した形のターン」がある時だけ数える（それ以外は 0, 0）。
+        サブエージェントは `subagent_since`（省略時は `since`）より後に起動した分だけ数える。"""
+        if not (self.last_ts and self.last_sr and self.last_sr != "tool_use"):
+            return (None, 0, 0)
+        te = peerlog._ts_key(self.last_ts)
+        if te <= since:
+            return (None, 0, 0)
+        waiting = expired = 0
+        if subagent_wait:
+            now = time.time() if now is None else now
+            floor = since if subagent_since is None else subagent_since
+            for launched, _delivered in self.open.values():
+                if launched <= floor:
+                    continue      # 数え始めより前に起動した分は数えない（落ちたプロセスが残した未完了を含む）
+                if now - launched < subagent_wait:
+                    waiting += 1
+                else:
+                    expired += 1
+        return (None if waiting else te, waiting, expired)
+
+
+def claude_done_ts(path, since, subagent_wait=0, on_subagents=None, now=None, subagent_since=None):
+    """Epoch of the latest completed Claude turn after `since`, else None.
+
+    subagent_wait > 0 の時、`subagent_since` より後に起動したバックグラウンドのサブエージェントが未決着
+    （上のコメント参照）なら、最新 assistant が end_turn でも完了とみなさない。起動から subagent_wait 秒を
+    過ぎたものは待たない（完了通知が来ない事故でも relay が止まり続けないための上限）。0 なら従来どおり
+    stop_reason だけで判定する。
+    subagent_since は `since` と別に渡す（省略時は `since`）。relay の `since` は Claude の 1 ターンの途中
+    でも進む（プラン承認・質問回答をダイアログで配達した時）ので、それを数え始めに使うと、ダイアログの前に
+    起動したサブエージェントが待ちから外れる（Codex レビュー 2026-10-12）。relay は起動時刻を渡す。
+    on_subagents(待っている件数, 上限切れで待たない件数) は判定のたびに呼ぶ（待っている理由を relay が
+    見せるため。同じ 1 回の読み取りから出すので二度読みしない）。"""
+    turn = ClaudeTurn()
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
           for line in fh:
@@ -51,15 +158,14 @@ def claude_done_ts(path, since):
                 d = peerlog.json.loads(line)
             except ValueError:
                 continue
-            if d.get("type") == "assistant":
-                last_ts = d.get("timestamp")
-                last_sr = (d.get("message") or {}).get("stop_reason")
+            if isinstance(d, dict):
+                turn.feed(d)
     except OSError:
         return None
-    if last_ts and last_sr and last_sr != "tool_use":
-        te = peerlog._ts_key(last_ts)
-        return te if te > since else None
-    return None
+    done, waiting, expired = turn.done(since, subagent_wait, now, subagent_since)
+    if on_subagents:
+        on_subagents(waiting, expired)
+    return done
 
 
 def codex_done_ts(path, since):

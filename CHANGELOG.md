@@ -120,6 +120,23 @@ task makes no progress across rounds) instead of guessing or spinning.
   approve edits" (no "bypass" wording), so the picker selects the first `Yes…` option.
 
 ### Fixed
+- **A Claude turn that ended only to wait for a background subagent is no longer handed to Codex** — Claude
+  Code runs subagents (the Agent tool, Workflow) in the background: Claude launches one, says "waiting for
+  the result" and ends its turn, then resumes by itself when the completion notification arrives. The relay
+  read that `end_turn` as "implementation done" and asked Codex for a review with nothing to review yet, so a
+  round was wasted every time (in real transcripts 107 of 125 background launches ended the turn before
+  their notification). The relay now does not count a Claude turn as complete while a subagent launched
+  since the relay started is unsettled — settled meaning its completion notification (completed, failed or stopped)
+  was delivered to Claude *and* Claude has acted since, so the seconds between the notification and the
+  resumed turn's first output are covered too. It says once why it is not handing over (`Claude は
+  サブエージェント N 件の完了待ち → …`). New `--subagent-wait SEC` (default 3600; `0` = off, the old
+  behaviour) caps the wait per subagent from its launch, so a notification that never comes cannot stall the
+  relay; past the cap it warns and hands over as before. Subagents launched before the relay started (e.g.
+  left unfinished by a Claude process that died) are not counted; a plan approval or a question answer
+  relayed in the middle of the turn does not drop the ones launched before it. A completion that no longer
+  holds when re-checked after the settle pause (Claude resumed meanwhile) is not handed over either — the
+  relay goes back to watching instead of reviving the stale value. Background Bash
+  (`run_in_background`) is deliberately not waited for — a dev server never finishes.
 - **Codex 0.158+ no longer runs the pair's Codex on the shared background server** — codex 0.158 routes
   every TUI through one shared app-server daemon by default. The daemon, not the pane's TUI, then held the
   session log and ran Codex's shell commands with the environment of whichever pane first started it: the

@@ -810,6 +810,13 @@ class CliBoundaries(unittest.TestCase):
             self.assertEqual(r.returncode, 2, f"{flag} {val}: {r.stderr}")
             self.assertIn(flag, r.stderr)
 
+    def test_subagent_wait_takes_zero_as_off_but_not_a_negative(self):
+        r = self.run_relay("--subagent-wait", "-1")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("--subagent-wait", r.stderr)
+        self.assertEqual(relay.build_parser("x").parse_args([]).subagent_wait, 3600, "on by default")
+        self.assertEqual(relay.build_parser("x").parse_args(["--subagent-wait", "0"]).subagent_wait, 0)
+
     def test_env_ints_also_guarded(self):
         r = self.run_relay(env={"AIPAIR_GATE_ROUNDS": "0"})
         self.assertEqual(r.returncode, 2)
@@ -1353,6 +1360,172 @@ class ReviewLoopExits(unittest.TestCase):
         code, _, _ = self._run(lambda who: ["x"] if who == "claude" else [self.HR], stall_rounds=0,
                                max_rounds=3, hr=())
         self.assertEqual(code, 3, "--stall-rounds 0 and an empty --human-required → old behaviour")
+
+
+class SubagentWaitInTheLoop(unittest.TestCase):
+    """Regression (2026-10-12): Claude launched a background subagent and ended its turn to wait for it; the
+    relay took that end_turn as 'implementation done' and poked Codex, which had nothing to review. These drive
+    the real StateMachine.run()."""
+
+    def _machine(self, baseline=0.0, tracked="c.jsonl", **a_extra):
+        sm = relay.state_machine
+        a = types.SimpleNamespace(start_side="claude", settle=0, poll=0, max_rounds=20, endless=False,
+                                  stop_side="codex", no_plan_review=True, no_question_relay=True,
+                                  plan_rounds=5, question_rounds=5, plan_ok="[AIPAIR_PLAN_APPROVED]",
+                                  gate=None, gate_timeout=600, gate_rounds=3, stall_rounds=3, **a_extra)
+        rg = types.SimpleNamespace(response_done=lambda who, path, done: done, noshow=lambda who: False,
+                                   arm=lambda nonce: None, clear=lambda: None, probe=None, probe_ts_cache=0.0)
+        return sm.StateMachine(
+            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x",
+            tracked={"claude": tracked, "codex": "x.jsonl"}, claude_seen=set(), codex_seen=set(),
+            baseline=baseline, sg=types.SimpleNamespace(guard=lambda: False), rg=rg,
+            vg=types.SimpleNamespace(dialog_ok=lambda: True), bw=60,
+            poke_codex="REVIEW", poke_codex_next="PCN", poke_claude="PCL", poke_claude_pass="PCP",
+            poke_claude_next="PCX", stop_phrases=["[AIPAIR_REVIEW_OK]"], next_ask_phrases=["[AIPAIR_NEXT]"],
+            all_done_phrases=["[AIPAIR_ALL_DONE]"], human_required_phrases=["[AIPAIR_HUMAN_REQUIRED]"])
+
+    def _run_scripted(self, answers, **a_extra):
+        """run() against a scripted claude_done_ts: `answers(n, wait, on_subagents)` is the n-th check's
+        result. Returns (exit code, the kwargs of every check, the check count at each poke, stdout)."""
+        sm = relay.state_machine
+        machine = self._machine(baseline=7.0, **a_extra)
+        checks, pokes_at = [], []
+
+        def claude_done(path, since, subagent_wait=0, on_subagents=None, now=None, subagent_since=None):
+            checks.append({"wait": subagent_wait, "floor": subagent_since, "visible": on_subagents is not None})
+            return answers(len(checks), subagent_wait, on_subagents)
+
+        with mock.patch.object(sm, "set_pane_title"), \
+             mock.patch.object(sm, "claude_done_ts", side_effect=claude_done), \
+             mock.patch.object(sm, "codex_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "claude_matches_pane", return_value=True), \
+             mock.patch.object(sm, "refresh_claude_lock", side_effect=lambda path, *r, **k: path), \
+             mock.patch.object(sm, "turn_texts",
+                               side_effect=lambda who, *r: ["done"] if who == "claude" else ["[AIPAIR_REVIEW_OK]"]), \
+             mock.patch.object(sm, "detect_plan_dialog", return_value=None), \
+             mock.patch.object(sm, "detect_question_dialog", return_value=None), \
+             mock.patch.object(sm, "repo_fingerprint", return_value="SAME"), \
+             mock.patch.object(sm, "poke", side_effect=lambda *r, **k: pokes_at.append(len(checks)) or "nonce"), \
+             mock.patch("time.sleep"), mock.patch("builtins.print") as printed:
+            code = machine.run()
+        out = "\n".join(str(c.args[0]) for c in printed.call_args_list if c.args)
+        return code, checks, pokes_at, out
+
+    @staticmethod
+    def _waiting_for_three_checks(n, wait, on_subagents):
+        held = bool(wait) and n <= 3
+        if on_subagents:
+            on_subagents(1 if held else 0, 0)
+        return None if held else 100.0
+
+    def test_a_claude_turn_waiting_for_a_subagent_is_not_handed_to_codex(self):
+        code, checks, pokes_at, out = self._run_scripted(self._waiting_for_three_checks, subagent_wait=900)
+        self.assertEqual(code, 0)
+        self.assertEqual({c["wait"] for c in checks}, {900}, "every completion check carries --subagent-wait")
+        self.assertEqual({c["floor"] for c in checks}, {7.0},
+                         "subagents are counted from the relay's start, not from the moving `since`")
+        self.assertEqual(pokes_at, [5], "Codex is poked once, after the 3 held checks (4th check + settle re-check)")
+        self.assertEqual(out.count("サブエージェント 1 件の完了待ち"), 1, "why it is not handed over is shown once")
+
+    def test_without_the_option_the_completion_check_is_the_old_one(self):
+        # callers (and older test namespaces) that carry no subagent_wait get 0 = off
+        code, checks, pokes_at, out = self._run_scripted(self._waiting_for_three_checks)
+        self.assertEqual(code, 0)
+        self.assertEqual({c["wait"] for c in checks}, {0})
+        self.assertEqual(pokes_at, [2], "handed to Codex at once (1st check + settle re-check)")
+        self.assertNotIn("サブエージェント", out)
+
+    def test_a_turn_that_resumed_during_settle_is_not_handed_over_on_the_stale_completion(self):
+        # Codex review 2026-10-12 [P2]: the first check saw a finished turn; while the relay settled, Claude
+        # resumed and went on to wait for a subagent, so the re-check said "not done" — and `or done` revived
+        # the stale value and sent the review anyway.
+        def answers(n, wait, on_subagents):
+            done = {1: 100.0, 2: None, 3: None}.get(n, 200.0)     # 2 = the settle re-check, 3 = still waiting
+            if on_subagents:
+                on_subagents(0 if done else 1, 0)
+            return done
+        code, checks, pokes_at, out = self._run_scripted(answers, subagent_wait=900)
+        self.assertEqual(code, 0)
+        self.assertEqual([c["visible"] for c in checks[:2]], [True, False], "check 2 is the settle re-check")
+        self.assertEqual(pokes_at, [5], "no poke after the cancelled completion; one after the real one (4 + 5)")
+        self.assertEqual(out.count("round 1:"), 1)
+        self.assertNotIn("round 2:", out, "the cancelled completion did not count as a round")
+
+    def test_a_subagent_launched_before_a_relayed_question_still_holds_the_turn(self):
+        # Codex review 2026-10-12 [P2], reproduced with the real state machine + the real parser: launch at
+        # +10 s → the relay delivers Codex's answer to Claude's question dialog at +30 s (which moves `since`)
+        # → Claude ends the turn at +40 s to wait for the subagent. With `since` as the floor the launch
+        # dropped out of the wait and the review was sent with no completion notification.
+        sm = relay.state_machine
+        base = 1_800_000_000.0
+        clock = [base]
+        iso = lambda sec: datetime.fromtimestamp(base + sec, timezone.utc).isoformat().replace("+00:00", "Z")
+        tmp = tempfile.TemporaryDirectory(prefix="aipair-subagent.")
+        self.addCleanup(tmp.cleanup)
+        log = os.path.join(tmp.name, "c.jsonl")
+        stage = ["question"]                 # question → waiting → resumed
+
+        def write(sec, *rows):
+            with open(log, "a", encoding="utf-8") as fh:
+                for r in rows:
+                    r["timestamp"] = iso(sec)
+                    fh.write(json.dumps(r) + "\n")
+            clock[0] = base + sec
+
+        notice = ("<task-notification>\n<task-id>ag1</task-id>\n<status>completed</status>\n"
+                  "<summary>done</summary>\n</task-notification>")
+        assistant = lambda stop: {"type": "assistant", "message": {"stop_reason": stop}}
+        write(10, {"type": "user", "toolUseResult": {"status": "async_launched", "isAsync": True, "agentId": "ag1"}},
+              assistant("tool_use"))                                   # …then AskUserQuestion is on screen
+
+        def deliver_answer(*r, **k):                                   # the relay answers the dialog at +30
+            clock[0] = base + 30
+            stage[0] = "waiting"
+            return True
+
+        polls_while_waiting = [0]
+
+        def sleep(sec=0):
+            if stage[0] == "waiting":
+                polls_while_waiting[0] += 1
+                if polls_while_waiting[0] == 1:
+                    write(40, assistant("end_turn"))                   # "waiting for the agent"
+                elif polls_while_waiting[0] == 4:                      # three polls later it reports back
+                    write(100, {"type": "user", "origin": {"kind": "task-notification"},
+                                "message": {"role": "user", "content": notice}})
+                    write(110, assistant("end_turn"))
+                    stage[0] = "resumed"
+            clock[0] += 1
+
+        pokes = []
+        codex_says = iter([["1問目: 選択肢1で"], ["[AIPAIR_REVIEW_OK]"]])
+        machine = self._machine(baseline=base, tracked=log, subagent_wait=3600)
+        machine.a.no_question_relay = False
+        with mock.patch.object(sm, "set_pane_title"), \
+             mock.patch.object(sm, "codex_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "claude_matches_pane", return_value=True), \
+             mock.patch.object(sm, "refresh_claude_lock", side_effect=lambda path, *r, **k: path), \
+             mock.patch.object(sm, "turn_texts",
+                               side_effect=lambda who, *r: ["x"] if who == "claude" else next(codex_says)), \
+             mock.patch.object(sm, "detect_plan_dialog", return_value=None), \
+             mock.patch.object(sm, "detect_question_dialog",
+                               side_effect=lambda pane: {"chat": "1"} if stage[0] == "question" else None), \
+             mock.patch.object(sm, "scrape_questions", return_value=["Pick a database"]), \
+             mock.patch.object(sm, "send_question_answer", side_effect=deliver_answer) as answered, \
+             mock.patch.object(sm, "repo_fingerprint", return_value="SAME"), \
+             mock.patch.object(sm, "poke", side_effect=lambda pane, text, **k: pokes.append((text[:6], stage[0]))
+                               or "nonce"), \
+             mock.patch("time.time", side_effect=lambda: clock[0]), \
+             mock.patch("time.sleep", side_effect=sleep), mock.patch("builtins.print") as printed:
+            code = machine.run()
+        out = "\n".join(str(c.args[0]) for c in printed.call_args_list if c.args)
+        self.assertEqual(code, 0)
+        answered.assert_called_once()
+        self.assertEqual([stage for _, stage in pokes], ["question", "resumed"],
+                         "Codex is asked the question, then asked to review only after Claude read the result")
+        self.assertEqual(pokes[1][0], "REVIEW")
+        self.assertEqual(out.count("サブエージェント 1 件の完了待ち"), 1)
+        self.assertGreaterEqual(polls_while_waiting[0], 4, "the relay kept polling through the wait")
 
 
 class StalePlanDialogIsNeverOperated(unittest.TestCase):
@@ -2647,6 +2820,156 @@ class DoneTimestamps(unittest.TestCase):
             {"type": "assistant", "timestamp": "2026-08-21T00:00:20Z", "message": {"stop_reason": "tool_use"}}])
         self.assertIsNone(relay.claude_done_ts(busy, 0))
         self.assertIsNone(relay.claude_done_ts(os.path.join(self.tmp.name, "missing"), 0))
+
+    # --- background subagents: row shapes copied from real claude 2.1.29x transcripts ----------- #
+    T = "2026-10-12T00:%02d:%02dZ"
+
+    def at(self, sec):
+        return self.T % divmod(sec, 60)
+
+    def a(self, sec, stop):
+        return {"type": "assistant", "timestamp": self.at(sec), "message": {"stop_reason": stop}}
+
+    def launch(self, sec, tid, key="agentId"):
+        return {"type": "user", "timestamp": self.at(sec),
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_" + tid,
+                     "content": [{"type": "text", "text": "Async agent launched successfully."}]}]},
+                "toolUseResult": {"status": "async_launched", "isAsync": True, key: tid}}
+
+    @staticmethod
+    def notice(tid, status="completed"):
+        return ("<task-notification>\n<task-id>%s</task-id>\n<tool-use-id>toolu_%s</tool-use-id>\n"
+                "<output-file>/tmp/x.output</output-file>\n<status>%s</status>\n"
+                "<summary>Agent \"x\" finished</summary>\n</task-notification>" % (tid, tid, status))
+
+    def queue(self, sec, op, content=None, **extra):
+        row = {"type": "queue-operation", "operation": op, "timestamp": self.at(sec), "sessionId": "s"}
+        if content is not None:
+            row["content"] = content
+        row.update(extra)
+        return row
+
+    def wake(self, sec, tid, status="completed"):
+        """The idle delivery: the notification becomes the next turn's input."""
+        return {"type": "user", "timestamp": self.at(sec), "origin": {"kind": "task-notification"},
+                "message": {"role": "user", "content": self.notice(tid, status)}}
+
+    def absorbed(self, sec, tid):
+        """The busy delivery: taken off the queue and injected into the running turn."""
+        return [self.queue(sec, "remove", self.notice(tid), reason="absorbed_mid_turn"),
+                {"type": "attachment", "timestamp": self.at(sec),
+                 "attachment": {"type": "queued_command", "commandMode": "task-notification",
+                                "prompt": self.notice(tid)}}]
+
+    def done(self, rows, since=0, wait=3600, now_sec=59 * 60):
+        seen = []
+        p = self.jsonl("sub.jsonl", rows)
+        got = relay.claude_done_ts(p, since, wait, lambda w, e: seen.append((w, e)), now=epoch(self.at(now_sec)))
+        return got, (seen[-1] if seen else None)
+
+    def test_a_turn_that_ended_only_to_wait_for_a_subagent_is_not_done(self):
+        waiting = [self.a(5, "tool_use"), self.launch(10, "ag1"), self.a(20, "end_turn")]
+        self.assertEqual(self.done(waiting), (None, (1, 0)), "Claude said 'waiting for the agent' and stopped")
+        self.assertEqual(self.done(waiting, wait=0)[0], epoch(self.at(20)), "0 = off: the old stop_reason-only rule")
+        p = self.jsonl("old.jsonl", waiting)
+        self.assertEqual(relay.claude_done_ts(p, 0), epoch(self.at(20)), "2-arg callers keep the old behaviour")
+
+    def test_the_hold_lasts_until_claude_acts_on_the_completion_notification(self):
+        rows = [self.launch(10, "ag1"), self.a(20, "end_turn"),
+                self.queue(300, "enqueue", self.notice("ag1"))]
+        self.assertEqual(self.done(rows), (None, (1, 0)),
+                         "notification queued but not yet delivered: the newest assistant row is still 'waiting'")
+        rows += [self.queue(300, "dequeue"), self.wake(300, "ag1")]
+        self.assertEqual(self.done(rows), (None, (1, 0)),
+                         "delivered, but the resumed turn has not written an assistant row yet (seconds long)")
+        rows += [self.a(305, "tool_use")]
+        self.assertEqual(self.done(rows), (None, (0, 0)), "resumed and working: an ordinary busy turn")
+        rows += [self.a(330, "end_turn")]
+        self.assertEqual(self.done(rows), (epoch(self.at(330)), (0, 0)), "the turn that read the result is the done one")
+
+    def test_an_end_turn_flushed_after_the_notification_was_queued_is_still_the_waiting_one(self):
+        # real ordering: enqueue → dequeue → [the 'waiting' end_turn is flushed late] → the wake-up row
+        rows = [self.launch(10, "ag1"), self.a(15, "tool_use"), self.queue(18, "enqueue", self.notice("ag1")),
+                self.queue(18, "dequeue"), self.a(17, "end_turn")]
+        self.assertEqual(self.done(rows), (None, (1, 0)))
+        rows += [self.wake(19, "ag1"), self.a(25, "end_turn")]
+        self.assertEqual(self.done(rows)[0], epoch(self.at(25)))
+
+    def test_a_subagent_that_finished_inside_the_turn_does_not_hold_it(self):
+        rows = [self.launch(10, "ag1"), self.a(15, "tool_use"), self.queue(40, "enqueue", self.notice("ag1")),
+                *self.absorbed(41, "ag1"), self.a(45, "tool_use"), self.a(60, "end_turn")]
+        self.assertEqual(self.done(rows), (epoch(self.at(60)), (0, 0)))
+
+    def test_with_two_subagents_the_turn_is_held_until_both_are_settled(self):
+        rows = [self.launch(10, "ag1"), self.launch(11, "ag2"), self.a(20, "end_turn")]
+        self.assertEqual(self.done(rows), (None, (2, 0)))
+        rows += [self.queue(100, "enqueue", self.notice("ag1")), self.queue(100, "dequeue"),
+                 self.wake(100, "ag1"), self.a(110, "end_turn")]
+        self.assertEqual(self.done(rows), (None, (1, 0)), "Claude: 'one is back, still waiting for the other'")
+        rows += [self.wake(200, "ag2", "failed"), self.a(210, "end_turn")]
+        self.assertEqual(self.done(rows), (epoch(self.at(210)), (0, 0)), "a failed subagent settles too")
+
+    def test_a_progress_event_without_a_status_does_not_settle_the_subagent(self):
+        event = "<task-notification>\n<task-id>ag1</task-id>\n<event>still going</event>\n</task-notification>"
+        rows = [self.launch(10, "ag1"), self.a(20, "end_turn"),
+                {"type": "user", "timestamp": self.at(30), "origin": {"kind": "task-notification"},
+                 "message": {"role": "user", "content": event}}, self.a(35, "end_turn")]
+        self.assertEqual(self.done(rows), (None, (1, 0)))
+
+    def test_workflow_launches_and_resumed_agents_are_held_the_same_way(self):
+        wf = [self.launch(10, "wf1", key="taskId"), self.a(20, "end_turn")]
+        self.assertEqual(self.done(wf), (None, (1, 0)), "Workflow: toolUseResult.taskId")
+        resumed = [self.launch(10, "ag1"), self.wake(50, "ag1"), self.a(55, "tool_use"),
+                   {"type": "user", "timestamp": self.at(60),
+                    "toolUseResult": {"success": True, "message": "resumed", "resumedAgentId": "ag1"}},
+                   self.a(70, "end_turn")]
+        self.assertEqual(self.done(resumed), (None, (1, 0)), "SendMessage resumed a finished agent: waiting again")
+        resumed += [self.wake(120, "ag1"), self.a(130, "end_turn")]
+        self.assertEqual(self.done(resumed)[0], epoch(self.at(130)))
+
+    def test_the_wait_is_capped_from_the_launch_so_a_lost_notification_cannot_stall_the_relay(self):
+        rows = [self.launch(10, "ag1"), self.a(20, "end_turn")]
+        self.assertEqual(self.done(rows, wait=600, now_sec=10 + 599), (None, (1, 0)))
+        self.assertEqual(self.done(rows, wait=600, now_sec=10 + 600), (epoch(self.at(20)), (0, 1)),
+                         "past the cap: reported as expired, and the turn counts as done")
+
+    def test_subagents_launched_before_the_floor_are_not_counted(self):
+        # a subagent a dead Claude process left unfinished (before the relay started) must not hold later turns
+        rows = [self.launch(10, "ag1"), self.a(20, "end_turn"), self.a(120, "end_turn")]
+        p = self.jsonl("floor.jsonl", rows)
+        late, now = epoch(self.at(60)), epoch(self.at(200))
+        self.assertEqual(relay.claude_done_ts(p, 0, 3600, now=now, subagent_since=late), epoch(self.at(120)))
+        self.assertIsNone(relay.claude_done_ts(p, 0, 3600, now=now, subagent_since=epoch(self.at(5))))
+
+    def test_the_floor_is_separate_from_the_completion_since(self):
+        # Codex review 2026-10-12 [P2]: the relay's `since` also moves inside one Claude turn (a plan approval
+        # or a question answer delivered through the dialog). launch +10 → `since` moved to +30 → end_turn +40.
+        rows = [self.launch(10, "ag1"), self.a(40, "end_turn")]
+        p = self.jsonl("moved.jsonl", rows)
+        moved, now = epoch(self.at(30)), epoch(self.at(60))
+        self.assertIsNone(relay.claude_done_ts(p, moved, 3600, now=now, subagent_since=0.0),
+                          "counted from the relay's start: still waiting")
+        self.assertEqual(relay.claude_done_ts(p, moved, 3600, now=now), epoch(self.at(40)),
+                         "without a floor of its own it falls back to `since` (the launch drops out)")
+
+    def test_background_bash_is_not_waited_for(self):
+        rows = [{"type": "user", "timestamp": self.at(10), "toolUseResult": {"backgroundTaskId": "b1"}},
+                self.a(20, "end_turn")]
+        self.assertEqual(self.done(rows), (epoch(self.at(20)), (0, 0)), "a dev server never finishes")
+
+    def test_drifted_or_foreign_rows_never_crash_the_scan(self):
+        rows = [[1, 2], "text", 7, None,
+                {"type": "user", "timestamp": 5, "toolUseResult": {"status": "async_launched", "agentId": ["x"]}},
+                {"type": "user", "timestamp": 5, "toolUseResult": {"status": "async_launched", "agentId": "bad-ts"}},
+                {"type": "user", "toolUseResult": "plain string", "origin": "human", "message": "str"},
+                {"type": "user", "origin": {"kind": "task-notification"}, "message": {"content": [{"type": "text"}]}},
+                {"type": "queue-operation", "operation": "remove", "content": {"not": "a string"}},
+                {"type": "attachment", "attachment": "str"},
+                {"type": "attachment", "attachment": {"type": "queued_command", "prompt": None}},
+                self.a(20, "end_turn")]
+        self.assertEqual(self.done(rows), (epoch(self.at(20)), (0, 0)),
+                         "an unreadable launch time is 'before this wait' = not counted (falls back to the old rule)")
 
     def test_codex_turn_is_done_on_task_complete_after_the_last_task_started(self):
         p = self.jsonl("x.jsonl", [
