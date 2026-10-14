@@ -34,7 +34,7 @@ def codex_all():
 def codex_cwd_matches(path, cwd):
     # peerlog caches each rollout's first line, so this no longer opens the file every poll.
     cw = peerlog.codex_cwd(path)
-    return bool(cw) and cw == peerlog._norm(cwd)
+    return bool(cw) and peerlog.same_dir(cw, peerlog._norm(cwd))
 
 
 _MD_STRIP = str.maketrans("", "", "*`#_~|")

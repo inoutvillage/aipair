@@ -23,6 +23,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 from datetime import datetime, timezone
 
 HOME = os.path.expanduser("~")
@@ -50,6 +51,34 @@ def c(code, s):
 # --------------------------------------------------------------------------- #
 def _norm(p):
     return os.path.normcase(os.path.realpath(os.path.expanduser(p))).rstrip("/")
+
+
+def _fold(p):
+    """大文字小文字と（macOS の）NFC/NFD の違いを無視した比較キー。ディスクには触れない。"""
+    return unicodedata.normalize("NFC", p).casefold()
+
+
+def same_dir(a, b):
+    """_norm 済みの 2 つのパスが同じディレクトリを指すか。文字列が一致すれば同じ。大文字小文字だけが違う
+    時は、その 2 つが《今》同じ実体かをディスクに聞く（samefile）。
+
+    大文字小文字を区別しないファイルシステム（WSL の DrvFs・macOS の APFS 既定）では realpath は《打たれた
+    表記》のままなので、同じディレクトリが /mnt/d/Work と /mnt/d/work の 2 つの文字列になる。Codex は会話に
+    よって session_meta.cwd を全部小文字で記録することがあり（実ログで /mnt 配下 327 件中 8 件）、文字列の
+    一致だけで照合すると、ペアの Codex が開いている rollout を「別のディレクトリのもの」として捨ててしまう
+    （2026-10-12 実障害: relay が Codex の完了を検知できず、peer も切り替え前の会話を読み続けた）。
+
+    答えは覚えない。ディレクトリは relay の稼働中に改名されたり後から作られたりするので、覚えた答えは
+    古くなる（2026-10-12 Codex レビュー P2）。聞くのは表記が違う時だけで、stat 2 回。区別するファイル
+    システムでは、大文字小文字だけが違う別々のディレクトリは別々のまま（片方が無ければ OSError＝別物）。"""
+    if a == b:
+        return True
+    if not a or not b or _fold(a) != _fold(b):
+        return False
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
 
 
 def claude_file(cwd):
@@ -181,7 +210,8 @@ class CodexIndex:
         self.root = None
         self.files = {}          # path -> mtime when indexed
         self.unresolved = []     # paths whose cwd has not been read yet
-        self.by_cwd = {}         # normalized cwd -> set(paths)
+        self.by_cwd = {}         # normalized cwd (as recorded) -> set(paths)
+        self.spellings = {}      # _fold(cwd) -> the by_cwd keys that differ only by case (see same_dir)
         self.dirs = {}           # watched directory -> mtime
         self.day_dirs = []
         self.last_full = None
@@ -208,7 +238,7 @@ class CodexIndex:
 
     def full_scan(self):
         self.root = CODEX_SESSIONS
-        self.files, self.unresolved, self.by_cwd = {}, [], {}      # also forgets vanished files
+        self.files, self.unresolved, self.by_cwd, self.spellings = {}, [], {}, {}   # also forgets vanished files
         for f in glob.glob(os.path.join(self.root, "*", "*", "*", "rollout-*.jsonl")):
             self._add(f)
         self._watch()
@@ -291,19 +321,31 @@ class CodexIndex:
                 keep.append(f)
             elif cw:
                 self.by_cwd.setdefault(cw, set()).add(f)
+                self.spellings.setdefault(_fold(cw), set()).add(cw)
         self.unresolved = keep
+
+    def _of(self, cwd):
+        """The indexed rollouts of cwd, under every recorded spelling that names that directory NOW.
+        The index is keyed by the cwd as recorded (a rollout's first line never changes); which
+        spellings are one directory is the disk's answer and is asked per query (same_dir), so a
+        directory renamed or created while we run cannot leave a stale entry behind."""
+        want = _norm(cwd)
+        out = set()
+        for cw in self.spellings.get(_fold(want), ()):
+            if same_dir(cw, want):
+                out |= self.by_cwd.get(cw, set())
+        return out
 
     def candidates(self, cwd, limit=CODEX_SCAN_LIMIT):
         """Every known rollout whose session_meta.cwd matches cwd (after a poll+resolve)."""
         self.poll()
         self._resolve(limit)
-        return list(self.by_cwd.get(_norm(cwd), ()))
+        return list(self._of(cwd))
 
     def newest(self, cwd, newer_than=0.0, limit=CODEX_SCAN_LIMIT, exclude=()):
-        want = _norm(cwd)
         self.poll()
         self._resolve(limit)
-        ours = sorted(self.by_cwd.get(want, ()), key=lambda f: self.files.get(f, 0.0), reverse=True)
+        ours = sorted(self._of(cwd), key=lambda f: self.files.get(f, 0.0), reverse=True)
         while True:
             best, best_m, verified = None, newer_than, False
             for i, f in enumerate(ours):
@@ -462,7 +504,7 @@ def codex_via_pane(cwd, pane=None):
     # a nested codex-in-codex sits deeper, so its (possibly newer) rollout never wins.
     for pid in _descendants(ppid):
         for roll in _open_rollouts(pid):
-            if codex_cwd(roll) == want:
+            if same_dir(codex_cwd(roll), want):
                 return roll
     return None
 

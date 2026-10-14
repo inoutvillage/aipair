@@ -608,6 +608,11 @@ aipair-relay --gate 'pytest -q' --gate-rounds 2              # フラグ
 - **ログの所在**
   - Claude: `~/.claude/projects/<cwd の非英数字を '-' に置換>/<sessionId>.jsonl`
   - Codex : `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`（先頭行 `session_meta.payload.cwd` で cwd 判定）
+    - cwd は symlink を解決した文字列で比べ、大文字小文字だけが違う時は、その 2 つが同じディレクトリかをその都度
+      ディスクに聞く（`samefile`）。Codex は会話によって cwd を全部小文字で記録することがあり（`/mnt/d/Work` を
+      `/mnt/d/work`）、大文字小文字を区別しない FS（WSL の `/mnt/*`・macOS の APFS 既定）で文字列の一致だけを見ると、
+      同じディレクトリの rollout を別物として見失う。区別する FS では、大文字小文字だけが違う別々のディレクトリは
+      別々のまま。
 - **peer-log** … 指定 cwd の最新セッション JSONL を見つけ、user/assistant の本文だけを抽出整形。
   Codex がセッション冒頭に注入する AGENTS.md 本文などのメタは除外。
 - **bridge（`--watch`）** … 両ログを追記監視し、新着メッセージをタイムスタンプ順にマージして流す。

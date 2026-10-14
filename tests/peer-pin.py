@@ -34,6 +34,7 @@ def load_module(name, path):
 
 sys.path.insert(0, BIN)
 import aipairlib.peerlog as pl
+import aipairlib.log_lock as log_lock
 
 
 def epoch(iso):
@@ -326,6 +327,122 @@ class ProcIdentity(Base):
         notroll = os.path.join(pl.CODEX_SESSIONS, "2026", "08", "21", "notes.jsonl")
         open(notroll, "w").close()
         self.assertFalse(pl._valid_rollout(notroll), "a non-rollout basename is refused")
+
+
+def case_insensitive_fs():
+    """Make os.path.samefile answer as a case-insensitive filesystem does (WSL DrvFs, macOS APFS by
+    default): a path names whichever entry matches it ignoring case — looked up in the REAL directory
+    listings, so a directory renamed or created under the patch behaves as it would there (and a path
+    with no such entry raises, as samefile does)."""
+    real = os.path.samefile
+
+    def on_disk(p):
+        cur = os.sep
+        for name in [x for x in p.split(os.sep) if x]:
+            hits = [n for n in os.listdir(cur) if n.casefold() == name.casefold()]
+            if not hits:
+                raise FileNotFoundError(p)
+            cur = os.path.join(cur, name if name in hits else hits[0])
+        return cur
+
+    return mock.patch("os.path.samefile", side_effect=lambda a, b: real(on_disk(a), on_disk(b)))
+
+
+class CwdSpelledInAnotherCase(Base):
+    """Regression (2026-10-12, a live pair on WSL DrvFs): the pair's Codex started a new conversation and
+    wrote its rollout with session_meta.cwd all in lower case (/mnt/d/work-dir/proj for /mnt/d/Work-Dir/Proj).
+    codex_via_pane found the rollout the Codex process held open and then dropped it, because it compared
+    the two spellings as strings; the relay never saw Codex finish and `peer` kept reading the previous
+    conversation."""
+
+    def setUp(self):
+        super().setUp()
+        self.root = os.path.realpath(self.tmp.name)
+        self.real = os.path.join(self.root, "Work-Dir", "Proj")
+        os.makedirs(self.real)
+        self.lower = os.path.join(self.root, "work-dir", "proj")
+        self.roll = self.rollout("lower", self.lower, "2026-08-21T00:00:00Z", 100)
+
+    def via_pane(self, cwd, holds=None):
+        tmux = lambda *a: "2000" if (a[0] == "display-message" and "-t" in a) else None     # pane_pid
+        with mock.patch.object(pl, "_tmux", side_effect=tmux), \
+             mock.patch.object(pl, "_descendants", return_value=[2000]), \
+             mock.patch.object(pl, "_open_rollouts", side_effect=lambda pid: [holds or self.roll]):
+            return pl.codex_via_pane(cwd, "%7")
+
+    def test_the_rollout_the_pane_codex_holds_is_found_on_a_case_insensitive_fs(self):
+        with case_insensitive_fs():
+            self.assertEqual(self.via_pane(self.real), self.roll)
+            self.assertEqual(self.via_pane(self.lower), self.roll, "whichever spelling the caller was started with")
+            self.assertEqual(pl.codex_newest(self.real), self.roll, "the per-cwd index agrees (the non-/proc path)")
+            self.assertEqual(pl.codex_since(self.real, epoch("2026-08-20T00:00:00Z")), self.roll)
+            self.assertTrue(log_lock.codex_cwd_matches(self.roll, self.real), "the relay's own check on a pinned log")
+
+    def test_both_spellings_of_one_directory_are_listed_together(self):
+        proper = self.rollout("proper", self.real, "2026-08-21T00:00:01Z", 90)
+        with case_insensitive_fs():
+            self.assertEqual(sorted(pl.CODEX_INDEX.candidates(self.real)), sorted([proper, self.roll]))
+            self.assertEqual(pl.codex_newest(self.real), self.roll, "the newest of the two, not the one spelled alike")
+
+    def test_on_a_case_sensitive_fs_the_two_spellings_stay_two_directories(self):
+        if os.path.exists(self.lower):
+            self.skipTest("the temp dir is on a case-insensitive filesystem")
+        self.assertIsNone(self.via_pane(self.real), "another directory's rollout is not this pair's")
+        self.assertIsNone(pl.codex_newest(self.real))
+        self.assertFalse(log_lock.codex_cwd_matches(self.roll, self.real))
+        os.makedirs(self.lower)                              # …and it may really be another directory
+        self.assertIsNone(self.via_pane(self.real))
+        self.assertIsNone(pl.codex_newest(self.real))
+        self.assertEqual(self.via_pane(self.lower), self.roll)
+        self.assertEqual(pl.codex_newest(self.lower), self.roll)
+
+    def test_a_directory_renamed_while_we_run_is_still_this_directory(self):
+        # 2026-10-12 review (P2): the relay keeps the spelling it was started with; the directory is renamed
+        # in case only and the next conversation records the new spelling. Nothing learnt before may stick.
+        old = self.rollout("before", self.real, "2026-08-21T00:00:01Z", 200)
+        with case_insensitive_fs():
+            self.assertEqual(pl.codex_newest(self.real), old)
+            self.assertEqual(self.via_pane(self.real, holds=old), old)
+            renamed = os.path.join(self.root, "Work-Dir", "PROJ")
+            os.rename(self.real, renamed)
+            new = self.rollout("after", renamed, "2026-08-21T00:00:02Z", 300)
+            self.assertEqual(self.via_pane(self.real, holds=new), new, "the rollout the pane's Codex holds now")
+            self.assertEqual(pl.codex_newest(self.real), new, "not the log from before the rename")
+            self.assertTrue(log_lock.codex_cwd_matches(new, self.real))
+            self.assertEqual(sorted(pl.CODEX_INDEX.candidates(renamed)), sorted([self.roll, old, new]))
+
+    def test_a_directory_created_later_in_another_case_is_matched(self):
+        # same review: a rollout read while its cwd did not exist must not stay "another directory" for good
+        made = os.path.join(self.root, "Later", "Proj")
+        roll = self.rollout("early", made.lower(), "2026-08-21T00:00:01Z", 200)
+        with case_insensitive_fs():
+            self.assertIsNone(pl.codex_newest(made), "nothing on disk yet: two spellings, not known to be one")
+            self.assertIsNone(self.via_pane(made, holds=roll))
+            os.makedirs(made)
+            self.assertEqual(pl.codex_newest(made), roll)
+            self.assertEqual(self.via_pane(made, holds=roll), roll)
+            self.assertTrue(log_lock.codex_cwd_matches(roll, made))
+
+    def test_no_disk_access_for_a_cwd_spelled_alike_or_another_directory(self):
+        other = self.rollout("other", os.path.join(self.root, "Elsewhere"), "2026-08-21T00:00:01Z", 50)
+        proper = self.rollout("proper", self.real, "2026-08-21T00:00:02Z", 60)
+        with mock.patch("os.path.samefile", side_effect=AssertionError("asked the disk")):
+            self.assertEqual(self.via_pane(self.real, holds=proper), proper)
+            self.assertIsNone(self.via_pane(self.real, holds=other))
+            self.assertTrue(log_lock.codex_cwd_matches(proper, self.real))
+            self.assertFalse(log_lock.codex_cwd_matches(other, self.real))
+
+    def test_the_repo_itself_when_it_sits_on_a_case_insensitive_fs(self):
+        # the real thing, no patching (like tests/session-name.sh [2]); skipped on a case-sensitive fs (CI)
+        repo = os.path.dirname(HERE)
+        head, tail = os.path.split(repo)
+        swapped = os.path.join(head, tail.swapcase())
+        if swapped == repo or not os.path.isdir(swapped) or not os.path.samefile(swapped, repo):
+            self.skipTest("the repo is on a case-sensitive filesystem")
+        roll = self.rollout("swapped", swapped, "2026-08-21T00:00:01Z", 200)
+        self.assertEqual(pl.codex_newest(repo), roll)
+        self.assertEqual(self.via_pane(repo, holds=roll), roll)
+        self.assertTrue(log_lock.codex_cwd_matches(roll, repo))
 
 
 class CliProcess(unittest.TestCase):
