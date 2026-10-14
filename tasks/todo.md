@@ -980,17 +980,8 @@ Codex にレビューを頼む。Codex は「レビューする対象があり�
   でも同じ失敗を再現したとの報告（今回の変更とは無関係）。Claude 側の環境では同じゲートを 2 回流して 2 回とも 9 件通過
 
 ### スコープ外の検出（未対応・記録のみ）
-- **Codex の会話を切り替えると relay と `peer` が Codex のログを見失う（2026-10-12・このペアで実発生）**。
-  Codex の TUI で新しい会話に切り替えた後の rollout は、`session_meta.cwd` が全部小文字で記録されていた
-  （例: 実際のパスが `/mnt/d/Work-Dir/Proj` なら `/mnt/d/work-dir/proj`。切り替え前の rollout は実際の表記どおり）。
-  `/mnt/d` は大文字小文字を区別しない（`os.path.samefile` は True）が、`peerlog.codex_via_pane` は
-  `codex_cwd(roll) == _norm(cwd)` の文字列一致で照合するので、Codex のプロセスが開いている rollout を見つけても
-  捨てる（導入済みコードで `codex_via_pane` = None を再現）。identity が使える環境なので別の探し方にも落ちず、
-  relay は「cwd一致の Codex rollout が見つからず → 新規セッションの出現待ち」のまま Codex の完了を検知できない
-  （レビューは終わっているのに「Codex の応答待ち」。コード上は `ResponseGate.POKE_NOSHOW`＝1800 秒で nonce 未着と
-  して exit 4 になるはずだが、そこまでは実機で見ていない）。`peer` も
-  切り替え前の rollout を読み続ける。回避: relay を止めて `--codex-log <rollout>` で明示指定して起こし直す。
-  直すなら cwd の照合箇所すべて（`codex_via_pane` のほか cwd で引く索引・`codex_since` など）を洗う必要がある
+- Codex のログを見失う不具合（cwd が小文字で記録された rollout）→ 下の「修正: 表記違いの cwd で Codex のログを
+  見失う」で対応
 - バックグラウンドの Bash（`run_in_background`）の完了待ちでターンを終えた場合も同じ空回りが起きるが、対象外に
   した。開発サーバのように終わらないものと、テスト実行のように終わるものをログから区別できないため
   （待つと毎ターン上限まで止まる）。区別する手掛かりが見つかれば別途
@@ -1003,3 +994,52 @@ Codex にレビューを頼む。Codex は「レビューする対象があり�
 
 - [x] 実機検証 34 / 34 PASS（ローカル検証ツール・私設 tmux socket）。ダイアログ画面: 前回（claude-2.1.296_codex-0.162.1）と同一構造
 - [x] `corelib.TESTED_VERSIONS` と README「必要環境」表を更新、`bash tests/run-all.sh` 全緑
+- PR #195 の CI で `test (py3.8, tmux distro)` が 2 本とも `tests/env-forward.sh` [1] の最初の `new-session` で
+  「server exited unexpectedly」になった。失敗したジョブだけ再実行して 2 本とも緑（同じイメージ・tmux 3.4 で main は緑）。
+  aipair-bump は CI の段で止まるので、マージ以降はツールの関数（merge / 比較基準 / 合格履歴 / install / 再点火）で続けた
+- スコープ外の検出（未対応・記録のみ）: `tests/env-forward.sh` 46 行目は、プローブ用サーバを `kill-server` した直後に
+  [1] で同じソケットへ `new-session` を打つ。49〜51 行目のコメントにある競合そのもので、そのための `reset_server`
+  （ソケットが消えるまで待つ）がここでは使われていない。46 行目を `reset_server` に替えれば済む見込み
+
+## 修正: 表記違いの cwd で Codex のログを見失う（2026-10-12・社長指示・このペアで実発生）
+
+症状: Codex のレビューは終わっているのに relay が「Codex の応答待ち」のまま進まない。`peer` も切り替え前の会話を
+読み続ける。relay の起動時の表示は「adopt: cwd一致の Codex rollout が見つからず → 新規セッションの出現待ちに切替」。
+
+原因: ペアの Codex が TUI の中で始めた新しい会話の rollout は、`session_meta.cwd` が全部小文字で記録されていた
+（実際のパスが `/mnt/d/Work-Dir/Proj` なら `/mnt/d/work-dir/proj`。切り替え前の rollout は実際の表記どおり）。
+`/mnt/*`（DrvFs）は大文字小文字を区別しないので同じディレクトリだが、`peerlog._norm` は `realpath` までで、
+DrvFs では打たれた表記のまま返る。`codex_via_pane` は Codex のプロセスが開いている rollout を見つけた後、
+`codex_cwd(roll) == _norm(cwd)` の文字列一致で落としていた（導入済みコードで `codex_via_pane` = None を再現）。
+identity が使える環境なので別の探し方にも落ちず、relay は Codex のログを特定できないままになる。
+
+- [x] 実ログで頻度を確認: `/mnt` 配下の rollout 327 件のうち 8 件が全部小文字（codex 0.137〜0.162・4 プロジェクト）。
+      小文字になる条件は特定できていない（`thread_source` / `history_mode` などの記録では区別できなかった）
+- [x] 照合箇所を全部洗った: `codex_via_pane` / `CodexIndex`（cwd で引く索引。`codex_newest` / `codex_since` /
+      `codex_follow` はこれ経由）/ `log_lock.codex_cwd_matches` の 3 箇所が `peerlog._norm` の文字列一致だった。
+      `resume._same_dir` は元から `samefile` も見ていたので対象外（変更なし）
+- [x] `peerlog.same_dir(a, b)` を足した: 文字列が一致すれば同じ。大文字小文字（と NFC/NFD）だけが違う時は
+      `os.path.samefile` でディスクに聞く。区別する FS では片方が無いか別の実体なので、別々のディレクトリは別々のまま
+- [x] 索引は「記録された表記」のまま持ち（`by_cwd`）、大文字小文字だけが違う表記の組（`spellings`）を照会のたびに
+      `same_dir` で確かめて束ねる。`_norm` と rollout ごとの cwd の覚え方は main のまま
+- [x] **Codex レビュー [P2]（1 巡目）への対応**: 最初の実装は `_norm` で各要素をディスク上の表記に揃え、その表記を
+      覚えていた。ディレクトリを大文字小文字だけ改名する／読んだ後に別の表記で作ると、覚えた表記（要素ごとの表記・
+      rollout ごとの正規化済み cwd・索引のキー）が古いまま残り、同じディレクトリのログをまた見失った（Codex が実際の
+      `/mnt/d` 上で再現）。覚えた答えを失効させるのではなく、ディスクに依る答えを一切覚えない作りに替えた（上の 2 項）
+- [x] 実 rollout 335 件（cwd 69 種）で確認: 2 つの表記で記録されていたディレクトリは 4 つ、新たに同じディレクトリと
+      判定されるのは全部小文字の 8 件だけ。索引の初回構築は main と差なし（3 回ずつ: main 461〜546 ms／修正後
+      477〜580 ms）。照会 1 回は 2 つの表記があるこのディレクトリで 約 1.1 ms → 約 1.4〜1.7 ms（`samefile` 1 回分）、
+      表記が 1 つのディレクトリでは増えない
+- [x] テスト: `tests/peer-pin.py` `CwdSpelledInAnotherCase` 7 件（ペイン経由の特定・索引・relay の照合／2 つの表記を
+      束ねる／区別する FS では別物のまま／稼働中の改名／後から別の表記で作成／表記が同じ・別のディレクトリではディスクに
+      聞かない／repo 自身での実 FS 確認＝区別する FS では skip）。区別しない FS は、実際のディレクトリ一覧から大文字小文字を
+      無視して実体を引く `samefile` で再現する。main の作りでは 5 件、1 巡目の作りでは改名・後作成の 2 件が落ちる
+- [x] Codex の再現手順 2 つを実際の `/mnt/d` 上（repo 内に作って消す一時ディレクトリ）で確認: 改名後も古い表記のまま
+      `codex_via_pane` / `codex_newest` / `codex_cwd_matches` が新しい rollout を返す。存在しない cwd の rollout を先に
+      読み、後から別の表記で作っても一致する
+- [x] このペアの実物で確認（repo のコード）: `codex_via_pane` / `lock_codex` が Codex の開いている rollout を返す。
+      `peer-log codex` は、導入済み（修正前）が切り替え前の会話を、repo（修正後）が今の会話を読む
+- [x] `bash tests/run-all.sh` 全緑（shellcheck は未導入でスキップ）
+- 対象外（main から変えていない）: rollout ごとに覚える cwd は symlink を解決した結果（`realpath`）なので、relay の
+  稼働中に symlink の向き先を変えた場合は追従しない
+- [ ] 反映: インストール → relay を `--codex-log` 無しで起こして Codex の完了を検知することを確認（未実施・社長確認待ち）

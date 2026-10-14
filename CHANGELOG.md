@@ -120,6 +120,17 @@ task makes no progress across rounds) instead of guessing or spinning.
   approve edits" (no "bypass" wording), so the picker selects the first `Yes…` option.
 
 ### Fixed
+- **A Codex rollout whose cwd was recorded in another letter case is no longer lost** — on a
+  case-insensitive filesystem (WSL `/mnt/*`, macOS APFS by default) Codex sometimes writes a conversation's
+  `session_meta.cwd` all in lower case (`/mnt/d/work-dir/proj` for `/mnt/d/Work-Dir/Proj`; 8 of 327 real
+  rollouts under `/mnt`). `peer-log` and the relay compared the recorded cwd with the pair's directory as
+  strings, so after the pair's Codex started such a conversation the relay found the rollout its process
+  held open and then discarded it as another directory's: it never saw Codex finish (the review was done
+  while the relay sat on "waiting for Codex"), and `peer` kept reading the previous conversation. Two
+  spellings that differ only by case are now compared by asking the disk whether they are one directory
+  (`samefile`), every time rather than once — so a directory renamed or created while the relay runs is
+  still matched — and only when the spellings differ. On a case-sensitive filesystem directories that
+  differ only by case stay distinct.
 - **A Claude turn that ended only to wait for a background subagent is no longer handed to Codex** — Claude
   Code runs subagents (the Agent tool, Workflow) in the background: Claude launches one, says "waiting for
   the result" and ends its turn, then resumes by itself when the completion notification arrives. The relay
