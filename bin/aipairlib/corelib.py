@@ -115,6 +115,15 @@ def version_gate(a, detected, tested=TESTED_VERSIONS):
 # aspect mismatch ⇒ mismatch; "ok" only once EVERY required aspect is positively verified (so a
 # task_started-only or user-metadata-less partial log stays "unverified", not a premature "ok").
 
+# Claude Code 2.1.300 から、API に送ったメッセージの写しを type=="api-request-blob" の行で書く
+# （hash で重複を省いた message{role, content} だけで、uuid も timestamp も無い）。会話の行（user /
+# assistant）は従来どおりで、relay と peer-log は type で選んで読むのでこの行を見ない。probe だけは
+# 型名ドリフトを捕まえるために type を問わず中身を見るので、写しの tool_result や role=="assistant" を
+# ドリフトと誤認する（ダイアログ解決の側面は、道具を一度でも使えば必ず mismatch → exit 7）。名前で除く
+# （tuple にしてあるのは、ドリフトした type が list 等でも in が TypeError にならないように）。
+_CLAUDE_REQUEST_COPIES = ("api-request-blob",)
+
+
 def schema_probe(agent, records):
     """Feature-probe decoded JSONL records for the schema markers the core relay reads.
     Returns (status, reason):
@@ -127,6 +136,7 @@ def schema_probe(agent, records):
     fresh session never false-alarms. `records` is a list of decoded dicts (see loglib.read_records)."""
     records = [d for d in (records or []) if isinstance(d, dict)]
     if agent == "claude":
+        records = [d for d in records if d.get("type") not in _CLAUDE_REQUEST_COPIES]
         # required: ターン完了＋応答帰属（毎ターン行使）。veto-only: 配達確認・ダイアログ解決
         # （その動作が起きた時だけ観測できるので未発生で ok を阻害しないが、ドリフトは mismatch）。
         return _combine_aspects(

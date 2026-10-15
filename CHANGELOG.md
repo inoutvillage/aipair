@@ -120,6 +120,14 @@ task makes no progress across rounds) instead of guessing or spinning.
   approve edits" (no "bypass" wording), so the picker selects the first `Yes…` option.
 
 ### Fixed
+- **The relay no longer stops (exit 7) on Claude Code 2.1.300+ logs** — from 2.1.300 Claude Code also writes
+  `api-request-blob` rows: copies of the messages sent in each API request (`message{role, content}`
+  deduplicated by `hash`, no `uuid` / `timestamp`). The conversation rows are unchanged and every runtime
+  reader (turn completion, attribution, delivery, dialog resolution, `peer-log`) selects rows by `type`, but
+  the log-schema probe looks at content regardless of `type` to catch a renamed row, so it took a copied
+  `tool_result` for a moved dialog-resolution row as soon as Claude used a tool (and a copied assistant
+  message for a renamed assistant row) and failed closed. The probe now skips rows of that one type; the
+  same content under any other type is still drift. Found by aipair-bump's live check on 2.1.301.
 - **A Codex rollout whose cwd was recorded in another letter case is no longer lost** — on a
   case-insensitive filesystem (WSL `/mnt/*`, macOS APFS by default) Codex sometimes writes a conversation's
   `session_meta.cwd` all in lower case (`/mnt/d/work-dir/proj` for `/mnt/d/Work-Dir/Proj`; 8 of 327 real
