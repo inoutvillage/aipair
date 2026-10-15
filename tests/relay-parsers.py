@@ -1760,6 +1760,37 @@ class SchemaProbe(unittest.TestCase):
                                        "message": {"role": "assistant", "content": [{"type": "tool_result"}]}}]
         self.assertEqual(relay.schema_probe("claude", dialog_drift)[0], "mismatch")
 
+    @staticmethod
+    def _blob(role, *blocks):
+        # the shape Claude Code 2.1.300+ writes (real 2.1.301 logs): a copy of one message of an API
+        # request, deduplicated by hash — no uuid, no timestamp, no parentUuid
+        return {"type": "api-request-blob", "sessionId": "s", "hash": "h",
+                "message": {"role": role, "content": [{"type": b} for b in blocks]}}
+
+    def test_claude_api_request_copies_are_not_drift(self):
+        # Without excluding these rows the copy of a tool_result tripped the dialog aspect (exit 7) as
+        # soon as Claude used a tool, and the copy of an assistant message tripped "型名ドリフト" while
+        # it was the latest assistant-role row (aipair-bump's live check on claude 2.1.301).
+        tool_turn = self.CLA_OK + [self._blob("assistant", "thinking", "tool_use"),
+                                   self._blob("user", "tool_result", "text")]
+        self.assertEqual(relay.schema_probe("claude", tool_turn)[0], "ok")
+        self.assertEqual(relay.schema_probe("claude", self.CLA_OK + [self._blob("assistant", "tool_use")])[0],
+                         "ok", "a copy as the latest assistant-role row: the real assistant row is judged")
+        self.assertEqual(relay.schema_probe("claude", [self._blob("assistant", "tool_use"),
+                                                       self._blob("user", "tool_result")])[0],
+                         "unverified", "copies alone are no evidence either way")
+
+    def test_claude_only_the_request_copy_type_is_excluded(self):
+        # the exclusion is by that one name: the same content under any other type is still drift
+        for t in ("api-request", "assistant_message"):
+            moved_result = dict(self._blob("user", "tool_result"), type=t)
+            self.assertEqual(relay.schema_probe("claude", self.CLA_OK + [moved_result])[0], "mismatch", t)
+            renamed = dict(self._blob("assistant", "text"), type=t)
+            self.assertEqual(relay.schema_probe("claude", self.CLA_OK + [renamed])[0], "mismatch", t)
+        # a type that drifted to a non-string value does not crash the probe
+        odd = {"type": ["user"], "message": {"role": "user", "content": "a"}}
+        self.assertEqual(relay.schema_probe("claude", self.CLA_OK + [odd])[0], "ok")
+
     def test_claude_compaction_boundary_needs_uuid_and_logical_parent(self):
         # P1-4 (Codex): claude_response_attributed bridges a compaction via the boundary's uuid +
         # logicalParentUuid. A boundary missing either can't be walked → attribution never

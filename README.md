@@ -585,6 +585,10 @@ aipair-relay --no-schema-probe             # schema probe 自体をしない（A
 
 - Codex の**応答帰属**は user アイテムの `turn_id`（`internal_chat_message_metadata_passthrough`）で行う。turn_id が欠落すると帰属が確定できないため、**自律運転の応答帰属ゲートは fail-closed**（位置推定は queue 投入時に先行タスクを誤帰属し得るので、停止/承認判定に使わず待機＝人間判断にする）。位置フォールバックは診断/表示用途のopt-in（`codex_response_complete(..., allow_position_fallback=True)`）としてのみ残り、relay の自律判定では使われない。
 
+- Claude Code 2.1.300 以降のログにある `api-request-blob` 行（API に送ったメッセージの写し）は会話の行ではないので、
+  probe の対象外（relay と peer-log も `type` で会話の行だけを読む）。写しの `tool_result` や `role: assistant` を
+  キーの移動と取り違えて止まらないように、この名前の行だけを除く。
+
 probe の実装は純関数 `schema_probe`（`bin/aipairlib/corelib.py`）で、`tests/relay-parsers.py` の `SchemaProbe` が
 claude/codex の ok・unverified・各ドリフトを被覆している。
 

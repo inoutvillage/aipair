@@ -1042,4 +1042,35 @@ identity が使える環境なので別の探し方にも落ちず、relay は C
 - [x] `bash tests/run-all.sh` 全緑（shellcheck は未導入でスキップ）
 - 対象外（main から変えていない）: rollout ごとに覚える cwd は symlink を解決した結果（`realpath`）なので、relay の
   稼働中に symlink の向き先を変えた場合は追従しない
-- [ ] 反映: インストール → relay を `--codex-log` 無しで起こして Codex の完了を検知することを確認（未実施・社長確認待ち）
+- [x] 反映（2026-10-15）: PR #196 をマージしてインストール。relay（`--codex-log` 無し）は起動時に Codex の開いている
+      rollout（`session_meta.cwd` が全部小文字）を自分で特定し（`adopt: codex = rollout-…`）、Codex の返答を検知して
+      「● Codex レビュー完了」→ 停止ワードで終了した
+
+## 修正: Claude Code 2.1.300 の新しいログ行でスキーマ検査が relay を止める（2026-10-16・社長指示「2.1.300 にも対応して」）
+
+症状: aipair-bump の実機検証（claude 2.1.301）が 34 項目中 32 PASS。`schema_probe claude` の 2 項目が
+「tool_result を持つが type!='user'（ダイアログ解決の検出不能）」で赤。relay の稼働中も同じ検査が走るので、
+2.1.300 以降の claude のペアでは、Claude が道具を一度使うと relay が exit 7 で止まる。
+
+原因: 2.1.300 から Claude のログに `api-request-blob` 行が増えた（API に送ったメッセージの写し。`hash` で重複を
+省いた `message{role, content}` だけで、`uuid` も `timestamp` も無い）。同じ版で増えた `api-request` /
+`api-request-shape` / `cost-state` は `message` を持たない。会話の行は従来どおり。スキーマ検査は型名のずれを
+捕まえるために `type` を問わず中身を見るので、写しの `tool_result` をダイアログ解決のずれ、写しの
+`role: assistant` を型名のずれと判定した。
+
+- [x] 読み手を全部洗った: ターン完了（`loglib` の assistant 行）・応答帰属・配達確認とダイアログ解決
+      （`state_machine`）・`log_lock`・`peer-log` はどれも `type` で user / assistant を選ぶので影響なし。影響は
+      スキーマ検査の 2 側面だけ（ダイアログ解決＝ログの最後まで読むと必ず／ターン完了＝最新の assistant 相当の行が
+      写しである間）
+- [x] `corelib.schema_probe`（claude）の入口で `api-request-blob` の行だけを名前で除く。同じ中身でも他の `type` の
+      行は従来どおりずれと判定する
+- [x] 実ログで確認: 2.1.301 の 2 本（検証ツールのログ）は、最後まで読んでも途中のどの時点でも mismatch が出ない。
+      手元の Claude のログ 141 本で main と比べ、判定が変わったのは写しを含む 3 本（2.1.300 が 1・2.1.301 が 2）だけ
+      （mismatch → ok）
+- [x] テスト: `tests/relay-parsers.py` `SchemaProbe` に 2 件（写しはずれではない／除くのはその名前だけで、`type` が
+      文字列でなくても落ちない）。main のコードでは前者が落ちる
+- [x] `bash tests/run-all.sh` 全緑
+- スコープ外の検出（未対応・記録のみ）: 手元の claude 2.1.293 のログ 1 本（aipair の外のプロジェクト）に、`content`
+  を持たない `queue-operation`（enqueue）の行があり、配達確認の側面が mismatch になる。relay の稼働中にこの行が
+  書かれると exit 7 で止まる。どういう操作で書かれるかは未特定
+- 反映: マージ・インストールの後に aipair-bump で claude 2.1.301 を検証する（その記録は下の追記）
