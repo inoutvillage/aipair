@@ -1074,3 +1074,8 @@ identity が使える環境なので別の探し方にも落ちず、relay は C
   を持たない `queue-operation`（enqueue）の行があり、配達確認の側面が mismatch になる。relay の稼働中にこの行が
   書かれると exit 7 で止まる。どういう操作で書かれるかは未特定
 - 反映: マージ・インストールの後に aipair-bump で claude 2.1.301 を検証する（その記録は下の追記）
+
+## 追記: 版ゲートの検証済み版を claude 2.1.301 / codex 0.162.1 へ更新（2026-10-16・aipair-bump）
+
+- [x] 実機検証 34 / 34 PASS（ローカル検証ツール・私設 tmux socket）。ダイアログ画面: 前回（claude-2.1.299_codex-0.162.1）と同一構造
+- [x] `corelib.TESTED_VERSIONS` と README「必要環境」表を更新、`bash tests/run-all.sh` 全緑
