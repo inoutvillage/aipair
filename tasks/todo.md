@@ -1079,3 +1079,8 @@ identity が使える環境なので別の探し方にも落ちず、relay は C
 
 - [x] 実機検証 34 / 34 PASS（ローカル検証ツール・私設 tmux socket）。ダイアログ画面: 前回（claude-2.1.299_codex-0.162.1）と同一構造
 - [x] `corelib.TESTED_VERSIONS` と README「必要環境」表を更新、`bash tests/run-all.sh` 全緑
+
+## 追記: 版ゲートの検証済み版を claude 2.1.302 / codex 0.163.0 へ更新（2026-10-17・aipair-bump）
+
+- [x] 実機検証 34 / 34 PASS（ローカル検証ツール・私設 tmux socket）。ダイアログ画面: 前回（claude-2.1.301_codex-0.162.1）と同一構造
+- [x] `corelib.TESTED_VERSIONS` と README「必要環境」表を更新、`bash tests/run-all.sh` 全緑
