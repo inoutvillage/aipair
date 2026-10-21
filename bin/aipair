@@ -1,0 +1,662 @@
+#!/usr/bin/env bash
+# aipair — launch Claude Code + Codex CLI side by side in tmux, with a live
+# "bridge" pane that merges both transcripts so each agent can reference the
+# other (via `peer` / `peer-log`).
+#
+#   aipair [dir]         start the pair (or re-attach if already running)
+#   aipair loop [dir]    start the pair + autonomous review relay (see aipair-relay)
+#   aipair attach [dir]  attach only (error if not running)
+#   aipair stop  [dir]   kill the session for dir
+#   aipair name  [dir]   print the tmux session name for dir
+#
+#   --unsafe (or AIPAIR_UNSAFE=1): launch agents with permission-bypass flags.
+#   Required for `aipair loop`; optional for interactive `aipair` (default: agents
+#   keep their normal permission prompts).
+#   --start-side claude|codex (or AIPAIR_START_SIDE; `aipair loop` only): which agent the
+#   relay waits on first (default claude). codex = wait for Codex to finish, then hand its
+#   result to Claude and continue as usual — NOT a role swap.
+#   --autopilot (or AIPAIR_AUTOPILOT=1; `aipair loop` only): fully autonomous relay — never stops
+#   for a human decision; Codex answers as the human's proxy (irreversible operations are not run,
+#   a reversible option is chosen instead). No round cap unless AIPAIR_MAX_ROUNDS is set.
+#
+# Layout:
+#   ┌───────────────┬───────────────┐
+#   │    claude     │     codex     │   two agents, same working dir
+#   ├───────────────┴───────────────┤
+#   │  bridge: peer-log both --watch │   live merged conversation (for you)
+#   └───────────────────────────────┘
+set -euo pipefail
+
+# --- aipair --version -----------------------------------------------------------
+# Read the single source of truth (aipairlib.__version__) sitting next to this script, whether run
+# from the repo (bin/) or installed (~/.local/bin/). Handled before any tmux/dir setup.
+for _va in "$@"; do
+  case "$_va" in
+    --version|-V)
+      exec python3 - "$0" <<'PY'
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(sys.argv[1])))
+try:
+    import aipairlib
+    print("aipair " + aipairlib.__version__)
+except Exception as e:  # noqa: BLE001 — any import failure means the package is missing
+    print("aipair: could not read version (%s)" % e, file=sys.stderr)
+    sys.exit(1)
+PY
+      ;;
+  esac
+done
+
+# --- safety: --unsafe / AIPAIR_UNSAFE opt-in to permission-bypass -------------
+# Without it, agents run with their normal permission prompts. `aipair loop` (the
+# unattended relay) REQUIRES it, since the relay cannot answer those prompts.
+UNSAFE=0
+case " ${AIPAIR_UNSAFE:-} " in *" 1 "*|*" true "*|*" yes "*|*" on "*) UNSAFE=1 ;; esac
+# --start-side <claude|codex> / --start-side=<claude|codex>: which agent the relay waits on FIRST
+# (`aipair loop` only). Its SYNTAX is checked here, before anything touches tmux: a missing value,
+# an empty `--start-side=`, anything but claude|codex, or two different values all exit 2.
+START_SIDE_FLAG=""
+AUTOPILOT_FLAG=0
+_args=()
+while [ $# -gt 0 ]; do
+  _a="$1"; shift
+  case "$_a" in
+    --unsafe) UNSAFE=1 ;;
+    --autopilot) AUTOPILOT_FLAG=1 ;;
+    --start-side|--start-side=*)
+      if [ "$_a" = --start-side ]; then
+        [ $# -gt 0 ] || { echo "aipair: --start-side needs a value (claude|codex)" >&2; exit 2; }
+        _v="$1"; shift
+      else
+        _v="${_a#--start-side=}"
+      fi
+      case "$_v" in
+        claude|codex) : ;;
+        *) echo "aipair: --start-side must be claude or codex (got '$_v')" >&2; exit 2 ;;
+      esac
+      if [ -n "$START_SIDE_FLAG" ] && [ "$START_SIDE_FLAG" != "$_v" ]; then
+        echo "aipair: --start-side given twice with different values ($START_SIDE_FLAG / $_v)" >&2; exit 2
+      fi
+      START_SIDE_FLAG="$_v" ;;
+    *) _args+=("$_a") ;;
+  esac
+done
+set -- ${_args[@]+"${_args[@]}"}
+
+# Canonical absolute path of a directory: symlinks resolved and, on
+# case-insensitive filesystems (WSL DrvFs, macOS APFS by default), every
+# component spelled as stored on disk. `pwd -P` keeps the *typed* case there, so
+# /mnt/d/Work and /mnt/d/work would hash to two names for one directory. On a
+# case-sensitive filesystem the exact entry always exists and is kept, so
+# distinct directories that differ only by case stay distinct.
+canon_dir() {
+  python3 - "$1" <<'PY'
+import os, sys, unicodedata
+def key(name):  # case-insensitive and, for macOS (NFC/NFD), normalization-insensitive
+    return unicodedata.normalize("NFC", name).casefold()
+p, cur = os.path.realpath(sys.argv[1]), os.sep
+for c in [x for x in p.split(os.sep) if x]:
+    nxt = os.path.join(cur, c)
+    try:
+        names = os.listdir(cur)
+    except OSError:
+        names = [c]
+    if c not in names:
+        for n in names:
+            if key(n) == key(c):
+                try:
+                    if os.path.samefile(os.path.join(cur, n), nxt):
+                        nxt = os.path.join(cur, n)
+                        break
+                except OSError:
+                    pass
+    cur = nxt
+print(cur)
+PY
+}
+
+# Single source of truth for a directory's tmux session name:
+#   aipair-<basename>-<first 12 hex of sha1(canonical path)>
+# The hash keeps /home/u/work/api and /home/u/other/api apart (basename alone
+# made them share one session and `aipair` re-attached to the wrong project).
+# 12 hex = 48 bits: with 6 a collision turned up within ~5k directories. An
+# existing session is in any case verified below against the directory it belongs
+# to — its @aipair-dir owner stamp, or #{session_path} where no stamp is present.
+# python3 is already a hard dependency (relay), which sidesteps the
+# sha1sum (GNU) / shasum (macOS) split.
+session_name() {
+  local base hash
+  base="$(basename "$1")"
+  hash="$(printf '%s' "$1" | python3 -c 'import hashlib,sys; print(hashlib.sha1(sys.stdin.buffer.read()).hexdigest()[:12])')"
+  printf 'aipair-%s-%s' "${base//[^A-Za-z0-9_]/-}" "$hash"
+}
+
+# Name used before the hash suffix existed (basename only). A pair started by an
+# older aipair keeps running under it across an upgrade, so attach/stop/name
+# adopt it — but only when it is provably this directory's pair.
+legacy_session_name() {
+  local base; base="$(basename "$1")"
+  printf 'aipair-%s' "${base//[^A-Za-z0-9_]/-}"
+}
+# Directory a session belongs to ("" if no session has exactly this name), read with
+# NO multi-field -F line and NO `-f` filter, so it works unchanged across the supported
+# range (tmux 3.1+) and dodges tmux 3.4's habit of escaping control bytes in -F output
+# (a \x1f field separator comes back as the literal "\037"). Two facts shape it:
+#   - `-f` (list-sessions filter) and #{session_path} are BOTH tmux 3.2+.
+#   - #{session_name} and the user option @aipair-dir exist on 3.1, and display-message
+#     reads a single value with no separator to escape.
+# So: confirm a session named EXACTLY $1 exists (single-field name list, exact shell
+# match — bare `-t $1` would prefix-match aipair-api → aipair-api-7f39ac), then read that
+# session's stamp. New-format sessions carry @aipair-dir, stamped at creation (see below)
+# and immutable afterwards; older sessions lack it, so fall back to #{session_path}, the
+# `new-session -c` dir — good enough for a legacy pair, absent on 3.1 (there legacy simply
+# is not adopted: a safe miss, never a false adopt), and not immutable either
+# (`attach-session -c` rewrites it), which is why new sessions get the option. Neither
+# reads pane_current_path, which moves with any `cd` typed in a pane (a session for /b/api
+# whose pane cd'ed into /a/api must not be taken for /a/api's pair and killed by
+# `aipair stop /a/api`). Exact existence is confirmed first, so `-t $1` resolves to the
+# exact session (tmux prefers an exact name over a prefix).
+session_dir_of() {
+  local names opt
+  names="$(tmux list-sessions -F '#{session_name}' 2>/dev/null)" || return 0
+  case $'\n'"$names"$'\n' in
+    *$'\n'"$1"$'\n'*) ;;   # a session named exactly $1 exists
+    *) return 0 ;;
+  esac
+  opt="$(tmux display-message -p -t "$1" '#{@aipair-dir}' 2>/dev/null || true)"
+  if [ -n "$opt" ]; then printf '%s' "$opt"; return 0; fi
+  printf '%s' "$(tmux display-message -p -t "$1" '#{session_path}' 2>/dev/null || true)"
+}
+# Same directory? -ef compares device+inode, so spelling/case differences on
+# case-insensitive filesystems don't matter; the string fallback keeps a pair
+# reachable after its directory was deleted and recreated.
+same_dir() { [ "$1" -ef "$2" ] || [ "$1" = "$2" ]; }
+legacy_is_ours() {  # $1 = legacy session name, $2 = canonical dir
+  local path; path="$(session_dir_of "$1")"
+  [ -n "$path" ] && same_dir "$path" "$2"
+}
+
+cmd="start"
+case "${1:-}" in
+  start|loop|attach|stop|name|status) cmd="$1"; shift ;;
+esac
+
+# --start-side is a relay setting, so it is valid ONLY with `loop`. Refuse it for every other command
+# right here — before any tmux query, and long before `stop`'s kill-session or `attach`.
+if [ -n "$START_SIDE_FLAG" ] && [ "$cmd" != loop ]; then
+  echo "aipair: --start-side is only valid with 'aipair loop' (got: aipair $cmd)" >&2; exit 2
+fi
+if [ "$AUTOPILOT_FLAG" = 1 ] && [ "$cmd" != loop ]; then
+  echo "aipair: --autopilot is only valid with 'aipair loop' (got: aipair $cmd)" >&2; exit 2
+fi
+# Effective start side for `loop`: flag > AIPAIR_START_SIDE > the relay's default (claude). The
+# environment is read ONLY for `loop`: start / attach / status / stop / name never look at it, so an
+# invalid value cannot break them. Nothing is saved for later — aipair-relay-here reads its own
+# caller's environment when it ignites. Not a role swap: the relay just waits on Codex first.
+START_SIDE=""
+if [ "$cmd" = loop ]; then
+  START_SIDE="${START_SIDE_FLAG:-${AIPAIR_START_SIDE:-}}"
+  case "$START_SIDE" in
+    ""|claude|codex) : ;;
+    *) echo "aipair: AIPAIR_START_SIDE must be claude or codex (got '$START_SIDE')" >&2; exit 2 ;;
+  esac
+  AIPAIR_START_SIDE="$START_SIDE"   # the relay's env pin (RELAY_ENV_VARS) carries the effective value
+fi
+
+DIR="${1:-$PWD}"
+if [ ! -d "$DIR" ]; then
+  echo "aipair: no such directory: $DIR" >&2
+  exit 1
+fi
+DIR="$(canon_dir "$DIR")"
+NAME="$(session_name "$DIR")"
+# An existing new-format session must really be this directory's: the hash is
+# short and a foreign session could carry the same name. On mismatch fail loudly
+# instead of attaching to / stopping someone else's pair. A legacy (hash-less)
+# session is considered only when no new-format session exists.
+OWNER="$(session_dir_of "$NAME")"
+if [ -n "$OWNER" ]; then
+  if ! same_dir "$OWNER" "$DIR"; then
+    echo "aipair: session '$NAME' exists but belongs to $OWNER (hash collision) — not touching it." >&2
+    echo "aipair: inspect: tmux list-sessions -F '#{session_name} #{@aipair-dir} #{session_path}'   kill: tmux kill-session -t '=$NAME'" >&2
+    exit 1
+  fi
+else
+  LEGACY="$(legacy_session_name "$DIR")"
+  if legacy_is_ours "$LEGACY" "$DIR"; then NAME="$LEGACY"; fi
+fi
+
+# "=" = exact match; a bare name also prefix-matches (aipair-api → aipair-api-7f39ac).
+if [ "$cmd" = loop ] && [ "$UNSAFE" != 1 ]; then
+  echo "aipair: 'aipair loop' runs the relay unattended and must drive both agents through" >&2
+  echo "        their permission prompts, so it needs permission-bypass. Re-run as one of:" >&2
+  echo "          aipair loop --unsafe [dir]" >&2
+  echo "          AIPAIR_UNSAFE=1 aipair loop [dir]" >&2
+  echo "        That launches: claude --dangerously-skip-permissions /" >&2
+  echo "                       codex  --dangerously-bypass-approvals-and-sandbox" >&2
+  exit 2
+fi
+
+running() { tmux has-session -t "=$NAME" 2>/dev/null; }
+# (named attach_session, not attach: a function called `attach` shadows the word in
+#  `tmux attach` for shellcheck SC2033)
+attach_session() {
+  if [ -n "${TMUX:-}" ]; then exec tmux switch-client -t "=$NAME"
+  else exec tmux attach -t "=$NAME"; fi
+}
+# pair_window_size PANE → "cols rows" the pair's window will have once it is shown on the terminal
+# `aipair` was started from (the terminal, minus tmux's status lines). Fails — printing nothing —
+# whenever that is not known for certain: no terminal, an unreadable size, an unknown `status` value.
+pair_window_size() {
+  local s cols rows st
+  if [ -n "${TMUX:-}" ]; then s=$(tmux display-message -p '#{client_width} #{client_height}' 2>/dev/null) || return 1
+  elif [ -t 0 ]; then s=$(stty size 2>/dev/null) || return 1; s="${s#* } ${s% *}"   # stty prints "rows cols"
+  else return 1; fi
+  [[ "$s" =~ ^([1-9][0-9]*)\ ([1-9][0-9]*)$ ]] || return 1
+  cols=${BASH_REMATCH[1]}; rows=${BASH_REMATCH[2]}
+  st=$(tmux display-message -p -t "$1" '#{status}' 2>/dev/null) || return 1
+  case "$st" in off) st=0 ;; on) st=1 ;; [2-5]) ;; *) return 1 ;; esac
+  rows=$((rows - st)); [ "$rows" -ge 1 ] || return 1
+  printf '%s %s\n' "$cols" "$rows"
+}
+
+case "$cmd" in
+  name)
+    printf '%s\n' "$NAME"; exit 0 ;;
+  stop)
+    if running; then tmux kill-session -t "=$NAME"; echo "aipair: stopped $NAME"
+    else echo "aipair: no running session $NAME"; fi
+    exit 0 ;;
+  attach)
+    if running; then attach_session
+    else echo "aipair: no running session $NAME (run 'aipair' to start)" >&2; exit 1; fi ;;
+  status)
+    if ! running; then echo "aipair: $NAME — 停止中（未起動）"; exit 1; fi
+    printf 'session: %s\n    dir: %s\n' "$NAME" "$DIR"
+    live_panes="$(tmux list-panes -t "=$NAME" -F '#{pane_id}')"
+    for role in claude codex bridge; do
+      pane="$(tmux show-options -t "$NAME" -qv "@aipair-${role}-pane" 2>/dev/null)"
+      if [ -n "$pane" ] && printf '%s\n' "$live_panes" | grep -qxF "$pane"; then
+        cmd_now="$(tmux display-message -p -t "$pane" '#{pane_current_command}' 2>/dev/null)"
+        case "$cmd_now" in
+          bash|zsh|sh|fish|dash|-bash|-zsh) state="idle（シェルに戻っている）" ;;
+          *)                                state="running（$cmd_now）" ;;
+        esac
+        printf '  %-8s %-5s %s\n' "$role" "$pane" "$state"
+      elif [ -n "$pane" ]; then
+        printf '  %-8s %-5s %s\n' "$role" "$pane" "ペイン消失"
+      else
+        printf '  %-8s %-5s %s\n' "$role" "-" "（このセッションには pane id が記録されていません＝旧セッション）"
+      fi
+    done
+    exit 0 ;;
+esac
+
+# cmd == start|loop.
+
+# ---- How each agent starts: a new conversation or the latest one, Remote Control ------------
+# Each side starts a NEW conversation (as always) or RESUMES its latest one for this directory — the
+# newest by last update, not a picker (aipairlib/resume.py) — and Claude can start with Remote Control
+# on. Asked on a terminal when a NEW pair is built (after the re-attach / already-running checks,
+# before anything is created). The environment answers instead, and skips that question:
+#   AIPAIR_CLAUDE_RESUME / AIPAIR_CODEX_RESUME = new|last, AIPAIR_REMOTE_CONTROL = off|on,
+#   AIPAIR_REMOTE_CONTROL_NAME = the Remote Control session's name (needs ..._CONTROL=on; unset: the
+#   name Claude Code picks). Never asked for a dry run or without a terminal: unset then means
+#   new / new / off — the launch aipair always made. All checked here, before a session is built.
+CLAUDE_RESUME="${AIPAIR_CLAUDE_RESUME:-}"
+CODEX_RESUME="${AIPAIR_CODEX_RESUME:-}"
+RC="${AIPAIR_REMOTE_CONTROL:-}"
+RC_NAME="${AIPAIR_REMOTE_CONTROL_NAME:-}"
+case "$CLAUDE_RESUME" in ""|new|last) ;; *) echo "aipair: AIPAIR_CLAUDE_RESUME must be new or last (got '$CLAUDE_RESUME')" >&2; exit 2 ;; esac
+case "$CODEX_RESUME" in ""|new|last) ;; *) echo "aipair: AIPAIR_CODEX_RESUME must be new or last (got '$CODEX_RESUME')" >&2; exit 2 ;; esac
+case "$RC" in ""|off|on) ;; *) echo "aipair: AIPAIR_REMOTE_CONTROL must be off or on (got '$RC')" >&2; exit 2 ;; esac
+# A name starting with '-' would be read by claude as an option, not as the name.
+rc_name_ok() { case "$1" in -*|*$'\n'*) return 1 ;; *) return 0 ;; esac; }
+if [ -n "$RC_NAME" ]; then
+  [ "$RC" = on ] || { echo "aipair: AIPAIR_REMOTE_CONTROL_NAME needs AIPAIR_REMOTE_CONTROL=on" >&2; exit 2; }
+  rc_name_ok "$RC_NAME" || { echo "aipair: AIPAIR_REMOTE_CONTROL_NAME must be one line not starting with '-' (got '$RC_NAME')" >&2; exit 2; }
+fi
+# The pins below name the conversation to read; resuming names another, so the two cannot be combined.
+if [ "$CLAUDE_RESUME" = last ] && [ -n "${AIPAIR_CLAUDE_SESSION:-}" ]; then
+  echo "aipair: AIPAIR_CLAUDE_RESUME=last cannot be combined with AIPAIR_CLAUDE_SESSION" >&2; exit 2
+fi
+if [ "$CODEX_RESUME" = last ] && [ -n "${AIPAIR_CODEX_SINCE:-}" ]; then
+  echo "aipair: AIPAIR_CODEX_RESUME=last cannot be combined with AIPAIR_CODEX_SINCE" >&2; exit 2
+fi
+
+# ---- What gets typed into each pane ------------------------------------------
+# Quote one word for the pane's shell: 'it'\''s'. Single quotes are the one form
+# sh/bash/zsh/fish all read alike, and they keep non-ASCII readable (printf %q
+# renders 完了です as $'\345...' under a C locale). Plain words stay bare.
+q() {
+  case "$1" in
+    ''|*[!A-Za-z0-9_./:=+@%,-]*) printf "'%s'" "${1//\'/\'\\\'\'}" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+cmdline() { local out="" w; for w in "$@"; do out+="$(q "$w") "; done; printf '%s' "${out% }"; }
+# Boolean env value, read the way the relay's _env_bool reads it: anything but
+# empty / 0 / false / no / off is on, ignoring case and surrounding blanks.
+# tr, not ${v,,}: macOS ships bash 3.2, which has no case-conversion expansion.
+env_on() {
+  local v; v="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+  case "$v" in ''|0|false|no|off) return 1 ;; *) return 0 ;; esac
+}
+
+# Launch flags are SHELL FRAGMENTS, parsed by the shell in the pane:
+# AIPAIR_CLAUDE_FLAGS='--model opus' is two arguments and
+# '--append-system-prompt "a b"' keeps "a b" together. Empty = no flags.
+# The permission-bypass defaults apply ONLY in --unsafe mode; the plain safe
+# default is no flags, so each agent shows its normal permission prompts. An
+# explicit AIPAIR_*_FLAGS always wins (set it empty to force no flags).
+# `aipair loop` runs unattended (UNSAFE is already enforced above), so the permission-bypass
+# flag is MANDATORY. Put it FIRST, as a fixed token, then the user's fragment — a '#' in the
+# fragment can comment out what FOLLOWS but never the leading flag, so the bypass stays an
+# active argv no matter what the fragment contains. Built from the raw env (not the branch
+# below) so the flag is never doubled.
+if [ "$cmd" = loop ]; then
+  CLAUDE_FLAGS="--dangerously-skip-permissions${AIPAIR_CLAUDE_FLAGS:+ $AIPAIR_CLAUDE_FLAGS}"
+  CODEX_FLAGS="--dangerously-bypass-approvals-and-sandbox${AIPAIR_CODEX_FLAGS:+ $AIPAIR_CODEX_FLAGS}"
+elif [ "$UNSAFE" = 1 ]; then
+  CLAUDE_FLAGS="${AIPAIR_CLAUDE_FLAGS---dangerously-skip-permissions}"
+  CODEX_FLAGS="${AIPAIR_CODEX_FLAGS---dangerously-bypass-approvals-and-sandbox}"
+else
+  CLAUDE_FLAGS="${AIPAIR_CLAUDE_FLAGS-}"
+  CODEX_FLAGS="${AIPAIR_CODEX_FLAGS-}"
+fi
+# Codex starts through the sibling `aipair-codex`, which adds --no-daemon (codex 0.158+ would otherwise run
+# the pair's Codex on one shared background server — see that script). It decides on the argv the pane's
+# shell has already expanded, so nothing here needs to guess what the user's fragment will become. The
+# absolute path means the pane's PATH need not contain aipair's install dir.
+AIPAIR_CODEX_BIN="$(python3 -c 'import os,sys; print(os.path.join(os.path.dirname(os.path.realpath(sys.argv[1])), "aipair-codex"))' "$0")"
+
+# Everything else from the environment travels as ONE argument each, whatever it
+# contains (apostrophes, spaces, $, ;), thanks to cmdline.
+if [ "$cmd" = loop ]; then
+  # --autopilot / AIPAIR_AUTOPILOT: no round cap unless AIPAIR_MAX_ROUNDS is set (convergence stages
+  # replace it); otherwise the default command line stays exactly as it was.
+  if [ "$AUTOPILOT_FLAG" = 1 ] || env_on "${AIPAIR_AUTOPILOT:-}"; then
+    AIPAIR_AUTOPILOT=1   # the relay's env pin (RELAY_ENV_VARS) carries the effective value
+    bridge=(aipair-relay --autopilot)
+    [ -n "${AIPAIR_MAX_ROUNDS:-}" ] && bridge+=(--max-rounds "$AIPAIR_MAX_ROUNDS")
+    bridge+=(--stop "${AIPAIR_STOP:-[AIPAIR_REVIEW_OK]}" --stop-side "${AIPAIR_STOP_SIDE:-codex}")
+    AP_TITLE="autopilot "
+    MAX_TITLE="${AIPAIR_MAX_ROUNDS:-∞}"
+  else
+    bridge=(aipair-relay --max-rounds "${AIPAIR_MAX_ROUNDS:-20}"
+            --stop "${AIPAIR_STOP:-[AIPAIR_REVIEW_OK]}" --stop-side "${AIPAIR_STOP_SIDE:-codex}")
+    AP_TITLE=""
+    MAX_TITLE="${AIPAIR_MAX_ROUNDS:-20}"
+  fi
+  # Codex-first (--start-side / AIPAIR_START_SIDE, resolved and validated right after the subcommand):
+  # the relay waits on Codex's completion first, then hands it to Claude as usual. Added only when
+  # set, so the default command line stays exactly as it was.
+  [ -n "$START_SIDE" ] && bridge+=(--start-side "$START_SIDE")
+  # 起動直後の暫定タイトル。relay 本体が起動後に実際の設定で名乗り直す
+  BRIDGE_TITLE="relay ● ${AP_TITLE}1タスク / max ${MAX_TITLE} / Ctrl-C で停止"
+  # AIPAIR_ENDLESS=1: 停止ワードで終わらず「次のタスクへ」を促し続ける連続モード。
+  # 終端は relay の task-list 分類（READY/BLOCKED/ALL_DONE）が権威で 2 つ: AIPAIR_ALL_DONE（exit 0）
+  # と AIPAIR_HUMAN_REQUIRED（exit 8・人間対応の [!] のみ残存）。分類が一致した時だけ honor（詳細は
+  # aipair-relay --help）。
+  # 0 / false / no / off は off — relay 自身が env を読む時と同じ解釈（以前は空以外を
+  # すべて on にして --endless を付けていたため、README の約束と食い違っていた）。
+  if env_on "${AIPAIR_ENDLESS:-}"; then
+    bridge+=(--endless --task-list "${AIPAIR_TASK_LIST:-tasks/todo.md}"
+             --next-ask "${AIPAIR_NEXT_ASK:-[AIPAIR_NEXT]}"
+             --all-done "${AIPAIR_ALL_DONE:-[AIPAIR_ALL_DONE]}"
+             --human-required "${AIPAIR_HUMAN_REQUIRED:-[AIPAIR_HUMAN_REQUIRED]}")
+    BRIDGE_TITLE="relay ● ${AP_TITLE}endless / max ${MAX_TITLE} / 終端 DONE/HUMAN / Ctrl-C で停止"
+  fi
+  # A pre-existing tmux server does NOT pass this process's env to the new session, so
+  # every AIPAIR_* the relay reads from the environment must be expanded onto its argv.
+  env_on "${AIPAIR_ALLOW_UNTESTED_DIALOGS:-}" && bridge+=(--allow-untested-dialogs)
+  env_on "${AIPAIR_NO_VERSION_GATE:-}"        && bridge+=(--no-version-gate)
+  env_on "${AIPAIR_ALLOW_UNTESTED_SCHEMA:-}" && bridge+=(--allow-untested-schema)
+  env_on "${AIPAIR_NO_SCHEMA_PROBE:-}"        && bridge+=(--no-schema-probe)
+  [ -n "${AIPAIR_GATE:-}" ]         && bridge+=(--gate "$AIPAIR_GATE")
+  [ -n "${AIPAIR_GATE_TIMEOUT:-}" ] && bridge+=(--gate-timeout "$AIPAIR_GATE_TIMEOUT")
+  [ -n "${AIPAIR_GATE_ROUNDS:-}" ]  && bridge+=(--gate-rounds "$AIPAIR_GATE_ROUNDS")
+else
+  bridge=(peer-log both --watch --last 15)
+  BRIDGE_TITLE='bridge  (claude × codex — peer-log both --watch)'
+fi
+# Pin the transcript `peer` reads to THIS pair, so it can never drift to another
+# Claude/Codex that merely shares the cwd (peer-log otherwise takes the newest session
+# for the dir). Claude gets a fixed session id (its log is <id>.jsonl) — an exact,
+# race-free pin. Codex has no --session-id flag, so we stamp the launch time; peer-log
+# reads the earliest rollout for the cwd that STARTED at/after it, which excludes every
+# Codex that predates the launch. (The one residual: a Codex that starts in the same cwd
+# during the brief launch window has no id to tell it apart — documented in the README.)
+# A high-resolution epoch via python3 (a hard dep) — `date +%s` is whole-second and macOS
+# `date` has no %N, so a second-granular stamp would let an unrelated rollout that opened
+# earlier in the same second slip past the filter.
+#
+# Both pins are honoured from the environment when already set (generated otherwise, which
+# also makes the launch lines deterministic for tests) — but a caller-supplied value is
+# VALIDATED and never expanded raw into a pane's command line: it is quoted with q() and
+# must be a UUID / a number, so `AIPAIR_CLAUDE_SESSION='x; rm -rf ~ #'` is refused, not run.
+PAIR_SID="${AIPAIR_CLAUDE_SESSION:-$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')}"
+if ! [[ "$PAIR_SID" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+  echo "aipair: AIPAIR_CLAUDE_SESSION must be a UUID (got '$PAIR_SID')" >&2; exit 2
+fi
+PAIR_SINCE="${AIPAIR_CODEX_SINCE:-$(python3 -c 'import time; print(time.time())')}"
+if ! [[ "$PAIR_SINCE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+  echo "aipair: AIPAIR_CODEX_SINCE must be a number (got '$PAIR_SINCE')" >&2; exit 2
+fi
+# Every AIPAIR_* the relay reads is pinned to THIS process's value (empty where unset) on
+# the relay's own command. A pre-existing tmux server may hold a stale value from an
+# earlier run; without pinning, `AIPAIR_GATE= aipair loop` could still run yesterday's
+# gate, and a stale invalid int would make the relay exit 2 before argparse even ran.
+RELAY_ENV_VARS=(AIPAIR_STOP AIPAIR_STOP_SIDE AIPAIR_START_SIDE AIPAIR_MAX_ROUNDS AIPAIR_ENDLESS AIPAIR_AUTOPILOT
+                AIPAIR_TASK_LIST AIPAIR_NEXT_ASK AIPAIR_ALL_DONE AIPAIR_HUMAN_REQUIRED
+                AIPAIR_GATE AIPAIR_GATE_TIMEOUT AIPAIR_GATE_ROUNDS
+                AIPAIR_ALLOW_UNTESTED_DIALOGS AIPAIR_NO_VERSION_GATE
+                AIPAIR_ALLOW_UNTESTED_SCHEMA AIPAIR_NO_SCHEMA_PROBE)
+
+# latest_conversation claude|codex → "<id>\t<start epoch>\t<last update, for display>" of the newest
+# conversation for $DIR that no running process holds, or nothing (aipairlib/resume.py).
+latest_conversation() {
+  python3 - "$0" "$1" "$DIR" <<'PY'
+import os, sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(sys.argv[1])))
+from aipairlib import resume
+sys.exit(resume.main(sys.argv[2:]))
+PY
+}
+# ask_choice PROMPT DEFAULT ANSWER... → CHOICE. Asks again until one of the answers (Enter = DEFAULT).
+# Input that ends (Ctrl-D) stops the launch: nothing has been created yet, and no answer is guessed.
+ask_choice() {
+  local prompt="$1" def="$2" a; shift 2
+  while :; do
+    printf '%s' "$prompt" >&2
+    IFS= read -r a || { echo >&2; echo "aipair: 入力が終わったので起動を中止しました（何も作っていません）" >&2; exit 1; }
+    a="${a:-$def}"
+    case " $* " in *" $a "*) CHOICE="$a"; return 0 ;; esac
+    echo "    → $* のどれかを入力してください" >&2
+  done
+}
+# resolve_start: settle CLAUDE_RESUME / CODEX_RESUME / RC / RC_NAME — from the environment, else by asking
+# (only where allowed, see above) — and point the pins at a resumed conversation. AIPAIR_TEST_ASK=1 asks
+# even for a dry run and reads plain stdin (tests/launch-cmds.sh).
+resolve_start() {
+  local ask=0 hit hid hstart hlabel name
+  if env_on "${AIPAIR_TEST_ASK:-}"; then ask=1
+  elif ! env_on "${AIPAIR_DRY_RUN:-}" && [ -t 0 ] && [ -t 2 ]; then ask=1; fi
+  if [ "$ask" = 1 ] && { [ -z "$CLAUDE_RESUME$CODEX_RESUME" ] || [ -z "$RC" ]; }; then
+    echo "aipair: 起動のしかたを選んでください（Enter で [ ] 内の既定）" >&2
+    # A pin in the environment (e.g. inherited from a pair's own pane) fixes that side; say so, never skip silently.
+    [ -z "$CLAUDE_RESUME" ] && [ -n "${AIPAIR_CLAUDE_SESSION:-}" ] && echo "  Claude: AIPAIR_CLAUDE_SESSION が設定済み → その ID の新しい会話（再開は聞かない）" >&2
+    [ -z "$CODEX_RESUME" ] && [ -n "${AIPAIR_CODEX_SINCE:-}" ] && echo "  Codex:  AIPAIR_CODEX_SINCE が設定済み → 新しい会話（再開は聞かない）" >&2
+  fi
+  # Claude. A caller-pinned session (AIPAIR_CLAUDE_SESSION) is a new conversation with that id.
+  if [ -z "${AIPAIR_CLAUDE_SESSION:-}" ] && { [ "$CLAUDE_RESUME" = last ] || { [ -z "$CLAUDE_RESUME" ] && [ "$ask" = 1 ]; }; }; then
+    hit="$(latest_conversation claude)"
+    if [ -z "$hit" ]; then
+      if [ "$CLAUDE_RESUME" = last ]; then echo "aipair: Claude の再開できる会話がこのディレクトリに無いので、新しい会話で起動します" >&2
+      else echo "  Claude: 再開できる会話なし → 新しい会話" >&2; fi
+      CLAUDE_RESUME=new
+    else
+      IFS=$'\t' read -r hid hstart hlabel <<<"$hit"
+      if [ -z "$CLAUDE_RESUME" ]; then
+        ask_choice "  Claude: 1) 新しい会話  2) 最新の会話を再開（${hlabel}） [1]: " 1 1 2
+        if [ "$CHOICE" = 2 ]; then CLAUDE_RESUME=last; else CLAUDE_RESUME=new; fi
+      fi
+      if [ "$CLAUDE_RESUME" = last ]; then
+        [[ "$hid" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] \
+          || { echo "aipair: 再開する Claude の会話 ID が UUID ではありません（'$hid'）" >&2; exit 1; }
+        PAIR_SID="$hid"
+      fi
+    fi
+  fi
+  [ -n "$CLAUDE_RESUME" ] || CLAUDE_RESUME=new
+  # Codex. A caller-pinned launch epoch (AIPAIR_CODEX_SINCE) is a new conversation.
+  CODEX_SID=""
+  if [ -z "${AIPAIR_CODEX_SINCE:-}" ] && { [ "$CODEX_RESUME" = last ] || { [ -z "$CODEX_RESUME" ] && [ "$ask" = 1 ]; }; }; then
+    hit="$(latest_conversation codex)"
+    if [ -z "$hit" ]; then
+      if [ "$CODEX_RESUME" = last ]; then echo "aipair: Codex の再開できる会話がこのディレクトリに無いので、新しい会話で起動します" >&2
+      else echo "  Codex:  再開できる会話なし → 新しい会話" >&2; fi
+      CODEX_RESUME=new
+    else
+      IFS=$'\t' read -r hid hstart hlabel <<<"$hit"
+      if [ -z "$CODEX_RESUME" ]; then
+        ask_choice "  Codex:  1) 新しい会話  2) 最新の会話を再開（${hlabel}） [1]: " 1 1 2
+        if [ "$CHOICE" = 2 ]; then CODEX_RESUME=last; else CODEX_RESUME=new; fi
+      fi
+      if [ "$CODEX_RESUME" = last ]; then
+        [[ "$hid" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] \
+          && [[ "$hstart" =~ ^[0-9]+(\.[0-9]+)?$ ]] \
+          || { echo "aipair: 再開する Codex の会話の ID / 開始時刻が不正です（'$hid' / '$hstart'）" >&2; exit 1; }
+        # Without /proc, peer and the relay find the pair's Codex as the earliest rollout for the dir that
+        # started at/after AIPAIR_CODEX_SINCE — for a resumed one that is its own start, not the launch.
+        CODEX_SID="$hid"; PAIR_SINCE="$hstart"
+      fi
+    fi
+  fi
+  [ -n "$CODEX_RESUME" ] || CODEX_RESUME=new
+  # Remote Control (Claude only).
+  if [ -z "$RC" ] && [ "$ask" = 1 ]; then
+    ask_choice "  Remote Control（Claude）: 1) オフ  2) オン（名前は自動）  3) オン（名前を入力） [1]: " 1 1 2 3
+    case "$CHOICE" in
+      1) RC=off ;;
+      2) RC=on ;;
+      3) RC=on
+         while :; do
+           printf '%s' "    名前（空なら自動）: " >&2
+           IFS= read -r name || { echo >&2; echo "aipair: 入力が終わったので起動を中止しました（何も作っていません）" >&2; exit 1; }
+           name="${name#"${name%%[![:space:]]*}"}"; name="${name%"${name##*[![:space:]]}"}"
+           if rc_name_ok "$name"; then RC_NAME="$name"; break; fi
+           echo "    → '-' で始まる名前は使えません" >&2
+         done ;;
+    esac
+  fi
+  [ -n "$RC" ] || RC=off
+}
+
+# build_lines: the command typed into each pane, from the settled choices and pins.
+build_lines() {
+  local claude_start codex_start="" rc_args=""
+  PAIR_PINS="AIPAIR_CLAUDE_SESSION=$(q "$PAIR_SID") AIPAIR_CODEX_SINCE=$(q "$PAIR_SINCE")"
+  if [ "$CLAUDE_RESUME" = last ]; then claude_start="--resume $(q "$PAIR_SID")"
+  else claude_start="--session-id $(q "$PAIR_SID")"; fi
+  [ "$CODEX_RESUME" = last ] && codex_start="resume $(q "$CODEX_SID") "
+  # --remote-control takes an OPTIONAL name, so it goes right before --session-id / --resume: what follows it
+  # is then always an option (never taken for the name), and a '#' in the user's fragment cannot comment it out.
+  if [ "$RC" = on ]; then
+    if [ -n "$RC_NAME" ]; then rc_args="--remote-control $(q "$RC_NAME") "; else rc_args="--remote-control "; fi
+  fi
+  # AI_SELF / AI_PEER let each agent's `peer` command target the other. They are
+  # passed with `env` rather than `export …;` because that is the one spelling
+  # sh, bash, zsh and fish all accept (fish has no `export`).
+  CLAUDE_LINE="clear; env AI_SELF=claude AI_PEER=codex $PAIR_PINS claude ${rc_args}${claude_start} $CLAUDE_FLAGS"
+  CODEX_LINE="clear; env AI_SELF=codex AI_PEER=claude $PAIR_PINS $(q "$AIPAIR_CODEX_BIN") ${codex_start}$CODEX_FLAGS"
+  if [ "$cmd" = loop ]; then
+    bridge_env=(AI_SELF=bridge)
+    for v in "${RELAY_ENV_VARS[@]}"; do bridge_env+=("$v=${!v-}"); done
+    BRIDGE_LINE="clear; env $(cmdline "${bridge_env[@]}") $(cmdline "${bridge[@]}")"
+  else
+    BRIDGE_LINE="clear; env AI_SELF=bridge $PAIR_PINS $(cmdline "${bridge[@]}")"   # pins let peer-log both --watch track THIS pair
+  fi
+}
+
+# AIPAIR_DRY_RUN=1: print the lines and stop — nothing is started (tests/launch-cmds.sh).
+if env_on "${AIPAIR_DRY_RUN:-}"; then
+  resolve_start
+  build_lines
+  printf 'session: %s\nclaude:  %s\ncodex:   %s\nbridge:  %s\ntitle:   %s\n' \
+    "$NAME" "$CLAUDE_LINE" "$CODEX_LINE" "$BRIDGE_LINE" "$BRIDGE_TITLE"
+  exit 0
+fi
+
+# ---- Build the session (or re-attach) -----------------------------------------
+if running; then
+  # `aipair loop` on an ALREADY-running pair used to silently attach WITHOUT starting the
+  # relay — the worst outcome, since the command name promises a review loop. Refuse with
+  # guidance instead; `aipair-relay-here` fires the relay on the live pair from any pane.
+  if [ "$cmd" = loop ]; then
+    echo "aipair: このディレクトリのペアは既に起動しています（$NAME）。" >&2
+    echo "aipair: 既存ペアで自動レビューを始めるには、ペア内のペインで  aipair-relay-here  を実行してください。" >&2
+    echo "aipair:   ただし起動済みエージェントの権限は変わりません（安全モードで起動していれば許可プロンプトは残ります）。" >&2
+    echo "aipair:   完全な自走（権限バイパス）には  aipair stop  後に  aipair loop  で起動し直してください。" >&2
+    exit 3
+  fi
+  attach_session
+fi
+
+# A NEW pair from here on: settle how each agent starts (asking on a terminal) before anything is created.
+resolve_start
+build_lines
+
+# #4 transactional build: the session is assembled step by step under `set -e`. If any step
+# fails partway, the half-built session must NOT survive — otherwise the next `aipair` would
+# re-attach to a broken pair (2026-08-22 review). Kill it on any early exit; disarm the trap
+# only once the pair is fully assembled.
+tmux new-session -d -s "$NAME" -c "$DIR"
+trap 'tmux kill-session -t "=$NAME" 2>/dev/null || true' EXIT   # EXIT keeps the triggering exit code
+CLAUDE=$(tmux list-panes -t "=$NAME" -F '#{pane_id}' | head -1)
+# The two splits below are percentages, and tmux applies a percentage to the window AS IT IS NOW.
+# `new-session -d` does not size that window after the terminal that is about to show it: depending
+# on the tmux version it is 80x24, the size of whichever OTHER terminal is attached to the server,
+# or (run from inside tmux) the size of the pane `aipair` was typed in — and when the window is then
+# stretched to the real terminal tmux does not keep the proportions (2026-09-29: 28% came out as
+# 20%..40%). So give the window its final size first. resize-window pins the window to that size
+# (window-size manual); the pin is dropped right after the splits so the window follows the
+# terminal again. No terminal (installer smoke test, cron, CI) → nothing is done, as before.
+SIZED=0
+if WSIZE=$(pair_window_size "$CLAUDE") \
+   && tmux resize-window -t "$CLAUDE" -x "${WSIZE% *}" -y "${WSIZE#* }" 2>/dev/null; then SIZED=1; fi
+BRIDGE=$(tmux split-window -v -l 17% -t "$CLAUDE" -c "$DIR" -P -F '#{pane_id}')
+CODEX=$(tmux split-window -h -l 28% -t "$CLAUDE" -c "$DIR" -P -F '#{pane_id}')
+[ "$SIZED" = 0 ] || tmux set-window-option -u -t "$CLAUDE" window-size 2>/dev/null || true
+
+# Session options via the pane id: set-option (tmux 3.2a) rejects the "=" exact
+# form, and a bare name could prefix-match another session (see running()).
+tmux set -t "$CLAUDE" @aipair-dir "$DIR"          # owner stamp, read by session_dir_of
+# peer resolves the pair's Codex by the process THIS pane runs (open rollout fd = exact
+# identity, @aipair-codex-pane); on non-/proc it falls back to the launch epoch
+# (@aipair-codex-since). BOTH are REQUIRED metadata — a silent miss would let peer and the relay
+# diverge onto different same-cwd Codex sessions (2026-08-22 review). So propagate a save failure
+# rather than swallowing it: the transactional EXIT trap above rolls the half-built session back.
+tmux set -t "$CLAUDE" @aipair-claude-pane "$CLAUDE" \
+  || { echo "aipair: 必須メタデータ @aipair-claude-pane を記録できません（起動を中止）" >&2; exit 1; }
+tmux set -t "$CLAUDE" @aipair-bridge-pane "$BRIDGE" \
+  || { echo "aipair: 必須メタデータ @aipair-bridge-pane を記録できません（起動を中止）" >&2; exit 1; }
+tmux set -t "$CLAUDE" @aipair-codex-pane "$CODEX" \
+  || { echo "aipair: 必須メタデータ @aipair-codex-pane を記録できません（起動を中止）" >&2; exit 1; }
+tmux set -t "$CLAUDE" @aipair-codex-since "$PAIR_SINCE" \
+  || { echo "aipair: 必須メタデータ @aipair-codex-since を記録できません（起動を中止）" >&2; exit 1; }
+tmux set -t "$CLAUDE" pane-border-status top >/dev/null 2>&1 || true
+tmux set -t "$CLAUDE" mouse on >/dev/null 2>&1 || true
+
+tmux select-pane -t "$CLAUDE" -T 'claude'
+tmux select-pane -t "$CODEX"  -T 'codex'
+tmux select-pane -t "$BRIDGE" -T "$BRIDGE_TITLE"
+
+tmux send-keys -t "$CLAUDE" "$CLAUDE_LINE" C-m
+tmux send-keys -t "$CODEX"  "$CODEX_LINE" C-m
+tmux send-keys -t "$BRIDGE" "$BRIDGE_LINE" C-m
+
+trap - EXIT          # fully assembled → keep the session and attach into it
+tmux select-pane -t "$CLAUDE"
+attach_session

@@ -1,0 +1,62 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false          # a red floor must not hide a red tip (python or tmux), or vice versa
+      matrix:
+        # Cover the SUPPORTED floors and a current release without a full cross-product:
+        #   - python 3.8 is the floor (aipair-install.sh requires python3 >= 3.8);
+        #   - tmux 3.1 is the floor (README「必要環境」: `split-window -l 30%` is 3.1+), built from
+        #     source since the distro ships 3.4. session-name.sh auto-detects tmux < 3.2 and skips
+        #     the `#{session_path}`-based legacy/collision cases (that path is a safe non-adopt,
+        #     covered by its [10] simulation); everything else runs on the real 3.1 binary.
+        # run-all.sh classifies by shebang, so the python files (the aipairlib package modules +
+        # the thin entrypoints + the .py tests) and everything the shell tests invoke as `python3`
+        # run on the matrix python.
+        include:
+          - { python: '3.8',  tmux: distro }   # python floor, distro tmux (3.4)
+          - { python: '3.13', tmux: distro }   # current python, distro tmux
+          - { python: '3.13', tmux: '3.1' }    # tmux floor, built from source
+    name: test (py${{ matrix.python }}, tmux ${{ matrix.tmux }})
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install shellcheck + tmux (${{ matrix.tmux }})
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          if [ "${{ matrix.tmux }}" = distro ]; then
+            sudo apt-get install -y -qq tmux
+          else
+            sudo apt-get install -y -qq libevent-dev libncurses-dev build-essential bison pkg-config
+            v='${{ matrix.tmux }}'
+            # Pin the release tarball's SHA-256 (fail-closed for any version without one) and
+            # verify it BEFORE extracting / building / `make install` as root.
+            case "$v" in
+              3.1) sha='979bf38db2c36193de49149aaea5c540d18e01ccc27cf76e2aff5606bd186722' ;;
+              *)   echo "no pinned sha256 for tmux $v — add it before building" >&2; exit 1 ;;
+            esac
+            curl -fsSL "https://github.com/tmux/tmux/releases/download/$v/tmux-$v.tar.gz" -o tmux.tgz
+            echo "$sha  tmux.tgz" | sha256sum -c -
+            tar xzf tmux.tgz
+            ( cd "tmux-$v" && ./configure && make -j"$(nproc)" && sudo make install )
+            hash -r
+          fi
+      - name: Versions
+        run: |
+          tmux -V; python3 --version; bash --version | head -1; shellcheck --version | head -2
+          # On a source-built lane, prove we run EXACTLY that tmux (not some other binary on PATH).
+          if [ "${{ matrix.tmux }}" != distro ]; then
+            tmux -V | grep -qx "tmux ${{ matrix.tmux }}" || { echo "expected 'tmux ${{ matrix.tmux }}', got '$(tmux -V)'" >&2; exit 1; }
+          fi
+      - name: Run all checks
+        run: bash tests/run-all.sh

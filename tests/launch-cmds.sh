@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+# Regression tests for the command lines `aipair` types into its panes (AIPAIR_DRY_RUN=1).
+# Each printed line is fed to a real shell whose PATH holds shims for claude / codex /
+# aipair-relay / peer-log / clear that print their argv — so what is checked is exactly
+# what the pane's shell would run, not how the string looks.
+# tmux is shimmed onto a private, never-started socket: `aipair` only reads session state.
+#
+# Usage: bash tests/launch-cmds.sh      (exit 0 = all passed)
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd -P)"; REPO="$(dirname "$HERE")"
+REAL_TMUX="$(command -v tmux)" || { echo "tmux not found" >&2; exit 2; }
+W="$(mktemp -d "${TMPDIR:-/tmp}/aipair-launch.XXXXXX")"; SOCKET="aipair-launch-$$-$RANDOM"
+cleanup() { "$REAL_TMUX" -L "$SOCKET" kill-server 2>/dev/null || true; rm -f "${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/$SOCKET" 2>/dev/null || true; rm -rf "$W"; }; trap cleanup EXIT
+mkdir -p "$W/bin" "$W/proj"
+for s in claude codex aipair-relay peer-log; do
+  printf '#!/usr/bin/env bash\necho "cmd=%s self=${AI_SELF:-} peer=${AI_PEER:-}"\nfor a in "$@"; do printf "[%%s]\\n" "$a"; done\n' "$s" > "$W/bin/$s"
+done
+printf '#!/usr/bin/env bash\nexit 0\n' > "$W/bin/clear"
+# AIPAIR_TEST_TMUX_LOG (opt-in per command): the shim appends each tmux invocation there, so a test can
+# prove that a rejected launch never called tmux at all.
+printf '#!/usr/bin/env bash\n[ -n "${AIPAIR_TEST_TMUX_LOG:-}" ] && printf "%%s\\n" "$*" >> "$AIPAIR_TEST_TMUX_LOG"\nexec %q -L %q "$@"\n' "$REAL_TMUX" "$SOCKET" > "$W/bin/tmux"
+chmod +x "$W"/bin/*; export PATH="$W/bin:$REPO/bin:$PATH"
+# Preflight: prove the tmux shim provably targets the PRIVATE socket before anything runs, so a
+# broken shim can never touch the user's default server (guardrail; same as the other tmux tests).
+# Then kill-server so the dry-run checks below still see a pristine (server-less) private socket.
+"$REAL_TMUX" -L "$SOCKET" new-session -d -s probe 2>/dev/null || true
+want="$("$REAL_TMUX" -L "$SOCKET" display-message -p -t probe '#{socket_path}' 2>/dev/null || true)"
+got="$(tmux display-message -p -t probe '#{socket_path}' 2>/dev/null || true)"
+"$REAL_TMUX" -L "$SOCKET" kill-server 2>/dev/null || true
+if [ -z "$got" ] || [ "$got" != "$want" ] || [ "$(basename "$got")" != "$SOCKET" ]; then
+  echo "tmux shim not effective (got '$got', want '$want') — refusing to touch the default server" >&2; exit 2
+fi
+# Hermetic: nothing from the parent environment (a live pair, a user's AIPAIR_* settings)
+# may leak into the checked lines.
+unset TMUX AI_SELF AI_PEER BASH_ENV ENV
+while IFS= read -r v; do unset "$v"; done < <(compgen -v AIPAIR_ || true)
+# Fixed peer pins so the launch lines are deterministic (aipair honours pre-set values;
+# it generates a random uuid / the wall-clock epoch otherwise — covered by [1c]).
+S=11111111-1111-1111-1111-111111111111   # a valid fixed UUID (aipair now validates the pin)
+K=1700000000                             # a valid fixed epoch (aipair validates it is numeric)
+export AIPAIR_CLAUDE_SESSION="$S" AIPAIR_CODEX_SINCE="$K"
+P="AIPAIR_CLAUDE_SESSION=$S AIPAIR_CODEX_SINCE=$K"   # the two env pins on every pane line
+CX="$REPO/bin/aipair-codex"                            # the Codex pane runs codex through this (adds --no-daemon)
+mkdir -p "$W/zdot" "$W/xdg"     # empty rc dirs so zsh/fish run without the user's config
+
+fail=0; n=0
+chk() { n=$((n+1)); if [ "$1" = "$2" ]; then echo "ok   $3"; else echo "FAIL $3"; printf -- '--- got ---\n%s\n--- want ---\n%s\n' "$1" "$2"; fail=1; fi; }
+# line MODE PANE [VAR=value ...] → the command line aipair would type into PANE
+# AIPAIR_UNSAFE=1 so loop-mode launch tests get past the D1 safety gate (they exercise the
+# bridge/relay args, not the gate — which has its own section below).
+line() { local mode="$1" pane="$2"; shift 2; env AIPAIR_UNSAFE=1 "$@" AIPAIR_DRY_RUN=1 aipair "$mode" "$W/proj" | sed -n "s/^$pane:  *//p"; }
+# run MODE PANE [VAR=value ...] → what the pane's shell does with that line (argv dump)
+run() { bash -c "$(line "$@")"; }
+J=$'\n'
+
+echo "# [1] loop defaults"
+chk "$(run loop bridge)" "cmd=aipair-relay self=bridge peer=${J}[--max-rounds]${J}[20]${J}[--stop]${J}[[AIPAIR_REVIEW_OK]]${J}[--stop-side]${J}[codex]" "bridge: relay with default args"
+chk "$(run loop claude)" "cmd=claude self=claude peer=codex${J}[--session-id]${J}[$S]${J}[--dangerously-skip-permissions]" "claude: --session-id pin + bypass under --unsafe, AI_SELF/AI_PEER exported"
+chk "$(run loop codex)"  "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]" "codex: bypass flag under --unsafe, AI_SELF/AI_PEER exported"
+chk "$(line loop session)" "$(aipair name "$W/proj")" "session line = aipair name"
+
+echo "# [1b] D1: safe by default, permission-bypass only with --unsafe"
+# safe default (no --unsafe): agents get NO flags (their normal permission prompts)
+chk "$(env AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id $S " "interactive: peer pins + --session-id, no bypass flag by default"
+chk "$(env AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^codex:  *//p')" "clear; env AI_SELF=codex AI_PEER=claude $P $CX " "interactive: codex peer pins, no bypass flag by default"
+# --unsafe adds the bypass flags
+chk "$(env AIPAIR_UNSAFE=1 AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id $S --dangerously-skip-permissions" "AIPAIR_UNSAFE=1: bypass flag added"
+# explicit flags win even in safe mode
+chk "$(env AIPAIR_CLAUDE_FLAGS='--model opus' AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id $S --model opus" "explicit AIPAIR_CLAUDE_FLAGS wins in safe mode"
+# `aipair loop` without --unsafe is refused (exit 2), nothing printed to stdout
+n=$((n+1)); rc=0; out="$(AIPAIR_DRY_RUN=1 aipair loop "$W/proj" 2>/dev/null)" || rc=$?
+if [ "$rc" = 2 ] && [ -z "$out" ]; then echo "ok   loop without --unsafe → exit 2, no launch"; else echo "FAIL loop refuse: rc=$rc out=$out"; fail=1; fi
+# loop ALWAYS carries the bypass flag under --unsafe, even if the user blanks/customises flags
+chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CLAUDE_FLAGS= AIPAIR_CODEX_FLAGS= AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id $S --dangerously-skip-permissions" "loop: empty AIPAIR_CLAUDE_FLAGS still gets the bypass"
+chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CODEX_FLAGS= AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^codex:  *//p')" "clear; env AI_SELF=codex AI_PEER=claude $P $CX --dangerously-bypass-approvals-and-sandbox" "loop: empty AIPAIR_CODEX_FLAGS still gets the bypass"
+chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CLAUDE_FLAGS='--model opus' AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id $S --dangerously-skip-permissions --model opus" "loop: bypass is prepended, custom flags follow"
+# the bypass is a FIXED token BEFORE the fragment, so a '#' in the fragment can't comment it out
+chk "$(env AIPAIR_UNSAFE=1 AIPAIR_CLAUDE_FLAGS='--model opus # --dangerously-skip-permissions' AIPAIR_DRY_RUN=1 aipair loop "$W/proj" | sed -n 's/^claude:  *//p')" "clear; env AI_SELF=claude AI_PEER=codex $P claude --session-id $S --dangerously-skip-permissions --model opus # --dangerously-skip-permissions" "loop: a '#' in the fragment cannot comment out the bypass (it is prepended)"
+
+echo "# [1c] with no pins pre-set, aipair generates a real session id + epoch and pins to them"
+GEN="$(env -u AIPAIR_CLAUDE_SESSION -u AIPAIR_CODEX_SINCE AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^claude:  *//p')"
+gsid="$(printf '%s\n' "$GEN" | sed -n 's/.*AIPAIR_CLAUDE_SESSION=\([^ ]*\).*/\1/p')"
+gsess="$(printf '%s\n' "$GEN" | sed -n 's/.*--session-id \([^ ]*\).*/\1/p')"
+gsince="$(printf '%s\n' "$GEN" | sed -n 's/.*AIPAIR_CODEX_SINCE=\([^ ]*\).*/\1/p')"
+n=$((n+1)); if printf '%s' "$gsid" | grep -qE '^[0-9a-fA-F-]{16,}$'; then echo "ok   generated AIPAIR_CLAUDE_SESSION looks like a uuid"; else echo "FAIL generated session id: '$gsid'"; fail=1; fi
+chk "$gsess" "$gsid" "claude --session-id equals the exported AIPAIR_CLAUDE_SESSION pin"
+n=$((n+1)); if printf '%s' "$gsince" | grep -qE '^[0-9]+([.][0-9]+)?$'; then echo "ok   generated AIPAIR_CODEX_SINCE is an epoch"; else echo "FAIL generated since: '$gsince'"; fail=1; fi
+
+echo "# [1d] a caller-supplied pin is validated (no shell injection, fail-closed)"
+for bad in 'x; echo PIN_INJECTED #' '$(touch /tmp/aipair-pwn)' 'a b' 'notauuid'; do
+  n=$((n+1)); rc=0; out="$(env AIPAIR_CLAUDE_SESSION="$bad" AIPAIR_DRY_RUN=1 aipair "$W/proj" 2>/dev/null)" || rc=$?
+  if [ "$rc" = 2 ] && [ -z "$out" ] && ! printf '%s' "$out" | grep -q PIN_INJECTED; then
+    echo "ok   AIPAIR_CLAUDE_SESSION='$bad' → refused (exit 2, nothing printed)"
+  else echo "FAIL bad session pin not refused: rc=$rc out=$out"; fail=1; fi
+done
+for bad in '1; rm -rf /' '1e3' 'abc'; do
+  n=$((n+1)); rc=0; out="$(env AIPAIR_CODEX_SINCE="$bad" AIPAIR_DRY_RUN=1 aipair "$W/proj" 2>/dev/null)" || rc=$?
+  if [ "$rc" = 2 ] && [ -z "$out" ]; then echo "ok   AIPAIR_CODEX_SINCE='$bad' → refused (exit 2)"; else echo "FAIL bad since not refused: rc=$rc out=$out"; fail=1; fi
+done
+# a valid fractional epoch IS accepted
+n=$((n+1)); if env AIPAIR_CODEX_SINCE=1700000000.5 AIPAIR_DRY_RUN=1 aipair "$W/proj" >/dev/null 2>&1; then echo "ok   AIPAIR_CODEX_SINCE=1700000000.5 accepted"; else echo "FAIL fractional epoch rejected"; fail=1; fi
+
+echo "# [2] values with shell metacharacters arrive as ONE argument each"
+chk "$(run loop bridge "AIPAIR_STOP=it's done" | sed -n '5p')" "[it's done]" "apostrophe in AIPAIR_STOP"
+chk "$(run loop bridge 'AIPAIR_STOP=say "ok" $HOME; rm -rf /' | sed -n '5p')" '[say "ok" $HOME; rm -rf /]' "double quotes, \$VAR and ; are literal (no expansion, no injection)"
+chk "$(run loop bridge 'AIPAIR_STOP=LGTM||完了です' | sed -n '5p')" "[LGTM||完了です]" "README example with || separator"
+chk "$(run loop bridge 'AIPAIR_STOP=' | sed -n '5p')" "[[AIPAIR_REVIEW_OK]]" "empty AIPAIR_STOP falls back to the default sentinel"
+chk "$(run loop bridge 'AIPAIR_MAX_ROUNDS=100' 'AIPAIR_STOP_SIDE=both' | sed -n '3p;7p' | paste -sd' ')" "[100] [both]" "max-rounds / stop-side pass through"
+
+echo "# [3] endless mode"
+chk "$(run loop bridge AIPAIR_ENDLESS=1 'AIPAIR_TASK_LIST=my tasks/todo list.md' 'AIPAIR_ALL_DONE=all done!' | sed -n '8,16p')" \
+    "[--endless]${J}[--task-list]${J}[my tasks/todo list.md]${J}[--next-ask]${J}[[AIPAIR_NEXT]]${J}[--all-done]${J}[all done!]${J}[--human-required]${J}[[AIPAIR_HUMAN_REQUIRED]]" "endless args (incl. --human-required), spaces and ! intact"
+for off in 0 false no off; do
+  chk "$(run loop bridge "AIPAIR_ENDLESS=$off" | grep -c -- '--endless' || true)" "0" "AIPAIR_ENDLESS=$off means off (as README promises)"
+done
+chk "$(line loop title AIPAIR_ENDLESS=1 'AIPAIR_ALL_DONE=fin')" "relay ● endless / max 20 / 終端 DONE/HUMAN / Ctrl-C で停止" "endless title (2 終端: ALL_DONE / HUMAN_REQUIRED)"
+
+echo "# [4] agent flags are shell fragments (documented, backwards compatible)"
+# `start` (interactive) mode: loop always appends the bypass flag, so test the fragment
+# semantics here where AIPAIR_*_FLAGS maps 1:1 to argv.
+chk "$(run start claude 'AIPAIR_CLAUDE_FLAGS=')" "cmd=claude self=claude peer=codex${J}[--session-id]${J}[$S]" "empty flags → only the --session-id pin"
+chk "$(run start claude 'AIPAIR_CLAUDE_FLAGS=--model opus' | sed -n '4,5p' | paste -sd' ')" "[--model] [opus]" "two words → two arguments (after the --session-id pin)"
+chk "$(run start codex 'AIPAIR_CODEX_FLAGS=--append-system-prompt "a b" -q' | sed -n '2,4p' | paste -sd' ')" "[--append-system-prompt] [a b] [-q]" "quoted word stays one argument"
+
+echo "# [5] collaborate mode (plain start)"
+chk "$(run start bridge)" "cmd=peer-log self=bridge peer=${J}[both]${J}[--watch]${J}[--last]${J}[15]" "bridge: peer-log both --watch --last 15"
+chk "$(line start title)" "bridge  (claude × codex — peer-log both --watch)" "bridge title"
+
+echo "# [6] the same lines under every installed shell (sh/dash/bash/zsh/fish)"
+STOPV='it'"'"'s "x" $HOME;'
+WANT_BRIDGE="cmd=aipair-relay self=bridge peer=${J}[--max-rounds]${J}[20]${J}[--stop]${J}[$STOPV]${J}[--stop-side]${J}[codex]"
+WANT_CLAUDE="cmd=claude self=claude peer=codex${J}[--session-id]${J}[$S]${J}[--dangerously-skip-permissions]"
+LINE_BRIDGE="$(line loop bridge "AIPAIR_STOP=$STOPV")"; LINE_CLAUDE="$(line loop claude)"
+for sh in sh dash bash zsh fish; do
+  if ! command -v "$sh" >/dev/null 2>&1; then echo "skip $sh (not installed)"; continue; fi
+  chk "$(env ZDOTDIR="$W/zdot" XDG_CONFIG_HOME="$W/xdg" "$sh" -c "$LINE_BRIDGE" 2>/dev/null || true)" "$WANT_BRIDGE" "$sh: bridge line → identical argv"
+  chk "$(env ZDOTDIR="$W/zdot" XDG_CONFIG_HOME="$W/xdg" "$sh" -c "$LINE_CLAUDE" 2>/dev/null || true)" "$WANT_CLAUDE" "$sh: claude line → identical argv"
+done
+
+echo "# [7] AIPAIR_DRY_RUN is a boolean like AIPAIR_ENDLESS"
+if "$REAL_TMUX" -L "$SOCKET" list-sessions >/dev/null 2>&1; then n=$((n+1)); echo "FAIL a tmux server was started by the dry runs above"; fail=1; else n=$((n+1)); echo "ok   dry runs started no tmux server on $SOCKET"; fi
+for v in 1 true yes on ' On '; do
+  chk "$(env "AIPAIR_DRY_RUN=$v" aipair start "$W/proj" | grep -c '^session: ' || true)" "1" "AIPAIR_DRY_RUN='$v' → dry run"
+done
+NAME="$(aipair name "$W/proj")"
+for v in 0 false no off; do
+  out="$(timeout 5 env "AIPAIR_DRY_RUN=$v" aipair start "$W/proj" </dev/null 2>/dev/null || true)"   # real start; attach fails (no tty)
+  if [ -z "$out" ] && "$REAL_TMUX" -L "$SOCKET" has-session -t "=$NAME" 2>/dev/null; then n=$((n+1)); echo "ok   AIPAIR_DRY_RUN='$v' → real start (session created, nothing printed)"; else n=$((n+1)); echo "FAIL AIPAIR_DRY_RUN='$v': out='$out'"; fail=1; fi
+  "$REAL_TMUX" -L "$SOCKET" kill-session -t "=$NAME" 2>/dev/null || true
+done
+
+echo "# [8] --start-side / AIPAIR_START_SIDE (Codex-first: the relay waits on Codex first — not a role swap)"
+# argline PANE [VAR=value ...] aipair ARGS... → like line(), but with arbitrary aipair arguments (flags anywhere)
+argline() { local pane="$1"; shift; env AIPAIR_UNSAFE=1 AIPAIR_DRY_RUN=1 "$@" | sed -n "s/^$pane:  *//p"; }
+argrun() { bash -c "$(argline "$@")"; }
+WANT_SS="cmd=aipair-relay self=bridge peer=${J}[--max-rounds]${J}[20]${J}[--stop]${J}[[AIPAIR_REVIEW_OK]]${J}[--stop-side]${J}[codex]${J}[--start-side]${J}[codex]"
+chk "$(argrun bridge AIPAIR_START_SIDE=codex aipair loop "$W/proj")" "$WANT_SS" "AIPAIR_START_SIDE=codex → relay gets --start-side codex"
+chk "$(argrun bridge aipair loop --start-side codex "$W/proj")" "$WANT_SS" "--start-side codex → relay gets --start-side codex"
+chk "$(argrun bridge aipair loop --start-side=codex "$W/proj")" "$WANT_SS" "--start-side=codex → same"
+chk "$(argrun bridge aipair --start-side codex loop "$W/proj")" "$WANT_SS" "flag before the subcommand → same"
+chk "$(argrun bridge aipair loop "$W/proj" --start-side codex --start-side=codex)" "$WANT_SS" "the same value twice is accepted"
+chk "$(argrun bridge AIPAIR_START_SIDE=claude aipair loop --start-side codex "$W/proj")" "$WANT_SS" "flag beats env (env claude + flag codex → codex)"
+chk "$(argrun bridge AIPAIR_START_SIDE=codex aipair loop --start-side claude "$W/proj" | tail -2 | paste -sd' ')" "[--start-side] [claude]" "flag beats env (env codex + flag claude → claude)"
+chk "$(run loop bridge 'AIPAIR_START_SIDE=' | grep -c -- '--start-side' || true)" "0" "empty AIPAIR_START_SIDE → no --start-side (the default line is unchanged)"
+# The relay's own env is pinned to the EFFECTIVE value: a stale value held by an old tmux server never leaks in.
+mkdir -p "$W/envbin"
+printf '#!/usr/bin/env bash\necho "AIPAIR_START_SIDE=[${AIPAIR_START_SIDE-<unset>}]"\n' > "$W/envbin/aipair-relay"; chmod +x "$W/envbin/aipair-relay"
+envrun() { local l; l="$(argline bridge "$@")"; env AIPAIR_START_SIDE=stale PATH="$W/envbin:$PATH" bash -c "$l"; }
+chk "$(envrun aipair loop "$W/proj")" "AIPAIR_START_SIDE=[]" "unset → the relay's env is pinned empty (stale server value neutralized)"
+chk "$(envrun aipair loop --start-side codex "$W/proj")" "AIPAIR_START_SIDE=[codex]" "the pin carries the flag's value"
+chk "$(envrun AIPAIR_START_SIDE=claude aipair loop --start-side codex "$W/proj")" "AIPAIR_START_SIDE=[codex]" "the pin carries the effective value (flag over env)"
+# Rejected: exit 2, nothing on stdout, and tmux is never called (the shim logs every call). Deliberately NOT a
+# dry run — a check that failed to fire would really reach tmux (the private socket) and show up in the log.
+reject() {   # reject DESC [VAR=value ...] aipair ARGS...
+  local desc="$1" rc=0 out err; shift
+  : > "$W/tmuxcalls"
+  out="$(timeout 10 env AIPAIR_UNSAFE=1 AIPAIR_TEST_TMUX_LOG="$W/tmuxcalls" "$@" </dev/null 2>"$W/err")" || rc=$?
+  err="$(cat "$W/err")"; n=$((n+1))
+  if [ "$rc" = 2 ] && [ -z "$out" ] && [ ! -s "$W/tmuxcalls" ] && printf '%s' "$err" | grep -q 'start-side\|START_SIDE'; then
+    echo "ok   $desc"
+  else
+    echo "FAIL $desc (rc=$rc stdout='$out' stderr='$err' tmux: $(paste -sd';' "$W/tmuxcalls"))"; fail=1
+  fi
+}
+reject "trailing --start-side (no value) → exit 2, tmux untouched" aipair loop "$W/proj" --start-side
+reject "--start-side= (empty) → exit 2, tmux untouched" aipair loop --start-side= "$W/proj"
+reject "--start-side typo → exit 2, tmux untouched" aipair loop --start-side typo "$W/proj"
+reject "--start-side <dir> (a directory is not a value) → exit 2, tmux untouched" aipair loop --start-side "$W/proj"
+reject "two different values → exit 2, tmux untouched" aipair loop --start-side codex --start-side=claude "$W/proj"
+reject "AIPAIR_START_SIDE=typo aipair loop → exit 2, tmux untouched" AIPAIR_START_SIDE=typo aipair loop "$W/proj"
+for sub in "" start attach stop name status; do
+  reject "aipair ${sub:-(no subcommand)} --start-side codex → exit 2 (loop only), tmux untouched" aipair ${sub:+"$sub"} --start-side codex "$W/proj"
+done
+# The env is read ONLY by loop: an invalid AIPAIR_START_SIDE cannot break the other commands.
+chk "$(env AIPAIR_START_SIDE=typo aipair name "$W/proj" 2>&1)" "$(aipair name "$W/proj")" "AIPAIR_START_SIDE=typo: 'aipair name' is unaffected"
+out="$(env AIPAIR_START_SIDE=typo AIPAIR_DRY_RUN=1 aipair start "$W/proj" 2>&1 || true)"
+chk "$(printf '%s\n' "$out" | grep -c '^session: ' || true)/$(printf '%s\n' "$out" | grep -c 'start-side\|START_SIDE' || true)" "1/0" "AIPAIR_START_SIDE=typo: 'aipair start' still runs (dry run) and mentions no start side"
+
+echo "# [9] --autopilot / AIPAIR_AUTOPILOT (fully autonomous: no human-decision stops, no round cap by default)"
+WANT_AP="cmd=aipair-relay self=bridge peer=${J}[--autopilot]${J}[--stop]${J}[[AIPAIR_REVIEW_OK]]${J}[--stop-side]${J}[codex]"
+chk "$(argrun bridge aipair loop --autopilot "$W/proj")" "$WANT_AP" "--autopilot → relay gets --autopilot and NO --max-rounds"
+chk "$(argrun bridge AIPAIR_AUTOPILOT=1 aipair loop "$W/proj")" "$WANT_AP" "AIPAIR_AUTOPILOT=1 → same"
+chk "$(argrun bridge AIPAIR_AUTOPILOT=1 AIPAIR_MAX_ROUNDS=50 aipair loop "$W/proj" | sed -n '3,4p' | paste -sd' ')" "[--max-rounds] [50]" "an explicit AIPAIR_MAX_ROUNDS still applies under autopilot"
+chk "$(run loop bridge 'AIPAIR_AUTOPILOT=0' | grep -c -- '--autopilot' || true)" "0" "AIPAIR_AUTOPILOT=0 → off (the default line is unchanged)"
+chk "$(argline bridge aipair loop --autopilot "$W/proj" | grep -o 'AIPAIR_AUTOPILOT=[^ ]*')" "AIPAIR_AUTOPILOT=1" "the relay's env pin carries the effective value"
+for sub in "" start attach stop name status; do
+  rc=0; out="$(env AIPAIR_UNSAFE=1 AIPAIR_DRY_RUN=1 aipair ${sub:+"$sub"} --autopilot "$W/proj" 2>&1)" || rc=$?; n=$((n+1))
+  if [ "$rc" = 2 ] && printf '%s' "$out" | grep -q 'autopilot'; then echo "ok   aipair ${sub:-(no subcommand)} --autopilot → exit 2 (loop only)"; else echo "FAIL aipair ${sub:-(no subcommand)} --autopilot: rc=$rc out=$out"; fail=1; fi
+done
+
+echo "# [10] codex --no-daemon via aipair-codex (codex 0.158+: keep the TUI off the shared background server)"
+# aipair-codex decides in the PANE, on the argv the pane's shell has already expanded. A codex whose --help offers
+# --no-daemon (the default shim above does not → nothing is added, the lines above stay as they were).
+mkdir -p "$W/bin-nd"
+printf '#!/usr/bin/env bash\nif [ "${1:-}" = --help ]; then printf "      --no-daemon\\n          Run without the shared background server\\n"; exit 0; fi\nexec %q "$@"\n' "$W/bin/codex" > "$W/bin-nd/codex"
+chmod +x "$W/bin-nd/codex"
+ND="PATH=$W/bin-nd:$PATH"
+ndrun() { env "$ND" bash -c "$(line "$@")"; }   # the pane (bash -c) sees the --no-daemon-capable codex
+chk "$(run loop codex | head -1)" "cmd=codex self=codex peer=claude" "the pane runs codex through aipair-codex (still AI_SELF/AI_PEER)"
+chk "$(line loop codex | sed 's/.* \([^ ]*aipair-codex\) .*/\1/')" "$CX" "the line names aipair-codex by its absolute path (pane PATH not needed)"
+chk "$(ndrun loop codex)" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]" "loop: --no-daemon first, then the bypass flag"
+chk "$(env "$ND" bash -c "$(env AIPAIR_DRY_RUN=1 aipair "$W/proj" | sed -n 's/^codex:  *//p')")" "cmd=codex self=codex peer=claude${J}[--no-daemon]" "interactive (safe default, no --unsafe): --no-daemon only"
+chk "$(ndrun loop codex 'AIPAIR_CODEX_FLAGS=-q --no-daemon')" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]${J}[-q]${J}[--no-daemon]" "already given → not added twice"
+chk "$(ndrun loop codex 'AIPAIR_CODEX_FLAGS=-q # --no-daemon')" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]${J}[-q]" "'# --no-daemon' is a comment → still added"
+chk "$(ndrun loop codex 'AIPAIR_CODEX_FLAGS=--append-system-prompt "use --no-daemon"')" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]${J}[--append-system-prompt]${J}[use --no-daemon]" "inside a quoted text → still added"
+# Expansions are decided on their RESULT (Codex review 2026-09-29): no duplicate, whatever they expand to
+chk "$(ndrun loop codex 'AIPAIR_CODEX_FLAGS=$(printf %s --no-daemon)')" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]${J}[--no-daemon]" "\$(…) yielding --no-daemon → not added twice"
+chk "$(env CODEX_EXTRA=--no-daemon "$ND" bash -c "$(line loop codex 'AIPAIR_CODEX_FLAGS=$CODEX_EXTRA')")" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]${J}[--no-daemon]" "\$VAR holding --no-daemon → not added twice"
+chk "$(env M=gpt "$ND" bash -c "$(line loop codex 'AIPAIR_CODEX_FLAGS=--model $M')")" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]${J}[--model]${J}[gpt]" "an unrelated expansion → added"
+chk "$(ndrun loop codex 'AIPAIR_CODEX_FLAGS=-- --no-daemon')" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[--dangerously-bypass-approvals-and-sandbox]${J}[--]${J}[--no-daemon]" "after a lone -- it is not an option → still added"
+chk "$(ndrun loop claude)" "cmd=claude self=claude peer=codex${J}[--session-id]${J}[$S]${J}[--dangerously-skip-permissions]" "claude's line is untouched"
+
+echo "# [11] start choices: resume the latest conversation (Claude / Codex) and Remote Control"
+# A fake HOME holding both CLIs' histories. For the project dir the newest INTERACTIVE conversation must win:
+# Claude: a newer `claude -p` one (entrypoint sdk-cli) and a newer one of another dir (same project folder —
+# folder names can collide) are skipped. Codex: a newer `codex exec` one (source exec) is skipped.
+H="$W/home"; PD="$(cd "$W/proj" && pwd -P)"
+mkdir -p "$H/.claude/projects/-fixture" "$H/.codex/sessions/2026/10/09"
+CA=aaaaaaaa-0000-4000-8000-000000000001; CB=bbbbbbbb-0000-4000-8000-000000000002
+CC=cccccccc-0000-4000-8000-000000000003; CD=dddddddd-0000-4000-8000-000000000004
+XA=01a11f00-0000-7000-8000-00000000000a; XB=01a11f00-0000-7000-8000-00000000000b; XC=01a11f00-0000-7000-8000-00000000000c
+cl() { printf '{"type":"mode"}\n{"type":"user","cwd":"%s","entrypoint":"%s","sessionId":"%s"}\n' "$2" "$3" "$1" > "$H/.claude/projects/-fixture/$1.jsonl"; touch -d "$4" "$H/.claude/projects/-fixture/$1.jsonl"; }
+cx() { local f="$H/.codex/sessions/2026/10/09/rollout-2026-10-09T00-00-00-$1.jsonl"
+       printf '{"timestamp":"%s","type":"session_meta","payload":{"id":"%s","cwd":"%s","source":"%s","timestamp":"%s"}}\n' "$3" "$1" "$PD" "$2" "$3" > "$f"; touch -d "$4" "$f"; }
+cl "$CA" "$PD" cli "2026-10-09 10:00"; cl "$CB" "$PD" cli "2026-10-09 11:00"
+cl "$CC" "$PD" sdk-cli "2026-10-09 12:00"; cl "$CD" "$W/elsewhere" cli "2026-10-09 13:00"
+cx "$XA" cli "2026-10-09T01:00:00.000Z" "2026-10-09 10:00"; cx "$XB" cli "2026-10-09T02:30:00.250Z" "2026-10-09 11:00"
+cx "$XC" exec "2026-10-09T03:00:00.000Z" "2026-10-09 12:00"
+XB_SINCE="$(python3 -c 'from datetime import datetime; print(repr(datetime.fromisoformat("2026-10-09T02:30:00.250+00:00").timestamp()))')"
+# rline [VAR=value ...] → `aipair loop` dry run with the fake HOME and NO caller pins (stdin: /dev/null)
+rline() { env -u AIPAIR_CLAUDE_SESSION -u AIPAIR_CODEX_SINCE HOME="$H" AIPAIR_UNSAFE=1 "$@" AIPAIR_DRY_RUN=1 aipair loop "$W/proj" </dev/null; }
+pane() { sed -n "s/^$1:  *//p"; }
+chk "$(bash -c "$(rline AIPAIR_CLAUDE_RESUME=last | pane claude)")" "cmd=claude self=claude peer=codex${J}[--resume]${J}[$CB]${J}[--dangerously-skip-permissions]" "claude last: --resume the newest interactive conversation of this dir (not -p, not another dir)"
+chk "$(rline AIPAIR_CLAUDE_RESUME=last | pane claude | sed -n 's/.*AIPAIR_CLAUDE_SESSION=\([^ ]*\).*/\1/p')" "$CB" "claude last: the pin follows the resumed conversation"
+chk "$(bash -c "$(rline AIPAIR_CODEX_RESUME=last | pane codex)")" "cmd=codex self=codex peer=claude${J}[resume]${J}[$XB]${J}[--dangerously-bypass-approvals-and-sandbox]" "codex last: resume <id> of the newest interactive session (not exec)"
+chk "$(rline AIPAIR_CODEX_RESUME=last | pane codex | sed -n 's/.*AIPAIR_CODEX_SINCE=\([^ ]*\).*/\1/p')" "$XB_SINCE" "codex last: AIPAIR_CODEX_SINCE = that rollout's own start (non-/proc pick)"
+chk "$(env "$ND" bash -c "$(rline AIPAIR_CODEX_RESUME=last | pane codex)")" "cmd=codex self=codex peer=claude${J}[--no-daemon]${J}[resume]${J}[$XB]${J}[--dangerously-bypass-approvals-and-sandbox]" "codex last through aipair-codex: --no-daemon first, then resume"
+chk "$(bash -c "$(rline AIPAIR_CLAUDE_RESUME=new AIPAIR_CODEX_RESUME=new | pane codex)")" "cmd=codex self=codex peer=claude${J}[--dangerously-bypass-approvals-and-sandbox]" "new: codex line as before"
+chk "$(bash -c "$(rline AIPAIR_REMOTE_CONTROL=on | pane claude)" | sed -n '2,3p' | paste -sd' ')" "[--remote-control] [--session-id]" "remote control on, name left to Claude: --remote-control right before --session-id"
+chk "$(bash -c "$(rline AIPAIR_REMOTE_CONTROL=on "AIPAIR_REMOTE_CONTROL_NAME=it's my pair" AIPAIR_CLAUDE_RESUME=last | pane claude)")" "cmd=claude self=claude peer=codex${J}[--remote-control]${J}[it's my pair]${J}[--resume]${J}[$CB]${J}[--dangerously-skip-permissions]" "remote control with a name (one argument, quotes intact) + resume"
+chk "$(bash -c "$(rline AIPAIR_REMOTE_CONTROL=on 'AIPAIR_CLAUDE_FLAGS=--model opus # x' | pane claude)" | sed -n '2p')" "[--remote-control]" "a '#' in the user's fragment cannot comment out --remote-control"
+# last with no history: a warning, then a new conversation (never a silent pick of something else)
+EH="$W/emptyhome"; mkdir -p "$EH"
+n=$((n+1)); out="$(env -u AIPAIR_CLAUDE_SESSION -u AIPAIR_CODEX_SINCE HOME="$EH" AIPAIR_UNSAFE=1 AIPAIR_CLAUDE_RESUME=last AIPAIR_CODEX_RESUME=last AIPAIR_DRY_RUN=1 aipair loop "$W/proj" </dev/null 2>"$W/err")"
+if printf '%s' "$out" | pane claude | grep -q -- '--session-id ' && ! printf '%s' "$out" | pane codex | grep -q ' resume ' \
+   && grep -q 'Claude の再開できる会話' "$W/err" && grep -q 'Codex の再開できる会話' "$W/err"; then echo "ok   last without history → warned, new conversations"
+else echo "FAIL last without history"; cat "$W/err"; fail=1; fi
+# invalid / contradictory settings: exit 2 and nothing printed
+for bad in AIPAIR_CLAUDE_RESUME=yes AIPAIR_CODEX_RESUME=latest AIPAIR_REMOTE_CONTROL=1 AIPAIR_REMOTE_CONTROL_NAME=x \
+           "AIPAIR_REMOTE_CONTROL=off AIPAIR_REMOTE_CONTROL_NAME=x" "AIPAIR_REMOTE_CONTROL=on AIPAIR_REMOTE_CONTROL_NAME=-x"; do
+  n=$((n+1)); rc=0; out="$(env HOME="$H" $bad AIPAIR_DRY_RUN=1 aipair "$W/proj" 2>/dev/null </dev/null)" || rc=$?   # $bad: word-split on purpose
+  if [ "$rc" = 2 ] && [ -z "$out" ]; then echo "ok   $bad → refused (exit 2)"; else echo "FAIL $bad not refused: rc=$rc"; fail=1; fi
+done
+for bad in AIPAIR_CLAUDE_RESUME=last AIPAIR_CODEX_RESUME=last; do   # with the caller's pins S / K still set
+  n=$((n+1)); rc=0; out="$(env HOME="$H" "$bad" AIPAIR_DRY_RUN=1 aipair "$W/proj" 2>/dev/null </dev/null)" || rc=$?
+  if [ "$rc" = 2 ] && [ -z "$out" ]; then echo "ok   $bad + a caller pin → refused (exit 2)"; else echo "FAIL $bad + pin not refused: rc=$rc"; fail=1; fi
+done
+# The questions (AIPAIR_TEST_ASK=1: asked in a dry run, answers from stdin)
+ask() { local in="$1"; shift; printf '%b' "$in" | env -u AIPAIR_CLAUDE_SESSION -u AIPAIR_CODEX_SINCE HOME="$H" AIPAIR_UNSAFE=1 AIPAIR_TEST_ASK=1 "$@" AIPAIR_DRY_RUN=1 aipair loop "$W/proj" 2>"$W/err"; }
+out="$(ask '2\n2\n3\n  my rc  \n')"
+chk "$(bash -c "$(printf '%s' "$out" | pane claude)")" "cmd=claude self=claude peer=codex${J}[--remote-control]${J}[my rc]${J}[--resume]${J}[$CB]${J}[--dangerously-skip-permissions]" "asked: resume Claude, Remote Control with a typed name (trimmed)"
+chk "$(bash -c "$(printf '%s' "$out" | pane codex)" | sed -n '2,3p' | paste -sd' ')" "[resume] [$XB]" "asked: resume Codex"
+n=$((n+1)); if grep -q "Claude: 1) 新しい会話  2) 最新の会話を再開（10/09 11:00）" "$W/err" && grep -q "Codex:  1) 新しい会話  2) 最新の会話を再開（10/09 11:00）" "$W/err"; then echo "ok   the questions show when the latest conversation was last used"; else echo "FAIL question text"; cat "$W/err"; fail=1; fi
+out="$(ask '\n\n\n')"
+n=$((n+1)); if printf '%s' "$out" | pane claude | grep -q -- ' --session-id ' && ! printf '%s' "$out" | pane claude | grep -q -- '--remote-control' && ! printf '%s' "$out" | pane codex | grep -q ' resume '; then echo "ok   Enter everywhere → new / new / off"; else echo "FAIL defaults: $out"; fail=1; fi
+out="$(ask '9\n2\n1\n2\n')"
+n=$((n+1)); if printf '%s' "$out" | pane claude | grep -q -- "--remote-control --resume $CB " && ! printf '%s' "$out" | pane codex | grep -q ' resume ' && grep -q 'のどれかを入力' "$W/err"; then echo "ok   an invalid answer is asked again"; else echo "FAIL re-ask: $out"; cat "$W/err"; fail=1; fi
+out="$(ask '1\n1\n3\n-x\nok\n')"
+chk "$(bash -c "$(printf '%s' "$out" | pane claude)" | sed -n '2,3p' | paste -sd' ')" "[--remote-control] [ok]" "a name starting with '-' is asked again"
+out="$(ask '2\n1\n' AIPAIR_CLAUDE_RESUME=new)"
+n=$((n+1)); if printf '%s' "$out" | pane claude | grep -q -- ' --session-id ' && printf '%s' "$out" | pane codex | grep -q " resume $XB " && ! grep -q 'Claude: 1)' "$W/err"; then echo "ok   a side set in the environment is not asked"; else echo "FAIL env side asked: $out"; cat "$W/err"; fail=1; fi
+n=$((n+1)); rc=0; out="$(ask '2\n')" || rc=$?
+if [ "$rc" = 1 ] && [ -z "$out" ] && grep -q '起動を中止' "$W/err"; then echo "ok   input that ends midway → launch stopped (exit 1), nothing printed"; else echo "FAIL EOF: rc=$rc out=$out"; fail=1; fi
+out="$(printf '1\n' | env -u AIPAIR_CLAUDE_SESSION -u AIPAIR_CODEX_SINCE HOME="$EH" AIPAIR_UNSAFE=1 AIPAIR_TEST_ASK=1 AIPAIR_DRY_RUN=1 aipair loop "$W/proj" 2>"$W/err")"
+n=$((n+1)); if [ "$(grep -c '再開できる会話なし' "$W/err")" = 2 ] && grep -q 'Remote Control' "$W/err" && printf '%s' "$out" | pane claude | grep -q -- ' --session-id '; then echo "ok   no history → only Remote Control is asked"; else echo "FAIL no-history questions"; cat "$W/err"; fail=1; fi
+# pins in the environment (e.g. aipair typed in a pair's own pane) fix the sides: said, not silently skipped
+n=$((n+1)); out="$(printf '1\n' | env HOME="$H" AIPAIR_UNSAFE=1 AIPAIR_TEST_ASK=1 AIPAIR_DRY_RUN=1 aipair loop "$W/proj" 2>"$W/err")"
+if grep -q 'AIPAIR_CLAUDE_SESSION が設定済み' "$W/err" && grep -q 'AIPAIR_CODEX_SINCE が設定済み' "$W/err" && ! grep -q '最新の会話を再開' "$W/err" \
+   && printf '%s' "$out" | pane claude | grep -q -- "--session-id $S "; then echo "ok   caller pins → the resume questions are skipped with a note"
+else echo "FAIL pinned sides: $out"; cat "$W/err"; fail=1; fi
+# never asked without AIPAIR_TEST_ASK in a dry run (live-version-check and these tests read the lines unattended)
+n=$((n+1)); out="$(printf '2\n2\n2\n' | env -u AIPAIR_CLAUDE_SESSION -u AIPAIR_CODEX_SINCE HOME="$H" AIPAIR_UNSAFE=1 AIPAIR_DRY_RUN=1 aipair loop "$W/proj" 2>"$W/err")"
+if ! grep -q '起動のしかた' "$W/err" && ! printf '%s' "$out" | pane claude | grep -q -- '--resume'; then echo "ok   a plain dry run never asks"; else echo "FAIL dry run asked"; fail=1; fi
+
+echo; echo "$n checks, $([ $fail = 0 ] && echo ALL PASSED || echo SOME FAILED)"
+exit $fail

@@ -1,0 +1,264 @@
+# Changelog
+
+All notable changes to aipair are recorded here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and aipair uses
+[Semantic Versioning](https://semver.org/). Between releases `aipairlib.__version__` carries the
+`-dev.N` prerelease suffix (`0.2.0-dev.0`) so a main checkout never claims to be a release; the
+release commit drops the suffix. The version headings below track the version being **prepared**
+(without the suffix). The version below is the single source of truth
+`aipairlib.__version__`; a release is the git tag `v<version>` and its GitHub Release (see
+[RELEASING.md](RELEASING.md)). The CHANGELOG top is in one of two lifecycle states: **while a
+version is being prepared**, a `## [X.Y.Z] — unreleased` section is at the top; **right after a
+release**, a `## [Unreleased]` section sits above the dated `## [X.Y.Z] - <date>` just shipped. In
+both, the topmost VERSION-numbered section is `aipairlib.__version__` **with any `-dev.N` suffix
+stripped**; its date is filled in in the release commit, just before the `v<version>` tag is pushed.
+`tests/doc-sync.py` enforces the version match, verifies both states, and pins which state each
+version form may appear in (`-dev.N` ⇒ prepared, bare `X.Y.Z` ⇒ the released/just-shipped state).
+
+## [0.2.0] — unreleased (prepared; main は `0.2.0-dev.0`)
+
+Correctness and safety of the autonomous `aipair loop --endless` relay: a task-list classification —
+not an agent's say-so — is the authority on when a run is finished, and the loop stops for a human on
+specific detectable conditions (the task-list classifies as `BLOCKED` with only human-dependent `[!]`
+tasks left, Codex declares `[AIPAIR_HUMAN_REQUIRED]`, a question is too large to relay intact, or a
+task makes no progress across rounds) instead of guessing or spinning.
+
+### Added
+- **Start choices: resume the latest conversation, Remote Control** — when `aipair` / `aipair loop` builds a
+  new pair on a terminal, it asks whether Claude and Codex each start a new conversation or resume the
+  latest one for the directory (the newest by last update; non-interactive `claude -p` / `codex exec`
+  conversations and ones a running process holds are skipped), and whether Claude starts with Remote
+  Control (off / on with Claude's name / on with a typed name). Resuming uses `claude --resume <id>` /
+  `codex resume <id>` (still through `aipair-codex`, so `--no-daemon` stays) and points the `peer` / relay
+  pins at the resumed conversation. `AIPAIR_CLAUDE_RESUME` / `AIPAIR_CODEX_RESUME` (`new|last`) and
+  `AIPAIR_REMOTE_CONTROL` (`off|on`) + `AIPAIR_REMOTE_CONTROL_NAME` answer instead and skip the question;
+  without a terminal (or for a dry run) nothing is asked and the launch is as before.
+- **Fully autonomous relay (`--autopilot`)** — `aipair loop --unsafe --autopilot` (or `AIPAIR_AUTOPILOT=1`,
+  `aipair-relay-here --autopilot`) never stops for a human decision: the human-wait sentinel is not offered,
+  and Codex answers as the human's proxy (irreversible operations — production deploys, billing, public
+  pushes, data deletion — are not run; a reversible option is chosen instead). Plan review, the question
+  relay and a stalled review no longer stop at a cap; they climb a convergence ladder that always moves on
+  (plan: approve with Codex's remaining points as feedback; questions: the relay's own safe-choice answer;
+  stall: breakout request → final pass request → forced pass with the remaining points in the banner). In
+  endless mode a task that makes no progress is turned into `[!]` (by Claude, then by the relay). Oversized
+  questions go to Codex through a file instead of stopping. `--max-rounds` applies only when given.
+- **Every question is answered** — the question relay now asks Codex to answer all N questions and checks
+  the reply for each "N問目"; missing ones are asked once more and delivered together (in every mode).
+- **Codex-first start (`--start-side codex`)** — `aipair loop --unsafe --start-side codex` (or
+  `AIPAIR_START_SIDE=codex`) and `aipair-relay-here --start-side codex` make the relay wait for **Codex's**
+  first completion instead of Claude's. It is not a role swap: once Codex finishes, its result goes to
+  Claude with the usual `poke_claude` and the loop continues as normal. The relay already had
+  `--start-side`; it now also reads `AIPAIR_START_SIDE` (validated — env values bypass argparse
+  `choices`). `aipair` checks the flag before touching tmux (a missing, empty or unknown value, two
+  different values, or using it outside `loop` exits 2) and reads the environment variable only for `loop`,
+  so an invalid value never breaks `start` / `attach` / `status`. `aipair-relay-here` lets an explicit
+  `--start-side=codex` win over the environment — its explicit-flag check now recognises the
+  `--flag=value` form, which also fixes that case for every flag it maps from the environment — and
+  checks every `--start-side` it is given by the same rules before building the launch line. The setting
+  applies to that one launch only: nothing is saved, so pass it again when re-igniting.
+- **`[!]` blocked-task notation** — a `- [!]` item with a required `blocker: <reason>` child line
+  marks work that needs a human or an external dependency; the agents move a task there instead of
+  leaving it `- [ ]` or guessing past it.
+- **`[AIPAIR_HUMAN_REQUIRED]` sentinel and exit code 8** — when only human-dependent `[!]` tasks
+  remain (classification `BLOCKED`), the loop stops for a human (exit 8) instead of spinning. Exit 8
+  is distinct from the max-rounds cap and carries a reason.
+- **no-progress guard** — if the same task is re-selected three rounds running with an unchanged
+  task-list snapshot, the loop stops (exit 8, no-progress) rather than looping forever.
+- **AskUserQuestion → HUMAN_REQUIRED** — when Claude stops on a choice dialog whose answer needs
+  human approval, authority, secrets, payment, or an irreversible/production action, Codex can
+  decline to proxy-answer (`[AIPAIR_HUMAN_REQUIRED]` on its reply's first line); the relay stops
+  (exit 8) without answering and leaves the dialog for a human. The task-list is untouched.
+- **Distinct exit-8 banners** — the human-wait and no-progress stops each print their own banner
+  (naming the blocking item or the question) so it is clear why the loop stopped and what to do.
+
+### Changed
+- **Default pane layout: bridge 17% high, Codex 28% wide** (was 30% / 50%) — `aipair` now splits the
+  window so the Claude pane gets most of the space. **This changes how a newly started pair looks**
+  for everyone who upgrades: the bottom bridge pane is shorter and the right-hand Codex pane is
+  narrower. Pairs that are already running keep their layout (the sizes are applied only when a
+  session is created). To get the old layout back, edit the two `split-window -l` values in `aipair`
+  (README「カスタマイズ」).
+- **The pane layout no longer depends on the tmux version or on other terminals** — the 17% / 28% split
+  was applied to whatever size `new-session -d` had given the window (80x24, the size of another terminal
+  attached to the same tmux server, or the pane `aipair` was typed in), and tmux does not keep proportions
+  when the window is then stretched to the real terminal; on a 184-column terminal the Codex pane came out
+  anywhere from 37 to 74 columns. `aipair` now sizes the window to the terminal it was started from (minus
+  tmux's status lines) **before** splitting, so a new pair starts at 17% / 28% (tmux rounds down: bridge
+  7 rows / Codex 51 columns on 184x46). This holds **at start-up only** — resizing the terminal afterwards
+  still redistributes the space, as tmux always did. Without a terminal (cron, CI, the installer's smoke
+  test) nothing is resized and the behaviour is unchanged. New test: `tests/pane-layout.py`.
+- **`templates/vscode-tasks.json`: every task is now one `command` string** —
+  `"command": "wsl.exe -e bash -ic '<command>'"` with `"options": { "cwd": "${workspaceFolder}" }`, instead of
+  `"command": "wsl.exe"` plus an `args` array with `--cd`. The commands the tasks run are unchanged, and
+  VS Code runs them as before. The reason is editors that read `.vscode/tasks.json` but join `command` and
+  `args` without quoting (Zed): there `bash -ic` received only the first word, so e.g. the stop task ran a
+  plain `aipair` (start / re-attach) **without any error**. `aipair-install.sh --vscode-tasks` never
+  overwrites an existing `tasks.json`, so **projects that already have the old template keep it** — replace
+  the file by hand to pick up the new form.
+- **no-progress の同一性照合を「見えない差」に依存させない**（P2-1・案B）— `resolve_task_identity` /
+  `advance_no_progress` の比較を `canonical_task_key`（NFC → 前後の空白除去 → checkbox 記法の正規化）
+  経由にした。Codex のエコーが行頭インデントを落とす・Markdown の hard-break を付け外しする・bullet を
+  `*` に変える、といった差だけでは同一タスクを取り逃がさない（＝偽の `UNRESOLVED` で no-progress を
+  積まない）。識別子として保持・表示するのは従来どおり task-list の**原文行**。トレードオフとして、
+  本文が同じでインデントだけ違う項目は区別できず `UNRESOLVED`（fail-closed）になる。
+- **リリース間の main は開発版 `X.Y.Z-dev.N` を名乗る**（P2-2・案B）— `__version__` を `0.2.0-dev.0` に。
+  main のチェックアウトがリリース版を名乗らなくなり、bare `X.Y.Z` を持つのはリリースコミットだけになる。
+  SemVer の prerelease なので `SEMVER` 契約・`v<version>` タグ契約は不変（PEP 440 の `0.2.0.dev0` は
+  SemVer 不正のため不採用）。CHANGELOG の見出しは従来どおり *リリース* 版（`## [X.Y.Z] — unreleased`）で、
+  doc-sync が「どの版形式がどの CHANGELOG 状態に出てよいか」まで固定する。
+- **Endless termination is decided by the task-list classification, not by the agent's sentinel
+  alone** — the relay reads and classifies the task-list (`READY` / `BLOCKED` / `ALL_DONE`), and a
+  terminal sentinel (`[AIPAIR_ALL_DONE]` / `[AIPAIR_HUMAN_REQUIRED]`) ends the run only when the
+  classification agrees; a sentinel the classification does not support does not terminate the loop.
+  Startup classification acts immediately (`ALL_DONE` → exit 0, `BLOCKED` → exit 8, `READY` → run).
+- **Tested CLI versions are raised only after a live check** (current pins: `corelib.TESTED_VERSIONS`,
+  README「必要環境」) — each bump is verified against the real TUIs and transcripts, not blind: the
+  plan-approval and AskUserQuestion dialogs are detected and driven end-to-end (feedback → replan →
+  shift+tab approval → the plan actually runs; multi-question tab scraping and the "Chat about this"
+  delivery), and `schema_probe` reads `ok` on a fresh claude session jsonl and codex rollout. Since
+  claude 2.1.247 the plan dialog's approve options are "Yes, and use auto mode" / "Yes, manually
+  approve edits" (no "bypass" wording), so the picker selects the first `Yes…` option.
+
+### Fixed
+- **The relay no longer stops (exit 7) on Claude Code 2.1.300+ logs** — from 2.1.300 Claude Code also writes
+  `api-request-blob` rows: copies of the messages sent in each API request (`message{role, content}`
+  deduplicated by `hash`, no `uuid` / `timestamp`). The conversation rows are unchanged and every runtime
+  reader (turn completion, attribution, delivery, dialog resolution, `peer-log`) selects rows by `type`, but
+  the log-schema probe looks at content regardless of `type` to catch a renamed row, so it took a copied
+  `tool_result` for a moved dialog-resolution row as soon as Claude used a tool (and a copied assistant
+  message for a renamed assistant row) and failed closed. The probe now skips rows of that one type; the
+  same content under any other type is still drift. Found by aipair-bump's live check on 2.1.301.
+- **A Codex rollout whose cwd was recorded in another letter case is no longer lost** — on a
+  case-insensitive filesystem (WSL `/mnt/*`, macOS APFS by default) Codex sometimes writes a conversation's
+  `session_meta.cwd` all in lower case (`/mnt/d/work-dir/proj` for `/mnt/d/Work-Dir/Proj`; 8 of 327 real
+  rollouts under `/mnt`). `peer-log` and the relay compared the recorded cwd with the pair's directory as
+  strings, so after the pair's Codex started such a conversation the relay found the rollout its process
+  held open and then discarded it as another directory's: it never saw Codex finish (the review was done
+  while the relay sat on "waiting for Codex"), and `peer` kept reading the previous conversation. Two
+  spellings that differ only by case are now compared by asking the disk whether they are one directory
+  (`samefile`), every time rather than once — so a directory renamed or created while the relay runs is
+  still matched — and only when the spellings differ. On a case-sensitive filesystem directories that
+  differ only by case stay distinct.
+- **A Claude turn that ended only to wait for a background subagent is no longer handed to Codex** — Claude
+  Code runs subagents (the Agent tool, Workflow) in the background: Claude launches one, says "waiting for
+  the result" and ends its turn, then resumes by itself when the completion notification arrives. The relay
+  read that `end_turn` as "implementation done" and asked Codex for a review with nothing to review yet, so a
+  round was wasted every time (in real transcripts 107 of 125 background launches ended the turn before
+  their notification). The relay now does not count a Claude turn as complete while a subagent launched
+  since the relay started is unsettled — settled meaning its completion notification (completed, failed or stopped)
+  was delivered to Claude *and* Claude has acted since, so the seconds between the notification and the
+  resumed turn's first output are covered too. It says once why it is not handing over (`Claude は
+  サブエージェント N 件の完了待ち → …`). New `--subagent-wait SEC` (default 3600; `0` = off, the old
+  behaviour) caps the wait per subagent from its launch, so a notification that never comes cannot stall the
+  relay; past the cap it warns and hands over as before. Subagents launched before the relay started (e.g.
+  left unfinished by a Claude process that died) are not counted; a plan approval or a question answer
+  relayed in the middle of the turn does not drop the ones launched before it. A completion that no longer
+  holds when re-checked after the settle pause (Claude resumed meanwhile) is not handed over either — the
+  relay goes back to watching instead of reviving the stale value. Background Bash
+  (`run_in_background`) is deliberately not waited for — a dev server never finishes.
+- **Codex 0.158+ no longer runs the pair's Codex on the shared background server** — codex 0.158 routes
+  every TUI through one shared app-server daemon by default. The daemon, not the pane's TUI, then held the
+  session log and ran Codex's shell commands with the environment of whichever pane first started it: the
+  relay could not find the pair's Codex log (it never saw Codex finish) and Codex's `peer` read another,
+  long-gone pair's pins ("no claude session found"). The Codex pane now starts codex through the new
+  `aipair-codex`, which adds `--no-daemon` when the installed codex offers it and the final argv (after the
+  pane's shell expanded `AIPAIR_CODEX_FLAGS`) does not already have it — codex rejects a repeated
+  `--no-daemon`. Pairs started before this fix keep the daemon until their Codex is restarted.
+- **The normal review loop can stop for a human instead of spinning to the cap** — when the remaining review
+  points needed a human decision, Claude answered "waiting for the user's decision / already decided by the
+  user — no change" and Codex "still unfixed" / "no diff, can't judge"; neither could emit the only stop
+  sentinel, so the relay ran to max-rounds (measured: 115 Claude turns in one pair). Both review prompts now
+  offer `[AIPAIR_HUMAN_REQUIRED]` (not in endless mode, whose HUMAN_REQUIRED is decided by the task-list), and
+  either side declaring it stops the relay with exit 8. As a mechanical backstop, `--stall-rounds N`
+  (default 3, `0` = off) stops with exit 8 when N reviews in a row pass without approval while the repo
+  (HEAD, worktree diff, untracked files) stays unchanged; it is off outside a git repository.
+- **The skills and `aipair-relay-here -h` name the relay's real default sentinels** — they still gave the
+  old Japanese defaults (「完了です」 to stop, 「次のタスクをください」 to ask for the next task, 「全タスク完了」 /
+  「人間対応待ち」 as the terminals) although the code defaults are `[AIPAIR_REVIEW_OK]` / `[AIPAIR_NEXT]` /
+  `[AIPAIR_ALL_DONE]` / `[AIPAIR_HUMAN_REQUIRED]`, so a user or Claude following them could pass
+  `stop 完了です` or explain the loop wrongly. Stop detection itself was unaffected (the relay's prompt to
+  Codex names the real sentinel). `tests/doc-sync.py` now checks these distributed docs — both skills, the
+  real `aipair-relay-here -h` output and the global-instructions template — against the code defaults,
+  not only the README.
+- **A long poke is pasted, not typed — so the Enter that follows actually submits** — `poke()` typed the
+  whole body with `send-keys -l`; on a narrow pane a long body (measured: ~1,900 chars of a question
+  relay in a 57-column pane) keeps the TUI ingesting, and the Enter that follows is swallowed as part of
+  that input burst, leaving the text in the composer unsent (the relay then stopped with "Enter を3回
+  送っても送信を確認できず"). The body now goes in as a bracketed paste — which submits on a plain Enter
+  at the same length on codex 0.153.4 and 0.154.0 — and only the short `relay-id:` nonce is typed after
+  it, so the delivery check still sees it (`[Pasted Content … chars] relay-id:…`) even on a narrow pane.
+  The paste buffer is also named per call instead of the fixed `aipair-relay`, so concurrent relays
+  cannot clobber each other's paste, and it is deleted in a `finally` (`paste-buffer -d` only deletes on
+  success, so a failed paste used to leave the prompt body sitting in a tmux buffer). Delivery is now
+  confirmed by the nonce alone: with the body and the nonce arriving as two separate commands, the old
+  "the body's first characters showed up" fallback could call a body-only arrival delivered and press
+  Enter for a nonce that never landed (on the Codex side the running badge would then mark it sent).
+- **`aipair-relay-here` verifies the relay actually started** — it used to send the launch line into the
+  bridge pane and report success unconditionally, so a bridge whose shell held half-typed input (the line
+  concatenated into `command not found`) or a pane left in copy-mode silently produced no relay while the
+  command exited 0 — and the previous relay's banner still in the scrollback made it look started. It now
+  cancels copy-mode, discards the pending input line, re-checks that the bridge is still an idle shell
+  **right before sending** (so it never types a launch line into a relay someone else just started), and
+  then waits for a NEW `┌─ aipair-relay` banner (`AIPAIR_IGNITE_TIMEOUT`, default 8s) before reporting
+  success; when it cannot confirm the start — or the relay exited immediately — it prints the bridge pane's
+  last lines and exits 2. The idle-shell test is now one shared check that also covers `dash` and login
+  shells (`-bash` / `-zsh`), which were previously misread as "busy".
+- **The version gate judges the CLI a pane is actually running, not the one on disk** — npm upgrades
+  replace the file under a live TUI, so `claude --version` from PATH described a binary the relay was
+  not scraping (measured: disk 2.1.269 while the panes ran 2.1.266 / 2.1.268) — a false ⚠ that turned
+  dialog automation off on a tested TUI, or a pass for an untested one. On Linux the relay now finds
+  each pane's CLI process under `/proc` and asks its own executable (`/proc/<pid>/exe --version`, valid
+  even after the upgrade deleted it), and re-checks the running claude right before touching any of its
+  dialogs; a process it cannot identify or verify is never operated (fail-closed). On Linux PATH's
+  version may still seed the startup value when a CLI is not up yet, but it never permits a dialog
+  operation — only where `/proc` does not exist does the PATH-based decision stand as before. The plan
+  approval also acts only on a dialog detected right now (a stale one that vanished while Codex was
+  reviewing is left alone). While Claude sits in a dialog, a review is also no longer typed in as a
+  plain poke (its digits could pick an option): the relay stops with exit 5 and leaves the screen untouched.
+- **Endless mode no longer marks a task done before review** — the `- [x]` is written only on the
+  next turn after Codex's review passes, not at implementation time, so a relay restart mid-review
+  can no longer misread the task-list as `ALL_DONE` and stop early.
+- **A missing / unreadable / zero-checkbox task-list no longer reads as "all done"** — it now exits
+  2 (configuration error) instead of terminating the loop as complete; endless mode requires at
+  least one recognized checkbox (`- [ ]` / `- [x]` / `- [!]`).
+- **An oversized question is no longer truncated and proxy-answered** — a question whose text
+  exceeds the auto-relay size limit stops for a human (exit 8) instead of being cut down and
+  answered from an incomplete prompt.
+- **A classification-rejected sentinel is no longer forwarded to Claude** — if Codex emits a
+  terminal sentinel the task-list classification does not support, the relay re-asks Codex to pick
+  the next task instead of sending the rejected turn on to Claude.
+
+## [0.1.0] - 2026-08-23
+
+The initial aipair release. aipair runs Claude Code and Codex CLI side by side in one tmux session with
+a live merged "bridge" pane, so each agent can read the other, and can drive an autonomous
+mutual-review relay.
+
+### Added
+- **Launcher** `aipair` — `aipair [dir]` / `aipair loop` / `aipair attach|stop|name|status`, plus
+  `peer` / `peer-log` to read the sibling agent's transcript, and `aipair-relay-here` to re-ignite
+  a relay on demand.
+- **`aipair --version` / `aipair-relay --version`** reporting `aipairlib.__version__`.
+- **Sentinel stop protocol** — stop / next / all-done / plan-approval are dedicated sentinels
+  (`[AIPAIR_REVIEW_OK]` / `[AIPAIR_NEXT]` / `[AIPAIR_ALL_DONE]` / `[AIPAIR_PLAN_APPROVED]`) that only
+  fire when alone on the final message's leading line — no false stop/approve from negation,
+  quotes, or inline mentions.
+- **Version gate + JSONL schema gate** — an untested claude/codex keeps the safe relay but loses
+  TUI dialog automation; a log-schema drift stops the loop **fail-closed (exit 7)** unless
+  `--allow-untested-schema`.
+- **Response-attribution gate** — a completed turn is accepted as the answer to our poke only via
+  turn_id (codex) / parentUuid ancestry (claude); a turn_id-less codex turn is never position-guessed.
+- **Transactional installer** — the aipairlib package, the thin entrypoints, the retired flat libs,
+  the skills, the two global notice blocks, and the optional VS Code tasks install as ONE journaled,
+  all-or-nothing transaction; a smoke-test failure rolls the whole install back.
+- **CI** — a 3-lane matrix (python 3.8 floor / 3.13 current, tmux 3.1 floor) plus a nightly split of
+  upstream-latest smoke and an authenticated end-to-end pinned to `corelib.TESTED_VERSIONS`.
+- **`tests/doc-sync.py`** — pins README / SECURITY / CI to the code (tested CLI versions, sentinels,
+  exit codes, schema protocol, CI matrix, release version).
+
+### Security
+- `SECURITY.md` threat model. Permission-bypass is opt-in (`--unsafe`) and required only for
+  `aipair loop`; interactive `aipair` keeps each agent's normal permission prompts.
+
+[0.2.0]: https://github.com/inoutvillage/aipair/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/inoutvillage/aipair/releases/tag/v0.1.0

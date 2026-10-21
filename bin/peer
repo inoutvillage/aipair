@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# peer — show the *other* agent's transcript.
+# Inside an `aipair` tmux session, $AI_PEER is set (claude<->codex), so an agent
+# can just run `peer` (or `peer --watch`) to read its sibling's live conversation.
+if [ -n "${AI_PEER:-}" ]; then
+  exec peer-log "$AI_PEER" "$@"
+fi
+# Not launched by aipair: no designated peer — show both merged.
+exec peer-log both "$@"

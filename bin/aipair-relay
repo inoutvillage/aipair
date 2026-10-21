@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Thin entrypoint for the relay (#7): the implementation is aipairlib.relay. This file adds
+its own directory to sys.path so `from aipairlib import relay` finds the sibling package,
+whether run from the repo (bin/) or installed (~/.local/bin/)."""
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from aipairlib import relay
+
+if __name__ == "__main__":
+    sys.exit(relay.main())

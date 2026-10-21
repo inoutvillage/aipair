@@ -1,0 +1,89 @@
+---
+name: aipair-relay
+description: "aipair セッション内で、Codex との自律レビュー往復（relay）をオンデマンドで1本起こす。relay は停止フレーズ（既定 [AIPAIR_REVIEW_OK]）等で終了して往復が止まるので、新しい仕事ができた時に再点火する。起動トリガー例『リレーで処理して』『relay で回して』『Codex にレビューさせて』『レビュー往復を起こして』『もう一周レビュー回して』。前提: 実行中の aipair ペア（tmux）の Claude ペイン内であること。ペア外の通常セッションでは使えない。"
+---
+
+# aipair-relay（レビュー往復のオンデマンド点火）
+
+`aipair` は Claude + Codex を tmux で並走させ、`aipair-relay` が両者のペインを交互に poke して
+自律的にレビューし合わせる。relay は停止フレーズ（既定 `[AIPAIR_REVIEW_OK]`）や上限ラウンドで**終了する**＝
+そこで往復が止まる。このスキルは、**新しい仕事ができた時に relay を1本だけ起こし直す**ためのもの。
+
+## いつ使うか（オンデマンド。自動再起動ではない）
+
+- **ユーザーが「リレーで処理して」「relay で回して」等**と言った（＝③のトリガー）。
+- **自分（Claude）がレビュー往復を回す価値があると判断した**（＝②のトリガー。例: 大きめの実装を終え、Codex の批判的レビューを一周かけたい）。
+- **前の relay が終了した後**、次の仕事について改めて往復したい（＝①。前 relay が終わっているのが前提）。
+
+> 🚫 これは「終わったら勝手に次を回す」常駐ではない。**1回叩けば relay 1本**。無限ループにしないための設計（maintainer decision）。停止フレーズ（`[AIPAIR_REVIEW_OK]`）で終わった直後に無条件で再点火すると、Codex がまた即 `[AIPAIR_REVIEW_OK]` → 延々ループになるため、**新しい入力がある時だけ**起こす。
+
+## 前提チェック（最初に必ず）
+
+- `echo "${TMUX:-なし} / self=${AI_SELF:-なし} / peer=${AI_PEER:-なし}"` を見る。
+- `TMUX` が空、または aipair ペアの外 → **このスキルは使えない**。ユーザーに「aipair ペア内の Claude ペインでのみ有効です」と伝えて終了する。ペアの起動自体は人間が `aipair loop <dir>` で行う（このスキルは起動しない）。
+
+## 実行
+
+共通コマンド **`aipair-relay-here`** を呼ぶ（Codex も同じコマンドを自分のペインから直接使える）。
+
+```bash
+# まずドライランで、検出した bridge ペインと組み立てたコマンドを確認する（推奨）
+aipair-relay-here --print [rounds N] [stop "フレーズ"] [stop-side codex|claude|both]
+
+# 問題なければ本番（--print を外す）
+aipair-relay-here [rounds N] [stop "フレーズ"] [stop-side codex|claude|both]
+```
+
+- 引数なし = `aipair-relay --adopt`（既存ペアに乗る）＋ relay 既定（stop=`[AIPAIR_REVIEW_OK]` / stop-side=codex / max-rounds=20）。
+  ただし `AIPAIR_*` が環境にあればそれが既定になる（**優先順位: 引数 > env > 既定**）。
+  何が実際に渡るかは必ず `--print` で確認する（env が効いていると見た目の引数と違う）。
+- 自然言語 → 引数の対応:
+  - 「10ラウンドで」 → `rounds 10`
+  - 「私が OK と言ったら止めて」 → `stop OK stop-side claude`
+  - 「Codex が納得したら終わり」 → 既定（stop-side codex）でよい
+  - 「Codex から始めて」「Codex の返事を待つところから」 → `--start-side codex`（**役割は変わらない**。最初に Codex の
+    完了を待ち、その結果を Claude に渡して通常の往復に入るだけ）
+- relay は **bridge ペイン**で走り出す。呼んだ側のターンはすぐ戻る（ブロックしない）。
+- **二重起動はガードされる**: bridge が busy（relay 走行中 / peer-log watch 中）なら exit 2 で中止する。その旨をユーザーに伝える。
+
+## 連続モード（endless・2026-08-16 追加）
+
+「全部終わるまで回して」「タスクリストが尽きるまで自走して」と**明示的に頼まれた時だけ**使う。
+
+```bash
+aipair-relay-here --print -- --endless --max-rounds 100     # まずドライラン
+aipair-relay-here -- --endless --max-rounds 100
+```
+
+- 停止フレーズ（`[AIPAIR_REVIEW_OK]`）は**終了ではなく「レビュー合格→次のタスクへ」**の合図になる。
+- Claude 側の手持ちが尽きたら本文冒頭に **`[AIPAIR_NEXT]`** と書く → relay が Codex に
+  `tasks/todo.md` の未チェック項目から次の1件を指示させる。
+- **終端は relay の task-list 分類（READY/BLOCKED/ALL_DONE）が権威で 2 つ**: 全完了（`[AIPAIR_ALL_DONE]`・exit 0）と、人間対応の `- [!]`（直下に `blocker:` 理由）だけが残る HUMAN_REQUIRED（`[AIPAIR_HUMAN_REQUIRED]`・exit 8・人間対応待ち）。着手可 `- [ ]` が残る間は終端 sentinel を無視して継続（+ `--max-rounds` の安全キャップ）。
+  既定の 20 往復ではすぐキャップに当たるので `--max-rounds` を大きめに。
+- 上の 🚫（無限ループにしない）は**既定モードの話**。連続モードはユーザーが明示的に選んだ時だけで、
+  こちらから勝手に `--endless` を付けない。
+
+## 完全自走モード（autopilot・2026-09-25 追加）
+
+「人間に確認せず最後まで走らせて」「止まらずに完成まで」と**明示的に頼まれた時だけ**使う（勝手に付けない）。
+
+```bash
+aipair-relay-here --print --autopilot             # まずドライラン（endless と併用するなら --endless も）
+aipair-relay-here --autopilot --endless
+```
+
+- 人間待ち（`[AIPAIR_HUMAN_REQUIRED]`）で止まらず、Codex が人間の代理として判断する。不可逆な操作は実行させず、元に戻せる選択肢で続行。
+- プランレビュー／質問リレー／レビュー停滞は上限で止めず《収束の段》で必ず前へ進む。`--max-rounds` は明示した時だけ効く。
+- 自分（Claude）も人間の確認待ちでターンを終えない。判断が要る点は推奨案で進めるか、質問として明記すれば Codex が答える。
+
+## 点火後の振る舞い（重要）
+
+- relay を起こしたら、**自分（Claude）はそのターンを終える**。以降は relay が「Codex にレビューさせる → その指摘を Claude に返す」を駆動する。点火後に自分で作業を続けると、relay の poke と衝突する。
+- 会話の流れは `peer`（相手の最新）/ `peer-log both`（両者マージ）で追える。
+- 止めたい時は bridge ペインで Ctrl-C（または relay が停止フレーズを検知して自然終了）。
+
+## 失敗時
+
+- `aipair-relay-here` が exit≠0 を返したら、その stderr（tmux外 / bridge が busy / bridge 未検出 等）を**そのままユーザーに伝えて停止**する。勝手に別手段で relay を起こそうとしない。
+- **点火したのに relay が立たなかった場合も exit≠0** になる（bridge の打ちかけ入力・copy-mode・launch 行のエラー等）。
+  その時は stderr に出る **bridge ペインの末尾**をそのままユーザーへ伝える。成功時は「起動を確認」と前景プロセス名が出る。

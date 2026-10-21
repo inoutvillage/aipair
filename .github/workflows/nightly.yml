@@ -1,0 +1,249 @@
+name: nightly-smoke
+# The push/PR CI (ci.yml) MOCKS claude/codex — fast and hermetic, but blind to the real CLIs
+# changing under aipair. This nightly is split into two independent jobs so a failure says WHICH
+# thing broke:
+#   upstream-latest-smoke — installs the LATEST claude + codex from npm (no secrets) and checks
+#     they still install / print --version / start a 3-pane aipair pair. A red here = "an upstream
+#     CLI changed today", independent of aipair.
+#   authenticated-e2e — pins the TESTED_VERSIONS claude + codex and runs the real authenticated
+#     round-trip (needs ANTHROPIC + OPENAI repo secrets + API budget; SKIPS without them). A red
+#     here on a KNOWN-GOOD pinned version = "aipair's own round-trip regressed", independent of
+#     whatever upstream shipped. The round-trip requires all three of: claude replied with EXACTLY
+#     the nonce, codex genuinely responded (non-empty last_agent_message in the poked turn), and
+#     the relay poked claude back — torn down either way (fail-closed).
+on:
+  schedule:
+    - cron: '37 18 * * *'   # daily ~03:37 JST
+  workflow_dispatch:
+jobs:
+  upstream-latest-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'   # current Claude Code needs node >= 22 (engines); lts/* satisfies it
+      - name: Install the real claude + codex CLIs (no auth needed for --version)
+        run: |
+          set -eux
+          npm install -g @anthropic-ai/claude-code @openai/codex
+          command -v claude; command -v codex
+          claude --version
+          codex --version
+      - name: Install tmux
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux
+      - name: Versions
+        run: tmux -V; node --version; python3 --version; claude --version; codex --version
+      - name: Verify aipair's real launch forms exit cleanly (not just that 3 panes exist)
+        run: |
+          set -eux
+          # The installer smoke only asserts 3 panes; a CLI that error-exits inside a pane would
+          # leave a shell and still "pass". aipair launches claude as `claude --session-id <uuid>
+          # <flags>`, so run that EXACT form and require a clean exit (set -e) + a version string.
+          uuid="$(cat /proc/sys/kernel/random/uuid)"
+          out="$(claude --session-id "$uuid" --version)"; echo "$out"
+          printf '%s\n' "$out" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+' || { echo "claude --session-id --version printed no version" >&2; exit 1; }
+          cout="$(codex --version)"; echo "$cout"
+          printf '%s\n' "$cout" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+' || { echo "codex --version printed no version" >&2; exit 1; }
+      - name: aipair install + smoke against the REAL CLIs
+        run: |
+          set -eux
+          # The installer's own smoke starts a real pair (AIPAIR_*_FLAGS=--version so no TUI),
+          # asserts 3 panes on a throw-away session, then tears it down. The CI runner's default
+          # tmux server is ephemeral, so no private-socket shim is needed here.
+          bash aipair-install.sh
+  authenticated-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'   # current Claude Code needs node >= 22 (engines); lts/* satisfies it
+      - name: Install the PINNED tested claude + codex (from TESTED_VERSIONS, not latest)
+        run: |
+          set -eux
+          # Pin to the versions aipair is VERIFIED against so a red here means aipair's round-trip
+          # regressed — not that upstream shipped something new today. Read the pins from the single
+          # source of truth (corelib.TESTED_VERSIONS) so they never drift from the code / README.
+          CV="$(python3 -c 'import sys; sys.path.insert(0,"bin"); from aipairlib.corelib import TESTED_VERSIONS as T; print(T["claude"])')"
+          XV="$(python3 -c 'import sys; sys.path.insert(0,"bin"); from aipairlib.corelib import TESTED_VERSIONS as T; print(T["codex"])')"
+          echo "pinning claude=$CV codex=$XV"
+          npm install -g "@anthropic-ai/claude-code@$CV" "@openai/codex@$XV"
+          claude --version | grep -qF "$CV" || { echo "claude pin mismatch: wanted $CV, got $(claude --version)" >&2; exit 1; }
+          codex --version | grep -qF "$XV" || { echo "codex pin mismatch: wanted $XV, got $(codex --version)" >&2; exit 1; }
+      - name: Install tmux
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux
+      - name: aipair install (+ smoke) against the pinned CLIs
+        run: |
+          set -eux
+          bash aipair-install.sh
+      - name: Authenticated end-to-end (opt-in; needs BOTH secrets)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -u
+          if [ -z "${ANTHROPIC_API_KEY:-}" ] || [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "skip: the round-trip E2E needs BOTH ANTHROPIC_API_KEY and OPENAI_API_KEY repo"
+            echo "secrets (+ API budget) — not run."
+            exit 0
+          fi
+          # Both credentials are present → run a real one-round-trip: drive claude with a first
+          # prompt carrying a unique nonce, and require that (a) the nonce reaches claude's
+          # transcript AND (b) claude's turn completes so the relay delivers a poke to codex — the
+          # relay stamps every delivery `relay-id:<hex>`, which then appears raw in codex's rollout.
+          # Both signals within the timeout = a genuine poke → reply → relay round-trip. Anything
+          # else FAILS (fail-closed). The session is always torn down (trap), pass or fail.
+          export PATH="$HOME/.local/bin:$PATH"          # aipair-install.sh installed the CLIs here
+          command -v aipair >/dev/null 2>&1 || { echo "E2E FAIL: aipair not on PATH after install" >&2; exit 1; }
+          # A tmux server inherits the environment of the process that STARTS it, not of a later
+          # client that attaches. Any server the smoke step left behind began WITHOUT these keys,
+          # so its panes could never authenticate. Kill it so `aipair loop` spawns a FRESH server
+          # under this step's env (both keys included), which the claude/codex panes inherit.
+          tmux kill-server 2>/dev/null || true
+
+          WORK="$(mktemp -d)"
+          printf '# e2e\n- [ ] echo the token\n' > "$WORK/todo.md"
+          SID="$(cat /proc/sys/kernel/random/uuid)"
+          NONCE="E2E-$(cat /proc/sys/kernel/random/uuid)"
+          # AIPAIR_STOP_SIDE=claude is DELIBERATE: with the default (codex), codex — following the
+          # review prompt — replies "[AIPAIR_REVIEW_OK]" on approval, which is the stop phrase, so the relay
+          # would terminate on the codex turn and NEVER poke claude back. That would make the
+          # return-hop signal unreachable even when both sides authenticated (a false failure).
+          # Ending only on CLAUDE's stop phrase (which our nonce reply never contains) lets the
+          # relay perform the return hop regardless of codex's content; max-rounds still bounds it.
+          export AIPAIR_UNSAFE=1 AIPAIR_MAX_ROUNDS=3 AIPAIR_STOP_SIDE=claude AIPAIR_CLAUDE_SESSION="$SID"
+          NAME="$(aipair name "$WORK")"
+
+          dump() {   # leave a readable trail in the run log on failure
+            echo "----- bridge (relay) pane -----" >&2
+            b="$(tmux show-options -t "$NAME" -qv @aipair-bridge-pane 2>/dev/null)"
+            [ -n "$b" ] && tmux capture-pane -pt "$b" 2>/dev/null | tail -40 >&2 || true
+            echo "----- transcripts -----" >&2
+            peer-log both --dir "$WORK" --full --tools 2>/dev/null | tail -80 >&2 || true
+          }
+          cleanup() { aipair stop "$WORK" >/dev/null 2>&1 || tmux kill-server 2>/dev/null || true; rm -rf "$WORK"; }
+          trap cleanup EXIT
+
+          # `aipair loop` builds a DETACHED session, then `exec tmux attach` (needs a tty). `script`
+          # supplies a pty and `timeout` bounds the attach; the session it built persists after the
+          # attach client is killed, and the agents keep running in their panes.
+          timeout 25 script -qec "aipair loop '$WORK'" /dev/null >/dev/null 2>&1 || true
+          tmux has-session -t "=$NAME" 2>/dev/null || { echo "E2E FAIL: the pair session was not created" >&2; dump; exit 1; }
+          claude_pane="$(tmux show-options -t "$NAME" -qv @aipair-claude-pane 2>/dev/null)"
+          [ -n "$claude_pane" ] || { echo "E2E FAIL: no claude pane recorded on the session" >&2; dump; exit 1; }
+
+          # Wait for claude to come up (its <SID>.jsonl transcript appears once it starts), then act
+          # as the human first mover and inject the nonce prompt. The round-trip poll is the real
+          # gate, so proceed after a bounded wait even if the file check is slow.
+          for _ in $(seq 1 15); do
+            find "$HOME/.claude/projects" -name "$SID.jsonl" 2>/dev/null | grep -q . && break
+            sleep 2
+          done
+          sleep 3
+          tmux send-keys -t "$claude_pane" -l "Reply with EXACTLY this token and nothing else: $NONCE"
+          sleep 1
+          tmux send-keys -t "$claude_pane" Enter
+
+          # Full round-trip, fail-closed — success needs ALL THREE, and each requires real auth:
+          #  (1) claude REPLIED with EXACTLY the nonce: an assistant turn in <SID>.jsonl whose
+          #      joined text.strip() == nonce (the prompt demanded exactly it — a mere mention
+          #      like "the token is …" must not pass), not the user prompt we injected.
+          #  (2) codex GENUINELY RESPONDED: in codex's rollout, the turn of the FIRST relay-id
+          #      poke (matched by internal_chat_message_metadata_passthrough.turn_id) has a
+          #      task_complete whose last_agent_message is NON-EMPTY. A relay-id user item alone
+          #      is recorded before any OpenAI call, and the relay pokes claude back even on an
+          #      empty task_complete — so an invalid OPENAI_API_KEY could clear (3) but never (2).
+          #  (3) the relay POKED CLAUDE BACK: a `relay-id:<hex>` appears in claude's own rollout.
+          #      claude's first turn is our injected prompt (no relay-id), so any relay-id there is
+          #      unambiguously the return hop. (AIPAIR_STOP_SIDE=claude above keeps codex's
+          #      approving "[AIPAIR_REVIEW_OK]" from ending the relay before that hop.)
+          claude_echoed() {
+            python3 - "$SID" "$NONCE" <<'PY' 2>/dev/null
+          import sys, os, json, glob
+          sid, nonce = sys.argv[1], sys.argv[2]
+          for f in glob.glob(os.path.expanduser("~/.claude/projects/*/%s.jsonl" % sid)):
+              try:
+                  for line in open(f, encoding="utf-8"):
+                      line = line.strip()
+                      if not line:
+                          continue
+                      try:
+                          d = json.loads(line)
+                      except Exception:
+                          continue
+                      if d.get("type") != "assistant":
+                          continue
+                      c = (d.get("message") or {}).get("content")
+                      if isinstance(c, str):
+                          text = c
+                      elif isinstance(c, list):
+                          text = "".join(b.get("text", "") for b in c
+                                         if isinstance(b, dict) and b.get("type") == "text")
+                      else:
+                          text = ""
+                      if text.strip() == nonce:
+                          sys.exit(0)
+              except Exception:
+                  pass
+          sys.exit(1)
+          PY
+          }
+          claude_log() { ls "$HOME"/.claude/projects/*/"$SID".jsonl 2>/dev/null | head -1; }
+          codex_replied() {   # codex produced a NON-EMPTY response in the turn the relay poked
+            python3 - "$WORK" <<'PY2' 2>/dev/null
+          import sys, os, glob, json
+          def norm(x): return os.path.normcase(os.path.realpath(os.path.expanduser(x))).rstrip("/")
+          work = norm(sys.argv[1])
+          def rollout_cwd(f):
+              try:
+                  with open(f, encoding="utf-8", errors="replace") as fh:
+                      m = json.loads(fh.readline())
+                  cw = (m.get("payload") or {}).get("cwd") or m.get("cwd")
+                  return norm(cw) if cw else ""
+              except Exception:
+                  return ""
+          root = os.path.expanduser("~/.codex/sessions")
+          cands = [f for f in glob.glob(os.path.join(root, "*", "*", "*", "rollout-*.jsonl"))
+                   if rollout_cwd(f) == work]
+          if not cands:
+              sys.exit(1)
+          path = max(cands, key=lambda f: os.path.getmtime(f))
+          relay_turn = None
+          completes = {}
+          for line in open(path, encoding="utf-8", errors="replace"):
+              try:
+                  d = json.loads(line)
+              except Exception:
+                  continue
+              pl = d.get("payload") or {}
+              typ, pt = d.get("type"), pl.get("type")
+              if typ == "response_item" and pt == "message" and pl.get("role") == "user" \
+                      and relay_turn is None:
+                  txt = "".join(b.get("text", "") for b in (pl.get("content") or [])
+                                if isinstance(b, dict))
+                  if "relay-id:" in txt:
+                      meta = pl.get("internal_chat_message_metadata_passthrough") or {}
+                      relay_turn = meta.get("turn_id")
+              elif typ == "event_msg" and pt == "task_complete":
+                  completes[pl.get("turn_id")] = (pl.get("last_agent_message") or "").strip()
+          sys.exit(0 if (relay_turn and completes.get(relay_turn)) else 1)
+          PY2
+          }
+          saw_reply=0; codex_real=0; saw_return=0
+          for _ in $(seq 1 120); do       # up to ~240s for the full round-trip
+            claude_echoed && saw_reply=1
+            codex_replied && codex_real=1
+            f="$(claude_log)"; [ -n "$f" ] && grep -qE 'relay-id:[0-9a-f]+' "$f" && saw_return=1
+            [ "$saw_reply" = 1 ] && [ "$codex_real" = 1 ] && [ "$saw_return" = 1 ] && break
+            sleep 2
+          done
+          if [ "$saw_reply" = 1 ] && [ "$codex_real" = 1 ] && [ "$saw_return" = 1 ]; then
+            echo "E2E PASS: claude replied EXACTLY with $NONCE, codex genuinely responded (non-empty last_agent_message in the poked turn), and the relay poked claude back — full round-trip confirmed."
+            exit 0
+          fi
+          echo "E2E FAIL: round-trip incomplete (claude_replied_exactly=$saw_reply codex_genuine_response=$codex_real relay_returned_to_claude=$saw_return)." >&2
+          dump
+          exit 1

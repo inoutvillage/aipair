@@ -1,0 +1,4216 @@
+#!/usr/bin/env python3
+"""Fixture tests for the pure parts of aipair-relay and peer-log: stop-phrase detection,
+env parsing, pane discovery, Claude's plan / question dialogs, turn-completion detection
+and transcript parsing. No tmux, no agents, nothing under ~ is touched.
+    python3 tests/relay-parsers.py
+"""
+import importlib.machinery, importlib.util, inspect, json, os, subprocess, sys, tempfile, time, types, unittest
+from datetime import datetime, timezone
+from unittest import mock
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+BIN = os.path.join(os.path.dirname(HERE), "bin")
+
+
+def load_module(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+sys.path.insert(0, BIN)
+import aipairlib.relay as relay   # the package (#7); was a SourceFileLoader of bin/aipair-relay
+peerlog = relay.peerlog
+
+
+def _imports_without_relay(modname, *check_attrs):
+    """A CLEAN interpreter can `import aipairlib.<modname>` WITHOUT pulling in aipairlib.relay
+    (the package's libs never depend back on relay). Returns True on that + every check_attr
+    being callable. Replaces the old standalone SourceFileLoader tests, which can't load a
+    package module that uses relative imports (from . import …)."""
+    attrs = "".join("; assert callable(getattr(m, %r))" % a for a in check_attrs)
+    code = ("import sys; sys.path.insert(0, %r); import aipairlib.%s as m%s; "
+            "sys.exit(3 if 'aipairlib.relay' in sys.modules else 0)" % (BIN, modname, attrs))
+    return subprocess.run([sys.executable, "-c", code], capture_output=True).returncode == 0
+
+
+def epoch(iso):
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+class HitStop(unittest.TestCase):
+    # 制御信号は自然言語から分離した専用 sentinel。最終メッセージの《先頭の非空行が
+    # sentinel と完全一致》した時だけ成立する（否定文・引用・文中言及・同一行の後続テキストは不成立）。
+    OK = "[AIPAIR_REVIEW_OK]"
+    DONE = "[AIPAIR_ALL_DONE]"
+
+    def test_sentinel_alone_or_with_following_lines(self):
+        self.assertTrue(relay.hit_stop([self.OK], [self.OK]), "sentinel 単独 → true")
+        self.assertTrue(relay.hit_stop([self.OK + "\n問題ありません。"], [self.OK]),
+                        "sentinel + 後続説明(2行目) → true")
+        self.assertTrue(relay.hit_stop(["\n\n" + self.OK], [self.OK]),
+                        "先頭の空行は許容")
+
+    def test_sentinel_not_at_head_does_not_stop(self):
+        self.assertFalse(relay.hit_stop(["レビュー結果:\n" + self.OK], [self.OK]),
+                         "sentinel が2行目 → false")
+        self.assertFalse(relay.hit_stop(["まだ " + self.OK + " とは言えません。"], [self.OK]),
+                         "「まだ sentinel ではない」→ false")
+        self.assertFalse(relay.hit_stop([self.DONE + "ではありません。あと2件残っています。"], [self.DONE]),
+                         "「sentinelではありません」→ false")
+        self.assertFalse(relay.hit_stop(["この後 " + self.OK + " と回答してください。"], [self.OK]),
+                         "「sentinel と回答してください」→ false")
+
+    def test_same_line_trailing_text_does_not_stop(self):
+        self.assertFalse(relay.hit_stop([self.OK + " 問題ありません"], [self.OK]),
+                         "sentinel は先頭行に単独で置かれた時のみ成立（同一行の後続テキストは不成立）")
+
+    def test_mid_message_mention_does_not_stop(self):
+        self.assertFalse(relay.hit_stop(["ツールの修正が " + self.OK + " 。ただし本題は残っています。"], [self.OK]),
+                         "100字以内の文中一致 → false")
+        self.assertFalse(relay.hit_stop(["x" * 120 + " " + self.OK], [self.OK]),
+                         "100字以降の一致 → false")
+
+    def test_only_the_last_message_head_counts(self):
+        self.assertFalse(relay.hit_stop([self.OK, "まだ直す点があります"], [self.OK]),
+                         "先行ナレーションが sentinel でも、最終メッセージが別なら停止しない")
+
+    def test_several_candidates_only_the_leading_one(self):
+        self.assertTrue(relay.hit_stop([self.OK], [self.OK, self.DONE]),
+                        "複数候補のうち先頭行に一致する sentinel のみ true")
+        self.assertFalse(relay.hit_stop([self.OK], [self.DONE]),
+                         "先頭が OK の時に DONE 単独では成立しない")
+
+    def test_custom_phrase_also_head_exact(self):
+        # カスタム停止ワードも先頭行完全一致（substring ではない）
+        self.assertTrue(relay.hit_stop(["LGTM\nship it"], ["LGTM"]))
+        self.assertFalse(relay.hit_stop(["**LGTM** — ship it"], ["LGTM"]),
+                         "markdown で囲んだ言及は制御信号ではない")
+
+    def test_empty(self):
+        self.assertFalse(relay.hit_stop([], [self.OK]))
+        self.assertFalse(relay.hit_stop([self.OK], []))
+
+
+class HeadLine(unittest.TestCase):
+    def test_first_non_empty_line_stripped(self):
+        self.assertEqual(relay.head_line("  [AIPAIR_NEXT]  \n次の行"), "[AIPAIR_NEXT]")
+        self.assertEqual(relay.head_line("\n\n  hello \nworld"), "hello")
+        self.assertEqual(relay.head_line(""), "")
+        self.assertEqual(relay.head_line("   \n\t\n"), "")
+
+
+class EnvHelpers(unittest.TestCase):
+    def setUp(self):
+        relay.ENV_USED.clear()
+
+    def test_str_and_empty_means_default(self):
+        with mock.patch.dict(os.environ, {"X_STR": ""}, clear=False):
+            self.assertEqual(relay._env_str("X_STR", "d"), "d")
+        with mock.patch.dict(os.environ, {"X_STR": "v"}):
+            self.assertEqual(relay._env_str("X_STR", "d"), "v")
+            self.assertIn("X_STR=v", relay.ENV_USED)
+
+    def test_int_accepts_positive_and_rejects_the_rest_loudly(self):
+        with mock.patch.dict(os.environ, {"X_INT": "7"}):
+            self.assertEqual(relay._env_int("X_INT", 1), 7)
+        for bad in ("0", "-3", "abc", "1.5"):
+            with mock.patch.dict(os.environ, {"X_INT": bad}), self.assertRaises(SystemExit) as cm, \
+                 mock.patch("sys.stderr"):
+                relay._env_int("X_INT", 1)
+            self.assertEqual(cm.exception.code, 2, bad)
+
+    def test_bool_values_like_the_launcher(self):
+        for v in ("1", "true", "YES", " On "):
+            with mock.patch.dict(os.environ, {"X_B": v}):
+                self.assertTrue(relay._env_bool("X_B"), v)
+        for v in ("0", "false", "No", " OFF "):
+            with mock.patch.dict(os.environ, {"X_B": v}):
+                self.assertFalse(relay._env_bool("X_B"), v)
+        with mock.patch.dict(os.environ, {"X_B": ""}):
+            self.assertEqual(relay._env_bool("X_B", default=True), True)
+
+
+def panes(*rows):
+    """Fake `tmux list-panes -F '#{pane_id}\\t#{pane_current_command}\\t#{pane_title}'` output.
+    find_panes now lives in aipairlib.tmuxlib and calls that module's `tmux`, so patch there."""
+    out = "\n".join("\t".join(r) for r in rows) + "\n"
+    def side(*a, **k):
+        if a and a[0] == "show-options":
+            return types.SimpleNamespace(stdout="")     # stamps unset here → heuristic path
+        return types.SimpleNamespace(stdout=out)
+    return mock.patch.object(relay.tmuxlib, "tmux", side_effect=side)
+
+
+class FindPanes(unittest.TestCase):
+    def test_by_title(self):
+        with panes(("%0", "claude", "claude"), ("%1", "python3", "relay ● …"), ("%2", "node", "codex")), \
+             mock.patch.dict(os.environ, {"TMUX_PANE": "%1"}):
+            self.assertEqual(relay.find_panes("s"), {"claude": "%0", "codex": "%2"})
+
+    def test_titles_overwritten_by_the_clis_fall_back_to_command_then_order(self):
+        with panes(("%0", "claude", "✳ aipair OSS review"), ("%1", "python3", "relay"), ("%2", "node", "aipair")), \
+             mock.patch.dict(os.environ, {"TMUX_PANE": "%1"}):
+            self.assertEqual(relay.find_panes("s"), {"claude": "%0", "codex": "%2"},
+                             "claude by command, codex as the only non-shell leftover")
+
+    def test_own_pane_is_never_picked(self):
+        with panes(("%0", "claude", "claude"), ("%2", "node", "codex")), \
+             mock.patch.dict(os.environ, {"TMUX_PANE": "%2"}):
+            self.assertEqual(relay.find_panes("s"), {"claude": "%0"})
+
+    def test_stamped_pane_options_win_over_the_heuristic(self):
+        # both agent panes look identical to the heuristic (node/blank title) and the stamps are
+        # REVERSED from layout order — only honouring @aipair-*-pane gets it right.
+        rows = [("%0", "node", "x"), ("%1", "python3", "relay"), ("%2", "node", "y")]
+        listing = "\n".join("\t".join(r) for r in rows) + "\n"
+        stamps = {"@aipair-claude-pane": "%2", "@aipair-codex-pane": "%0"}
+        def fake(*a, **k):
+            if a[0] == "list-panes":
+                return types.SimpleNamespace(stdout=listing)
+            if a[0] == "show-options":
+                return types.SimpleNamespace(stdout=stamps.get(a[-1], "") + "\n")
+            return types.SimpleNamespace(stdout="")
+        with mock.patch.object(relay.tmuxlib, "tmux", side_effect=fake), \
+             mock.patch.dict(os.environ, {"TMUX_PANE": "%1"}):
+            self.assertEqual(relay.find_panes("s"), {"claude": "%2", "codex": "%0"})
+
+    def test_one_dead_stamp_does_NOT_fall_back_and_reverse_roles(self):
+        # Codex's scenario: claude stamp=%2 (live), codex stamp=%9 (gone). Live %0=node,%2=node are
+        # ambiguous, so the heuristic would return {claude:%0,codex:%2} — REVERSED. Once ANY stamp
+        # exists the heuristic is forbidden: keep the live stamp, leave the dead side UNRESOLVED so
+        # the relay refuses to start (it checks both roles) rather than guess.
+        rows = [("%0", "node", "x"), ("%1", "python3", "relay"), ("%2", "node", "y")]
+        listing = "\n".join("\t".join(r) for r in rows) + "\n"
+        stamps = {"@aipair-claude-pane": "%2", "@aipair-codex-pane": "%9"}   # %9 gone
+        def fake(*a, **k):
+            if a[0] == "list-panes":
+                return types.SimpleNamespace(stdout=listing)
+            if a[0] == "show-options":
+                return types.SimpleNamespace(stdout=stamps.get(a[-1], "") + "\n")
+            return types.SimpleNamespace(stdout="")
+        with mock.patch.object(relay.tmuxlib, "tmux", side_effect=fake), \
+             mock.patch.dict(os.environ, {"TMUX_PANE": "%1"}):
+            self.assertEqual(relay.find_panes("s"), {"claude": "%2"})
+
+    def test_a_stamp_query_failure_is_not_read_as_unset(self):
+        # a tmux hiccup reading one stamp must NOT drop to the heuristic (fail-open) — the role is
+        # left unresolved, like a dead stamp.
+        rows = [("%0", "node", "x"), ("%1", "python3", "relay"), ("%2", "node", "y")]
+        listing = "\n".join("\t".join(r) for r in rows) + "\n"
+        def fake(*a, **k):
+            if a[0] == "list-panes":
+                return types.SimpleNamespace(stdout=listing)
+            if a[0] == "show-options":
+                if a[-1] == "@aipair-claude-pane":
+                    return types.SimpleNamespace(stdout="%2\n")
+                raise subprocess.CalledProcessError(1, "tmux")   # codex query fails
+            return types.SimpleNamespace(stdout="")
+        with mock.patch.object(relay.tmuxlib, "tmux", side_effect=fake), \
+             mock.patch.dict(os.environ, {"TMUX_PANE": "%1"}):
+            self.assertEqual(relay.find_panes("s"), {"claude": "%2"})
+
+    def test_codex_only_stamp_keeps_codex_and_infers_claude_from_the_rest(self):
+        # backward compat: a pair started before the claude/bridge stamps existed has ONLY
+        # @aipair-codex-pane. Codex stays pinned by its stamp; the genuinely-UNSET claude role is
+        # inferred from the remaining panes (not a hard fail). node/node is ambiguous to the
+        # heuristic, but codex is already locked to %2, so claude can only be %0.
+        rows = [("%0", "node", "x"), ("%1", "python3", "relay"), ("%2", "node", "y")]
+        listing = "\n".join("\t".join(r) for r in rows) + "\n"
+        stamps = {"@aipair-codex-pane": "%2"}   # claude stamp UNSET
+        def fake(*a, **k):
+            if a[0] == "list-panes":
+                return types.SimpleNamespace(stdout=listing)
+            if a[0] == "show-options":
+                return types.SimpleNamespace(stdout=stamps.get(a[-1], "") + "\n")
+            return types.SimpleNamespace(stdout="")
+        with mock.patch.object(relay.tmuxlib, "tmux", side_effect=fake), \
+             mock.patch.dict(os.environ, {"TMUX_PANE": "%1"}):
+            self.assertEqual(relay.find_panes("s"), {"codex": "%2", "claude": "%0"})
+
+    def test_a_stamp_pointing_at_the_relays_own_pane_is_unresolved(self):
+        # relay wrongly launched from the codex pane (%2). @aipair-codex-pane=%2 == self must NOT
+        # resolve codex to the relay's own pane (it would then monitor / poke itself). Codex is
+        # unresolved; claude (unset) is inferred from the rest.
+        rows = [("%0", "claude", "claude"), ("%2", "node", "codex")]
+        listing = "\n".join("\t".join(r) for r in rows) + "\n"
+        stamps = {"@aipair-codex-pane": "%2"}   # points at self
+        def fake(*a, **k):
+            if a[0] == "list-panes":
+                return types.SimpleNamespace(stdout=listing)
+            if a[0] == "show-options":
+                return types.SimpleNamespace(stdout=stamps.get(a[-1], "") + "\n")
+            return types.SimpleNamespace(stdout="")
+        with mock.patch.object(relay.tmuxlib, "tmux", side_effect=fake), \
+             mock.patch.dict(os.environ, {"TMUX_PANE": "%2"}):
+            self.assertEqual(relay.find_panes("s"), {"claude": "%0"})   # codex(self) unresolved
+
+    def test_duplicate_stamps_leave_the_second_role_unresolved(self):
+        rows = [("%0", "node", "x"), ("%1", "python3", "relay"), ("%2", "node", "y")]
+        listing = "\n".join("\t".join(r) for r in rows) + "\n"
+        stamps = {"@aipair-claude-pane": "%2", "@aipair-codex-pane": "%2"}   # both point at %2
+        def fake(*a, **k):
+            if a[0] == "list-panes":
+                return types.SimpleNamespace(stdout=listing)
+            if a[0] == "show-options":
+                return types.SimpleNamespace(stdout=stamps.get(a[-1], "") + "\n")
+            return types.SimpleNamespace(stdout="")
+        with mock.patch.object(relay.tmuxlib, "tmux", side_effect=fake), \
+             mock.patch.dict(os.environ, {"TMUX_PANE": "%1"}):
+            self.assertEqual(relay.find_panes("s"), {"claude": "%2"})
+
+    def test_layout_order_when_nothing_identifies_them(self):
+        with panes(("%0", "foo", "x"), ("%1", "bash", "shell"), ("%2", "bar", "y")), \
+             mock.patch.dict(os.environ, {"TMUX_PANE": "%9"}):
+            self.assertEqual(relay.find_panes("s"), {"claude": "%0", "codex": "%2"})
+
+
+# claude 2.1.247 の実画面（2026-08-27 実測）。承認肢から "bypass" 表記が消え、プランのパスは
+# 「ctrl+g to edit in nano · <path>」の形で出る（`·` を挟むのでパス抽出の除外文字も回帰にかかる）。
+PLAN_SCREEN = """\
+   検証
+  ──────────────────────────────────────────────────
+   Claude has written up a plan and is ready to execute. Would you like to proceed?
+
+   ❯ 1. Yes, and use auto mode
+     2. Yes, manually approve edits
+     3. Tell Claude what to change
+        shift+tab to approve with this feedback
+
+   ctrl+g to edit in nano · ~/.claude/plans/snazzy-fox.md
+"""
+
+
+# 旧 UI（"Yes, and bypass permissions" があった頃）。承認肢の文言は版で動くので、
+# 現行と旧の両方を検出できることを別ケースとして残す。
+LEGACY_BYPASS_PLAN_SCREEN = """\
+ ╭─ Plan ───────────────────────────────────╮
+ │ Ready to code?                            │
+ │ Plan saved: ~/.claude/plans/snazzy-fox.md │
+ ╰───────────────────────────────────────────╯
+ Would you like to proceed?
+
+ ❯ 1. Yes, and bypass permissions
+   2. Yes, manually approve edits
+   3. Tell Claude what to change
+"""
+
+
+class TmuxHelpers(unittest.TestCase):
+    """aipairlib.tmuxlib: the tmux runner's pane helpers. Every real subprocess is faked by
+    patching aipairlib.tmuxlib's own `tmux` (the helpers call it within that module)."""
+    def _tmux(self, side_effect):
+        return mock.patch.object(relay.tmuxlib, "tmux", side_effect=side_effect)
+
+    def test_current_session_ok_and_error(self):
+        with self._tmux(lambda *a, **k: types.SimpleNamespace(stdout="sess-1\n")):
+            self.assertEqual(relay.current_session(), "sess-1")
+        import subprocess
+        with self._tmux(subprocess.CalledProcessError(1, "tmux")):
+            self.assertIsNone(relay.current_session())
+
+    def test_own_pane(self):
+        import subprocess
+        # no TMUX_PANE → None (no tmux call)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(relay.own_pane("s"))
+        with mock.patch.dict(os.environ, {"TMUX_PANE": "%2"}):
+            with self._tmux(lambda *a, **k: types.SimpleNamespace(stdout="%0\n%2\n%3\n")):
+                self.assertEqual(relay.own_pane("s"), "%2")     # our pane belongs to the session
+            with self._tmux(lambda *a, **k: types.SimpleNamespace(stdout="%0\n%3\n")):
+                self.assertIsNone(relay.own_pane("s"))          # our pane is in another session
+            with self._tmux(subprocess.CalledProcessError(1, "tmux")):
+                self.assertIsNone(relay.own_pane("s"))
+
+    def test_cancel_copy_mode_only_cancels_when_in_mode(self):
+        calls = []
+        def fake(*a, **k):
+            calls.append(a)
+            if a[:1] == ("display-message",):
+                return types.SimpleNamespace(stdout=self._mode + "\n")
+            return types.SimpleNamespace(stdout="")
+        self._mode = "1"                                        # pane IS in copy-mode
+        with self._tmux(fake), mock.patch.object(relay.tmuxlib.time, "sleep"):
+            relay.cancel_copy_mode("%0")
+        self.assertTrue(any(a[:2] == ("send-keys", "-t") and "cancel" in a for a in calls), "sends the cancel key")
+        calls.clear(); self._mode = "0"                        # pane NOT in copy-mode
+        with self._tmux(fake), mock.patch.object(relay.tmuxlib.time, "sleep"):
+            relay.cancel_copy_mode("%0")
+        self.assertFalse(any(a[:1] == ("send-keys",) for a in calls), "no cancel when not in copy-mode")
+
+    def test_pane_busy_fast_path_and_diff_boundary(self):
+        # fast path: 'esc to interrupt' visible → busy immediately
+        with self._tmux(lambda *a, **k: types.SimpleNamespace(stdout="working... esc to interrupt")):
+            self.assertTrue(relay.pane_busy("%0"))
+        # two captures identical → idle
+        seq = iter(["same\nlines\nhere", "same\nlines\nhere"])
+        with self._tmux(lambda *a, **k: types.SimpleNamespace(stdout=next(seq))), \
+             mock.patch.object(relay.tmuxlib.time, "sleep"):
+            self.assertFalse(relay.pane_busy("%0"))
+        # 2 lines changed (< 3) → NOT busy (idle animation tolerance)
+        seq = iter(["a\nb\nc\nd", "a\nX\nY\nd"])
+        with self._tmux(lambda *a, **k: types.SimpleNamespace(stdout=next(seq))), \
+             mock.patch.object(relay.tmuxlib.time, "sleep"):
+            self.assertFalse(relay.pane_busy("%0"))
+        # 3 lines changed (>= 3) → busy
+        seq = iter(["a\nb\nc\nd", "a\nX\nY\nZ"])
+        with self._tmux(lambda *a, **k: types.SimpleNamespace(stdout=next(seq))), \
+             mock.patch.object(relay.tmuxlib.time, "sleep"):
+            self.assertTrue(relay.pane_busy("%0"))
+
+    def test_capture_pane_and_set_title(self):
+        with self._tmux(lambda *a, **k: types.SimpleNamespace(stdout="screen")):
+            self.assertEqual(relay.capture_pane("%0"), "screen")
+        seen = []
+        with self._tmux(lambda *a, **k: seen.append(a) or types.SimpleNamespace(stdout="")):
+            relay.set_pane_title("%0", "hi"); relay.set_pane_title("", "no-op")
+        self.assertEqual(len([a for a in seen if a[:1] == ("select-pane",)]), 1, "empty pane → no call")
+
+
+class Delivery(unittest.TestCase):
+    """aipairlib.deliverylib: poke / submit_enter / press / paste_text. The tmux runner and the
+    dialog/log hooks are injected into the delivery module — patch them there."""
+    def setUp(self):
+        self.dl = relay.deliverylib
+        self._clock = [1000.0]                          # a fake clock: sleep() advances it, so the
+        def _sleep(sec): self._clock[0] += (sec or 0.01)  # busy-wait deadlines are reached at once
+        def _time(): self._clock[0] += 0.001; return self._clock[0]
+        self.p = [
+            mock.patch.object(self.dl.time, "sleep", side_effect=_sleep),
+            mock.patch.object(self.dl.time, "time", side_effect=_time),
+            mock.patch.object(self.dl, "dim"),
+        ]
+        for x in self.p: x.start()
+    def tearDown(self):
+        for x in self.p: x.stop()
+
+    def _tmux(self, side_effect):
+        return mock.patch.object(self.dl, "tmux", side_effect=side_effect)
+
+    def test_press_and_paste_cancel_copy_mode_first(self):
+        seen = []
+        with mock.patch.object(self.dl, "cancel_copy_mode", side_effect=lambda p: seen.append(("cancel", p))), \
+             self._tmux(lambda *a, **k: seen.append(a) or types.SimpleNamespace(stdout="")):
+            self.dl.press("%0", "Enter")
+            self.assertEqual(seen[0], ("cancel", "%0"), "press cancels copy-mode before send-keys")
+            seen.clear()
+            self.dl.paste_text("%0", "hi")
+            self.assertEqual(seen[0], ("cancel", "%0"), "paste cancels copy-mode first")
+            self.assertTrue(any(a[:1] == ("paste-buffer",) for a in seen))
+
+    def test_submit_enter_confirm_success(self):
+        with self._tmux(lambda *a, **k: types.SimpleNamespace(stdout="")), \
+             mock.patch.object(self.dl, "cancel_copy_mode"):
+            self.assertTrue(self.dl.submit_enter("%0", confirm=lambda: True, badge=False))
+
+    def test_submit_enter_badge_success(self):
+        with self._tmux(lambda *a, **k: types.SimpleNamespace(stdout="running esc to interrupt")), \
+             mock.patch.object(self.dl, "cancel_copy_mode"):
+            self.assertTrue(self.dl.submit_enter("%0", confirm=None, badge=True))
+
+    def test_submit_enter_aborts_on_dialog_before_re_pressing(self):
+        # first Enter isn't confirmed → on the retry, a dialog is on screen → abort (return True,
+        # do NOT press Enter again, which would mis-select an option)
+        sends = []
+        with self._tmux(lambda *a, **k: (sends.append(a) if a[:1] == ("send-keys",) else None) or types.SimpleNamespace(stdout="")), \
+             mock.patch.object(self.dl, "cancel_copy_mode"), \
+             mock.patch.object(relay.dialoglib, "dialog_on_screen", side_effect=[True]):
+            ok = self.dl.submit_enter("%0", confirm=lambda: False, badge=False)
+        self.assertTrue(ok)
+        self.assertEqual(len([a for a in sends if "Enter" in a]), 1, "only the first Enter is sent; retry aborts")
+
+    def test_submit_enter_three_retries_then_fail(self):
+        enters = []
+        with self._tmux(lambda *a, **k: (enters.append(a) if a[-1:] == ("Enter",) else None) or types.SimpleNamespace(stdout="")), \
+             mock.patch.object(self.dl, "cancel_copy_mode"), \
+             mock.patch.object(relay.dialoglib, "dialog_on_screen", return_value=False), \
+             mock.patch.object(self.dl.sys.stdout, "write"), mock.patch.object(self.dl.sys.stdout, "flush"):
+            self.assertFalse(self.dl.submit_enter("%0", confirm=lambda: False, badge=False))
+        self.assertEqual(len(enters), 3, "Enter re-pressed 3 times before giving up")
+
+    def test_poke_confirms_via_nonce_and_returns_it(self):
+        # composer shows whatever was sent (echo of the last -l text) → nonce appears → delivered;
+        # confirm(probe) True → submit_enter succeeds → poke returns the nonce string.
+        state = {"buf": ""}
+        def fake(*a, **k):
+            if a[:2] == ("send-keys", "-t") and "-l" in a:
+                state["buf"] = a[-1]                      # the literal text incl. the nonce
+            if a[:1] == ("capture-pane",):
+                return types.SimpleNamespace(stdout=state["buf"])
+            return types.SimpleNamespace(stdout="")
+        got = {}
+        with self._tmux(fake), mock.patch.object(self.dl, "cancel_copy_mode"), \
+             mock.patch.object(self.dl, "pane_busy", return_value=False), \
+             mock.patch.object(relay.dialoglib, "dialog_on_screen", return_value=False):
+            res = self.dl.poke("%0", "please review", confirm=lambda probe: got.setdefault("p", probe) or True, badge=False)
+        self.assertIsInstance(res, str); self.assertTrue(res.startswith("relay-id:"))
+        self.assertEqual(res, got["p"], "poke returns the nonce it delivered and confirmed")
+
+    def test_poke_delivery_failure_returns_None_and_never_enters(self):
+        # composer never shows the nonce → 3 delivery attempts fail → return None, no Enter sent
+        enters = []
+        def fake(*a, **k):
+            if a[-1:] == ("Enter",): enters.append(a)
+            return types.SimpleNamespace(stdout="unrelated screen")   # nonce never appears
+        with self._tmux(fake), mock.patch.object(self.dl, "cancel_copy_mode"), \
+             mock.patch.object(self.dl, "pane_busy", return_value=False), \
+             mock.patch.object(relay.dialoglib, "dialog_on_screen", return_value=False), \
+             mock.patch.object(self.dl.sys.stdout, "write"), mock.patch.object(self.dl.sys.stdout, "flush"):
+            self.assertFalse(self.dl.poke("%0", "hi", confirm=lambda p: True, badge=False))
+        self.assertEqual(enters, [], "no Enter is pressed when delivery could not be confirmed")
+
+    def test_poke_waits_for_busy_then_proceeds(self):
+        # busy for the first checks, then idle; poke still proceeds and delivers
+        busy = iter([True, True, False, False, False, False, False, False])
+        state = {"buf": ""}
+        def fake(*a, **k):
+            if a[:2] == ("send-keys", "-t") and "-l" in a: state["buf"] = a[-1]
+            if a[:1] == ("capture-pane",): return types.SimpleNamespace(stdout=state["buf"])
+            return types.SimpleNamespace(stdout="")
+        with self._tmux(fake), \
+             mock.patch.object(self.dl, "cancel_copy_mode"), \
+             mock.patch.object(self.dl, "pane_busy", side_effect=lambda p: next(busy, False)), \
+             mock.patch.object(relay.dialoglib, "dialog_on_screen", return_value=False):
+            res = self.dl.poke("%0", "x", confirm=lambda p: True, badge=False, busy_wait=30)
+        self.assertTrue(res and res.startswith("relay-id:"))
+
+
+    def test_poke_pastes_the_body_and_types_only_the_nonce(self):
+        # 2026-09-14 実測（Codex）: 幅 57 のペインへ ~1,900 字を send-keys -l で打つと、後続の Enter が
+        # TUI の取り込みバーストに吸収されて未送信のまま残る（codex 0.153.4 / 0.154.0 とも。実障害:
+        # 質問リレーが「Enter を3回送っても送信を確認できず」で停止）。同じ長さでもブラケットペースト
+        # なら通常の Enter で即送信できる → 本文はペースト、画面確認用の nonce だけをリテラル入力する。
+        body = "Q" * 1900
+        seen = []
+        state = {"buf": ""}
+
+        def fake(*a, **k):
+            seen.append(a)
+            if a[:2] == ("send-keys", "-t") and "-l" in a:
+                state["buf"] += a[-1]                       # composer echoes only what was typed
+            if a[:1] == ("capture-pane",):
+                return types.SimpleNamespace(stdout=state["buf"])
+            return types.SimpleNamespace(stdout="")
+        with self._tmux(fake), mock.patch.object(self.dl, "cancel_copy_mode"), \
+             mock.patch.object(self.dl, "pane_busy", return_value=False), \
+             mock.patch.object(relay.dialoglib, "dialog_on_screen", return_value=False):
+            res = self.dl.poke("%0", body, confirm=lambda p: True, badge=False)
+        self.assertTrue(res and res.startswith("relay-id:"))
+        literals = [a[-1] for a in seen if a[:2] == ("send-keys", "-t") and "-l" in a]
+        self.assertTrue(all(body not in x for x in literals), "the long body must NEVER go through send-keys -l")
+        self.assertTrue(any(res in x and len(x) < 60 for x in literals), "only the short nonce is typed")
+        self.assertTrue(any(body in a for a in seen if a[:1] == ("set-buffer",)), "the body goes into a paste buffer")
+        i_paste = max(i for i, a in enumerate(seen) if a[:1] == ("paste-buffer",))
+        i_nonce = max(i for i, a in enumerate(seen) if a[:2] == ("send-keys", "-t") and "-l" in a)
+        i_enter = min(i for i, a in enumerate(seen) if a[-1:] == ("Enter",))
+        self.assertLess(i_paste, i_nonce, "paste the body first")
+        self.assertLess(i_nonce, i_enter, "type the nonce, then Enter")
+
+    def test_poke_fails_when_only_the_body_arrives_and_the_nonce_does_not(self):
+        # 本文ペーストと nonce 入力は別コマンドなので「本文だけ届き nonce が届かない」が起こりうる。
+        # 以前の《本文冒頭が見えたら配達とみなす》フォールバックはこれを成功扱いにし、届いていない
+        # nonce で Enter を押して arm してしまう（Codex レビュー 2026-09-14）→ nonce 確認のみを成立条件に。
+        body = "PLEASE REVIEW THE DIFF" * 10
+        enters = []
+        caps = {"n": 0}
+
+        def fake(*a, **k):
+            if a[-1:] == ("Enter",):
+                enters.append(a)
+            if a[:1] == ("capture-pane",):
+                caps["n"] += 1
+                # 1 回目（旧実装が撮る "before"）は本文の無い画面。以後は本文だけが見え nonce は出ない
+                # ＝旧実装が「本文冒頭が新たに現れた」と見て配達成立にしてしまう条件そのもの。
+                return types.SimpleNamespace(stdout="" if caps["n"] == 1 else body)
+            return types.SimpleNamespace(stdout="")
+        with self._tmux(fake), mock.patch.object(self.dl, "cancel_copy_mode"), \
+             mock.patch.object(self.dl, "pane_busy", return_value=False), \
+             mock.patch.object(relay.dialoglib, "dialog_on_screen", return_value=False), \
+             mock.patch.object(self.dl.sys.stdout, "write"), mock.patch.object(self.dl.sys.stdout, "flush"):
+            res = self.dl.poke("%0", body, confirm=lambda p: True, badge=True)
+        self.assertFalse(res, "delivery is confirmed by the nonce alone — the body being visible is not enough")
+        self.assertEqual(enters, [], "no Enter when the nonce never appeared")
+
+    def test_paste_text_deletes_its_buffer_even_when_the_paste_fails(self):
+        # paste-buffer -d は貼り付けが成功した時しか消さない。失敗（ペイン消失等）で本文入りバッファが
+        # 残り、一意名にしたぶん溜まっていく（Codex レビュー 2026-09-14）→ try/finally で必ず消す。
+        seen = []
+
+        def fake(*a, **k):
+            seen.append(a)
+            if a[:1] == ("paste-buffer",):
+                raise subprocess.CalledProcessError(1, "tmux")
+            return types.SimpleNamespace(stdout="")
+        with self._tmux(fake), mock.patch.object(self.dl, "cancel_copy_mode"):
+            with self.assertRaises(subprocess.CalledProcessError):
+                self.dl.paste_text("%0", "body")               # 元の例外は握り潰さない
+        name = next(a[a.index("-b") + 1] for a in seen if a[:1] == ("set-buffer",))
+        deletes = [a for a in seen if a[:1] == ("delete-buffer",)]
+        self.assertTrue(deletes, "the buffer is deleted even when the paste failed")
+        self.assertEqual(deletes[-1][deletes[-1].index("-b") + 1], name, "the same buffer name is deleted")
+
+    def test_paste_text_uses_a_unique_buffer_per_call(self):
+        # 固定名 (`aipair-relay`) は、同時に走る別 relay の貼り付けを上書きしうる（Codex レビュー）。
+        seen = []
+        with self._tmux(lambda *a, **k: seen.append(a) or types.SimpleNamespace(stdout="")), \
+             mock.patch.object(self.dl, "cancel_copy_mode"):
+            self.dl.paste_text("%0", "a")
+            self.dl.paste_text("%0", "b")
+        names = [a[a.index("-b") + 1] for a in seen if a[:1] in (("set-buffer",), ("paste-buffer",))]
+        self.assertEqual(len(names), 4, "set-buffer + paste-buffer per call")
+        self.assertEqual(len(set(names)), 2, "each call uses its own buffer name")
+        self.assertNotIn("aipair-relay", names, "the old fixed buffer name is gone")
+        self.assertTrue(all("-d" in a for a in seen if a[:1] == ("paste-buffer",)), "the buffer is deleted after pasting")
+
+
+class DeliverylibStandalone(unittest.TestCase):
+    def test_loads_without_relay_and_re_exports(self):
+        self.assertTrue(_imports_without_relay("deliverylib", "poke", "submit_enter", "press", "paste_text"))
+        # the idle budget is an explicit poke() argument now (was an injected BUSY_WAIT attribute)
+        self.assertEqual(inspect.signature(relay.deliverylib.poke).parameters["busy_wait"].default, 90)
+        self.assertIs(relay.poke, relay.deliverylib.poke)
+
+
+class TmuxlibStandalone(unittest.TestCase):
+    def test_loads_without_relay(self):
+        loader = importlib.machinery.SourceFileLoader("tmuxlib_standalone", os.path.join(BIN, "aipairlib", "tmuxlib.py"))
+        tl = importlib.util.module_from_spec(importlib.util.spec_from_loader("tmuxlib_standalone", loader))
+        loader.exec_module(tl)
+        self.assertTrue(callable(tl.tmux) and callable(tl.find_panes))
+        self.assertIs(relay.find_panes, relay.tmuxlib.find_panes)
+
+
+class PlanDialog(unittest.TestCase):
+    def detect(self, screen):
+        with mock.patch.object(relay.dialoglib, "capture_pane", return_value=screen), \
+             mock.patch.object(relay.dialoglib, "newest_plan", return_value=None):
+            return relay.detect_plan_dialog("%0")
+
+    def test_reads_numbers_from_the_screen(self):
+        # 現行 UI: "bypass" 表記が無いので、先頭の "Yes…"（= auto mode）が承認肢になる
+        d = self.detect(PLAN_SCREEN)
+        self.assertEqual((d["tell"], d["yes"]), ("3", "1"))
+        self.assertEqual(d["yes_label"], "Yes, and use auto mode")
+        self.assertEqual(d["plan"], os.path.expanduser("~/.claude/plans/snazzy-fox.md"))
+
+    def test_legacy_bypass_screen_still_parses(self):
+        # 旧 UI 互換: 文言が変わっても検出は壊れない（番号は画面から読む）
+        d = self.detect(LEGACY_BYPASS_PLAN_SCREEN)
+        self.assertEqual((d["tell"], d["yes"]), ("3", "1"))
+        self.assertTrue(d["yes_label"].startswith("Yes, and bypass"))
+        self.assertEqual(d["plan"], os.path.expanduser("~/.claude/plans/snazzy-fox.md"))
+
+    def test_prefers_the_bypass_variant_wherever_it_is(self):
+        screen = (LEGACY_BYPASS_PLAN_SCREEN
+                  .replace("1. Yes, and bypass permissions", "1. Yes")
+                  .replace("2. Yes, manually approve edits", "2. Yes, and bypass permissions"))
+        self.assertEqual(self.detect(screen)["yes"], "2")
+
+    def test_no_dialog(self):
+        self.assertIsNone(self.detect("just a transcript\n1. not an option list\n"))
+        self.assertIsNone(self.detect("Would you like to proceed?\n(no numbered options)\n"))
+
+
+QUESTION_SCREEN = """\
+ ← ☐ Database  ☒ Cache  ✔ Submit →
+ ─────────────────────────────────
+ Pick a database
+ ❯ 1. Postgres
+   2. SQLite
+   3. Chat about this
+
+ Enter to select · ↑↓ to navigate · Esc to cancel
+"""
+
+
+class QuestionDialog(unittest.TestCase):
+    def detect(self, screen):
+        with mock.patch.object(relay.dialoglib, "capture_pane", return_value=screen):
+            return relay.detect_question_dialog("%0")
+
+    def test_detects_chat_number_only_while_the_footer_is_the_last_line(self):
+        self.assertEqual(self.detect(QUESTION_SCREEN), {"chat": "3"})
+        self.assertIsNone(self.detect(QUESTION_SCREEN + "\n > composer\n"), "footer gone = dialog gone")
+        self.assertIsNone(self.detect(QUESTION_SCREEN.replace("3. Chat about this", "3. Other")), "no chat action")
+        self.assertIsNone(self.detect("Would you like to proceed?\n" + QUESTION_SCREEN), "plan dialog wins")
+
+    def test_question_block_text(self):
+        block = relay.dialoglib._question_block(QUESTION_SCREEN)
+        self.assertIn("Pick a database", block)
+        self.assertIn("1. Postgres", block)
+        self.assertIn("2. SQLite", block)
+        self.assertNotIn("Chat about this", block)
+        self.assertNotIn("Submit", block)
+
+    def test_single_question_without_tab_bar(self):
+        screen = "\n".join(l for l in QUESTION_SCREEN.splitlines() if "Submit" not in l) + "\n"
+        self.assertIn("Pick a database", relay.dialoglib._question_block(screen))
+        self.assertIsNone(relay.dialoglib._question_block("no footer here\n1. a\n2. b\n"))
+
+    def test_poke_does_not_truncate_question_body(self):
+        # P1-3: question_poke_codex は truncate しない（上限超過は decide_question_relay が事前に停止）。
+        # payload 全文がそのまま含まれ、省略記号は入らない。
+        body = "q" * 5000
+        text = relay.question_poke_codex([body], "[AIPAIR_HUMAN_REQUIRED]")
+        self.assertIn(body, text)
+        self.assertNotIn("…", text)
+
+    def test_poke_offers_human_required_when_token_given(self):
+        # P1-2: sentinel トークンが与えられたら HUMAN_REQUIRED 経路（1行目に単独出力）を案内する。
+        text = relay.question_poke_codex(["Pick a database"], "[AIPAIR_HUMAN_REQUIRED]")
+        self.assertIn("[AIPAIR_HUMAN_REQUIRED]", text)
+        self.assertIn("1行目", text)
+        self.assertIn("人間", text)
+
+    def test_poke_omits_human_required_when_token_empty(self):
+        # 通常モードで --human-required を空にした場合（None）は HR 経路を案内しない。
+        text = relay.question_poke_codex(["Pick a database"], None)
+        self.assertNotIn("HUMAN_REQUIRED", text)
+        self.assertIn("Pick a database", text)
+
+
+class StopGate(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="aipair-gate.")
+        self.quiet = [mock.patch.object(relay, "log"), mock.patch("builtins.print")]
+        for q in self.quiet:
+            q.start()
+
+    def tearDown(self):
+        for q in self.quiet:
+            q.stop()
+        self.tmp.cleanup()
+
+    def args(self, gate, rounds=3, timeout=5):
+        return types.SimpleNamespace(gate=gate, dir=self.tmp.name, gate_timeout=timeout, gate_rounds=rounds)
+
+    def test_timeout_kills_the_whole_process_group(self):
+        marker = os.path.join(self.tmp.name, "marker")
+        ok, out = relay.run_gate(f"(sleep 0.8; echo x > {marker!r}) & wait", self.tmp.name, 0.2)
+        self.assertFalse(ok); self.assertIn("timeout", out)
+        time.sleep(1.2)                                       # long enough for an orphan to have written it
+        self.assertFalse(os.path.exists(marker), "the backgrounded grandchild must have been killed")
+
+    def test_term_ignoring_child_is_sigkilled(self):
+        marker = os.path.join(self.tmp.name, "marker")
+        ok, out = relay.run_gate(f"(trap '' TERM; sleep 1.2; printf survived > {marker!r}) & wait", self.tmp.name, 0.2)
+        self.assertFalse(ok); self.assertIn("timeout", out)
+        time.sleep(1.8)
+        self.assertFalse(os.path.exists(marker), "a child ignoring SIGTERM must still be SIGKILLed")
+
+    def test_unbounded_output_is_capped_not_accumulated(self):
+        ok, out = relay.run_gate("yes ABCDEFGH | head -c 5000000; false", self.tmp.name, 10)
+        self.assertFalse(ok)
+        self.assertLessEqual(len(out.encode("utf-8", "replace")), relay.GATE_OUTPUT_CAP + 64)
+        self.assertIn("truncated", out)
+
+    def test_non_utf8_output_does_not_crash(self):
+        ok, out = relay.run_gate(r"printf '\377\376done'; exit 5", self.tmp.name, 5)
+        self.assertFalse(ok); self.assertIn("done", out)
+
+    def test_keyboardinterrupt_kills_the_group_and_re_raises(self):
+        import threading, _thread
+        marker = os.path.join(self.tmp.name, "ci-marker")
+        threading.Timer(0.3, _thread.interrupt_main).start()
+        with self.assertRaises(KeyboardInterrupt):
+            relay.run_gate(f"(trap '' TERM; sleep 1.2; printf x > {marker!r}) & wait", self.tmp.name, 10)
+        time.sleep(1.4)
+        self.assertFalse(os.path.exists(marker), "gate group must be killed on Ctrl-C")
+
+    def test_shell_exiting_with_a_background_job_leaves_nothing_running(self):
+        marker = os.path.join(self.tmp.name, "bg-marker")
+        ok, _ = relay.run_gate(f"(sleep 1.0; printf x > {marker!r}) & true", self.tmp.name, 10)
+        self.assertTrue(ok)
+        time.sleep(1.5)
+        self.assertFalse(os.path.exists(marker), "backgrounded job must be reaped, not orphaned")
+
+    def test_control_chars_are_scrubbed_from_output(self):
+        ok, out = relay.run_gate(r"printf '\000\033[31mFAIL\033[0m\007tab\there'; false", self.tmp.name, 5)
+        self.assertFalse(ok)
+        self.assertNotIn("\x00", out); self.assertNotIn("\x1b", out); self.assertNotIn("\x07", out)
+        self.assertIn("FAIL", out); self.assertIn("\t", out)     # tab kept (poke folds it later)
+        m = relay.gate_message("gate", out, 1, 3)
+        self.assertNotIn("\x00", m); self.assertNotIn("\x1b", m)
+
+    def test_scrub_output_unit(self):
+        self.assertEqual(relay.scrub_output("a\x00b\x1b[31mc\x1b[0m"), "a bc")   # NUL→space, ANSI removed
+        self.assertEqual(relay.scrub_output("keep\nnew\tt"), "keep\nnew\tt")     # newline/tab preserved
+        self.assertEqual(relay.scrub_output("x\x1b]0;title\x07y"), "xy")           # OSC removed
+        # the whole Cc category, not just ord < 32: DEL (0x7f) and C1 (0x80-0x9f)
+        self.assertEqual(relay.scrub_output("A\x7fB\x85C\x9fD"), "A B C D")
+        for cc in ("\x7f", "\x80", "\x9f", "\x9b"):    # incl. C1 CSI (0x9b)
+            self.assertNotIn(cc, relay.scrub_output("x" + cc + "y"))
+
+    def test_gate_runs_in_the_normalised_cwd_even_when_dir_is_unexpanded(self):
+        # gate_or_message must use the cwd it is handed, not a.dir (which may be quoted / ~)
+        a = types.SimpleNamespace(gate="test -f only-here", dir="~/does-not-exist", gate_timeout=5, gate_rounds=3)
+        open(os.path.join(self.tmp.name, "only-here"), "w").close()
+        self.assertEqual(relay.gate_or_message(a, {"fails": 0}, self.tmp.name), (True, None))
+
+    def test_multiline_command_never_puts_a_newline_in_the_poke(self):
+        cmd = "npm test\nnpx tsc --noEmit\n" + "x" * 400
+        m = relay.gate_message(cmd, "boom", 1, 3)
+        self.assertNotIn("\n", m)
+        self.assertIn("npm test npx tsc", m)
+        self.assertLess(m.index("`") + 1 + 210, len(m))       # command portion capped near 200
+
+    def test_run_gate(self):
+        self.assertEqual(relay.run_gate("true", self.tmp.name, 5), (True, ""))
+        ok, out = relay.run_gate("echo out; echo err >&2; exit 3", self.tmp.name, 5)
+        self.assertFalse(ok); self.assertIn("out", out); self.assertIn("err", out)
+        ok, out = relay.run_gate("sleep 5", self.tmp.name, 0.3)
+        self.assertFalse(ok); self.assertIn("timeout", out)
+        ok, out = relay.run_gate("pwd", self.tmp.name, 5)
+        self.assertEqual(out.strip(), os.path.realpath(self.tmp.name), "runs in --dir")
+
+    def test_gate_tail_is_one_line_and_capped(self):
+        out = "\n".join(f"line {i}" for i in range(100)) + "\n\n   \n"
+        tail = relay.gate_tail(out, lines=40, limit=1500)
+        self.assertNotIn("\n", tail)
+        self.assertTrue(tail.startswith("line 60"), tail[:30])
+        self.assertTrue(tail.endswith("line 99"))
+        self.assertLessEqual(len(relay.gate_tail("x" * 5000, limit=1500)), 1500)
+        self.assertEqual(relay.gate_tail(""), "")
+
+    def test_gate_message_mentions_count_and_output(self):
+        m = relay.gate_message("npm test", "FAIL src/a.test.ts\n  expected 1 got 2", 2, 3)
+        self.assertNotIn("\n", m)
+        self.assertIn("`npm test`", m); self.assertIn("2/3", m); self.assertIn("expected 1 got 2", m)
+        self.assertIn("(no output)", relay.gate_message("true", "", 1, 3))
+
+    def test_gate_or_message_state_machine(self):
+        st = {"fails": 0}; d = self.tmp.name
+        self.assertEqual(relay.gate_or_message(self.args(None), st, d), (True, None), "no gate = as before")
+        self.assertEqual(relay.gate_or_message(self.args("true"), st, d), (True, None))
+        ok, msg = relay.gate_or_message(self.args("echo boom >&2; false", rounds=3), st, d)
+        self.assertFalse(ok); self.assertIn("boom", msg); self.assertEqual(st["fails"], 1)
+        ok, msg = relay.gate_or_message(self.args("false", rounds=3), st, d)
+        self.assertFalse(ok); self.assertIn("2/3", msg)
+        self.assertEqual(relay.gate_or_message(self.args("false", rounds=3), st, d), (False, None), "limit reached")
+        self.assertEqual(relay.gate_or_message(self.args("true"), st, d), (True, None))
+        self.assertEqual(st["fails"], 0, "a pass resets the counter (endless: per task)")
+
+
+class CliBoundaries(unittest.TestCase):
+    """The real script must reject non-positive integer flags before doing anything
+    (argparse type=int lets 0 / negatives through; the env path is guarded separately)."""
+    RELAY = os.path.join(BIN, "aipair-relay")
+
+    def run_relay(self, *args, env=None):
+        e = dict(os.environ); e.update(env or {})
+        return subprocess.run([sys.executable, self.RELAY, *args, "--session", "none"],
+                              capture_output=True, text=True, env=e, timeout=20)
+
+    def test_cli_non_positive_ints_exit_2(self):
+        for flag, val in [("--gate-timeout", "0"), ("--gate-rounds", "-1"), ("--max-rounds", "0"),
+                          ("--plan-rounds", "0"), ("--question-rounds", "-5")]:
+            r = self.run_relay(flag, val)
+            self.assertEqual(r.returncode, 2, f"{flag} {val}: {r.stderr}")
+            self.assertIn(flag, r.stderr)
+
+    def test_subagent_wait_takes_zero_as_off_but_not_a_negative(self):
+        r = self.run_relay("--subagent-wait", "-1")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("--subagent-wait", r.stderr)
+        self.assertEqual(relay.build_parser("x").parse_args([]).subagent_wait, 3600, "on by default")
+        self.assertEqual(relay.build_parser("x").parse_args(["--subagent-wait", "0"]).subagent_wait, 0)
+
+    def test_env_ints_also_guarded(self):
+        r = self.run_relay(env={"AIPAIR_GATE_ROUNDS": "0"})
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("AIPAIR_GATE_ROUNDS", r.stderr)
+
+    def test_bad_stop_side_exits_2(self):
+        r = self.run_relay(env={"AIPAIR_STOP_SIDE": "typo"})
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--stop-side", r.stderr)
+
+    def test_bad_start_side_env_exits_2(self):
+        # argparse の choices は env 由来の既定値を検証しない → main() で弾く（stop_side と同型）
+        r = self.run_relay(env={"AIPAIR_START_SIDE": "typo"})
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--start-side", r.stderr)
+        self.assertIn("typo", r.stderr)
+
+
+class CodexFirstStart(unittest.TestCase):
+    """--start-side codex（Codex 先攻）は《最初に完了を待つ相手》だけを Codex にする。役割交換ではない:
+    Codex の完了 → poke_claude で Claude へ → Claude の完了 → poke_codex で Codex へ、の通常の往復になる。
+    非 endless の実 `StateMachine.run()` を scripted fake で駆動し、poke の (pane, 文面) 履歴で固定する。"""
+
+    def _drive(self, start_side, turns):
+        sm = relay.state_machine
+        a = types.SimpleNamespace(start_side=start_side, settle=0, poll=0, max_rounds=20, endless=False,
+                                  task_list="tasks/todo.md", stop_side="codex", no_plan_review=True,
+                                  no_question_relay=True, plan_rounds=5, question_rounds=5, plan_ok="[P]",
+                                  gate=None, gate_timeout=600, gate_rounds=3)
+        rg = types.SimpleNamespace(response_done=lambda who, path, done: done, noshow=lambda who: False,
+                                   arm=lambda nonce: None, clear=lambda: None, probe=None, probe_ts_cache=0.0)
+        turn_iter = iter(turns)
+
+        def _turn_texts(who, *aa, **kk):
+            agent, texts = next(turn_iter)
+            self.assertEqual(agent, who, "turn script mismatch")
+            return list(texts)
+
+        machine = sm.StateMachine(
+            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x",
+            tracked={"claude": "c.jsonl", "codex": "x.jsonl"}, claude_seen=set(), codex_seen=set(),
+            baseline=0.0, sg=types.SimpleNamespace(guard=lambda: False), rg=rg, bw=60,
+            poke_codex="POKE_CODEX", poke_codex_next="POKE_CODEX_NEXT", poke_claude="POKE_CLAUDE",
+            poke_claude_pass="POKE_CLAUDE_PASS", poke_claude_next="POKE_CLAUDE_NEXT",
+            stop_phrases=["[AIPAIR_REVIEW_OK]"], next_ask_phrases=["[AIPAIR_NEXT]"],
+            all_done_phrases=["[AIPAIR_ALL_DONE]"], human_required_phrases=["[AIPAIR_HUMAN_REQUIRED]"])
+        with mock.patch.object(sm, "set_pane_title"), \
+             mock.patch.object(sm, "claude_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "codex_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "claude_matches_pane", return_value=True), \
+             mock.patch.object(sm, "detect_plan_dialog", return_value=None), \
+             mock.patch.object(sm, "detect_question_dialog", return_value=None), \
+             mock.patch.object(sm, "turn_texts", side_effect=_turn_texts), \
+             mock.patch.object(sm, "poke", return_value=object()) as poke_mock, \
+             mock.patch("time.sleep"):
+            code = machine.run()
+        self.assertRaises(StopIteration, next, turn_iter)   # 台本を最後まで消費した（途中で止まっていない）
+        return code, [(c.args[0], c.args[1]) for c in poke_mock.call_args_list]
+
+    def test_codex_first_waits_on_codex_then_hands_to_claude(self):
+        code, pokes = self._drive("codex", [
+            ("codex", ["X を直してください"]),    # 最初に待つのは Codex の完了（依頼は人間が Codex に出した想定）
+            ("claude", ["直しました"]),
+            ("codex", ["[AIPAIR_REVIEW_OK]"]),    # stop_side=codex の停止ワード → exit 0
+        ])
+        self.assertEqual(code, 0)
+        # 最初の配達は Claude ペインへの poke_claude（Codex への poke はそれより前に出ない）。以後は通常の往復で、
+        # 宛先と文面の組は Claude 先攻と同じ（Codex へは poke_codex）＝役割は入れ替わらない。
+        self.assertEqual(pokes, [("%1", "POKE_CLAUDE"), ("%2", "POKE_CODEX")])
+
+    def test_claude_first_default_is_unchanged(self):
+        code, pokes = self._drive("claude", [
+            ("claude", ["実装しました"]),
+            ("codex", ["[AIPAIR_REVIEW_OK]"]),
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(pokes, [("%2", "POKE_CODEX")])
+
+
+class VersionGate(unittest.TestCase):
+    def a(self, allow=False):
+        return types.SimpleNamespace(no_plan_review=False, no_question_relay=False, allow_untested_dialogs=allow)
+
+    def test_parse_version(self):
+        self.assertEqual(relay.parse_version("2.1.238 (Claude Code)"), "2.1.238")
+        self.assertEqual(relay.parse_version("codex-cli 0.149.0"), "0.149.0")
+        self.assertEqual(relay.parse_version("v12.4 beta"), "12.4")
+        self.assertIsNone(relay.parse_version("no version here"))
+        self.assertIsNone(relay.parse_version(""))
+        # prerelease/build suffixes are KEPT so they don't pass as the tested release
+        self.assertEqual(relay.parse_version("2.1.238-beta.1 (Claude Code)"), "2.1.238-beta.1")
+        self.assertEqual(relay.parse_version("codex-cli 0.149.0-nightly.2"), "0.149.0-nightly.2")
+        self.assertEqual(relay.parse_version("1.2.3+build.5"), "1.2.3+build.5")
+        self.assertNotEqual(relay.parse_version("2.1.238-beta.1"), "2.1.238")
+        # a 4th component or a glued suffix must NOT truncate onto the tested 3-part version.
+        # Derived from TESTED_VERSIONS so a version bump can never leave this checking strings
+        # that are no longer the tested ones (which would pass vacuously).
+        self.assertEqual(relay.parse_version("2.1.238.1"), "2.1.238.1")
+        self.assertEqual(relay.parse_version("2.1.238rc1"), "2.1.238rc1")
+        for tested in relay.TESTED_VERSIONS.values():
+            for bad in (tested + ".1", tested + "rc1", tested + "-beta.1"):
+                self.assertEqual(relay.parse_version(bad), bad)
+                self.assertNotIn(relay.parse_version(bad), relay.TESTED_VERSIONS.values())
+        self.assertEqual(relay.parse_version("2.1."), "2.1")   # never ends on a separator
+
+    def test_prerelease_is_treated_as_a_mismatch(self):
+        a = self.a()
+        _rows, bad = relay.version_gate(a, {"claude": relay.TESTED_VERSIONS["claude"] + "-beta.1",
+                                            "codex": relay.TESTED_VERSIONS["codex"]})
+        self.assertEqual(bad, ["claude"])
+        self.assertTrue(a.no_plan_review, "a prerelease of the tested version is still untested")
+
+    def test_detect_version_runs_binary_and_survives_failure(self):
+        ok = types.SimpleNamespace(stdout="2.1.238 (Claude Code)\n", stderr="", returncode=0)
+        with mock.patch.object(relay.subprocess, "run", return_value=ok):
+            self.assertEqual(relay.detect_version("claude"), "2.1.238")
+        with mock.patch.object(relay.subprocess, "run", side_effect=FileNotFoundError):
+            self.assertIsNone(relay.detect_version("nope"))
+        with mock.patch.object(relay.subprocess, "run",
+                               side_effect=relay.subprocess.TimeoutExpired("x", 10)):
+            self.assertIsNone(relay.detect_version("claude"))
+
+    def test_detect_version_ignores_output_on_non_zero_exit(self):
+        bad = types.SimpleNamespace(stdout="2.1.238\n", stderr="error: not logged in", returncode=1)
+        with mock.patch.object(relay.subprocess, "run", return_value=bad):
+            self.assertIsNone(relay.detect_version("claude"), "non-zero exit is 'unknown', not a version")
+
+    def test_non_utf8_output_is_unknown_not_a_version(self):
+        # errors="replace" keeps decode from raising, but the replacement char means the
+        # bytes were not valid UTF-8 → unknown (None), even if a tested number is present.
+        repl = types.SimpleNamespace(stdout="\ufffd 2.1.238\n", stderr="", returncode=0)
+        with mock.patch.object(relay.subprocess, "run", return_value=repl) as run:
+            self.assertIsNone(relay.detect_version("claude"))
+            self.assertEqual(run.call_args.kwargs.get("errors"), "replace")
+
+    def test_non_utf8_version_disables_dialog_automation(self):
+        a = self.a()
+        with mock.patch.object(relay, "detect_version",
+                               side_effect=lambda b: None if b == "claude"
+                               else relay.TESTED_VERSIONS["codex"]):
+            _rows, bad = relay.version_gate(a, {n: relay.detect_version(n) for n in ("claude", "codex")})
+        self.assertEqual(bad, ["claude"])
+        self.assertTrue(a.no_plan_review and a.no_question_relay)
+
+    def test_matching_versions_keep_dialogs_on(self):
+        a = self.a()
+        rows, bad = relay.version_gate(a, dict(relay.TESTED_VERSIONS))
+        self.assertEqual(bad, [])
+        self.assertFalse(a.no_plan_review or a.no_question_relay)
+        self.assertTrue(all(s == "ok" for _n, _d, _t, s in rows))
+
+    def test_mismatch_turns_dialog_automation_off(self):
+        a = self.a()
+        rows, bad = relay.version_gate(a, {"claude": "9.9.9",
+                                           "codex": relay.TESTED_VERSIONS["codex"]})
+        self.assertEqual(bad, ["claude"])
+        self.assertTrue(a.no_plan_review and a.no_question_relay, "dialogs disabled")
+        self.assertEqual([s for _n, _d, _t, s in rows], ["mismatch", "ok"])
+
+    def test_undetectable_version_is_treated_as_untested(self):
+        a = self.a()
+        _rows, bad = relay.version_gate(a, {"claude": None,
+                                            "codex": relay.TESTED_VERSIONS["codex"]})
+        self.assertEqual(bad, ["claude"])
+        self.assertTrue(a.no_plan_review)
+
+    def test_allow_untested_dialogs_keeps_them_on_but_still_reports(self):
+        a = self.a(allow=True)
+        rows, bad = relay.version_gate(a, {"claude": "9.9.9", "codex": None})
+        self.assertEqual(bad, ["claude", "codex"])
+        self.assertFalse(a.no_plan_review or a.no_question_relay, "opt-in keeps them on")
+
+
+class RunningVersion(unittest.TestCase):
+    """The version gate judges what the pane is RUNNING, not what PATH resolves to (2026-09-12):
+    corelib.cli_version, relay.probe_running's fail-closed 4-state contract, and the startup value."""
+    CLAUDE_OUT = "2.1.268 (Claude Code)\n"
+    CODEX_OUT = "codex-cli 0.154.0\n"
+
+    def test_cli_version_accepts_only_the_clis_own_banner(self):
+        self.assertEqual(relay.cli_version("claude", self.CLAUDE_OUT), ("2.1.268", True))
+        self.assertEqual(relay.cli_version("codex", self.CODEX_OUT), ("0.154.0", True))
+        for foreign in ("v20.11.1\n", "GNU bash, version 5.1.8(1)-release (x86_64-redhat-linux-gnu)\n",
+                        "sleep (GNU coreutils) 8.32\n"):
+            self.assertEqual(relay.cli_version("claude", foreign), (None, False), foreign)
+            self.assertEqual(relay.cli_version("codex", foreign), (None, False), foreign)
+        self.assertEqual(relay.cli_version("codex", self.CLAUDE_OUT), (None, False), "claude's banner is not codex's")
+        self.assertEqual(relay.cli_version("claude", None), (None, False))
+
+    def test_cli_version_takes_the_version_bound_to_the_banner_not_the_first_number(self):
+        # Codex review 2026-09-12: a preceding notice must not pass as the running version.
+        self.assertEqual(relay.cli_version("claude", "notice 2.1.268\n2.1.269 (Claude Code)\n"), ("2.1.269", True))
+        self.assertEqual(relay.cli_version("codex", "update available: 0.150.1\ncodex-cli 0.154.0\n"),
+                         ("0.154.0", True))
+        self.assertEqual(relay.cli_version("codex", "see codex-cli 0.150.1 notes\ncodex-cli 0.154.0\n"),
+                         ("0.154.0", True), "only a line-LEADING codex-cli is the banner")
+        # the banner must carry its number on the same line; disagreeing banners are unknown
+        self.assertEqual(relay.cli_version("claude", "2.1.268\n(Claude Code)\n"), (None, False))
+        self.assertEqual(relay.cli_version("claude", "2.1.268 (Claude Code)\n2.1.269 (Claude Code)\n"), (None, True))
+        self.assertEqual(relay.cli_version("claude", "beta (Claude Code)\n"), (None, True), "no parseable number")
+        # a prerelease stays whole so it can't pass as the tested release
+        self.assertEqual(relay.cli_version("claude", "2.1.268-beta.1 (Claude Code)\n"), ("2.1.268-beta.1", True))
+
+    def _probe(self, *, proc=True, ident=(4242, 99), out=None, same=True):
+        with mock.patch.object(relay.peerlog, "proc_available", return_value=proc), \
+             mock.patch.object(relay.peerlog, "cli_process", return_value=ident) as cp, \
+             mock.patch.object(relay.peerlog, "same_process", return_value=same), \
+             mock.patch.object(relay, "version_output", return_value=out) as vo:
+            return relay.probe_running("%1", "claude"), cp, vo
+
+    def test_probe_running_ok_reads_the_running_executable(self):
+        res, _cp, vo = self._probe(out=self.CLAUDE_OUT)
+        self.assertEqual(res, ("ok", "2.1.268", (4242, 99)))
+        vo.assert_called_once_with("/proc/4242/exe")
+
+    def test_probe_running_unsupported_only_without_proc(self):
+        res, cp, vo = self._probe(proc=False)
+        self.assertEqual(res, ("unsupported", None, None))
+        cp.assert_not_called()
+        vo.assert_not_called()
+
+    def test_probe_running_none_when_there_is_no_candidate_process(self):
+        # not started / restarting / tmux query failed / unusual comm all surface as cli_process() → None
+        # (the tmux-failure path itself is covered in tests/peer-pin.py)
+        res, _cp, vo = self._probe(ident=None)
+        self.assertEqual(res, ("none", None, None))
+        vo.assert_not_called()
+
+    def test_probe_running_is_fail_closed_when_a_candidate_cannot_be_verified(self):
+        # a `claude` process IS there, so each of these must be "fail" (unknown → OFF), never "none" (→ PATH)
+        for out, same, why in ((None, True, "exe won't run / non-zero / non-UTF-8"),
+                               ("v20.11.1\n", True, "an interpreter's banner (script-type CLI)"),
+                               ("(Claude Code)\n", True, "no parseable number"),
+                               (self.CLAUDE_OUT, False, "pid replaced while probing")):
+            res, _cp, _vo = self._probe(out=out, same=same)
+            self.assertEqual(res, ("fail", None, (4242, 99)), why)
+
+    def test_startup_version_is_the_initial_value(self):
+        with mock.patch.object(relay, "probe_running", return_value=("ok", "2.1.268", (1, 2))), \
+             mock.patch.object(relay, "detect_version", return_value="2.1.269"):
+            self.assertEqual(relay.startup_version("%1", "claude"),
+                             {"version": "2.1.268", "source": "ok", "ident": (1, 2), "disk": "2.1.269"})
+        with mock.patch.object(relay, "probe_running", return_value=("fail", None, (1, 2))), \
+             mock.patch.object(relay, "detect_version", return_value="2.1.269"):
+            self.assertIsNone(relay.startup_version("%1", "claude")["version"],
+                              "fail → unknown, NOT the PATH version")
+        for st in ("none", "unsupported"):
+            with mock.patch.object(relay, "probe_running", return_value=(st, None, None)), \
+                 mock.patch.object(relay, "detect_version", return_value="2.1.269") as dv:
+                info = relay.startup_version("%1", "claude")
+                self.assertEqual((info["version"], info["source"], info["disk"]), ("2.1.269", st, None), st)
+                dv.assert_called_once_with("claude")
+        notes = {s: relay.version_source_note("claude", s) for s in ("ok", "fail", "none", "unsupported")}
+        self.assertEqual(len(set(notes.values())), 4, "the banner tells the four sources apart")
+        self.assertIn("PATH", notes["none"])
+        self.assertIn("PATH", notes["unsupported"])
+        self.assertNotIn("PATH", notes["ok"])
+
+    @unittest.skipUnless(os.path.isdir("/proc") and os.path.exists("/bin/sleep"), "needs /proc + /bin/sleep")
+    def test_real_proc_a_look_alike_process_is_fail_not_none(self):
+        # A real child whose comm is `claude` but whose executable is something else (/bin/sleep copied
+        # under that name). It is found; after the file is DELETED (like an npm upgrade) its /proc exe
+        # still answers; the answer is not Claude Code's banner → "fail" (fail-closed), never "none".
+        import shutil
+        with tempfile.TemporaryDirectory() as d:
+            fake = os.path.join(d, "claude")
+            shutil.copy("/bin/sleep", fake)
+            if relay.version_output(fake) is None:
+                self.skipTest("this sleep has no --version")
+            proc = subprocess.Popen([fake, "30"])
+            try:
+                os.remove(fake)
+                with mock.patch.object(relay.peerlog, "_tmux", return_value=str(os.getpid())):
+                    ident, deadline = None, time.time() + 5
+                    while ident is None and time.time() < deadline:
+                        ident = relay.peerlog.cli_process("%0", "claude")
+                        if ident is None:
+                            time.sleep(0.05)
+                    self.assertIsNotNone(ident, "the child is found by its exact comm")
+                    self.assertEqual(ident[0], proc.pid)
+                    self.assertTrue(relay.peerlog.same_process(ident))
+                    self.assertIsNotNone(relay.version_output("/proc/%d/exe" % proc.pid),
+                                         "a deleted executable still runs via /proc/<pid>/exe")
+                    self.assertEqual(relay.probe_running("%0", "claude"), ("fail", None, ident))
+            finally:
+                proc.kill()
+                proc.wait()
+
+
+class VersionGuardClass(unittest.TestCase):
+    """The authoritative version check right before a Claude dialog is touched (2026-09-12)."""
+    TESTED = "2.1.268"
+
+    def _vg(self, locates, measures=None, allow=False, no_gate=False):
+        from aipairlib.schema_guard import VersionGuard
+        a = types.SimpleNamespace(no_version_gate=no_gate, allow_untested_dialogs=allow,
+                                  no_plan_review=False, no_question_relay=False)
+        self.warns, self.measured = [], []
+        seq, measures = iter(locates), (measures or {})
+
+        def measure(ident):
+            self.measured.append(ident)
+            return measures[ident]
+        vg = VersionGuard(a, locate=lambda: next(seq), measure=measure, tested=self.TESTED,
+                          dim=lambda m: None, warn=lambda m, bell=False: self.warns.append((m, bell)))
+        return a, vg
+
+    def test_a_tested_running_claude_is_allowed_and_measured_once(self):
+        A = (10, 1)
+        a, vg = self._vg([("found", A)] * 3, {A: ("ok", self.TESTED)})
+        self.assertTrue(vg.dialog_ok() and vg.dialog_ok() and vg.dialog_ok())
+        self.assertEqual(self.measured, [A], "the same process is not exec'd again")
+        self.assertFalse(a.no_plan_review or a.no_question_relay)
+        self.assertEqual(self.warns, [])
+
+    def test_identity_change_mid_dialog_to_an_untested_claude_stops_before_sending(self):
+        # detection saw A (tested); before sending, Claude was restarted in the pane as B (untested)
+        A, B = (10, 1), (11, 2)
+        a, vg = self._vg([("found", A), ("found", B)], {A: ("ok", self.TESTED), B: ("ok", "2.1.269")})
+        self.assertTrue(vg.dialog_ok(), "at detection")
+        self.assertFalse(vg.dialog_ok(), "right before sending")
+        self.assertTrue(a.no_plan_review and a.no_question_relay, "latched OFF")
+        self.assertEqual(len(self.warns), 1)
+        self.assertTrue(self.warns[0][1], "with a bell")
+        self.assertIn("2.1.269", self.warns[0][0])
+
+    def test_same_pid_that_execs_another_binary_is_measured_again(self):
+        # Codex review 2026-09-12: an execve keeps the pid AND the starttime — only the executable changes,
+        # so the old binary's cached verdict must not be reused.
+        A, A_exec = (10, 1, (5, 100)), (10, 1, (5, 200))
+        a, vg = self._vg([("found", A), ("found", A_exec)],
+                         {A: ("ok", self.TESTED), A_exec: ("ok", "2.1.269")})
+        self.assertTrue(vg.dialog_ok())
+        self.assertFalse(vg.dialog_ok(), "not the cached verdict of the old binary")
+        self.assertEqual(self.measured, [A, A_exec])
+        self.assertTrue(a.no_plan_review and a.no_question_relay)
+
+    def test_fail_turns_automation_off(self):
+        A = (10, 1)
+        a, vg = self._vg([("found", A)], {A: ("fail", None)})
+        self.assertFalse(vg.dialog_ok())
+        self.assertTrue(a.no_plan_review and a.no_question_relay)
+
+    def test_none_on_linux_is_never_operated_even_first_time_and_does_not_latch(self):
+        # /proc exists but the process can't be identified (not found / tmux failed): PATH is not trusted →
+        # False even on the very first dialog; not latched, so a later poll that finds it proceeds.
+        A = (10, 1)
+        a, vg = self._vg([("none", None), ("none", None), ("found", A)], {A: ("ok", self.TESTED)})
+        self.assertFalse(vg.dialog_ok())
+        self.assertFalse(vg.dialog_ok())
+        self.assertFalse(a.no_plan_review or a.no_question_relay, "not latched")
+        self.assertEqual(len(self.warns), 1, "warned once, not every poll")
+        self.assertTrue(vg.dialog_ok(), "identified on a later poll → allowed")
+
+    def test_only_unsupported_inherits_the_startup_decision(self):
+        a, vg = self._vg([("unsupported", None)])
+        self.assertTrue(vg.dialog_ok(), "no /proc → the startup (PATH) decision already in the flags stands")
+        self.assertEqual(self.measured, [])
+
+    def test_overrides_skip_the_probe(self):
+        for kw in ({"allow": True}, {"no_gate": True}):
+            _a, vg = self._vg([], **kw)                 # locate() would raise StopIteration if called
+            self.assertTrue(vg.dialog_ok(), kw)
+
+    def test_never_turns_automation_back_on(self):
+        A = (10, 1)
+        a, vg = self._vg([("found", A)], {A: ("ok", self.TESTED)})
+        a.no_plan_review = a.no_question_relay = True   # OFF for another reason (schema fail-open, flags)
+        vg.dialog_ok()
+        self.assertTrue(a.no_plan_review and a.no_question_relay)
+
+
+class DecideDeliveryBack(unittest.TestCase):
+    """Never type a plain poke into a Claude dialog (2026-09-12): the review goes back through the dialog
+    when that automation may run, otherwise the relay stops with the screen untouched."""
+    PLAN = {"tell": "3", "yes": "1"}
+    PLAN_NO_TELL = {"tell": None, "yes": "1"}
+    Q = {"chat": "4"}
+
+    def test_decision_table(self):
+        d = relay.decide_delivery_back
+        self.assertEqual(d(None, None, False, False), "poke", "no dialog → the normal poke")
+        self.assertEqual(d(self.PLAN, None, True, False), "plan_tell")
+        self.assertEqual(d(None, self.Q, False, True), "question_chat")
+        self.assertEqual(d(self.PLAN, None, False, False), "stop", "plan automation OFF (incl. from startup)")
+        self.assertEqual(d(None, self.Q, False, False), "stop", "question automation OFF (incl. from startup)")
+        self.assertEqual(d(self.PLAN_NO_TELL, None, True, False), "stop", "no Tell option")
+        self.assertEqual(d(self.PLAN, self.Q, True, True), "plan_tell", "plan first")
+        self.assertEqual(d(self.PLAN, self.Q, False, True), "stop", "a plan dialog on screen is never bypassed")
+
+
+class VersionGuardWiring(unittest.TestCase):
+    """Source-structure check (like SchemaGuardOrdering — the loop is one monolithic run()): every Claude
+    dialog operation is gated by allowed(...) with an exit-5 stop, the detection sites re-check the running
+    version, and the delivery-back never skips detection because a flag is OFF (incl. OFF from startup)."""
+    OPS = ('send_plan_feedback(panes["claude"]', 'send_question_answer(panes["claude"]',
+           'press(panes["claude"], dialog["yes"])')
+    STATE_HDR = ("if state ==", "elif state ==", "else:  # codex")
+
+    def _loop(self):
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
+            src = fh.read().split("\n")
+        start = next(i for i, l in enumerate(src) if l.strip() == "while True:")
+        return src[start:]
+
+    def test_every_dialog_operation_is_preceded_by_allowed_and_an_exit5_stop(self):
+        lines = self._loop()
+        ops = [i for i, l in enumerate(lines) if any(o in l for o in self.OPS)]
+        self.assertEqual(len(ops), 7, "plan approve/feedback x3 + question answer x2 (Codex / autopilot force)"
+                                      " + delivery-back x2")
+        for i in ops:
+            hdr = max(k for k in range(i) if lines[k].strip().startswith(self.STATE_HDR))
+            guards = [k for k in range(hdr, i) if "allowed(" in lines[k]]
+            self.assertTrue(guards, f"no allowed(...) guard before loop-line {i}: {lines[i].strip()}")
+            self.assertIn("code = 5", "\n".join(lines[guards[-1]:i]),
+                          f"the guard before loop-line {i} must stop with exit 5")
+
+    def test_detection_sites_recheck_the_running_version(self):
+        lines = self._loop()
+        for det in ("(plan_dialog := detect_plan_dialog(", 'and detect_question_dialog(panes["claude"])'):
+            hit = [l for l in lines if det in l and l.strip().startswith("elif")]
+            self.assertEqual(len(hit), 1, det)
+            self.assertIn("vg.dialog_ok()", hit[0])
+
+    def test_delivery_back_detects_regardless_of_flags_and_pokes_only_without_a_dialog(self):
+        lines = self._loop()
+        src = "\n".join(lines)
+        self.assertNotIn("None if a.no_plan_review else detect_plan_dialog", src)
+        self.assertNotIn("None if a.no_question_relay else detect_question_dialog", src)
+        k = next(i for i, l in enumerate(lines) if "decide_delivery_back(" in l)
+        first = next(i for i, l in enumerate(lines) if i > k and 'poke(panes["claude"]' in l)
+        branch = max(i for i in range(k, first)
+                     if lines[i].strip().startswith(("if back", "elif back", "else:")))
+        self.assertIn('back == "poke"', lines[branch], "the Claude poke lives only in the no-dialog branch")
+
+
+class ReviewLoopExits(unittest.TestCase):
+    """Regression (2026-09-24, a real project): in the normal review loop Claude said "needs the user's decision /
+    already decided by the user — no change" and Codex answered "still unfixed" / "no diff, can't judge";
+    neither could emit the only stop sentinel ([AIPAIR_REVIEW_OK]) so the relay spun to max-rounds (115
+    Claude turns). Now (1) both review prompts offer [AIPAIR_HUMAN_REQUIRED], honoured by run() as exit 8,
+    and (2) a mechanical stall guard stops when no review passes while the repo stays unchanged."""
+    HR = "[AIPAIR_HUMAN_REQUIRED]"
+
+    def test_prompts_offer_the_human_required_exit_only_when_given(self):
+        rp = relay.review_protocol
+        self.assertIn(self.HR, rp.default_poke_codex("[AIPAIR_REVIEW_OK]", self.HR))
+        self.assertIn("人間の判断事項", rp.default_poke_codex("[AIPAIR_REVIEW_OK]", self.HR))
+        self.assertIn("コードで直すべき点が残る場合は使わない", rp.default_poke_codex("[AIPAIR_REVIEW_OK]", self.HR))
+        self.assertNotIn(self.HR, rp.default_poke_codex("[AIPAIR_REVIEW_OK]"))
+        self.assertIn(self.HR, rp.default_poke_claude(self.HR))
+        self.assertEqual(rp.default_poke_claude(None), rp.DEFAULT_POKE_CLAUDE)
+
+    def test_relay_offers_it_in_the_review_loop_but_not_in_endless(self):
+        src = inspect.getsource(relay.main)
+        self.assertIn("review_hr = human_required_phrases[0] if (human_required_phrases and not a.endless) else None", src)
+        self.assertIn("default_poke_claude(review_hr)", src)
+
+    def test_advance_stall(self):
+        adv = relay.state_machine.advance_stall
+        self.assertEqual(adv(None, "A"), ("A", 0))
+        self.assertEqual(adv(("A", 0), "A"), ("A", 1))
+        self.assertEqual(adv(("A", 2), "B"), ("B", 0), "any repo change restarts the count")
+        self.assertIsNone(adv(("A", 2), None), "no fingerprint (not a git repo) never counts")
+
+    def test_repo_fingerprint_tracks_head_worktree_and_untracked(self):
+        fp = relay.state_machine.repo_fingerprint
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(fp(d), "not a git repo → None (guard off)")
+            g = lambda *a: subprocess.run(["git", "-C", d] + list(a), check=True, capture_output=True)
+            g("init", "-q"); g("config", "user.email", "t@t"); g("config", "user.name", "t")
+            open(os.path.join(d, "a.txt"), "w").write("1\n"); g("add", "a.txt"); g("commit", "-qm", "c1")
+            base = fp(d)
+            self.assertEqual(fp(d), base, "same state → same fingerprint")
+            open(os.path.join(d, "a.txt"), "w").write("2\n")
+            edited = fp(d)
+            self.assertNotEqual(edited, base, "a tracked edit changes it")
+            open(os.path.join(d, "new.txt"), "w").write("x\n")
+            self.assertNotEqual(fp(d), edited, "a new untracked file changes it")
+            g("add", "-A"); g("commit", "-qm", "c2")
+            self.assertNotEqual(fp(d), base, "a commit changes it")
+
+    # --- the real run() ------------------------------------------------------------------ #
+    def _run(self, texts_for, fingerprints=None, stall_rounds=3, max_rounds=20, hr=("[AIPAIR_HUMAN_REQUIRED]",)):
+        sm = relay.state_machine
+        a = types.SimpleNamespace(start_side="claude", settle=0, poll=0, max_rounds=max_rounds, endless=False,
+                                  stop_side="codex", no_plan_review=True, no_question_relay=True,
+                                  plan_rounds=5, question_rounds=5, plan_ok="[AIPAIR_PLAN_APPROVED]",
+                                  gate=None, gate_timeout=600, gate_rounds=3, stall_rounds=stall_rounds)
+        rg = types.SimpleNamespace(response_done=lambda who, path, done: done, noshow=lambda who: False,
+                                   arm=lambda nonce: None, clear=lambda: None, probe=None, probe_ts_cache=0.0)
+        machine = sm.StateMachine(
+            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x",
+            tracked={"claude": "c.jsonl", "codex": "x.jsonl"}, claude_seen=set(), codex_seen=set(),
+            baseline=0.0, sg=types.SimpleNamespace(guard=lambda: False), rg=rg,
+            vg=types.SimpleNamespace(dialog_ok=lambda: True), bw=60,
+            poke_codex="PC", poke_codex_next="PCN", poke_claude="PCL", poke_claude_pass="PCP",
+            poke_claude_next="PCX", stop_phrases=["[AIPAIR_REVIEW_OK]"], next_ask_phrases=["[AIPAIR_NEXT]"],
+            all_done_phrases=["[AIPAIR_ALL_DONE]"], human_required_phrases=list(hr))
+        fps = iter(fingerprints or [])
+        with mock.patch.object(sm, "set_pane_title"), \
+             mock.patch.object(sm, "claude_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "codex_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "claude_matches_pane", return_value=True), \
+             mock.patch.object(sm, "turn_texts", side_effect=lambda who, *r: texts_for(who)), \
+             mock.patch.object(sm, "detect_plan_dialog", return_value=None), \
+             mock.patch.object(sm, "detect_question_dialog", return_value=None), \
+             mock.patch.object(sm, "repo_fingerprint", side_effect=lambda cwd: next(fps, "SAME")), \
+             mock.patch.object(sm, "poke", return_value="nonce") as poke_mock, \
+             mock.patch("time.sleep"), mock.patch("builtins.print"):
+            code = machine.run()
+        return code, [c.args[0] for c in poke_mock.call_args_list], machine
+
+    def test_codex_human_required_stops_with_exit_8(self):
+        code, pokes, _ = self._run(lambda who: ["修正あり"] if who == "claude" else [self.HR + "\nD1: 仕様の選択"])
+        self.assertEqual(code, 8)
+        self.assertEqual(pokes, ["%2"], "Codex's HUMAN_REQUIRED is not relayed back to Claude")
+
+    def test_claude_human_required_stops_before_asking_codex(self):
+        code, pokes, _ = self._run(lambda who: [self.HR + "\nユーザー判断待ち"] if who == "claude" else ["x"])
+        self.assertEqual(code, 8)
+        self.assertEqual(pokes, [], "Claude's HUMAN_REQUIRED stops before any review request")
+
+    def test_an_inline_mention_does_not_stop(self):
+        # head-line-only contract: a mention inside the text is not a declaration
+        code, _, _ = self._run(lambda who: ["なお " + self.HR + " は使わない"], stall_rounds=0, max_rounds=3)
+        self.assertEqual(code, 3, "runs to the max-rounds cap")
+
+    def test_stall_stops_after_n_unchanged_unapproved_reviews(self):
+        code, pokes, _ = self._run(lambda who: ["同一2点、修正なし"] if who == "claude" else ["2点とも未修正"])
+        self.assertEqual(code, 8)
+        # reviews 1..4: baseline + 3 unchanged → stop at the 4th review, before poking Claude again
+        self.assertEqual(pokes, ["%2", "%1"] * 3 + ["%2"])
+
+    def test_a_changing_repo_is_not_a_stall(self):
+        code, _, _ = self._run(lambda who: ["直した"] if who == "claude" else ["まだ1点"],
+                               fingerprints=["A", "B", "C", "D", "E", "F"], max_rounds=6)
+        self.assertEqual(code, 3, "progress every round → only the max-rounds cap stops it")
+
+    def test_stall_guard_can_be_disabled_and_hr_emptied(self):
+        code, _, _ = self._run(lambda who: ["x"] if who == "claude" else [self.HR], stall_rounds=0,
+                               max_rounds=3, hr=())
+        self.assertEqual(code, 3, "--stall-rounds 0 and an empty --human-required → old behaviour")
+
+
+class SubagentWaitInTheLoop(unittest.TestCase):
+    """Regression (2026-10-12): Claude launched a background subagent and ended its turn to wait for it; the
+    relay took that end_turn as 'implementation done' and poked Codex, which had nothing to review. These drive
+    the real StateMachine.run()."""
+
+    def _machine(self, baseline=0.0, tracked="c.jsonl", **a_extra):
+        sm = relay.state_machine
+        a = types.SimpleNamespace(start_side="claude", settle=0, poll=0, max_rounds=20, endless=False,
+                                  stop_side="codex", no_plan_review=True, no_question_relay=True,
+                                  plan_rounds=5, question_rounds=5, plan_ok="[AIPAIR_PLAN_APPROVED]",
+                                  gate=None, gate_timeout=600, gate_rounds=3, stall_rounds=3, **a_extra)
+        rg = types.SimpleNamespace(response_done=lambda who, path, done: done, noshow=lambda who: False,
+                                   arm=lambda nonce: None, clear=lambda: None, probe=None, probe_ts_cache=0.0)
+        return sm.StateMachine(
+            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x",
+            tracked={"claude": tracked, "codex": "x.jsonl"}, claude_seen=set(), codex_seen=set(),
+            baseline=baseline, sg=types.SimpleNamespace(guard=lambda: False), rg=rg,
+            vg=types.SimpleNamespace(dialog_ok=lambda: True), bw=60,
+            poke_codex="REVIEW", poke_codex_next="PCN", poke_claude="PCL", poke_claude_pass="PCP",
+            poke_claude_next="PCX", stop_phrases=["[AIPAIR_REVIEW_OK]"], next_ask_phrases=["[AIPAIR_NEXT]"],
+            all_done_phrases=["[AIPAIR_ALL_DONE]"], human_required_phrases=["[AIPAIR_HUMAN_REQUIRED]"])
+
+    def _run_scripted(self, answers, **a_extra):
+        """run() against a scripted claude_done_ts: `answers(n, wait, on_subagents)` is the n-th check's
+        result. Returns (exit code, the kwargs of every check, the check count at each poke, stdout)."""
+        sm = relay.state_machine
+        machine = self._machine(baseline=7.0, **a_extra)
+        checks, pokes_at = [], []
+
+        def claude_done(path, since, subagent_wait=0, on_subagents=None, now=None, subagent_since=None):
+            checks.append({"wait": subagent_wait, "floor": subagent_since, "visible": on_subagents is not None})
+            return answers(len(checks), subagent_wait, on_subagents)
+
+        with mock.patch.object(sm, "set_pane_title"), \
+             mock.patch.object(sm, "claude_done_ts", side_effect=claude_done), \
+             mock.patch.object(sm, "codex_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "claude_matches_pane", return_value=True), \
+             mock.patch.object(sm, "refresh_claude_lock", side_effect=lambda path, *r, **k: path), \
+             mock.patch.object(sm, "turn_texts",
+                               side_effect=lambda who, *r: ["done"] if who == "claude" else ["[AIPAIR_REVIEW_OK]"]), \
+             mock.patch.object(sm, "detect_plan_dialog", return_value=None), \
+             mock.patch.object(sm, "detect_question_dialog", return_value=None), \
+             mock.patch.object(sm, "repo_fingerprint", return_value="SAME"), \
+             mock.patch.object(sm, "poke", side_effect=lambda *r, **k: pokes_at.append(len(checks)) or "nonce"), \
+             mock.patch("time.sleep"), mock.patch("builtins.print") as printed:
+            code = machine.run()
+        out = "\n".join(str(c.args[0]) for c in printed.call_args_list if c.args)
+        return code, checks, pokes_at, out
+
+    @staticmethod
+    def _waiting_for_three_checks(n, wait, on_subagents):
+        held = bool(wait) and n <= 3
+        if on_subagents:
+            on_subagents(1 if held else 0, 0)
+        return None if held else 100.0
+
+    def test_a_claude_turn_waiting_for_a_subagent_is_not_handed_to_codex(self):
+        code, checks, pokes_at, out = self._run_scripted(self._waiting_for_three_checks, subagent_wait=900)
+        self.assertEqual(code, 0)
+        self.assertEqual({c["wait"] for c in checks}, {900}, "every completion check carries --subagent-wait")
+        self.assertEqual({c["floor"] for c in checks}, {7.0},
+                         "subagents are counted from the relay's start, not from the moving `since`")
+        self.assertEqual(pokes_at, [5], "Codex is poked once, after the 3 held checks (4th check + settle re-check)")
+        self.assertEqual(out.count("サブエージェント 1 件の完了待ち"), 1, "why it is not handed over is shown once")
+
+    def test_without_the_option_the_completion_check_is_the_old_one(self):
+        # callers (and older test namespaces) that carry no subagent_wait get 0 = off
+        code, checks, pokes_at, out = self._run_scripted(self._waiting_for_three_checks)
+        self.assertEqual(code, 0)
+        self.assertEqual({c["wait"] for c in checks}, {0})
+        self.assertEqual(pokes_at, [2], "handed to Codex at once (1st check + settle re-check)")
+        self.assertNotIn("サブエージェント", out)
+
+    def test_a_turn_that_resumed_during_settle_is_not_handed_over_on_the_stale_completion(self):
+        # Codex review 2026-10-12 [P2]: the first check saw a finished turn; while the relay settled, Claude
+        # resumed and went on to wait for a subagent, so the re-check said "not done" — and `or done` revived
+        # the stale value and sent the review anyway.
+        def answers(n, wait, on_subagents):
+            done = {1: 100.0, 2: None, 3: None}.get(n, 200.0)     # 2 = the settle re-check, 3 = still waiting
+            if on_subagents:
+                on_subagents(0 if done else 1, 0)
+            return done
+        code, checks, pokes_at, out = self._run_scripted(answers, subagent_wait=900)
+        self.assertEqual(code, 0)
+        self.assertEqual([c["visible"] for c in checks[:2]], [True, False], "check 2 is the settle re-check")
+        self.assertEqual(pokes_at, [5], "no poke after the cancelled completion; one after the real one (4 + 5)")
+        self.assertEqual(out.count("round 1:"), 1)
+        self.assertNotIn("round 2:", out, "the cancelled completion did not count as a round")
+
+    def test_a_subagent_launched_before_a_relayed_question_still_holds_the_turn(self):
+        # Codex review 2026-10-12 [P2], reproduced with the real state machine + the real parser: launch at
+        # +10 s → the relay delivers Codex's answer to Claude's question dialog at +30 s (which moves `since`)
+        # → Claude ends the turn at +40 s to wait for the subagent. With `since` as the floor the launch
+        # dropped out of the wait and the review was sent with no completion notification.
+        sm = relay.state_machine
+        base = 1_800_000_000.0
+        clock = [base]
+        iso = lambda sec: datetime.fromtimestamp(base + sec, timezone.utc).isoformat().replace("+00:00", "Z")
+        tmp = tempfile.TemporaryDirectory(prefix="aipair-subagent.")
+        self.addCleanup(tmp.cleanup)
+        log = os.path.join(tmp.name, "c.jsonl")
+        stage = ["question"]                 # question → waiting → resumed
+
+        def write(sec, *rows):
+            with open(log, "a", encoding="utf-8") as fh:
+                for r in rows:
+                    r["timestamp"] = iso(sec)
+                    fh.write(json.dumps(r) + "\n")
+            clock[0] = base + sec
+
+        notice = ("<task-notification>\n<task-id>ag1</task-id>\n<status>completed</status>\n"
+                  "<summary>done</summary>\n</task-notification>")
+        assistant = lambda stop: {"type": "assistant", "message": {"stop_reason": stop}}
+        write(10, {"type": "user", "toolUseResult": {"status": "async_launched", "isAsync": True, "agentId": "ag1"}},
+              assistant("tool_use"))                                   # …then AskUserQuestion is on screen
+
+        def deliver_answer(*r, **k):                                   # the relay answers the dialog at +30
+            clock[0] = base + 30
+            stage[0] = "waiting"
+            return True
+
+        polls_while_waiting = [0]
+
+        def sleep(sec=0):
+            if stage[0] == "waiting":
+                polls_while_waiting[0] += 1
+                if polls_while_waiting[0] == 1:
+                    write(40, assistant("end_turn"))                   # "waiting for the agent"
+                elif polls_while_waiting[0] == 4:                      # three polls later it reports back
+                    write(100, {"type": "user", "origin": {"kind": "task-notification"},
+                                "message": {"role": "user", "content": notice}})
+                    write(110, assistant("end_turn"))
+                    stage[0] = "resumed"
+            clock[0] += 1
+
+        pokes = []
+        codex_says = iter([["1問目: 選択肢1で"], ["[AIPAIR_REVIEW_OK]"]])
+        machine = self._machine(baseline=base, tracked=log, subagent_wait=3600)
+        machine.a.no_question_relay = False
+        with mock.patch.object(sm, "set_pane_title"), \
+             mock.patch.object(sm, "codex_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "claude_matches_pane", return_value=True), \
+             mock.patch.object(sm, "refresh_claude_lock", side_effect=lambda path, *r, **k: path), \
+             mock.patch.object(sm, "turn_texts",
+                               side_effect=lambda who, *r: ["x"] if who == "claude" else next(codex_says)), \
+             mock.patch.object(sm, "detect_plan_dialog", return_value=None), \
+             mock.patch.object(sm, "detect_question_dialog",
+                               side_effect=lambda pane: {"chat": "1"} if stage[0] == "question" else None), \
+             mock.patch.object(sm, "scrape_questions", return_value=["Pick a database"]), \
+             mock.patch.object(sm, "send_question_answer", side_effect=deliver_answer) as answered, \
+             mock.patch.object(sm, "repo_fingerprint", return_value="SAME"), \
+             mock.patch.object(sm, "poke", side_effect=lambda pane, text, **k: pokes.append((text[:6], stage[0]))
+                               or "nonce"), \
+             mock.patch("time.time", side_effect=lambda: clock[0]), \
+             mock.patch("time.sleep", side_effect=sleep), mock.patch("builtins.print") as printed:
+            code = machine.run()
+        out = "\n".join(str(c.args[0]) for c in printed.call_args_list if c.args)
+        self.assertEqual(code, 0)
+        answered.assert_called_once()
+        self.assertEqual([stage for _, stage in pokes], ["question", "resumed"],
+                         "Codex is asked the question, then asked to review only after Claude read the result")
+        self.assertEqual(pokes[1][0], "REVIEW")
+        self.assertEqual(out.count("サブエージェント 1 件の完了待ち"), 1)
+        self.assertGreaterEqual(polls_while_waiting[0], 4, "the relay kept polling through the wait")
+
+
+class StalePlanDialogIsNeverOperated(unittest.TestCase):
+    """Regression (Codex review 2026-09-12): codex_plan used `detect_plan_dialog(...) or plan_dialog`, so a
+    plan dialog that vanished while Codex was reviewing (a human handled it) was still 'answered' from the
+    stale parse — the approve digit / feedback typed into the normal composer. Drives the real run():
+    claude state detects the dialog → Codex approves → at send time the dialog is gone → nothing is pressed
+    or sent (even though the running version is fine), and the loop goes back to waiting."""
+
+    class _Stop(Exception):
+        pass
+
+    DIALOG = {"tell": "3", "yes": "1", "yes_label": "Yes, and use auto mode", "plan": "/tmp/p.md"}
+
+    def test_vanished_dialog_with_a_cached_parse_is_left_alone(self):
+        sm = relay.state_machine
+        a = types.SimpleNamespace(start_side="claude", settle=0, poll=0, max_rounds=20, endless=False,
+                                  stop_side="codex", no_plan_review=False, no_question_relay=False,
+                                  plan_rounds=5, question_rounds=5, plan_ok="[AIPAIR_PLAN_APPROVED]",
+                                  gate=None, gate_timeout=600, gate_rounds=3)
+        rg = types.SimpleNamespace(response_done=lambda who, path, done: done, noshow=lambda who: False,
+                                   arm=lambda nonce: None, clear=lambda: None, probe=None, probe_ts_cache=0.0)
+        box = {"stop": False}
+
+        def guard():
+            if box["stop"]:
+                raise self._Stop()
+            return False
+
+        detections = iter([self.DIALOG, None])       # detected in claude state → gone when sending
+
+        def detect(pane):
+            d = next(detections)
+            if d is None:
+                box["stop"] = True                   # stop at the NEXT loop-top guard
+            return d
+
+        vg = types.SimpleNamespace(dialog_ok=lambda: True)   # the version is fine: only staleness matters
+        machine = sm.StateMachine(
+            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x",
+            tracked={"claude": "c.jsonl", "codex": "x.jsonl"}, claude_seen=set(), codex_seen=set(),
+            baseline=0.0, sg=types.SimpleNamespace(guard=guard), rg=rg, vg=vg, bw=60,
+            poke_codex="PC", poke_codex_next="PCN", poke_claude="PCL", poke_claude_pass="PCP",
+            poke_claude_next="PCX", stop_phrases=["[AIPAIR_REVIEW_OK]"], next_ask_phrases=["[AIPAIR_NEXT]"],
+            all_done_phrases=["[AIPAIR_ALL_DONE]"], human_required_phrases=["[AIPAIR_HUMAN_REQUIRED]"])
+        with mock.patch.object(sm, "set_pane_title"), \
+             mock.patch.object(sm, "claude_done_ts", return_value=None), \
+             mock.patch.object(sm, "codex_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "turn_texts", return_value=["[AIPAIR_PLAN_APPROVED]"]), \
+             mock.patch.object(sm, "detect_plan_dialog", side_effect=detect) as det, \
+             mock.patch.object(sm, "poke", return_value=object()) as poke_mock, \
+             mock.patch.object(sm, "press") as press_mock, \
+             mock.patch.object(sm, "send_plan_feedback") as feedback_mock, \
+             mock.patch.object(sm, "approval_took_effect", return_value=True), \
+             mock.patch("time.sleep"):
+            with self.assertRaises(self._Stop):
+                machine.run()
+        self.assertEqual(det.call_count, 2, "detected once to start the review, once right before sending")
+        self.assertEqual([c.args[0] for c in poke_mock.call_args_list], ["%2"], "only the plan review to Codex")
+        press_mock.assert_not_called()
+        feedback_mock.assert_not_called()
+
+    def test_codex_plan_does_not_fall_back_to_the_cached_parse(self):
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertFalse("or plan_dialog" in src,
+                         "codex_plan must act only on a dialog detected right now, never the cached parse")
+
+
+class SchemaProbe(unittest.TestCase):
+    """The JSONL schema feature-probe (corelib.schema_probe/schema_gate + relay.probe_log_schema):
+    the version gate only sees --version strings, so the core relay also probes the real
+    transcript keys it reads (claude: type==assistant + message.stop_reason + timestamp + uuid;
+    codex: type==event_msg + payload.type task_started/complete + timestamp). Only POSITIVE drift
+    (a record of the right kind missing the keyed sub-field) trips 'mismatch'; a bare/nascent log
+    stays 'unverified' so a fresh pair never false-alarms."""
+
+    def a(self, allow=False):
+        return types.SimpleNamespace(no_plan_review=False, no_question_relay=False,
+                                     allow_untested_schema=allow, schema_mismatch=False)
+
+    # a fully-shaped, completed Claude assistant turn (the exact shape claude_done_ts reads)
+    CLA_OK = [{"type": "assistant", "timestamp": "2026-08-22T00:00:00Z", "uuid": "u1",
+               "parentUuid": None,
+               "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}],
+                           "stop_reason": "end_turn"}}]
+    # a FULL Codex turn — the probe latches ok only when started + user-metadata + complete are ALL
+    # present (P1-2: no early ok on partial evidence)
+    COD_OK = [{"type": "session_meta", "payload": {"cwd": "/x"}},
+              {"type": "event_msg", "timestamp": "t1", "payload": {"type": "task_started", "turn_id": "T1"}},
+              {"type": "response_item",
+               "payload": {"type": "message", "role": "user", "content": [{"text": "relay-id:ab"}],
+                           "internal_chat_message_metadata_passthrough": {"turn_id": "T1"}}},
+              {"type": "event_msg", "timestamp": "t2", "payload": {"type": "task_complete", "turn_id": "T1"}}]
+
+    def test_claude_ok_on_a_well_formed_turn(self):
+        st, _r = relay.schema_probe("claude", self.CLA_OK)
+        self.assertEqual(st, "ok")
+
+    def test_claude_empty_and_nascent_are_unverified(self):
+        # empty, and a log with only summary/user records (no assistant turn yet) → can't tell
+        self.assertEqual(relay.schema_probe("claude", [])[0], "unverified")
+        nascent = [{"type": "summary", "summary": "x"},
+                   {"type": "user", "message": {"role": "user", "content": "hello"}}]
+        self.assertEqual(relay.schema_probe("claude", nascent)[0], "unverified")
+
+    def test_claude_mismatch_positive_drift_only(self):
+        # renamed top-level type (inner role still assistant) → drift
+        renamed = [{"type": "agent", "timestamp": "t", "uuid": "u1",
+                    "message": {"role": "assistant", "content": [], "stop_reason": "end_turn"}}]
+        self.assertEqual(relay.schema_probe("claude", renamed)[0], "mismatch")
+        # stop_reason key removed from the assistant message → completion undetectable
+        no_sr = [{"type": "assistant", "timestamp": "t", "uuid": "u1",
+                  "message": {"role": "assistant", "content": []}}]
+        self.assertEqual(relay.schema_probe("claude", no_sr)[0], "mismatch")
+        # uuid removed → attribution chain impossible
+        no_uuid = [{"type": "assistant", "timestamp": "t",
+                    "message": {"role": "assistant", "content": [], "stop_reason": "end_turn"}}]
+        self.assertEqual(relay.schema_probe("claude", no_uuid)[0], "mismatch")
+        # timestamp removed
+        no_ts = [{"type": "assistant", "uuid": "u1",
+                  "message": {"role": "assistant", "content": [], "stop_reason": "end_turn"}}]
+        self.assertEqual(relay.schema_probe("claude", no_ts)[0], "mismatch")
+        # parentUuid removed → the attribution chain (claude_response_attributed) can't walk
+        no_parent = [{"type": "assistant", "timestamp": "t", "uuid": "u1",
+                      "message": {"role": "assistant", "content": [], "stop_reason": "end_turn"}}]
+        st, reason = relay.schema_probe("claude", no_parent)
+        self.assertEqual(st, "mismatch")
+        self.assertIn("parentUuid", reason)
+
+    def test_claude_one_good_turn_wins_over_earlier_partials(self):
+        # a bad-shaped record BEFORE a good one still resolves ok (one good line proves the schema)
+        mixed = [{"type": "assistant", "message": {"role": "assistant"}},  # missing keys
+                 self.CLA_OK[0]]
+        self.assertEqual(relay.schema_probe("claude", mixed)[0], "ok")
+
+    def test_codex_ok_needs_started_complete_and_user_metadata(self):
+        # ok ONLY when the full picture is present (started + complete + user-metadata turn_id)
+        self.assertEqual(relay.schema_probe("codex", self.COD_OK)[0], "ok")
+        # partial evidence must NOT latch ok (it would stop later re-probing) → unverified
+        started = [{"type": "event_msg", "timestamp": "t", "payload": {"type": "task_started", "turn_id": "T1"}}]
+        self.assertEqual(relay.schema_probe("codex", started)[0], "unverified",
+                         "task_started alone is a mid-turn log — not yet compatible")
+        complete = [{"type": "event_msg", "timestamp": "t", "payload": {"type": "task_complete", "turn_id": "T1"}}]
+        self.assertEqual(relay.schema_probe("codex", complete)[0], "unverified",
+                         "task_complete alone (no started, no user metadata) → unverified")
+        started_complete_no_meta = [
+            {"type": "event_msg", "timestamp": "t1", "payload": {"type": "task_started", "turn_id": "T1"}},
+            {"type": "event_msg", "timestamp": "t2", "payload": {"type": "task_complete", "turn_id": "T1"}}]
+        self.assertEqual(relay.schema_probe("codex", started_complete_no_meta)[0], "unverified",
+                         "no user-metadata turn_id yet → attribution unproven → unverified")
+
+    def test_codex_nascent_is_unverified(self):
+        self.assertEqual(relay.schema_probe("codex", [])[0], "unverified")
+        # session_meta alone, and session_meta + a not-yet-complete task_started → still nascent
+        self.assertEqual(relay.schema_probe("codex", [{"type": "session_meta", "payload": {"cwd": "/x"}}])[0],
+                         "unverified")
+        meta_and_started = [{"type": "session_meta", "payload": {"cwd": "/x"}},
+                            {"type": "event_msg", "timestamp": "t",
+                             "payload": {"type": "task_started", "turn_id": "T1"}}]
+        self.assertEqual(relay.schema_probe("codex", meta_and_started)[0], "unverified")
+
+    def test_codex_mismatch_positive_drift_only(self):
+        renamed = [{"type": "turn", "timestamp": "t", "payload": {"type": "task_complete", "turn_id": "T1"}}]
+        self.assertEqual(relay.schema_probe("codex", renamed)[0], "mismatch")   # not under event_msg
+        no_ts = [{"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "T1"}}]
+        self.assertEqual(relay.schema_probe("codex", no_ts)[0], "mismatch")
+
+    def test_codex_attribution_turn_id_drift_is_mismatch(self):
+        # P1-2: the probe also covers RESPONSE ATTRIBUTION (codex_response_complete's turn_id
+        # pairing), not just turn completion. A task event that completes fine but LOST its turn_id
+        # is drift — without it, attribution silently falls back to a time/position heuristic that
+        # can misattribute a queued turn.
+        no_turn = [{"type": "event_msg", "timestamp": "t", "payload": {"type": "task_complete"}}]
+        st, reason = relay.schema_probe("codex", no_turn)
+        self.assertEqual(st, "mismatch")
+        self.assertIn("turn_id", reason)
+        # a user response_item whose metadata passthrough exists but dropped turn_id → drift
+        user_no_turn = [{"type": "event_msg", "timestamp": "t",
+                         "payload": {"type": "task_complete", "turn_id": "T1"}},
+                        {"type": "response_item",
+                         "payload": {"type": "message", "role": "user", "content": [{"text": "x"}],
+                                     "internal_chat_message_metadata_passthrough": {}}}]
+        self.assertEqual(relay.schema_probe("codex", user_no_turn)[0], "mismatch")
+
+    def test_codex_completion_and_attribution_both_required_for_ok(self):
+        # both aspects must be positively present AND complete → ok
+        self.assertEqual(relay.schema_probe("codex", self.COD_OK)[0], "ok")
+
+    def test_codex_full_turn_without_user_metadata_is_mismatch(self):
+        # Regression (P1-2, tightened): started + a REAL text user response_item + complete, but the
+        # user item has no metadata.turn_id → the turn happened yet can't be attributed by turn_id.
+        # This must be mismatch (fail-closed), NOT unverified — otherwise it doesn't block and the
+        # relay keeps running on an unattributable schema.
+        full_no_meta = [
+            {"type": "event_msg", "timestamp": "t1", "payload": {"type": "task_started", "turn_id": "T1"}},
+            {"type": "response_item",
+             "payload": {"type": "message", "role": "user", "content": [{"text": "relay-id:ab"}]}},
+            {"type": "event_msg", "timestamp": "t2", "payload": {"type": "task_complete", "turn_id": "T1"}}]
+        st, reason = relay.schema_probe("codex", full_no_meta)
+        self.assertEqual(st, "mismatch")
+        self.assertIn("turn_id", reason)
+        # a NON-text user item (no text blocks) is not one the relay attributes → not drift
+        nontext = [{"type": "response_item",
+                    "payload": {"type": "message", "role": "user", "content": [{"image": "x"}]}}]
+        self.assertEqual(relay.schema_probe("codex", nontext)[0], "unverified")
+
+    def test_unknown_agent_and_non_dicts_are_unverified(self):
+        self.assertEqual(relay.schema_probe("other", self.CLA_OK)[0], "unverified")
+        self.assertEqual(relay.schema_probe("claude", ["not a dict", 5, None])[0], "unverified")
+        self.assertEqual(relay.schema_probe("claude", None)[0], "unverified")
+
+    def test_claude_delivery_and_dialog_aspects_are_veto_only(self):
+        # P1-2: delivery confirmation (claude_input) + dialog resolution (claude_resolved) are
+        # probed as their own aspects, but they are VETO-ONLY — a well-formed turn stays ok even
+        # though these haven't occurred yet (unverified), while a positive drift in them fails closed.
+        self.assertEqual(relay.schema_probe("claude", self.CLA_OK)[0], "ok",
+                         "core turn ok; delivery/dialog unverified must not block ok")
+        # delivery ok evidence: a user input row with string content
+        deliv = self.CLA_OK + [{"type": "user", "message": {"role": "user", "content": "a poke"}}]
+        self.assertEqual(relay.schema_probe("claude", deliv)[0], "ok")
+        # delivery drift: a queue-operation whose content is not a string → mismatch (veto fires)
+        deliv_drift = self.CLA_OK + [{"type": "queue-operation", "operation": "enqueue",
+                                      "content": {"not": "a string"}}]
+        self.assertEqual(relay.schema_probe("claude", deliv_drift)[0], "mismatch")
+        # dialog ok: a tool_result-bearing user row
+        dialog_ok = self.CLA_OK + [{"type": "user",
+                                    "message": {"role": "user", "content": [{"type": "tool_result"}]}}]
+        self.assertEqual(relay.schema_probe("claude", dialog_ok)[0], "ok")
+        # dialog drift: tool_result content NOT under type==user → mismatch (veto fires)
+        dialog_drift = self.CLA_OK + [{"type": "assistant",
+                                       "message": {"role": "assistant", "content": [{"type": "tool_result"}]}}]
+        self.assertEqual(relay.schema_probe("claude", dialog_drift)[0], "mismatch")
+
+    @staticmethod
+    def _blob(role, *blocks):
+        # the shape Claude Code 2.1.300+ writes (real 2.1.301 logs): a copy of one message of an API
+        # request, deduplicated by hash — no uuid, no timestamp, no parentUuid
+        return {"type": "api-request-blob", "sessionId": "s", "hash": "h",
+                "message": {"role": role, "content": [{"type": b} for b in blocks]}}
+
+    def test_claude_api_request_copies_are_not_drift(self):
+        # Without excluding these rows the copy of a tool_result tripped the dialog aspect (exit 7) as
+        # soon as Claude used a tool, and the copy of an assistant message tripped "型名ドリフト" while
+        # it was the latest assistant-role row (aipair-bump's live check on claude 2.1.301).
+        tool_turn = self.CLA_OK + [self._blob("assistant", "thinking", "tool_use"),
+                                   self._blob("user", "tool_result", "text")]
+        self.assertEqual(relay.schema_probe("claude", tool_turn)[0], "ok")
+        self.assertEqual(relay.schema_probe("claude", self.CLA_OK + [self._blob("assistant", "tool_use")])[0],
+                         "ok", "a copy as the latest assistant-role row: the real assistant row is judged")
+        self.assertEqual(relay.schema_probe("claude", [self._blob("assistant", "tool_use"),
+                                                       self._blob("user", "tool_result")])[0],
+                         "unverified", "copies alone are no evidence either way")
+
+    def test_claude_only_the_request_copy_type_is_excluded(self):
+        # the exclusion is by that one name: the same content under any other type is still drift
+        for t in ("api-request", "assistant_message"):
+            moved_result = dict(self._blob("user", "tool_result"), type=t)
+            self.assertEqual(relay.schema_probe("claude", self.CLA_OK + [moved_result])[0], "mismatch", t)
+            renamed = dict(self._blob("assistant", "text"), type=t)
+            self.assertEqual(relay.schema_probe("claude", self.CLA_OK + [renamed])[0], "mismatch", t)
+        # a type that drifted to a non-string value does not crash the probe
+        odd = {"type": ["user"], "message": {"role": "user", "content": "a"}}
+        self.assertEqual(relay.schema_probe("claude", self.CLA_OK + [odd])[0], "ok")
+
+    def test_claude_compaction_boundary_needs_uuid_and_logical_parent(self):
+        # P1-4 (Codex): claude_response_attributed bridges a compaction via the boundary's uuid +
+        # logicalParentUuid. A boundary missing either can't be walked → attribution never
+        # succeeds, so the schema probe must flag it as mismatch (it is a required-when-present
+        # aspect: no boundary → doesn't block ok; a malformed boundary → mismatch).
+        A = self.CLA_OK[0]
+        valid = {"type": "system", "subtype": "compact_boundary", "uuid": "B1", "logicalParentUuid": "L1"}
+        self.assertEqual(relay.schema_probe("claude", [valid, A])[0], "ok")
+        no_uuid = {"type": "system", "subtype": "compact_boundary", "logicalParentUuid": "L1"}
+        self.assertEqual(relay.schema_probe("claude", [no_uuid, A])[0], "mismatch")
+        no_lpu = {"type": "system", "subtype": "compact_boundary", "uuid": "B1"}
+        st, reason = relay.schema_probe("claude", [no_lpu, A])
+        self.assertEqual(st, "mismatch")
+        self.assertIn("logicalParentUuid", reason)
+        # an empty logicalParentUuid is also drift (non-empty required)
+        empty_lpu = {"type": "system", "subtype": "compact_boundary", "uuid": "B1", "logicalParentUuid": ""}
+        self.assertEqual(relay.schema_probe("claude", [empty_lpu, A])[0], "mismatch")
+        # no boundary at all → the aspect does not fire (plain turn stays ok)
+        self.assertEqual(relay.schema_probe("claude", [A])[0], "ok")
+
+    def test_claude_probe_judges_the_latest_assistant_after_resume(self):
+        # P1-4 (Codex): /resume appends a NEW version's records to the SAME JSONL. The probe must
+        # judge the LATEST assistant, so a later drift is not masked by an earlier good record.
+        good = self.CLA_OK[0]
+        bad = {"type": "assistant", "timestamp": "t", "uuid": {"x": 1}, "parentUuid": None,
+               "message": {"role": "assistant", "content": [], "stop_reason": "end_turn"}}  # uuid type drift
+        self.assertEqual(relay.schema_probe("claude", [bad, good])[0], "ok",
+                         "old malformed → new good (resume fixed the schema) → ok")
+        self.assertEqual(relay.schema_probe("claude", [good, bad])[0], "mismatch",
+                         "old good → new malformed (resume introduced drift) → mismatch")
+        # a later missing-key drift also wins over an earlier good record
+        partial = {"type": "assistant", "message": {"role": "assistant"}}
+        self.assertEqual(relay.schema_probe("claude", [good, partial])[0], "mismatch")
+
+    def test_claude_attribution_keys_must_be_string_typed(self):
+        # P1-4 (Codex): uuid / parentUuid / logicalParentUuid are used as DICT KEYS by
+        # claude_response_attributed. A truthy but non-string value (object/list/number) would pass
+        # a mere truthiness check yet crash the relay with TypeError: unhashable type. The probe must
+        # flag such type drift as mismatch (→ exit 7) so the crash never happens.
+        A = self.CLA_OK[0]
+        self.assertEqual(relay.schema_probe("claude",
+            [{"type": "assistant", "timestamp": "t", "uuid": {"x": 1}, "parentUuid": None,
+              "message": {"role": "assistant", "content": [], "stop_reason": "end_turn"}}])[0],
+            "mismatch", "assistant uuid=object → mismatch")
+        self.assertEqual(relay.schema_probe("claude",
+            [{"type": "assistant", "timestamp": "t", "uuid": "u1", "parentUuid": ["b"],
+              "message": {"role": "assistant", "content": [], "stop_reason": "end_turn"}}])[0],
+            "mismatch", "assistant parentUuid=list → mismatch")
+        cb_obj = {"type": "system", "subtype": "compact_boundary", "uuid": {"x": 1}, "logicalParentUuid": "L1"}
+        self.assertEqual(relay.schema_probe("claude", [cb_obj, A])[0], "mismatch",
+                         "boundary uuid=object → mismatch")
+        cb_lst = {"type": "system", "subtype": "compact_boundary", "uuid": "B1", "logicalParentUuid": ["L"]}
+        self.assertEqual(relay.schema_probe("claude", [cb_lst, A])[0], "mismatch",
+                         "boundary logicalParentUuid=list → mismatch")
+
+    def test_claude_response_attributed_does_not_crash_on_type_drift(self):
+        # Belt-and-suspenders: even if a non-string uuid/parent slips through, the attribution walker
+        # must not raise (unhashable dict/list) — it fails closed (False) instead.
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            fh.write(json.dumps({"type": "user", "uuid": {"bad": 1}, "parentUuid": None,
+                                 "message": {"content": "relay-id:x"}}) + "\n")
+            fh.write(json.dumps({"type": "assistant", "uuid": ["also", "bad"], "parentUuid": {"n": 1},
+                                 "message": {"content": "y"}}) + "\n")
+            path = fh.name
+        try:
+            self.assertFalse(relay.loglib.claude_response_attributed(path, "relay-id:x"))
+        finally:
+            os.unlink(path)
+
+    def test_claude_delivery_drift_only_for_a_typed_input(self):
+        # A TYPED human input (promptSource / origin.kind==human) whose content became a text-block
+        # array is a delivery drift — claude_input() matches a STRING content, so it can't see it.
+        typed = self.CLA_OK + [{"type": "user", "promptSource": "typed",
+                                "message": {"role": "user",
+                                            "content": [{"type": "text", "text": "relay-id:x"}]}}]
+        self.assertEqual(relay.schema_probe("claude", typed)[0], "mismatch")
+        typed2 = self.CLA_OK + [{"type": "user", "origin": {"kind": "human"},
+                                 "message": {"role": "user", "content": [{"type": "text", "text": "x"}]}}]
+        self.assertEqual(relay.schema_probe("claude", typed2)[0], "mismatch")
+
+    def test_claude_delivery_does_not_false_stop_on_normal_text_block_rows(self):
+        # Regression (Codex): text-block user rows are NORMAL in real Claude JSONL — isMeta skill
+        # injections, `[Request interrupted by user]` (interruptedMessageId), image attachments, and
+        # rows without typed-input markers. None of these must become a delivery mismatch (they
+        # would false-stop the loop with exit 7 during normal operation).
+        def probe(row):
+            return relay.schema_probe("claude", self.CLA_OK + [row])[0]
+        text = [{"type": "text", "text": "hi"}]
+        self.assertEqual(probe({"type": "user", "isMeta": True, "promptSource": "typed",
+                                "message": {"role": "user", "content": text}}), "ok", "isMeta injection")
+        self.assertEqual(probe({"type": "user", "interruptedMessageId": "msg_1",
+                                "message": {"role": "user", "content": text}}), "ok", "interrupt row")
+        self.assertEqual(probe({"type": "user", "promptSource": "typed",
+                                "message": {"role": "user",
+                                            "content": [{"type": "text", "text": "see"},
+                                                        {"type": "image"}]}}), "ok", "image attachment")
+        self.assertEqual(probe({"type": "user",
+                                "message": {"role": "user", "content": text}}), "ok", "no typed markers")
+
+    def test_schema_gate_mismatch_fails_closed_by_default(self):
+        # default = fail-closed: the gate flags the drift (schema_mismatch) so the relay stops
+        # (exit 7). It does NOT silently degrade-and-continue, so it must not force dialogs off here.
+        a = self.a()
+        rows, bad = relay.schema_gate(a, {"claude": ("mismatch", "x"), "codex": ("ok", "y")})
+        self.assertEqual(bad, ["claude"])
+        self.assertTrue(a.schema_mismatch, "drift is flagged so the relay can fail closed")
+        self.assertFalse(a.no_plan_review or a.no_question_relay,
+                         "no silent degrade-and-continue without the override (the relay exits 7)")
+        self.assertEqual([st for _n, st, _r in rows], ["mismatch", "ok"])
+
+    def test_schema_gate_unverified_never_trips(self):
+        a = self.a()
+        rows, bad = relay.schema_gate(a, {"claude": ("unverified", ""), "codex": ("unverified", "")})
+        self.assertEqual(bad, [])
+        self.assertFalse(a.no_plan_review or a.no_question_relay or a.schema_mismatch)
+
+    def test_schema_gate_allow_untested_continues_with_dialogs_off(self):
+        # explicit override = fail-open: keep running, but still degrade the schema-sensitive
+        # dialog automation (and flag the drift). It must NOT exit.
+        a = self.a(allow=True)
+        rows, bad = relay.schema_gate(a, {"claude": ("mismatch", "x"), "codex": ("mismatch", "y")})
+        self.assertEqual(bad, ["claude", "codex"])
+        self.assertTrue(a.schema_mismatch, "the drift is acknowledged")
+        self.assertTrue(a.no_plan_review and a.no_question_relay,
+                        "fail-open still turns off the schema-sensitive dialog automation")
+
+    def test_schema_fail_closed_policy(self):
+        # the single decision point: drift + no override → stop (exit 7); override or no drift → run
+        self.assertTrue(relay.schema_fail_closed(self.a(allow=False), ["claude"]))
+        self.assertFalse(relay.schema_fail_closed(self.a(allow=True), ["claude"]),
+                         "explicit override opts into fail-open")
+        self.assertFalse(relay.schema_fail_closed(self.a(allow=False), []),
+                         "no drift → no stop")
+
+    def test_a_done_but_mismatched_log_must_stop_before_action(self):
+        # Regression (P1-a): a log the relay would treat as a COMPLETED turn (stop_reason +
+        # timestamp + uuid present) but whose schema has drifted (parentUuid removed → attribution
+        # impossible). The relay must probe a freshly-locked log BEFORE completion detection, or it
+        # would fire one automated poke before exit 7. Here we prove BOTH facts hold on one record,
+        # which is exactly why the schema_guard is placed after the lock and before done-detection.
+        done_but_drifted = [{"type": "assistant", "timestamp": "2026-08-23T00:00:00Z", "uuid": "u1",
+                             "message": {"role": "assistant",
+                                         "content": [{"type": "text", "text": "ok"}],
+                                         "stop_reason": "end_turn"}}]   # NOTE: no parentUuid
+        self.assertEqual(relay.schema_probe("claude", done_but_drifted)[0], "mismatch",
+                         "attribution key missing → mismatch")
+        a = self.a(allow=False)
+        _rows, bad = relay.schema_gate(a, {"claude": ("mismatch", "x"), "codex": ("unverified", "")})
+        self.assertTrue(relay.schema_fail_closed(a, bad),
+                        "such a log must fail the relay closed (guard runs before the poke)")
+
+
+    def test_probe_log_schema_reads_the_pinned_log(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            for d in self.CLA_OK:
+                fh.write(json.dumps(d) + "\n")
+            path = fh.name
+        try:
+            self.assertEqual(relay.probe_log_schema("claude", path)[0], "ok")
+        finally:
+            os.unlink(path)
+        # no pinned log / missing file → unverified, never a mismatch
+        self.assertEqual(relay.probe_log_schema("claude", None), ("unverified", "ログ未特定"))
+        self.assertEqual(relay.probe_log_schema("codex", "/no/such/file.jsonl")[0], "unverified")
+
+    def test_read_records_tails_and_skips_junk(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            fh.write("not json\n")                      # unparseable → skipped
+            fh.write(json.dumps("a bare string") + "\n")  # valid JSON but not a dict → skipped
+            for i in range(5):
+                fh.write(json.dumps({"type": "assistant", "i": i}) + "\n")
+            path = fh.name
+        try:
+            recs = relay.read_records(path)
+            self.assertEqual([d.get("i") for d in recs], [0, 1, 2, 3, 4])   # 7 lines → 5 dict records
+            self.assertEqual(len(relay.read_records(path, tail_lines=2)), 2)  # bounded to the tail
+        finally:
+            os.unlink(path)
+        self.assertEqual(relay.read_records("/no/such/file.jsonl"), [])
+
+    def test_read_records_seeks_the_tail_not_the_whole_file(self):
+        # Perf regression: read_records must read only the TAIL window, not scan a huge file from
+        # the start every probe. Write a large log and read with a small tail_bytes; only the last
+        # records in that window come back, and the partial leading line is dropped cleanly.
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            for i in range(20000):
+                fh.write(json.dumps({"type": "event_msg", "i": i}) + "\n")
+            path = fh.name
+        try:
+            recs = relay.read_records(path, tail_lines=5)
+            self.assertEqual([d.get("i") for d in recs], [19995, 19996, 19997, 19998, 19999])
+            # a tiny byte window still yields valid records (no half-line JSON errors leaking out)
+            tail = relay.read_records(path, tail_lines=800, tail_bytes=2000)
+            self.assertTrue(tail and all(isinstance(d, dict) and "i" in d for d in tail))
+            self.assertLess(len(tail), 800, "the 2000-byte window holds far fewer than 800 lines")
+        finally:
+            os.unlink(path)
+
+
+class SchemaGuardClass(unittest.TestCase):
+    """P2-1: the runtime schema monitor is now the SchemaGuard class (extracted from the monolithic
+    relay loop), so it is unit-testable in isolation — previously it was a nested closure."""
+    def _sg(self, probe_status, allow=False, no_probe=False):
+        import types
+        from aipairlib.schema_guard import SchemaGuard
+        a = types.SimpleNamespace(no_schema_probe=no_probe, allow_untested_schema=allow,
+                                  schema_stop=False, schema_mismatch=False,
+                                  no_plan_review=False, no_question_relay=False)
+        tracked = {"claude": "/log/claude.jsonl", "codex": None}
+        self.dims, self.warns = [], []
+        # a fresh stat-like identity: monkeypatch os.stat via the probe returning a fixed value is
+        # hard, so drive the generation by patching the instance's _identity to a stable tuple.
+        sg = SchemaGuard(a, tracked,
+                         probe_log_schema=lambda agent, path: (probe_status, "r"),
+                         latest_compact_boundary=lambda path: None,
+                         dim=lambda m: self.dims.append(m),
+                         warn=lambda m, bell=False: self.warns.append((m, bell)))
+        sg._identity = lambda agent, path: (("gen", 1, 1), 100, None)  # stable ident per call
+        return a, sg
+
+    def test_mismatch_fails_closed_by_default(self):
+        a, sg = self._sg("mismatch")
+        sg.watch()
+        self.assertTrue(a.schema_stop and a.schema_mismatch)
+        self.assertTrue(any(bell for _m, bell in self.warns), "mismatch warns with a bell")
+        # guard() re-runs watch() and reports the stop
+        a2, sg2 = self._sg("mismatch")
+        self.assertTrue(sg2.guard())
+        self.assertTrue(a2.schema_stop)
+
+    def test_mismatch_with_override_degrades_not_stops(self):
+        a, sg = self._sg("mismatch", allow=True)
+        sg.watch()
+        self.assertFalse(a.schema_stop)
+        self.assertTrue(a.no_plan_review and a.no_question_relay and a.schema_mismatch)
+
+    def test_ok_logs_once_and_never_stops(self):
+        a, sg = self._sg("ok")
+        sg.watch()
+        self.assertFalse(a.schema_stop)
+        self.assertEqual(len(self.dims), 1, "ok logged once")
+        sg.watch()   # same identity → skip (no re-log)
+        self.assertEqual(len(self.dims), 1)
+
+    def test_no_schema_probe_is_a_noop(self):
+        a, sg = self._sg("mismatch", no_probe=True)
+        sg.watch()
+        self.assertFalse(a.schema_stop or a.schema_mismatch)
+
+    def test_a_new_generation_reprobes_a_terminal_mismatch(self):
+        a, sg = self._sg("mismatch")
+        sg.watch()
+        self.assertEqual(sg.latched["claude"], "mismatch")
+        # the log switches to a NEW generation → latch resets and it is re-probed (still mismatch here)
+        sg._identity = lambda agent, path: (("gen2", 2, 2), 50, None)
+        a.schema_stop = False
+        sg.watch()
+        self.assertTrue(a.schema_stop, "a new generation must be re-probed, not skipped by the old latch")
+
+
+class SchemaLatchStep(unittest.TestCase):
+    """Regression (P1-b): the runtime schema latch must NOT go terminal on 'ok'. delivery/dialog
+    are veto-only aspects that surface only when that action happens, so after 'ok' the relay must
+    KEEP probing — a dialog that only occurs later and drifts must still become a mismatch (exit 7).
+    Only 'mismatch' is terminal."""
+
+    def test_ok_is_not_terminal_and_a_late_mismatch_stops(self):
+        # first ok → log once, but stay in a re-probing state ('ok-seen', not terminal)
+        self.assertEqual(relay.schema_latch_step(None, "ok", False), ("ok-seen", "ok"))
+        # subsequent ok → no re-log, still probing
+        self.assertEqual(relay.schema_latch_step("ok-seen", "ok", False), ("ok-seen", "none"))
+        # a mismatch that only appears AFTER ok (e.g. a dialog that finally happens and has drifted)
+        # → stop (exit 7). This is the crux Codex asked for.
+        self.assertEqual(relay.schema_latch_step("ok-seen", "mismatch", False), ("mismatch", "stop"))
+
+    def test_override_degrades_instead_of_stopping(self):
+        self.assertEqual(relay.schema_latch_step("ok-seen", "mismatch", True), ("mismatch", "degrade"))
+        self.assertEqual(relay.schema_latch_step(None, "mismatch", True), ("mismatch", "degrade"))
+
+    def test_mismatch_is_terminal_and_unverified_keeps_probing(self):
+        self.assertEqual(relay.schema_latch_step("mismatch", "ok", False), ("mismatch", "none"))
+        self.assertEqual(relay.schema_latch_step("mismatch", "mismatch", False), ("mismatch", "none"))
+        self.assertEqual(relay.schema_latch_step(None, "unverified", False), (None, "none"))
+        self.assertEqual(relay.schema_latch_step("ok-seen", "unverified", False), ("ok-seen", "none"))
+
+    def test_schema_reprobe_uses_a_generation_identity(self):
+        # P1-4: the latch is per (agent, log GENERATION) where
+        # generation identity = ((path, dev, ino), size, compaction-marker). A terminal "mismatch"
+        # pertains to ONE generation; a new path, a same-path inode swap (rotation), a size shrink
+        # (truncate), OR a Claude compaction (same path/inode, size grows, NEW compact_boundary)
+        # must reset it and re-probe.
+        def ident(path, ino, size, dev=1, marker=None):
+            return ((path, dev, ino), size, marker)
+        A = ident("A", 10, 100)
+        self.assertEqual(relay.schema_should_reprobe("mismatch", A, ident("A", 10, 100)), (False, True),
+                         "same generation + terminal mismatch → skip")
+        self.assertEqual(relay.schema_should_reprobe("mismatch", A, ident("B", 30, 80)), (True, False),
+                         "different path → reset the mismatch latch")
+        self.assertEqual(relay.schema_should_reprobe("mismatch", A, ident("A", 20, 50)), (True, False),
+                         "SAME path, NEW inode (rotation replaced the file) → reset")
+        self.assertEqual(relay.schema_should_reprobe("mismatch", A, ident("A", 10, 40)), (True, False),
+                         "SAME path+inode, size SHRANK (truncate/rewrite) → reset")
+        self.assertEqual(relay.schema_should_reprobe("ok-seen", A, ident("A", 10, 150)), (False, False),
+                         "same generation, grew (append) → re-probe, no reset")
+        self.assertEqual(relay.schema_should_reprobe("ok-seen", A, ident("A", 10, 100)), (False, True),
+                         "unchanged → incremental skip")
+        self.assertEqual(relay.schema_should_reprobe(None, None, A), (True, False),
+                         "first identity → probe it")
+        # Claude COMPACTION: same path+inode, size GROWS, a NEW compact_boundary appears → reset
+        # even from a terminal mismatch (the post-compaction structure must be re-probed).
+        self.assertEqual(relay.schema_should_reprobe("mismatch", A, ident("A", 10, 150, marker="B1")),
+                         (True, False), "compaction (new compact_boundary) → reset from mismatch")
+        self.assertEqual(relay.schema_should_reprobe("mismatch", A, ident("A", 10, 150)), (False, True),
+                         "plain append (no new boundary) stays terminal-mismatch skip (no noise)")
+        # a boundary scrolling OUT of the tail window (B1 → None) is NOT a new generation
+        self.assertEqual(relay.schema_should_reprobe("mismatch", ident("A", 10, 150, marker="B1"),
+                                                     ident("A", 10, 200)), (False, True),
+                         "boundary scrolled out → no spurious reset")
+        # wiring guard: the SchemaGuard (P2-1 extraction) consults the generation reset
+        # (stat + compaction marker), and relay drives it via sg.watch()/sg.guard().
+        with open(os.path.join(BIN, "aipairlib", "schema_guard.py"), encoding="utf-8") as fh:
+            sgsrc = fh.read()
+        self.assertIn("schema_should_reprobe(self.latched[agent], self.ident[agent], ident)", sgsrc)
+        self.assertIn("st.st_dev, st.st_ino", sgsrc, "identity must include inode (same-path rotation)")
+        self.assertIn("_latest_compact_boundary(path)", sgsrc, "claude identity must fold in compaction")
+        self.assertIn("self.watch()", sgsrc, "guard() must re-probe via watch()")
+        # the StateMachine (P2-1) drives the guard between iterations / after every fresh lock
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("sg.guard()", src)
+
+    def test_latest_compact_boundary(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            fh.write(json.dumps({"type": "assistant", "uuid": "a1"}) + "\n")
+            fh.write(json.dumps({"type": "system", "subtype": "compact_boundary", "uuid": "B1"}) + "\n")
+            fh.write(json.dumps({"type": "system", "subtype": "compact_boundary", "uuid": "B2"}) + "\n")
+            path = fh.name
+        try:
+            self.assertEqual(relay.latest_compact_boundary(path), "B2")  # the LATEST boundary
+        finally:
+            os.unlink(path)
+        # no boundary → None; missing file → None
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            fh.write(json.dumps({"type": "assistant", "uuid": "a1"}) + "\n")
+            path2 = fh.name
+        try:
+            self.assertIsNone(relay.latest_compact_boundary(path2))
+        finally:
+            os.unlink(path2)
+        self.assertIsNone(relay.latest_compact_boundary("/no/such/file.jsonl"))
+
+    def test_uuidless_boundaries_get_distinct_markers(self):
+        # P1-4 (Codex): consecutive UUID-less compact_boundary records must be distinguishable, so a
+        # second such compaction is still detected as a new generation.
+        b1 = {"type": "system", "subtype": "compact_boundary",
+              "timestamp": "2026-08-23T01:00:00Z", "logicalParentUuid": "L1"}
+        b2 = {"type": "system", "subtype": "compact_boundary",
+              "timestamp": "2026-08-23T02:00:00Z", "logicalParentUuid": "L2"}
+        m1, m2 = relay.loglib._boundary_marker(b1), relay.loglib._boundary_marker(b2)
+        self.assertIsNotNone(m1)
+        self.assertNotEqual(m1, m2, "UUID-less boundaries must not collapse to one fixed marker")
+
+    def test_probe_restricts_claude_to_records_after_the_latest_boundary(self):
+        # P1-4 (Codex): after a compaction the probe must look only at the post-boundary generation.
+        # A pre-boundary drift + a post-boundary compatible turn must re-verify as OK (not be dragged
+        # back to mismatch by the stale pre-boundary record still in the tail).
+        recs = [
+            {"type": "user", "promptSource": "typed",   # pre-boundary delivery drift (typed text-block)
+             "message": {"role": "user", "content": [{"type": "text", "text": "x"}]}},
+            {"type": "system", "subtype": "compact_boundary", "uuid": "B1", "logicalParentUuid": "L1"},
+            {"type": "assistant", "timestamp": "t", "uuid": "u1", "parentUuid": None,   # post-boundary OK
+             "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}],
+                         "stop_reason": "end_turn"}},
+        ]
+        # the whole tail would be a mismatch (pre-boundary drift)…
+        self.assertEqual(relay.schema_probe("claude", recs)[0], "mismatch")
+        # …but restricted to post-boundary records it is ok
+        self.assertEqual(relay.schema_probe("claude", relay.records_since_compaction(recs))[0], "ok")
+        # and probe_log_schema (which applies the restriction for claude) reads a file as ok
+        with tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False) as fh:
+            for r in recs:
+                fh.write(json.dumps(r) + "\n")
+            path = fh.name
+        try:
+            self.assertEqual(relay.probe_log_schema("claude", path)[0], "ok")
+        finally:
+            os.unlink(path)
+
+    def test_forced_relock_reprobes_before_response_done(self):
+        # P1-4 (Codex): the forced re-lock switches tracked["claude"] to a NEW log, then processes
+        # its `done`. A schema_guard() must run on the switched log BEFORE response_done, so a
+        # malformed new log fails closed (exit 7) instead of driving a review/stop.
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        i_relock = src.index('tracked["claude"] = relocked')
+        i_guard = src.index("sg.guard()", i_relock)
+        i_respond = src.index('response_done("claude", tracked["claude"], done)', i_relock)
+        self.assertLess(i_guard, i_respond,
+                        "sg.guard() must run after the forced re-lock and BEFORE response_done")
+
+
+class SchemaGuardOrdering(unittest.TestCase):
+    """Regression (P1-a): in EVERY loop state, a freshly-locked transcript must be schema-probed
+    (schema_guard) BEFORE the relay treats it as a completed turn (*_done_ts) — otherwise a
+    schema-drifted log that *_done_ts still reads as 'done' fires one automated poke/dialog action
+    before exit 7. This is a source-structure check because the loop lives in a monolithic main();
+    it fails on the pre-fix code where codex_plan / codex_question locked then went straight to
+    codex_done_ts with no guard in between."""
+
+    def _main_loop_lines(self):
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
+            src = fh.read().split("\n")
+        start = next(i for i, l in enumerate(src) if l.strip() == "while True:")
+        return src[start:]
+
+    def test_every_initial_lock_is_guarded_before_done_detection(self):
+        lines = self._main_loop_lines()
+        lock_idx = [i for i, l in enumerate(lines)
+                    if ("= lock_codex(" in l) or ("= lock_claude(" in l)]
+        self.assertGreaterEqual(len(lock_idx), 4, "expected the claude + 3 codex states to lock")
+        for i in lock_idx:
+            # scan forward to the next completion-detection call for the SAME agent
+            done_key = "codex_done_ts(" if "lock_codex(" in lines[i] else "claude_done_ts("
+            j = next((k for k in range(i + 1, len(lines)) if done_key in lines[k]), None)
+            self.assertIsNotNone(j, f"no {done_key} after the lock at loop-line {i}")
+            between = "\n".join(lines[i + 1:j])
+            self.assertIn("sg.guard()", between,
+                          f"lock at loop-line {i} reaches {done_key} with no sg.guard() before it "
+                          "— a drifted log could be acted on before exit 7")
+
+
+class PlanApproval(unittest.TestCase):
+    OK = "[AIPAIR_PLAN_APPROVED]"
+
+    def test_extra_comment_comes_from_the_final_message_only(self):
+        # Regression (P1-c): a long preceding narration must NOT be read as an approval comment —
+        # the comment is the FINAL message minus its leading sentinel, not the whole turn joined.
+        self.assertEqual(relay.plan_extra_comment(["x" * 300, self.OK], self.OK), "",
+                         "narration before a sentinel-only final message → no付帯コメント (plain approve)")
+        self.assertEqual(relay.plan_extra_comment([self.OK + "\n細かい補足がある"], self.OK), "細かい補足がある")
+        self.assertEqual(relay.plan_extra_comment([], self.OK), "")
+        # the sentinel itself is stripped; surrounding punctuation trimmed
+        self.assertEqual(relay.plan_extra_comment([self.OK], self.OK), "")
+
+    def _dlg(self, tell="2"):
+        return {"tell": tell, "yes": "1", "yes_label": "Yes, and use auto mode", "plan": "p.md"}
+
+    def test_approve_feedback_delivers_extra_not_the_joined_turn(self):
+        # Regression (P1-c, delivery side): the feedback-approve path must carry `extra` (the
+        # final-message comment), never the whole-turn joined `text`. P2-1 made the decision a
+        # pure function (decide_plan_action), so assert it directly instead of grepping main():
+        # a long preceding narration + a sentinel-led final message with an extra note →
+        # approve_feedback carrying ONLY the final-message comment.
+        long_extra = "あ" * 100                         # > 80 かつ最終メッセージ由来
+        d = relay.decide_plan_action(["x" * 300, self.OK + "\n" + long_extra], self.OK, self._dlg())
+        self.assertEqual(d.action, "approve_feedback")
+        self.assertEqual(d.payload, long_extra)
+        self.assertNotIn("x", d.payload)                # 先行ナレーションは混入しない
+        # relay は「決定した payload」を approve=True で配達する（text を再計算して送らない）
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn('send_plan_feedback(panes["claude"], dialog, decision.payload, approve=True', src)
+        self.assertNotIn('dialog, text, approve=True', src, "must not deliver the whole-turn joined text")
+
+    def test_decide_plan_action_covers_every_branch(self):
+        # P2-1 plan_flow: the plan auto-approval decision (highest-stakes autonomous action) is a
+        # pure, tmux-free function — every branch is unit-covered here.
+        dlg = self._dlg()
+        # sentinel ALONE at the head → plain approve
+        self.assertEqual(relay.decide_plan_action([self.OK], self.OK, dlg).action, "approve")
+        # sentinel at head + short note (≤80) → still plain approve (no feedback churn)
+        self.assertEqual(relay.decide_plan_action([self.OK + "\nLGTM"], self.OK, dlg).action, "approve")
+        # sentinel at head + long note → approve_feedback
+        self.assertEqual(relay.decide_plan_action([self.OK + "\n" + "ok " * 40], self.OK, dlg).action,
+                         "approve_feedback")
+        # long note but the dialog has no "Tell Claude" slot → cannot attach feedback → plain approve
+        self.assertEqual(relay.decide_plan_action([self.OK + "\n" + "ok " * 40], self.OK,
+                                                  self._dlg(tell=None)).action, "approve")
+        # 🔴 safety: sentinel NOT at the head (negated / mid-sentence) must NEVER approve
+        self.assertEqual(relay.decide_plan_action(["なお " + self.OK + " とは判断できません"], self.OK, dlg).action,
+                         "changes")
+        self.assertEqual(relay.decide_plan_action(["2行目に\n" + self.OK], self.OK, dlg).action, "changes")
+        # changes carries the whole-turn text (so Claude sees the full review)
+        chg = relay.decide_plan_action(["please fix the retry logic"], self.OK, dlg)
+        self.assertEqual((chg.action, chg.payload), ("changes", "please fix the retry logic"))
+        # changes requested but no "Tell Claude" slot → fail-closed stop
+        self.assertEqual(relay.decide_plan_action(["fix it"], self.OK, self._dlg(tell=None)).action,
+                         "no_tell_option")
+        # empty review body → no_text; dialog vanished → no_dialog
+        self.assertEqual(relay.decide_plan_action([""], self.OK, dlg).action, "no_text")
+        self.assertEqual(relay.decide_plan_action(["fix it"], self.OK, None).action, "no_dialog")
+
+
+class StateMachineWiring(unittest.TestCase):
+    """P2-1 完了: relay.main() は arg parse／依存構築／起動／exit のみを担い、ループ本体は
+    state_machine.StateMachine.run() へ移設。ここでは main() 由来の全依存を構築子が受け取り属性化
+    することと、run() が呼べることを配線レベルで確認する（ループ本体は tmux/画面と密結合な統合
+    レベルのため単体では回さない — 判定核 ResponseGate / decide_* は別途被覆済み）。"""
+    def test_constructs_and_stores_every_dependency(self):
+        import types
+        SM = relay.state_machine.StateMachine
+        a = types.SimpleNamespace(start_side="claude", settle=0, poll=0, max_rounds=20)
+        tracked = {"claude": None, "codex": None}
+        sm = SM(a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x", tracked=tracked,
+                claude_seen=set(), codex_seen=set(), baseline=123.0, sg=object(), rg=object(),
+                bw=60, poke_codex="pc", poke_codex_next="pcn", poke_claude="pcl",
+                poke_claude_pass="pcp", poke_claude_next="pcnx", stop_phrases=["[AIPAIR_REVIEW_OK]"],
+                next_ask_phrases=["[AIPAIR_NEXT]"], all_done_phrases=["[AIPAIR_ALL_DONE]"],
+                human_required_phrases=["[AIPAIR_HUMAN_REQUIRED]"])
+        self.assertIs(sm.a, a)
+        self.assertIs(sm.tracked, tracked)                 # relay と共有する可変 dict
+        self.assertEqual((sm.own, sm.cwd, sm.baseline, sm.bw), ("%0", "/x", 123.0, 60))
+        self.assertEqual(sm.panes["codex"], "%2")
+        self.assertEqual((sm.poke_codex, sm.poke_claude_next), ("pc", "pcnx"))
+        self.assertEqual(sm.all_done_phrases, ["[AIPAIR_ALL_DONE]"])
+        self.assertEqual(sm.human_required_phrases, ["[AIPAIR_HUMAN_REQUIRED]"])
+        self.assertTrue(callable(sm.run))
+
+    def test_resolve_task_identity_verbatim_and_fail_closed(self):
+        # Phase 4（§8）: 識別子は task-list の verbatim `- [ ]` 行を丁度1件同定。抽出失敗・0/≥2 一致は
+        # UNRESOLVED（fail-closed）。返り値は原文の ready 行。
+        R = relay.state_machine.resolve_task_identity
+        U = relay.state_machine.UNRESOLVED
+        ready = ["- [ ] task A", "- [ ] task A extended", "  - [ ] nested B"]
+        # 単独行での逐語エコー → その行
+        self.assertEqual(R("次はこれ:\n- [ ] task A\n頑張って", ready), "- [ ] task A")
+        # バッククォート囲みでも同定（返り値は verbatim）
+        self.assertEqual(R("次は `  - [ ] nested B` を実装", ready), "  - [ ] nested B")
+        # prefix 部分一致で誤検出しない（full-line 比較）
+        self.assertEqual(R("- [ ] task A extended\n", ready), "- [ ] task A extended")
+        # 抽出失敗（どの行もエコーされていない）→ UNRESOLVED
+        self.assertEqual(R("適当に何かやって", ready), U)
+        # ≥2 一致（曖昧）→ UNRESOLVED
+        self.assertEqual(R("- [ ] task A\n- [ ] task A extended", ready), U)
+        # ready が空 → UNRESOLVED
+        self.assertEqual(R("- [ ] task A", []), U)
+
+    def test_canonical_task_key_drops_only_invisible_differences(self):
+        # P2-1・案B（CEO 判断 2026-08-27）: 照合キーは「見えない差」だけを落とす。
+        # 落とすもの: 先頭インデント / 行末空白（hard-break）/ checkbox 記法ゆれ / NFC。
+        # 落とさないもの: 本文そのもの（内部空白・大小・語順）。
+        K = relay.state_machine.canonical_task_key
+        base = K("- [ ] task A")
+        for same in ("  - [ ] task A", "- [ ] task A  ", "\t- [ ] task A\t", "* [ ] task A",
+                     "+ [ ] task A", "-  [ ] task A"):
+            self.assertEqual(K(same), base, "%r should canonicalise to the same key" % same)
+        self.assertEqual(K("- [X] done"), K("- [x] done"))          # マーカーの大小
+        self.assertEqual(K("- [ ] \u30ac"), K("- [ ] \u30ab\u3099"))  # NFC（合成/結合）
+        self.assertNotEqual(K("- [ ] task A"), K("- [ ] task  A"))  # 本文の内部空白は保持
+        self.assertNotEqual(K("- [ ] task A"), K("- [ ] Task A"))   # 大小は本文の一部
+        self.assertNotEqual(K("- [ ] task A"), K("- [x] task A"))   # 状態は別物
+        self.assertEqual(K("ただの散文"), "ただの散文")             # checkbox でない行は trim のみ
+        self.assertEqual(K(None), "")
+
+    def test_resolve_task_identity_tolerates_echo_whitespace_and_notation(self):
+        # P2-1・案B: エコーが行頭インデントを落とす / 行末に hard-break を足す / bullet を変える、
+        # といった「見えない差」では取り逃がさない（旧: 逐語完全一致のみ → 偽 UNRESOLVED）。
+        R = relay.state_machine.resolve_task_identity
+        U = relay.state_machine.UNRESOLVED
+        ready = ["  - [ ] nested task", "- [ ] other task"]
+        for echo in ("- [ ] nested task",            # インデントを落としたエコー
+                     "  - [ ] nested task  ",        # hard-break 付き
+                     "* [ ] nested task",            # bullet ゆれ
+                     "次はこれ `- [ ] nested task` を実装"):   # バッククォート span
+            self.assertEqual(R(echo, ready), "  - [ ] nested task",
+                             "echo %r must resolve to the verbatim ready line" % echo)
+        # 本文が違えば当然一致しない（prefix 部分一致でも同定しない）
+        self.assertEqual(R("- [ ] nested", ready), U)
+
+    def test_resolve_task_identity_same_body_different_indent_is_unresolved(self):
+        # 案B の代償（意図的・fail-closed）: 本文が同じでインデントだけ違う 2 項目は canonical key が
+        # 一致するため区別できず、**両方一致 → UNRESOLVED**。安定 ID（案A）を採らない以上ここは
+        # 安全側に倒す（同一性不明のまま無限往復させない）。
+        R = relay.state_machine.resolve_task_identity
+        U = relay.state_machine.UNRESOLVED
+        two = ["- [ ] task", "  - [ ] task"]                    # 同本文・インデント違い
+        self.assertEqual(R("- [ ] task", two), U)
+        self.assertEqual(R("  - [ ] task", two), U)
+        # 片方だけなら（曖昧でないので）通常どおり同定できる
+        self.assertEqual(R("- [ ] task", ["  - [ ] task"]), "  - [ ] task")
+
+    def test_advance_no_progress_streak(self):
+        # Phase 4（§8）: (同一識別子 OR UNRESOLVED) AND snapshot hash 不変 が 3 回連続で停止。
+        A = relay.state_machine.advance_no_progress
+        U = relay.state_machine.UNRESOLVED
+        # Case 5: 同一 (X, H) を 3 回 → 2回目まで継続・3回目で停止
+        s, stop = A(None, "X", "H");   self.assertEqual((s, stop), (("X", "H", 1), False))
+        s, stop = A(s, "X", "H");      self.assertEqual((s, stop), (("X", "H", 2), False))
+        s, stop = A(s, "X", "H");      self.assertEqual((s, stop), (("X", "H", 3), True))
+        # 新しい識別子でリセット
+        s, stop = A(("X", "H", 2), "Y", "H"); self.assertEqual((s[2], stop), (1, False))
+        # snapshot hash 変化でリセット（＝進捗あり）
+        s, stop = A(("X", "H1", 2), "X", "H2"); self.assertEqual((s[2], stop), (1, False))
+        # P2-1・案B: 識別子が「見えない差」だけ変わってもストリークは継続（不当リセットでガードが
+        # 緩まない）。task-list 側の行末空白を直しただけ、等。
+        s, stop = A(("- [ ] t", "H", 2), "  - [ ] t  ", "H")
+        self.assertEqual((s[2], stop), (3, True), "空白差だけの再選択は同一タスクとして停滞に数える")
+        # UNRESOLVED が同一 hash で 3 連続 → 停止（同一性不明のまま無限往復させない）
+        s, stop = A(None, U, "H")
+        s, stop = A(s, U, "H");        self.assertFalse(stop)
+        s, stop = A(s, U, "H");        self.assertTrue(stop)
+        # UNRESOLVED でも hash が変われば進捗ありでリセット
+        s, stop = A((U, "H1", 2), U, "H2"); self.assertEqual((s[2], stop), (1, False))
+
+    def test_human_required_banner_lists_blocked_items(self):
+        # §6/P2-5: HUMAN_REQUIRED banner は endless_flow が (level,text) 行データで返す（残 [!] 項目名＋
+        # blocker 理由を列挙）。print は state_machine.print_banner 経由（_drive テストで実駆動被覆）。
+        from aipairlib import endless_flow
+        cls = {"state": "BLOCKED", "ready": [],
+               "blocked": [{"item": "- [!] set GitHub Secrets", "blocker": "repo admin による設定"}], "hash": "h"}
+        flat = "\n".join(t for _l, t in endless_flow.human_required_banner_lines(cls, 5, 8))
+        self.assertIn("自動処理を停止しました", flat)
+        self.assertIn("HUMAN_REQUIRED", flat)
+        self.assertIn("exit 8", flat)                       # 渡した exit_code を表示
+        self.assertIn("- [!] set GitHub Secrets", flat)     # 項目名
+        self.assertIn("repo admin による設定", flat)          # blocker 理由
+
+    def test_no_progress_banner_shows_item_streak_hash(self):
+        # §6/P2-5: no-progress banner は endless_flow が (level,text) 行データで返す（繰り返し項目・
+        # ストリーク数・snapshot hash。[!] 一覧に依存しない）。
+        from aipairlib import endless_flow
+        flat = "\n".join(t for _l, t in
+                         endless_flow.no_progress_banner_lines(("- [ ] task A", "abc123", 3), 7, 8))
+        self.assertIn("no-progress", flat)
+        self.assertIn("- [ ] task A", flat)
+        self.assertIn("3", flat)              # ストリーク数
+        self.assertIn("abc123", flat)         # snapshot hash
+        # UNRESOLVED（[!] が無い場合）でもクラッシュせず表示
+        flat2 = "\n".join(t for _l, t in
+                          endless_flow.no_progress_banner_lines((endless_flow.UNRESOLVED, "h9", 3), 7, 8))
+        self.assertIn("UNRESOLVED", flat2)
+
+    def test_no_progress_warns_on_unresolved_identity(self):
+        # 契約（§8 / Codex relay-id:7292a881）: 識別子が UNRESOLVED（抽出失敗・0/≥2 一致）の時、
+        # controller（endless_flow.handle_endless_response）は警告 log を outcome に載せストリークを進める。
+        # P2-5 で判定核が state_machine から endless_flow へ移ったので controller を直接駆動して固定する。
+        from aipairlib import endless_flow as ef
+        cls = {"state": "READY", "ready": ["- [ ] A"], "blocked": [], "hash": "h1"}
+        eo = ef.handle_endless_response(
+            ["逐語エコーの無い指示"], ["[AIPAIR_ALL_DONE]"], ["[AIPAIR_HUMAN_REQUIRED]"],
+            "next", None, 1, 8, "HR", "NOPROG", lambda: cls)          # 0 一致 → UNRESOLVED
+        self.assertEqual(eo.kind, "advance_next")        # 1 回目は継続
+        self.assertEqual(eo.log, ef.UNRESOLVED_LOG)      # UNRESOLVED 警告を outcome に載せる
+        self.assertEqual(eo.np_state[0], ef.UNRESOLVED)  # ストリークを進めた
+
+    def test_no_progress_guard_wired_at_codex_next(self):
+        # §8: pending_kind=="next" で同一識別子＋hash が limit(3) 連続なら no_progress で停止
+        # （reason=BLOCKED_NOPROGRESS ＋ banner）。判定は endless_flow.handle_endless_response（P2-5）。
+        from aipairlib import endless_flow as ef
+        cls = {"state": "READY", "ready": ["- [ ] A"], "blocked": [], "hash": "H"}
+        base = (["- [ ] A"], ["[AIPAIR_ALL_DONE]"], ["[AIPAIR_HUMAN_REQUIRED]"], "next")
+        np = None
+        for expect in ("advance_next", "advance_next", "no_progress"):   # 3 連続で停止
+            eo = ef.handle_endless_response(*base, np, 1, 8, "HR", "NOPROG", lambda: cls)
+            self.assertEqual(eo.kind, expect)
+            np = eo.np_state
+        self.assertEqual(eo.reason, "NOPROG")            # relay 内部理由
+        self.assertTrue(eo.banner)                       # no-progress banner を outcome に載せる
+        # 逐語一致で識別子が解決されていること（ストリークが進む前提）
+        self.assertEqual(np[0], "- [ ] A")
+
+    def test_codex_next_prompt_asks_to_echo_the_task_line(self):
+        # §8 の識別子契約: Codex は指示するタスク行を逐語エコーする（プロンプトで指定）。
+        txt = relay.review_protocol.endless_poke_codex_next("t.md", "[AIPAIR_ALL_DONE]", "[AIPAIR_HUMAN_REQUIRED]")
+        self.assertIn("逐語", txt)
+        self.assertIn("進捗検出", txt)
+
+    def test_decide_endless_terminal_is_classification_gated(self):
+        # Phase 2: task-list 分類が権威。sentinel は分類一致時のみ honor、READY 残は reject（継続）。
+        d = relay.state_machine.decide_endless_terminal
+        tl = relay.state_machine.tasklist
+        self.assertEqual(d(True, False, tl.ALL_DONE), "all_done")        # §11 Case 2
+        self.assertEqual(d(False, True, tl.BLOCKED), "human_required")   # §11 Case 3
+        self.assertEqual(d(True, False, tl.READY), "reject")             # §11 Case 6: [ ] 残で ALL_DONE 拒否
+        self.assertEqual(d(False, True, tl.READY), "reject")             # [ ] 残で HUMAN_REQUIRED 拒否
+        self.assertEqual(d(True, False, tl.BLOCKED), "reject")           # sentinel と分類の不一致
+        self.assertIsNone(d(False, False, tl.READY))                     # sentinel 無し=通常継続
+
+    def test_relay_builds_and_passes_human_required_phrases(self):
+        # relay.main() が a.human_required を分割して StateMachine へ渡す配線
+        with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("human_required_phrases = [s for s in a.human_required.split", src)
+        self.assertIn("human_required_phrases=human_required_phrases", src)
+
+    def test_endless_rejects_empty_sentinels(self):
+        # fail-closed（Codex relay-id:c24c2593 / 3a1abe3b）: endless の sentinel（終端 --all-done /
+        # --human-required、合図 --next-ask）が空だと、文面は既定 sentinel を出すのに検出リストが空で
+        # 認識できず、その遷移が起きても max-rounds まで続く。→ 起動時に exit 2 で拒否する。
+        # 3 つの sentinel すべて、"" と "||" の両方を固定する。
+        relay_bin = os.path.join(BIN, "aipair-relay")
+        base = ["--endless", "--dir", "/tmp"]
+        ok = {"--all-done": "[X]", "--human-required": "[Y]", "--next-ask": "[Z]"}
+        for empty in ("", "||"):
+            for flag in ("--all-done", "--human-required", "--next-ask"):
+                argv = [sys.executable, relay_bin]
+                for f, v in ok.items():
+                    argv += [f, empty if f == flag else v]      # 対象 flag だけ空、他は有効値
+                r = subprocess.run(argv + base, capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2, "%s=%r should exit 2: %s" % (flag, empty, r.stderr))
+                self.assertIn(flag, r.stderr)
+
+    def test_relay_endless_pane_title_shows_both_terminals(self):
+        # Codex relay-id:09d4bcf5: relay 本体のタイトルが launcher の 2 終端表示を ALL_DONE のみへ
+        # 上書きしていたのを是正。endless タイトルは両終端（DONE/HUMAN）を示し、旧『終端「{a.all_done}」』は使わない。
+        with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("endless / max {max_label} / 終端 DONE/HUMAN", src)
+        self.assertNotIn('終端「{a.all_done}」', src)
+
+    def _run_startup(self, state):
+        # 起動時分類が state の StateMachine.run() を、tmux/poke を mock して回す。
+        # 戻り値 code と「poke が呼ばれたか」を返す（起動時終端では 1 度も poke しないのが要件）。
+        import types
+        sm_mod = relay.state_machine
+        a = types.SimpleNamespace(start_side="claude", settle=0, poll=0, max_rounds=20,
+                                  endless=True, task_list="tasks/todo.md")
+        tracked = {"claude": "a.jsonl", "codex": "b.jsonl"}
+        sm = sm_mod.StateMachine(
+            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x", tracked=tracked,
+            claude_seen=set(), codex_seen=set(), baseline=0.0, sg=object(), rg=object(),
+            bw=60, poke_codex="pc", poke_codex_next="pcn", poke_claude="pcl",
+            poke_claude_pass="pcp", poke_claude_next="pcnx", stop_phrases=["[AIPAIR_REVIEW_OK]"],
+            next_ask_phrases=["[AIPAIR_NEXT]"], all_done_phrases=["[AIPAIR_ALL_DONE]"],
+            human_required_phrases=["[AIPAIR_HUMAN_REQUIRED]"])
+        cls = {"state": state, "ready": [], "blocked": [], "hash": "h"}
+        with mock.patch.object(sm_mod.tasklist, "load_or_exit", return_value=cls), \
+             mock.patch.object(sm_mod, "set_pane_title"), \
+             mock.patch.object(sm_mod, "poke") as poke_mock:
+            code = sm.run()
+        return code, poke_mock.called
+
+    def test_startup_all_done_exits_0_without_poking(self):
+        code, poked = self._run_startup(relay.state_machine.tasklist.ALL_DONE)
+        self.assertEqual(code, 0)         # 起動時点で完了 → exit 0
+        self.assertFalse(poked)           # 1 度も poke せず（エージェントを駆動しない）
+
+    def test_startup_blocked_exits_8_without_poking(self):
+        code, poked = self._run_startup(relay.state_machine.tasklist.BLOCKED)
+        self.assertEqual(code, relay.state_machine.EXIT_BLOCKED)   # [!] のみ → exit 8
+        self.assertFalse(poked)
+
+    def test_startup_ready_enters_the_loop(self):
+        # READY のときは _skip_loop=False でループへ入る。ループ先頭の sg.guard() を marker で捕捉して、
+        # 起動時に skip して即 return していないことを証明する。
+        import types
+        sm_mod = relay.state_machine
+        a = types.SimpleNamespace(start_side="claude", settle=0, poll=0, max_rounds=20,
+                                  endless=True, task_list="tasks/todo.md")
+
+        class _Guard:
+            def guard(self):
+                raise RuntimeError("LOOP-ENTERED")
+
+        sm = sm_mod.StateMachine(
+            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x",
+            tracked={"claude": "a", "codex": "b"}, claude_seen=set(), codex_seen=set(),
+            baseline=0.0, sg=_Guard(), rg=object(), bw=60, poke_codex="pc", poke_codex_next="pcn",
+            poke_claude="pcl", poke_claude_pass="pcp", poke_claude_next="pcnx",
+            stop_phrases=["[AIPAIR_REVIEW_OK]"], next_ask_phrases=["[AIPAIR_NEXT]"],
+            all_done_phrases=["[AIPAIR_ALL_DONE]"], human_required_phrases=["[AIPAIR_HUMAN_REQUIRED]"])
+        cls = {"state": sm_mod.tasklist.READY, "ready": ["- [ ] a"], "blocked": [], "hash": "h"}
+        with mock.patch.object(sm_mod.tasklist, "load_or_exit", return_value=cls), \
+             mock.patch.object(sm_mod, "set_pane_title"), \
+             mock.patch.object(sm_mod, "poke"):
+            with self.assertRaisesRegex(RuntimeError, "LOOP-ENTERED"):
+                sm.run()
+
+    def test_exit_blocked_code_and_two_distinct_reasons(self):
+        # endless BLOCKED/HUMAN_REQUIRED (メンテナーの決定 2026-08-24): exit 8 は max-rounds(3) と別コードで、
+        # 2 つの内部理由（HUMAN_REQUIRED / no-progress）を区別する文字列を Phase 2/4 が使う。
+        sm = relay.state_machine
+        self.assertEqual(sm.EXIT_BLOCKED, 8)
+        self.assertNotIn(sm.EXIT_BLOCKED, (0, 3))          # max-rounds(3)・正常(0) と衝突しない
+        self.assertTrue(sm.BLOCKED_HR_REASON and sm.BLOCKED_NOPROGRESS_REASON)
+        self.assertNotEqual(sm.BLOCKED_HR_REASON, sm.BLOCKED_NOPROGRESS_REASON)
+        # reason dict は literal『8:』を持つ（doc-sync が README との同期を検証する）
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertRegex(src, r"reason = \{[^}]*\b8:\s")
+
+    def test_relay_main_is_a_thin_launcher(self):
+        # main() ends by delegating to StateMachine(...).run(); the loop no longer lives in relay.py
+        with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
+            relay_src = fh.read()
+        self.assertIn("return StateMachine(", relay_src)
+        self.assertIn(").run()", relay_src)
+        for gone in ("while True:", "= lock_codex(", "codex_done_ts(", "class LogWatch:"):
+            self.assertNotIn(gone, relay_src, f"{gone!r} must have moved out of relay.py")
+
+    def test_question_hr_reason_is_distinct(self):
+        # P1-2: 質問 HUMAN_REQUIRED は exit 8 の他 2 理由（endless HR / no-progress）と区別する reason を持つ。
+        # 実駆動での exit 8・banner・回答非送信は EndlessScenarios.test_question_* が固定する。
+        sm = relay.state_machine
+        self.assertTrue(sm.QUESTION_HR_REASON)
+        self.assertNotIn(sm.QUESTION_HR_REASON, (sm.BLOCKED_HR_REASON, sm.BLOCKED_NOPROGRESS_REASON))
+
+    def test_new_cycle_logic_lives_in_flow_modules_not_state_machine(self):
+        # P2-5（メンテナーの決定・Codex relay-id:8938cb00）: 今回追加した question / endless のロジック —
+        # 質問 HUMAN_REQUIRED（P1-2）・質問 payload guard（P1-3）・endless 終端 / no-progress — は
+        # question_flow / endless_flow に《純粋な判定＋banner 文言》として置き、state_machine は
+        # それらを《呼んで結果を適用するだけ》にする（判定分岐も banner 生成も state_machine に直書きしない）。
+        from aipairlib import question_flow, endless_flow, state_machine as sm
+        # 判定核 + banner 文言ビルダは flow module が所有する
+        for name in ("decide_question_action", "handle_question_answer", "decide_question_relay",
+                     "human_required_banner_lines", "question_oversize_banner_lines"):
+            self.assertTrue(hasattr(question_flow, name), f"question_flow must own {name}")
+        # endless の終端判定・no-progress・停止 banner・応答 outcome 生成はすべて endless_flow が所有する
+        for name in ("decide_endless_terminal", "resolve_task_identity", "advance_no_progress",
+                     "human_required_banner_lines", "no_progress_banner_lines",
+                     "handle_endless_response", "EndlessOutcome"):
+            self.assertTrue(hasattr(endless_flow, name), f"endless_flow must own {name}")
+        # state_machine は import して同一オブジェクトを使う（再実装しない）
+        self.assertIs(sm.handle_question_answer, question_flow.handle_question_answer)
+        self.assertIs(sm.decide_question_relay, question_flow.decide_question_relay)
+        self.assertIs(sm.handle_endless_response, endless_flow.handle_endless_response)
+        self.assertIs(sm.human_required_banner_lines, endless_flow.human_required_banner_lines)
+        self.assertIs(sm.no_progress_banner_lines, endless_flow.no_progress_banner_lines)
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
+            sm_src = fh.read()
+        # run() は handler / controller を呼び、outcome を適用するだけ（P1-2/P1-3/P2-5）
+        self.assertIn("handle_question_answer(", sm_src)
+        self.assertIn("decide_question_relay(", sm_src)
+        self.assertIn("handle_endless_response(", sm_src)   # endless 応答は endless_flow の controller が判定
+        self.assertIn("print_banner(eo.banner)", sm_src)    # 停止 banner は outcome から print（run() で組まない）
+        self.assertNotIn('decision.action == "human_required"', sm_src,
+                         "質問の分岐判定は question_flow.handle_question_answer 内へ")
+        # Codex 応答の判定分岐・no-progress 更新・banner 生成が state_machine 直書きに戻らないことを固定。
+        # （起動時 BLOCKED の print_banner(human_required_banner_lines(...)) は endless_flow のビルダを
+        #  print するだけの適用側なので許容 — これは判定ではなく outcome の表示）。
+        for gone in ('term == "reject"', 'term == "human_required"', 'if pending_kind == "next":',
+                     "advance_no_progress(np_state", "resolve_task_identity(",
+                     "print_banner(no_progress_banner_lines(",
+                     "def question_human_required_banner", "def human_required_banner",
+                     "def no_progress_banner", "def question_oversize_banner_lines",
+                     "def decide_question_relay", "def handle_question_answer",
+                     "def decide_endless_terminal", "def handle_endless_response"):
+            self.assertNotIn(gone, sm_src, f"{gone!r} は flow module 側に置く（state_machine で再定義/直書きしない）")
+
+class QuestionRelayDecision(unittest.TestCase):
+    """P2-1 question_flow: Codex の質問回答をどうするかの判定は純粋関数 decide_question_action。
+    plan と対称に「no_text→再検知 / no_dialog→人間操作 / else→配達」を副作用抜きで被覆する。"""
+    def test_all_branches(self):
+        qdlg = {"chat": "1", "footer": "Chat about this"}
+        d = relay.decide_question_action(["Postgres を選ぶべき"], qdlg)
+        self.assertEqual((d.action, d.payload), ("deliver", "Postgres を選ぶべき"))
+        # 複数行の回答は連結して配達（そのまま中継 — 承認 sentinel は無い）
+        self.assertEqual(relay.decide_question_action(["1行目", "2行目"], qdlg).payload, "1行目\n2行目")
+        # 空本文 → no_text（ダイアログ検知からやり直し・未送信で state を進めない）
+        self.assertEqual(relay.decide_question_action([""], qdlg).action, "no_text")
+        self.assertEqual(relay.decide_question_action([], qdlg).action, "no_text")
+        # 回答中に人間がダイアログを操作 → 消えていれば no_dialog（通常待機へ戻す）
+        self.assertEqual(relay.decide_question_action(["answer"], None).action, "no_dialog")
+
+    def test_human_required_branch(self):
+        # P1-2: Codex が最終メッセージ1行目に [AIPAIR_HUMAN_REQUIRED] を単独出力 → human_required。
+        # Claude へ回答を送らず exit 8 で停止する経路（state_machine 側）。
+        qdlg = {"chat": "1", "footer": "Chat about this"}
+        HR = ["[AIPAIR_HUMAN_REQUIRED]"]
+        # 単独 1 行目 → human_required（ダイアログ有無に依らない）
+        self.assertEqual(relay.decide_question_action(["[AIPAIR_HUMAN_REQUIRED]"], qdlg, HR).action,
+                         "human_required")
+        self.assertEqual(relay.decide_question_action(["[AIPAIR_HUMAN_REQUIRED]"], None, HR).action,
+                         "human_required")
+        # 最終メッセージの 1 行目に単独 → human_required（先行の進捗ナレーションは無視）
+        self.assertEqual(
+            relay.decide_question_action(["調べます", "[AIPAIR_HUMAN_REQUIRED]"], qdlg, HR).action,
+            "human_required")
+        # sentinel が最終メッセージでない → deliver（契約は「最終回答の1行目」）
+        self.assertEqual(
+            relay.decide_question_action(["[AIPAIR_HUMAN_REQUIRED]", "本番DBの可否"], qdlg, HR).action,
+            "deliver")
+        # phrases 未指定（通常モードで --human-required 空）→ HR 判定しない
+        self.assertEqual(relay.decide_question_action(["[AIPAIR_HUMAN_REQUIRED]"], qdlg, ()).action,
+                         "deliver")
+        # 空本文は HR より優先（no_text）
+        self.assertEqual(relay.decide_question_action([""], qdlg, HR).action, "no_text")
+
+    def test_relay_length_gate(self):
+        # P1-3: 質問本文（payload）が自動中継上限を超えたら truncate せず human_required。上限内は relay。
+        from aipairlib import question_flow
+        from aipairlib.review_protocol import QUESTION_RELAY_LIMIT, question_payload_text
+        self.assertEqual(question_flow.decide_question_relay(["短い質問"]).kind, "relay")
+        # 境界は **payload 全体（プレフィックス込み）** で判定する。ブロック本体を調整して
+        # payload がちょうど LIMIT／LIMIT+1 になるケースを作り、relay / human_required を明示固定する。
+        prefix = len(question_payload_text([""]))       # "◆1問目: " の長さ
+        at_block = "x" * (QUESTION_RELAY_LIMIT - prefix)
+        over_block = "x" * (QUESTION_RELAY_LIMIT - prefix + 1)
+        self.assertEqual(len(question_payload_text([at_block])), QUESTION_RELAY_LIMIT)       # ちょうど 3000
+        self.assertEqual(len(question_payload_text([over_block])), QUESTION_RELAY_LIMIT + 1)  # 3001
+        self.assertEqual(question_flow.decide_question_relay([at_block]).kind, "relay")          # 3000 → relay
+        over = question_flow.decide_question_relay([over_block])                                 # 3001 → HR
+        self.assertEqual(over.kind, "human_required")
+        self.assertIsNotNone(over.banner)
+        # banner は全文を載せず先頭 preview のみ（省略記号）＋実長を表示
+        flat = "\n".join(t for _l, t in over.banner)
+        self.assertIn("自動中継上限", flat)
+        self.assertIn("…", flat)
+        self.assertLess(len(flat), 1200)               # 3001 字の質問全文は載らない
+        # relay のときは level/log/banner が None
+        ok = question_flow.decide_question_relay([at_block])
+        self.assertEqual((ok.kind, ok.level, ok.log, ok.banner), ("relay", None, None, None))
+
+
+class DialogSendScrape(unittest.TestCase):
+    """aipairlib.dialoglib: multi-tab scrape, capture failure, plan revise/approve, question
+    answer, watch present/absent. tmux/capture/delivery hooks are injected → patch there."""
+    def setUp(self):
+        self.dg = relay.dialoglib
+        clk = [1000.0]
+        def _sleep(s): clk[0] += (s or 0.01)
+        def _time(): clk[0] += 0.001; return clk[0]
+        self.q = [mock.patch.object(self.dg.time, "sleep", side_effect=_sleep),
+                  mock.patch.object(self.dg.time, "time", side_effect=_time),
+                  mock.patch.object(self.dg, "dim")]
+        for x in self.q: x.start()
+    def tearDown(self):
+        for x in self.q: x.stop()
+
+    Q1 = ("← ☐ Database  ☒ Cache  ✔ Submit →\n─────\nPick a database\n"
+          "❯ 1. Postgres\n   2. SQLite\n   3. Chat about this\n\nEnter to select · Esc")
+    Q2 = ("← ☐ Database  ☒ Cache  ✔ Submit →\n─────\nPick a cache\n"
+          "❯ 1. Redis\n   2. Memcached\n   3. Chat about this\n\nEnter to select · Esc")
+
+    def test_scrape_two_tabs(self):
+        caps = iter([self.Q1, self.Q1, self.Q2])   # read Q1, press Right, read Q2
+        presses = []
+        with mock.patch.object(self.dg, "capture_pane", side_effect=lambda p: next(caps)), \
+             mock.patch.object(relay.deliverylib, "press", side_effect=lambda p, k: presses.append(k)):
+            blocks = self.dg.scrape_questions("%0")
+        self.assertEqual(len(blocks), 2)
+        self.assertIn("Pick a database", blocks[0]); self.assertIn("Pick a cache", blocks[1])
+        self.assertIn("Right", presses, "moves to the next tab with a non-destructive Right")
+
+    def test_scrape_capture_failure_stops_cleanly(self):
+        import subprocess
+        with mock.patch.object(self.dg, "capture_pane", side_effect=subprocess.CalledProcessError(1, "tmux")):
+            self.assertEqual(self.dg.scrape_questions("%0"), [])
+
+    def test_plan_revise_uses_submit_enter_with_watch_confirm(self):
+        w = mock.Mock(); w.claude_resolved.return_value = False; w.claude_input.return_value = True
+        seen = {}
+        with mock.patch.object(relay.deliverylib, "press") as press, \
+             mock.patch.object(relay.deliverylib, "paste_text") as paste, \
+             mock.patch.object(relay.deliverylib, "submit_enter", side_effect=lambda p, confirm=None, badge=True: seen.update(confirm=confirm, badge=badge) or True) as se:
+            ok = self.dg.send_plan_feedback("%0", {"tell": "3"}, "please change X", approve=False, watch=w)
+        self.assertTrue(ok)
+        press.assert_any_call("%0", "3")                 # 'Tell Claude what to change'
+        paste.assert_called_once()
+        w.reset.assert_called_once()
+        self.assertTrue(seen["confirm"]())               # confirm wired to the watch
+        self.assertFalse(seen["badge"], "watch present → badge not used")
+
+    def test_plan_approve_uses_btab_and_confirms_via_watch(self):
+        w = mock.Mock(); w.claude_resolved.side_effect = [False, True]; w.claude_input.return_value = False
+        with mock.patch.object(relay.deliverylib, "press") as press, mock.patch.object(relay.deliverylib, "paste_text"), \
+             mock.patch.object(self.dg, "tmux", return_value=types.SimpleNamespace(stdout="")):
+            ok = self.dg.send_plan_feedback("%0", {"tell": "3"}, "ok", approve=True, watch=w)
+        self.assertTrue(ok)
+        press.assert_any_call("%0", "BTab")              # feedback-approve is Shift+Tab
+
+    def test_plan_approve_badge_fallback_without_watch(self):
+        with mock.patch.object(relay.deliverylib, "press"), mock.patch.object(relay.deliverylib, "paste_text"), \
+             mock.patch.object(self.dg, "tmux", return_value=types.SimpleNamespace(stdout="running esc to interrupt")):
+            self.assertTrue(self.dg.send_plan_feedback("%0", {"tell": "3"}, "ok", approve=True, watch=None))
+
+    def test_plan_approve_failure_when_not_confirmed(self):
+        w = mock.Mock(); w.claude_resolved.return_value = False; w.claude_input.return_value = False
+        with mock.patch.object(relay.deliverylib, "press"), mock.patch.object(relay.deliverylib, "paste_text"):
+            self.assertFalse(self.dg.send_plan_feedback("%0", {"tell": "3"}, "x", approve=True, watch=w))
+
+    def test_question_answer_with_and_without_watch(self):
+        # with watch: chat pressed, answer pasted, submit_enter confirm=watch.claude_input, badge False
+        w = mock.Mock(); w.claude_input.return_value = True
+        seen = {}
+        with mock.patch.object(relay.deliverylib, "press") as press, mock.patch.object(relay.deliverylib, "paste_text") as paste, \
+             mock.patch.object(relay.deliverylib, "submit_enter", side_effect=lambda p, confirm=None, badge=True: seen.update(c=confirm, b=badge) or True):
+            self.assertTrue(self.dg.send_question_answer("%0", {"chat": "3"}, "my answer", watch=w))
+        press.assert_any_call("%0", "3"); paste.assert_called_once()
+        self.assertTrue(seen["c"]()); self.assertFalse(seen["b"])
+        # without watch: badge fallback (confirm None → badge True)
+        seen.clear()
+        with mock.patch.object(relay.deliverylib, "press"), mock.patch.object(relay.deliverylib, "paste_text"), \
+             mock.patch.object(relay.deliverylib, "submit_enter", side_effect=lambda p, confirm=None, badge=True: seen.update(c=confirm, b=badge) or True):
+            self.dg.send_question_answer("%0", {"chat": "3"}, "a", watch=None)
+        self.assertIsNone(seen["c"]); self.assertTrue(seen["b"])
+
+
+class DialoglibStandalone(unittest.TestCase):
+    def test_loads_without_relay(self):
+        self.assertTrue(_imports_without_relay("dialoglib", "detect_plan_dialog", "dialog_on_screen"))
+        self.assertIn("Would you like to proceed?", relay.dialoglib.PLAN_QUESTION)
+        self.assertIs(relay.detect_plan_dialog, relay.dialoglib.detect_plan_dialog)
+        # delivery routes its re-press guard through the dialog MODULE (the delivery<->dialog cycle)
+        self.assertIs(relay.deliverylib.dialoglib, relay.dialoglib)
+        self.assertIs(relay.dialoglib.deliverylib, relay.deliverylib)
+
+
+class ModuleLayout(unittest.TestCase):
+    """#7: relay imports the aipairlib sibling modules normally and binds a representative symbol
+    from each to that module's implementation (guards against a future re-merge / broken import)."""
+    def test_all_libs_loaded_and_bindings_point_to_them(self):
+        for lib in ("corelib", "loglib", "tmuxlib", "deliverylib", "dialoglib", "peerlog", "logs"):
+            self.assertTrue(hasattr(relay, lib), f"relay must import {lib}")
+        self.assertIs(relay.parse_version, relay.corelib.parse_version)
+        self.assertIs(relay.schema_probe, relay.corelib.schema_probe)
+        self.assertIs(relay.schema_gate, relay.corelib.schema_gate)
+        self.assertIs(relay.claude_done_ts, relay.loglib.claude_done_ts)
+        self.assertIs(relay.read_records, relay.loglib.read_records)
+        self.assertIs(relay.find_panes, relay.tmuxlib.find_panes)
+        self.assertIs(relay.poke, relay.deliverylib.poke)
+        self.assertIs(relay.detect_plan_dialog, relay.dialoglib.detect_plan_dialog)
+        # the delivery<->dialog cycle is a plain module import (used at call-time), not injection
+        self.assertIs(relay.deliverylib.dialoglib, relay.dialoglib)
+        self.assertIs(relay.dialoglib.deliverylib, relay.deliverylib)
+        self.assertIs(relay.dim, relay.logs.dim)
+        # P2-1: the state machine (loop + LogWatch + approval_took_effect + done_banner) now lives
+        # in state_machine.py; relay imports it and wires StateMachine in main().
+        self.assertTrue(hasattr(relay, "state_machine"))
+        self.assertIs(relay.StateMachine, relay.state_machine.StateMachine)
+        self.assertIs(relay.decide_plan_action, relay.state_machine.decide_plan_action)
+        for moved in ("LogWatch", "approval_took_effect", "done_banner", "StateMachine"):
+            self.assertTrue(hasattr(relay.state_machine, moved), f"state_machine must own {moved}")
+        # plan_flow / question_flow は named module として独立（判定核の在処）。state_machine は
+        # そこから re-export する（`from .plan_flow import ...`）ので、実体との同一性で確認する。
+        from aipairlib import plan_flow, question_flow
+        self.assertIs(relay.state_machine.decide_plan_action, plan_flow.decide_plan_action)
+        self.assertIs(relay.state_machine.decide_question_action, question_flow.decide_question_action)
+        # what stays in relay (the launcher): main() + the re-exported helpers it wires
+        for core in ("main", "lock_codex", "run_gate", "gate_or_message"):
+            self.assertTrue(hasattr(relay, core))
+
+
+class DoneTimestamps(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="aipair-parsers.")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def jsonl(self, name, rows):
+        p = os.path.join(self.tmp.name, name)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("not json\n")
+            for r in rows:
+                fh.write(json.dumps(r) + "\n")
+        return p
+
+    def test_claude_turn_is_done_when_the_last_assistant_row_is_not_tool_use(self):
+        p = self.jsonl("c.jsonl", [
+            {"type": "assistant", "timestamp": "2026-08-21T00:00:10Z", "message": {"stop_reason": "tool_use"}},
+            {"type": "user", "timestamp": "2026-08-21T00:00:15Z"},
+            {"type": "assistant", "timestamp": "2026-08-21T00:00:20Z", "message": {"stop_reason": "end_turn"}},
+        ])
+        self.assertEqual(relay.claude_done_ts(p, 0), epoch("2026-08-21T00:00:20Z"))
+        self.assertIsNone(relay.claude_done_ts(p, epoch("2026-08-21T00:00:20Z")), "not after `since`")
+        busy = self.jsonl("busy.jsonl", [
+            {"type": "assistant", "timestamp": "2026-08-21T00:00:20Z", "message": {"stop_reason": "tool_use"}}])
+        self.assertIsNone(relay.claude_done_ts(busy, 0))
+        self.assertIsNone(relay.claude_done_ts(os.path.join(self.tmp.name, "missing"), 0))
+
+    # --- background subagents: row shapes copied from real claude 2.1.29x transcripts ----------- #
+    T = "2026-10-12T00:%02d:%02dZ"
+
+    def at(self, sec):
+        return self.T % divmod(sec, 60)
+
+    def a(self, sec, stop):
+        return {"type": "assistant", "timestamp": self.at(sec), "message": {"stop_reason": stop}}
+
+    def launch(self, sec, tid, key="agentId"):
+        return {"type": "user", "timestamp": self.at(sec),
+                "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_" + tid,
+                     "content": [{"type": "text", "text": "Async agent launched successfully."}]}]},
+                "toolUseResult": {"status": "async_launched", "isAsync": True, key: tid}}
+
+    @staticmethod
+    def notice(tid, status="completed"):
+        return ("<task-notification>\n<task-id>%s</task-id>\n<tool-use-id>toolu_%s</tool-use-id>\n"
+                "<output-file>/tmp/x.output</output-file>\n<status>%s</status>\n"
+                "<summary>Agent \"x\" finished</summary>\n</task-notification>" % (tid, tid, status))
+
+    def queue(self, sec, op, content=None, **extra):
+        row = {"type": "queue-operation", "operation": op, "timestamp": self.at(sec), "sessionId": "s"}
+        if content is not None:
+            row["content"] = content
+        row.update(extra)
+        return row
+
+    def wake(self, sec, tid, status="completed"):
+        """The idle delivery: the notification becomes the next turn's input."""
+        return {"type": "user", "timestamp": self.at(sec), "origin": {"kind": "task-notification"},
+                "message": {"role": "user", "content": self.notice(tid, status)}}
+
+    def absorbed(self, sec, tid):
+        """The busy delivery: taken off the queue and injected into the running turn."""
+        return [self.queue(sec, "remove", self.notice(tid), reason="absorbed_mid_turn"),
+                {"type": "attachment", "timestamp": self.at(sec),
+                 "attachment": {"type": "queued_command", "commandMode": "task-notification",
+                                "prompt": self.notice(tid)}}]
+
+    def done(self, rows, since=0, wait=3600, now_sec=59 * 60):
+        seen = []
+        p = self.jsonl("sub.jsonl", rows)
+        got = relay.claude_done_ts(p, since, wait, lambda w, e: seen.append((w, e)), now=epoch(self.at(now_sec)))
+        return got, (seen[-1] if seen else None)
+
+    def test_a_turn_that_ended_only_to_wait_for_a_subagent_is_not_done(self):
+        waiting = [self.a(5, "tool_use"), self.launch(10, "ag1"), self.a(20, "end_turn")]
+        self.assertEqual(self.done(waiting), (None, (1, 0)), "Claude said 'waiting for the agent' and stopped")
+        self.assertEqual(self.done(waiting, wait=0)[0], epoch(self.at(20)), "0 = off: the old stop_reason-only rule")
+        p = self.jsonl("old.jsonl", waiting)
+        self.assertEqual(relay.claude_done_ts(p, 0), epoch(self.at(20)), "2-arg callers keep the old behaviour")
+
+    def test_the_hold_lasts_until_claude_acts_on_the_completion_notification(self):
+        rows = [self.launch(10, "ag1"), self.a(20, "end_turn"),
+                self.queue(300, "enqueue", self.notice("ag1"))]
+        self.assertEqual(self.done(rows), (None, (1, 0)),
+                         "notification queued but not yet delivered: the newest assistant row is still 'waiting'")
+        rows += [self.queue(300, "dequeue"), self.wake(300, "ag1")]
+        self.assertEqual(self.done(rows), (None, (1, 0)),
+                         "delivered, but the resumed turn has not written an assistant row yet (seconds long)")
+        rows += [self.a(305, "tool_use")]
+        self.assertEqual(self.done(rows), (None, (0, 0)), "resumed and working: an ordinary busy turn")
+        rows += [self.a(330, "end_turn")]
+        self.assertEqual(self.done(rows), (epoch(self.at(330)), (0, 0)), "the turn that read the result is the done one")
+
+    def test_an_end_turn_flushed_after_the_notification_was_queued_is_still_the_waiting_one(self):
+        # real ordering: enqueue → dequeue → [the 'waiting' end_turn is flushed late] → the wake-up row
+        rows = [self.launch(10, "ag1"), self.a(15, "tool_use"), self.queue(18, "enqueue", self.notice("ag1")),
+                self.queue(18, "dequeue"), self.a(17, "end_turn")]
+        self.assertEqual(self.done(rows), (None, (1, 0)))
+        rows += [self.wake(19, "ag1"), self.a(25, "end_turn")]
+        self.assertEqual(self.done(rows)[0], epoch(self.at(25)))
+
+    def test_a_subagent_that_finished_inside_the_turn_does_not_hold_it(self):
+        rows = [self.launch(10, "ag1"), self.a(15, "tool_use"), self.queue(40, "enqueue", self.notice("ag1")),
+                *self.absorbed(41, "ag1"), self.a(45, "tool_use"), self.a(60, "end_turn")]
+        self.assertEqual(self.done(rows), (epoch(self.at(60)), (0, 0)))
+
+    def test_with_two_subagents_the_turn_is_held_until_both_are_settled(self):
+        rows = [self.launch(10, "ag1"), self.launch(11, "ag2"), self.a(20, "end_turn")]
+        self.assertEqual(self.done(rows), (None, (2, 0)))
+        rows += [self.queue(100, "enqueue", self.notice("ag1")), self.queue(100, "dequeue"),
+                 self.wake(100, "ag1"), self.a(110, "end_turn")]
+        self.assertEqual(self.done(rows), (None, (1, 0)), "Claude: 'one is back, still waiting for the other'")
+        rows += [self.wake(200, "ag2", "failed"), self.a(210, "end_turn")]
+        self.assertEqual(self.done(rows), (epoch(self.at(210)), (0, 0)), "a failed subagent settles too")
+
+    def test_a_progress_event_without_a_status_does_not_settle_the_subagent(self):
+        event = "<task-notification>\n<task-id>ag1</task-id>\n<event>still going</event>\n</task-notification>"
+        rows = [self.launch(10, "ag1"), self.a(20, "end_turn"),
+                {"type": "user", "timestamp": self.at(30), "origin": {"kind": "task-notification"},
+                 "message": {"role": "user", "content": event}}, self.a(35, "end_turn")]
+        self.assertEqual(self.done(rows), (None, (1, 0)))
+
+    def test_workflow_launches_and_resumed_agents_are_held_the_same_way(self):
+        wf = [self.launch(10, "wf1", key="taskId"), self.a(20, "end_turn")]
+        self.assertEqual(self.done(wf), (None, (1, 0)), "Workflow: toolUseResult.taskId")
+        resumed = [self.launch(10, "ag1"), self.wake(50, "ag1"), self.a(55, "tool_use"),
+                   {"type": "user", "timestamp": self.at(60),
+                    "toolUseResult": {"success": True, "message": "resumed", "resumedAgentId": "ag1"}},
+                   self.a(70, "end_turn")]
+        self.assertEqual(self.done(resumed), (None, (1, 0)), "SendMessage resumed a finished agent: waiting again")
+        resumed += [self.wake(120, "ag1"), self.a(130, "end_turn")]
+        self.assertEqual(self.done(resumed)[0], epoch(self.at(130)))
+
+    def test_the_wait_is_capped_from_the_launch_so_a_lost_notification_cannot_stall_the_relay(self):
+        rows = [self.launch(10, "ag1"), self.a(20, "end_turn")]
+        self.assertEqual(self.done(rows, wait=600, now_sec=10 + 599), (None, (1, 0)))
+        self.assertEqual(self.done(rows, wait=600, now_sec=10 + 600), (epoch(self.at(20)), (0, 1)),
+                         "past the cap: reported as expired, and the turn counts as done")
+
+    def test_subagents_launched_before_the_floor_are_not_counted(self):
+        # a subagent a dead Claude process left unfinished (before the relay started) must not hold later turns
+        rows = [self.launch(10, "ag1"), self.a(20, "end_turn"), self.a(120, "end_turn")]
+        p = self.jsonl("floor.jsonl", rows)
+        late, now = epoch(self.at(60)), epoch(self.at(200))
+        self.assertEqual(relay.claude_done_ts(p, 0, 3600, now=now, subagent_since=late), epoch(self.at(120)))
+        self.assertIsNone(relay.claude_done_ts(p, 0, 3600, now=now, subagent_since=epoch(self.at(5))))
+
+    def test_the_floor_is_separate_from_the_completion_since(self):
+        # Codex review 2026-10-12 [P2]: the relay's `since` also moves inside one Claude turn (a plan approval
+        # or a question answer delivered through the dialog). launch +10 → `since` moved to +30 → end_turn +40.
+        rows = [self.launch(10, "ag1"), self.a(40, "end_turn")]
+        p = self.jsonl("moved.jsonl", rows)
+        moved, now = epoch(self.at(30)), epoch(self.at(60))
+        self.assertIsNone(relay.claude_done_ts(p, moved, 3600, now=now, subagent_since=0.0),
+                          "counted from the relay's start: still waiting")
+        self.assertEqual(relay.claude_done_ts(p, moved, 3600, now=now), epoch(self.at(40)),
+                         "without a floor of its own it falls back to `since` (the launch drops out)")
+
+    def test_background_bash_is_not_waited_for(self):
+        rows = [{"type": "user", "timestamp": self.at(10), "toolUseResult": {"backgroundTaskId": "b1"}},
+                self.a(20, "end_turn")]
+        self.assertEqual(self.done(rows), (epoch(self.at(20)), (0, 0)), "a dev server never finishes")
+
+    def test_drifted_or_foreign_rows_never_crash_the_scan(self):
+        rows = [[1, 2], "text", 7, None,
+                {"type": "user", "timestamp": 5, "toolUseResult": {"status": "async_launched", "agentId": ["x"]}},
+                {"type": "user", "timestamp": 5, "toolUseResult": {"status": "async_launched", "agentId": "bad-ts"}},
+                {"type": "user", "toolUseResult": "plain string", "origin": "human", "message": "str"},
+                {"type": "user", "origin": {"kind": "task-notification"}, "message": {"content": [{"type": "text"}]}},
+                {"type": "queue-operation", "operation": "remove", "content": {"not": "a string"}},
+                {"type": "attachment", "attachment": "str"},
+                {"type": "attachment", "attachment": {"type": "queued_command", "prompt": None}},
+                self.a(20, "end_turn")]
+        self.assertEqual(self.done(rows), (epoch(self.at(20)), (0, 0)),
+                         "an unreadable launch time is 'before this wait' = not counted (falls back to the old rule)")
+
+    def test_codex_turn_is_done_on_task_complete_after_the_last_task_started(self):
+        p = self.jsonl("x.jsonl", [
+            {"type": "event_msg", "timestamp": "2026-08-21T00:00:10Z", "payload": {"type": "task_started"}},
+            {"type": "event_msg", "timestamp": "2026-08-21T00:00:30Z", "payload": {"type": "task_complete"}},
+        ])
+        self.assertEqual(relay.codex_done_ts(p, 0), epoch("2026-08-21T00:00:30Z"))
+        again = self.jsonl("y.jsonl", [
+            {"type": "event_msg", "timestamp": "2026-08-21T00:00:30Z", "payload": {"type": "task_complete"}},
+            {"type": "event_msg", "timestamp": "2026-08-21T00:00:40Z", "payload": {"type": "task_started"}},
+        ])
+        self.assertIsNone(relay.codex_done_ts(again, 0), "a new turn started after the completion")
+
+
+class TranscriptParsers(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="aipair-parsers.")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def jsonl(self, name, rows):
+        p = os.path.join(self.tmp.name, name)
+        with open(p, "w", encoding="utf-8") as fh:
+            for r in rows:
+                fh.write((json.dumps(r) if not isinstance(r, str) else r) + "\n")
+        return p
+
+    def test_claude(self):
+        p = self.jsonl("c.jsonl", [
+            "garbage line",
+            {"type": "user", "timestamp": "t1", "message": {"content": "<system-reminder>hidden</system-reminder>"}},
+            {"type": "user", "timestamp": "t2", "message": {"content": "please review"}},
+            {"type": "assistant", "timestamp": "t3", "message": {"content": [
+                {"type": "text", "text": "looking"}, {"type": "tool_use", "name": "Bash"}]}},
+            {"type": "progress", "timestamp": "t4"},
+            {"type": "assistant", "timestamp": "t5", "message": {"content": [{"type": "text", "text": ""}]}},
+        ])
+        self.assertEqual(peerlog.parse_claude(p, False), [("t2", "user", "please review"), ("t3", "assistant", "looking")])
+        self.assertEqual(peerlog.parse_claude(p, True)[1], ("t3", "assistant", "looking\n· tool:Bash"))
+
+    def test_codex(self):
+        p = self.jsonl("x.jsonl", [
+            {"timestamp": "t0", "type": "session_meta", "payload": {"cwd": "/x"}},
+            {"timestamp": "t1", "type": "response_item", "payload": {"type": "message", "role": "user",
+                                                                     "content": [{"type": "input_text", "text": "<environment_context>…"}]}},
+            {"timestamp": "t2", "type": "response_item", "payload": {"type": "message", "role": "user",
+                                                                     "content": [{"type": "input_text", "text": "review this"}]}},
+            {"timestamp": "t3", "type": "response_item", "payload": {"type": "function_call", "name": "exec_command"}},
+            {"timestamp": "t4", "type": "response_item", "payload": {"type": "message", "role": "assistant",
+                                                                     "content": [{"type": "output_text", "text": "完了です"}]}},
+            {"timestamp": "t5", "type": "response_item", "payload": {"type": "message", "role": "system", "content": "x"}},
+        ])
+        self.assertEqual(peerlog.parse_codex(p, False), [("t2", "user", "review this"), ("t4", "assistant", "完了です")])
+        self.assertEqual(peerlog.parse_codex(p, True)[1], ("t3", "assistant", "· tool:exec_command"))
+
+    def test_ts_key_and_meta_filter(self):
+        self.assertEqual(peerlog._ts_key("2026-08-21T00:00:20Z"), epoch("2026-08-21T00:00:20Z"))
+        self.assertEqual(peerlog._ts_key("nope"), 0.0)
+        self.assertTrue(peerlog._is_meta("  <SYSTEM-reminder>x", peerlog.CLAUDE_META_PREFIXES))
+        self.assertFalse(peerlog._is_meta("system reminder text", peerlog.CLAUDE_META_PREFIXES))
+
+
+class CorelibStandalone(unittest.TestCase):
+    """aipairlib.corelib must load with NO aipair-relay dependency (that decoupling is the point
+    of the split): a fresh SourceFileLoader of just corelib exposes the pure helpers."""
+    def test_corelib_loads_and_works_without_relay(self):
+        loader = importlib.machinery.SourceFileLoader("corelib_standalone", os.path.join(BIN, "aipairlib", "corelib.py"))
+        core = importlib.util.module_from_spec(importlib.util.spec_from_loader("corelib_standalone", loader))
+        loader.exec_module(core)   # would raise if it referenced relay-only globals
+        self.assertEqual(core.parse_version("2.1.238 (Claude Code)"), "2.1.238")
+        self.assertTrue(core.hit_stop(["[AIPAIR_REVIEW_OK]"], ["[AIPAIR_REVIEW_OK]"]))   # head-exact
+        self.assertFalse(core.hit_stop(["まだ [AIPAIR_REVIEW_OK] ではない"], ["[AIPAIR_REVIEW_OK]"]))
+        self.assertEqual(core.scrub_output("a\x00b"), "a b")
+        self.assertEqual(core.schema_probe("claude", [])[0], "unverified")   # pure, no relay needed
+        self.assertEqual(core.TESTED_VERSIONS, relay.TESTED_VERSIONS)
+        self.assertEqual(core.oneline("a   b\n c", 100), "a b c")   # generic text helper (moved from relay)
+        self.assertEqual(core.oneline("x" * 10, 5), "xxxx…")
+        self.assertIs(relay.oneline, relay.corelib.oneline)          # relay re-exports the corelib helper
+
+    def test_relay_reexports_are_the_corelib_objects(self):
+        # relay.X is bound to the corelib implementation (not a stale copy)
+        self.assertIs(relay.parse_version, relay.corelib.parse_version)
+        self.assertIs(relay.version_gate, relay.corelib.version_gate)
+        self.assertIs(relay.version_output, relay.corelib.version_output)
+        self.assertIs(relay.cli_version, relay.corelib.cli_version)
+        self.assertIs(relay.decide_delivery_back, relay.state_machine.decide_delivery_back)
+        self.assertIs(relay.schema_probe, relay.corelib.schema_probe)
+        self.assertIs(relay.schema_gate, relay.corelib.schema_gate)
+
+
+class LoglibStandalone(unittest.TestCase):
+    """aipairlib.loglib loads with only peer-log (no aipair-relay), and relay re-exports it."""
+    def test_loglib_loads_and_works_without_relay(self):
+        self.assertTrue(_imports_without_relay("loglib", "claude_done_ts", "turn_texts", "read_records"))
+        self.assertEqual(relay.loglib.read_records("/no/such/file"), [])
+        self.assertEqual(relay.loglib.make_fragment("hello world", 5), relay.make_fragment("hello world", 5))
+
+    def test_relay_reexports_are_the_loglib_objects(self):
+        self.assertIs(relay.claude_done_ts, relay.loglib.claude_done_ts)
+        self.assertIs(relay.turn_texts, relay.loglib.turn_texts)
+        self.assertIs(relay.read_records, relay.loglib.read_records)
+
+    def test_cli_module_is_standalone(self):
+        # P2-1 増分6: argparse + AIPAIR_* env defaults live in a standalone cli module; relay
+        # re-exports _env_* / ENV_USED / build_parser so EnvHelpers and the launch forms are
+        # unchanged.
+        self.assertTrue(_imports_without_relay("cli", "build_parser", "_env_str", "_env_int"))
+        self.assertIs(relay._env_str, relay.cli._env_str)
+        self.assertIs(relay.ENV_USED, relay.cli.ENV_USED)
+        # build_parser produces the real parser (defaults resolve from AIPAIR_* / sentinels)
+        a = relay.build_parser("x").parse_args([])
+        self.assertEqual(a.stop, "[AIPAIR_REVIEW_OK]")
+        self.assertEqual(a.plan_ok, "[AIPAIR_PLAN_APPROVED]")
+        # endless BLOCKED/HUMAN_REQUIRED sentinel (メンテナーの決定 2026-08-24 / 設計メモ)
+        self.assertEqual(a.human_required, "[AIPAIR_HUMAN_REQUIRED]")
+
+    def test_human_required_sentinel_default_and_env_override(self):
+        # 既定は [AIPAIR_HUMAN_REQUIRED]、env AIPAIR_HUMAN_REQUIRED で上書きできる（他 sentinel と同経路）。
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AIPAIR_HUMAN_REQUIRED", None)
+            self.assertEqual(relay.build_parser("x").parse_args([]).human_required,
+                             "[AIPAIR_HUMAN_REQUIRED]")
+        with mock.patch.dict(os.environ, {"AIPAIR_HUMAN_REQUIRED": "[CUSTOM_HR]"}):
+            self.assertEqual(relay.build_parser("x").parse_args([]).human_required, "[CUSTOM_HR]")
+        # 明示フラグは env より優先
+        with mock.patch.dict(os.environ, {"AIPAIR_HUMAN_REQUIRED": "[CUSTOM_HR]"}):
+            self.assertEqual(
+                relay.build_parser("x").parse_args(["--human-required", "[FLAG_HR]"]).human_required,
+                "[FLAG_HR]")
+
+    def test_log_lock_module_is_standalone(self):
+        # P2-1 増分4: the log-locking cluster is a standalone module; relay re-exports the lock/
+        # refresh functions so codex-follow's relay.lock_codex / relay.refresh_codex_lock etc.
+        # are unchanged.
+        self.assertTrue(_imports_without_relay("log_lock", "lock_codex", "lock_claude",
+                                               "refresh_claude_lock", "read_codex_since"))
+        self.assertIs(relay.lock_codex, relay.log_lock.lock_codex)
+        self.assertIs(relay.refresh_claude_lock, relay.log_lock.refresh_claude_lock)
+
+    def test_gate_module_is_standalone(self):
+        # P2-1 増分3: the stop-gate runner is a standalone module (no relay dependency); relay
+        # re-exports run_gate so call sites / GateRunner tests are unchanged.
+        self.assertTrue(_imports_without_relay("gate", "run_gate"))
+        self.assertIs(relay.run_gate, relay.gate.run_gate)
+
+    def test_review_protocol_is_standalone_and_instructs_sentinel_at_head(self):
+        # P2-1 増分2: the poke templates are a standalone pure module (no relay dependency), and
+        # every stop/next/all-done/plan template instructs the sentinel ALONE on the first line.
+        self.assertTrue(_imports_without_relay("review_protocol", "default_poke_codex",
+                                               "endless_poke_codex_next", "plan_poke_codex",
+                                               "plan_extra_comment"))
+        rp = relay.review_protocol
+        self.assertIn("【1行目】", rp.default_poke_codex("[AIPAIR_REVIEW_OK]"))
+        self.assertIn("[AIPAIR_REVIEW_OK]", rp.default_poke_codex("[AIPAIR_REVIEW_OK]"))
+        _codex_next = rp.endless_poke_codex_next("tasks/todo.md", "[AIPAIR_ALL_DONE]", "[AIPAIR_HUMAN_REQUIRED]")
+        self.assertIn("[AIPAIR_ALL_DONE]", _codex_next)
+        self.assertIn("[AIPAIR_HUMAN_REQUIRED]", _codex_next)          # §4: [!] のみ残なら HUMAN_REQUIRED
+        self.assertIn("【1行目】", _codex_next)                          # シグナルは 1行目に単独
+        self.assertIn("再指示しない", _codex_next)                       # [!] は AI では進められない→再指示禁止
+        _pass = rp.endless_poke_claude_pass("tasks/todo.md", "[AIPAIR_NEXT]")
+        _next = rp.endless_poke_claude_next("tasks/todo.md", "[AIPAIR_NEXT]")
+        # §5: 実行不能を検出したら [ ]→[!]＋blocker、その後「他の [ ] 続行 or 手詰まりシグナル」まで
+        # 両 Claude 文面が含む（_next も blocker 更新後に次選択へ遷移できる）。
+        for txt in (_pass, _next):
+            self.assertIn("[!]", txt)
+            self.assertIn("blocker:", txt)
+            self.assertIn("[AIPAIR_NEXT]", txt)
+        # P0-1（メンテナーの決定 2026-08-24）: 実装しただけでは [x] にしない。[x] 化はレビュー合格後の pass 文面だけ。
+        self.assertNotIn("`- [x]` にチェック", _next)     # Case A: next（着手指示）は完了チェックを指示しない
+        self.assertIn("この時点では `- [x]` にしない", _next)
+        self.assertIn("完了した項目を `- [x]` にチェック", _pass)   # Case C: pass（レビュー合格）だけが [x] 化
+        # §9: endless 文面は「人間に伝言を頼むな」が [!]/HUMAN_REQUIRED エスカレーションを妨げないと明記。
+        for txt in (_pass, _next, _codex_next):
+            self.assertIn("妨げない", txt)
+        # 通常レビュー往復の文面（§9 の対象外）は従来どおり明確化を足さない。
+        self.assertNotIn("妨げない", rp.default_poke_codex("[AIPAIR_REVIEW_OK]"))
+        self.assertIn("[AIPAIR_PLAN_APPROVED]", rp.plan_poke_codex("p.md", "[AIPAIR_PLAN_APPROVED]"))
+        # relay re-exports the same objects (call sites unchanged)
+        self.assertIs(relay.default_poke_codex, rp.default_poke_codex)
+        self.assertIs(relay.plan_extra_comment, rp.plan_extra_comment)
+
+
+
+class ResponseGateBehavior(unittest.TestCase):
+    """P2-1: the poke/attribution gate — formerly the nested closures response_done / poke_noshow
+    inside main(), which no test could reach — is now ResponseGate in state_machine.py, owning the
+    probe lifecycle with injected pure deps (find_poke_ts / codex_response_complete /
+    claude_response_attributed) + a fake clock. So the fail-closed attribution invariants (P1-2 /
+    P1-3) get direct unit coverage: a turn_id-less codex turn is rejected, never position-guessed."""
+    def _gate(self, *, find=None, codex=None, claude=None, now=1000.0):
+        from aipairlib.state_machine import ResponseGate
+        self.dims = []
+        self.warns = []
+        self.clock = [now]
+        tracked = {"claude": "/c.jsonl", "codex": "/x.jsonl"}
+        self.tracked = tracked
+        return ResponseGate(
+            tracked,
+            find or (lambda *a: 100.0),
+            codex or (lambda *a: (None, None)),
+            claude or (lambda *a: True),
+            lambda m: self.dims.append(m),
+            lambda m, bell=False: self.warns.append((m, bell)),
+            clock=lambda: self.clock[0],
+        )
+
+    def test_standalone_import_and_relay_reexport(self):
+        self.assertTrue(_imports_without_relay("state_machine", "ResponseGate", "decide_plan_action",
+                                               "decide_question_action"))
+        # P2-1: 判定核は plan_flow / question_flow の named module に在り、state_machine が再エクスポート
+        self.assertTrue(_imports_without_relay("plan_flow", "decide_plan_action"))
+        self.assertTrue(_imports_without_relay("question_flow", "decide_question_action"))
+        from aipairlib.state_machine import ResponseGate, decide_plan_action, decide_question_action
+        from aipairlib.plan_flow import decide_plan_action as pf
+        from aipairlib.question_flow import decide_question_action as qf
+        self.assertIs(decide_plan_action, pf)          # state_machine は plan_flow から re-export
+        self.assertIs(decide_question_action, qf)
+        self.assertIs(relay.ResponseGate, ResponseGate)
+        self.assertIs(relay.decide_plan_action, pf)
+        self.assertIs(relay.decide_question_action, qf)
+
+    def test_arm_sets_lifecycle_and_clear_disables(self):
+        g = self._gate(now=42.0)
+        g.arm("NONCE")
+        self.assertEqual((g.probe, g.probe_ts_cache, g.probe_sent_at), ("NONCE", None, 42.0))
+        g.clear()
+        self.assertIsNone(g.probe)
+
+    def test_no_probe_passes_raw_done_through(self):
+        # dialog-path delivery (clear()) → gate disabled → raw completion flows unchanged; and an
+        # un-armed gate never fires a no-show.
+        g = self._gate()
+        g.clear()
+        self.assertEqual(g.response_done("codex", "/x.jsonl", 500.0), 500.0)
+        self.assertFalse(g.noshow("codex"))
+
+    def test_codex_turn_id_returns_response_completion_not_raw(self):
+        # turn_id pairs → the RETURNED ts is the response task's own completion (comp), and the
+        # texts-window anchor advances to the response task start — never raw_done (a later task).
+        g = self._gate(find=lambda *a: 100.0, codex=lambda *a: (150.0, 175.0))
+        g.arm("NONCE")
+        self.assertEqual(g.response_done("codex", "/x.jsonl", 999.0), 175.0)
+        self.assertEqual(g.probe_ts_cache, 150.0)
+
+    def test_codex_missing_turn_id_is_fail_closed(self):
+        # anchor None (turn_id absent / nonce user-item not found) → reject, and NEVER a position
+        # fallback. This is the P1-3 invariant that keeps an unattributable turn out of auto stop.
+        g = self._gate(find=lambda *a: 100.0, codex=lambda *a: (None, None))
+        g.arm("NONCE")
+        self.assertIsNone(g.response_done("codex", "/x.jsonl", 999.0))
+        self.assertTrue(any("自律判定に使わず" in d for d in self.dims))
+
+    def test_codex_response_task_incomplete_rejects(self):
+        g = self._gate(find=lambda *a: 100.0, codex=lambda *a: (150.0, None))
+        g.arm("NONCE")
+        self.assertIsNone(g.response_done("codex", "/x.jsonl", 999.0))
+
+    def test_nonce_not_yet_delivered_waits(self):
+        # find_poke_ts None → the nonce has not landed in the log yet → None (noshow owns the
+        # deadline); no reject log, because nothing is wrong yet.
+        g = self._gate(find=lambda *a: None)
+        g.arm("NONCE")
+        self.assertIsNone(g.response_done("codex", "/x.jsonl", 999.0))
+        self.assertEqual(self.dims, [])
+
+    def test_claude_ancestry_and_ordering(self):
+        g = self._gate(find=lambda *a: 100.0, claude=lambda *a: True)
+        g.arm("NONCE")
+        self.assertEqual(g.response_done("claude", "/c.jsonl", 200.0), 200.0)
+        g.probe_ts_cache = 100.0    # completion at/under the nonce ts → reject
+        self.assertIsNone(g.response_done("claude", "/c.jsonl", 100.0))
+
+    def test_claude_unattributed_rejects(self):
+        g = self._gate(find=lambda *a: 100.0, claude=lambda *a: False)
+        g.arm("NONCE")
+        self.assertIsNone(g.response_done("claude", "/c.jsonl", 200.0))
+
+    def test_reject_dedups_per_completion_value(self):
+        g = self._gate(find=lambda *a: 100.0, claude=lambda *a: False)
+        g.arm("NONCE")
+        g.response_done("claude", "/c.jsonl", 200.0)
+        g.response_done("claude", "/c.jsonl", 200.0)     # same value → not dimmed twice
+        self.assertEqual(sum("棄却" in d for d in self.dims), 1)
+        g.response_done("claude", "/c.jsonl", 300.0)     # new value → dimmed again
+        self.assertEqual(sum("棄却" in d for d in self.dims), 2)
+
+    def test_noshow_silent_when_unarmed_or_within_deadline(self):
+        g = self._gate(now=1000.0)
+        self.assertFalse(g.noshow("codex"))              # not armed
+        g.arm("NONCE")
+        self.clock[0] = 1000.0 + g.POKE_NOSHOW - 1       # just under the deadline
+        self.assertFalse(g.noshow("codex"))
+        self.assertEqual(self.warns, [])
+
+    def test_noshow_fires_past_deadline_when_nonce_absent(self):
+        g = self._gate(now=1000.0, find=lambda *a: None)
+        g.arm("NONCE")
+        self.clock[0] = 1000.0 + g.POKE_NOSHOW + 1
+        self.assertTrue(g.noshow("codex"))
+        self.assertEqual(len(self.warns), 1)
+        self.assertTrue(self.warns[0][1])                # bell=True
+        self.assertIn("未配達", self.warns[0][0])
+
+    def test_noshow_stands_down_if_nonce_appears_late(self):
+        # past the deadline but the nonce has since landed → not a no-show; it caches the ts.
+        g = self._gate(now=1000.0, find=lambda *a: 1234.0)
+        g.arm("NONCE")
+        self.clock[0] = 1000.0 + g.POKE_NOSHOW + 1
+        self.assertFalse(g.noshow("codex"))
+        self.assertEqual(g.probe_ts_cache, 1234.0)
+        self.assertEqual(self.warns, [])
+
+class ResponseAttribution(unittest.TestCase):
+    """The loglib functions that decide whether a completed turn is the answer to OUR poke —
+    the source of truth for delivery. Fixtures are real jsonl / rollout shapes."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="aipair-attrib.")
+    def tearDown(self):
+        self.tmp.cleanup()
+    def w(self, name, rows):
+        p = os.path.join(self.tmp.name, name)
+        with open(p, "w", encoding="utf-8") as fh:
+            for r in rows:
+                fh.write((r if isinstance(r, str) else json.dumps(r)) + "\n")
+        return p
+
+    # ---- Codex: turn_id pairing -------------------------------------------------
+    def _cx_user(self, ts, text, turn=None):
+        p = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}
+        if turn is not None:
+            p["internal_chat_message_metadata_passthrough"] = {"turn_id": turn}
+        return {"timestamp": ts, "type": "response_item", "payload": p}
+    def _ev(self, ts, kind, turn):
+        return {"timestamp": ts, "type": "event_msg", "payload": {"type": kind, "turn_id": turn}}
+
+    def test_codex_turn_id_match(self):
+        p = self.w("cx.jsonl", [
+            self._ev("2026-08-21T00:00:01Z", "task_started", "T1"),
+            self._cx_user("2026-08-21T00:00:02Z", "review relay-id:abcd", "T1"),
+            self._ev("2026-08-21T00:00:09Z", "task_complete", "T1")])
+        anchor, comp = relay.codex_response_complete(p, "relay-id:abcd")
+        self.assertEqual(anchor, epoch("2026-08-21T00:00:01Z"))
+        self.assertEqual(comp, epoch("2026-08-21T00:00:09Z"))
+
+    def test_codex_ignores_completion_of_a_different_turn(self):
+        p = self.w("cx.jsonl", [
+            self._ev("2026-08-21T00:00:01Z", "task_started", "T1"),
+            self._cx_user("2026-08-21T00:00:02Z", "review relay-id:abcd", "T1"),
+            self._ev("2026-08-21T00:00:05Z", "task_complete", "T0")])   # a foreign turn's completion
+        anchor, comp = relay.codex_response_complete(p, "relay-id:abcd")
+        self.assertEqual(anchor, epoch("2026-08-21T00:00:01Z")); self.assertIsNone(comp)
+
+    def test_codex_not_yet_complete(self):
+        p = self.w("cx.jsonl", [
+            self._ev("2026-08-21T00:00:01Z", "task_started", "T1"),
+            self._cx_user("2026-08-21T00:00:02Z", "x relay-id:abcd", "T1")])
+        anchor, comp = relay.codex_response_complete(p, "relay-id:abcd")
+        self.assertEqual(anchor, epoch("2026-08-21T00:00:01Z")); self.assertIsNone(comp)
+
+    def test_codex_metadata_missing_is_fail_closed_by_default(self):
+        # P1-3: no turn_id on the nonce user → attribution can't be confirmed. The position
+        # heuristic can misattribute a queued turn, so by DEFAULT it is NOT used — fail-closed.
+        p = self.w("cx.jsonl", [
+            self._ev("2026-08-21T00:00:01Z", "task_started", "T1"),
+            self._cx_user("2026-08-21T00:00:03Z", "x relay-id:abcd"),   # no turn_id
+            self._ev("2026-08-21T00:00:09Z", "task_complete", "T1")])
+        self.assertEqual(relay.codex_response_complete(p, "relay-id:abcd"), (None, None),
+                         "default = fail-closed (no position heuristic for autonomous decisions)")
+        # only an EXPLICIT compatibility mode opts into the position fallback
+        anchor, comp = relay.codex_response_complete(p, "relay-id:abcd", allow_position_fallback=True)
+        self.assertEqual(anchor, epoch("2026-08-21T00:00:01Z"))
+        self.assertEqual(comp, epoch("2026-08-21T00:00:09Z"))
+
+    def test_codex_nonce_absent(self):
+        p = self.w("cx.jsonl", [self._ev("2026-08-21T00:00:01Z", "task_started", "T1")])
+        self.assertEqual(relay.codex_response_complete(p, "relay-id:zzz"), (None, None))
+
+    def test_response_done_gate_never_uses_the_position_fallback(self):
+        # P1-3 (integration guard): the AUTONOMOUS attribution gate (ResponseGate.response_done,
+        # P2-1: extracted to state_machine.py) must call codex_response_complete WITHOUT the
+        # position fallback — so a turn_id-less, unattributable codex turn can never be accepted as
+        # a completion and drive an auto stop / review-forward / question-answer / plan
+        # auto-approval. The fallback stays opt-in for diagnostics only. Neither the gate module nor
+        # the relay that wires it may ever enable the fallback.
+        with open(os.path.join(BIN, "aipairlib", "state_machine.py"), encoding="utf-8") as fh:
+            gate_src = fh.read()
+        with open(os.path.join(BIN, "aipairlib", "relay.py"), encoding="utf-8") as fh:
+            relay_src = fh.read()
+        self.assertIn("anchor, comp = self._codex_response_complete(path, self.probe)", gate_src,
+                      "the gate must call it plainly (no fallback)")
+        for src in (gate_src, relay_src):
+            self.assertNotIn("allow_position_fallback=True", src, "the fallback must never be enabled")
+            self.assertNotIn("allow_position_fallback=(", src, "the fallback must never be enabled")
+
+    # ---- Claude: parentUuid ancestry -------------------------------------------
+    def _cl_user(self, uuid, parent, text, ts="2026-08-21T00:00:05Z"):
+        return {"type": "user", "uuid": uuid, "parentUuid": parent, "timestamp": ts, "message": {"content": text}}
+    def _cl_asst(self, uuid, parent, text="ok"):
+        return {"type": "assistant", "uuid": uuid, "parentUuid": parent,
+                "message": {"content": [{"type": "text", "text": text}]}}
+
+    def test_claude_ancestor_match(self):
+        p = self.w("cl.jsonl", [
+            self._cl_user("u1", None, "review relay-id:abcd"),
+            self._cl_asst("a1", "u1"), self._cl_asst("a2", "a1")])   # a2's chain a2→a1→u1
+        self.assertTrue(relay.claude_response_attributed(p, "relay-id:abcd"))
+
+    def test_claude_unrelated_last_assistant(self):
+        p = self.w("cl.jsonl", [
+            self._cl_user("u1", None, "review relay-id:abcd"),
+            self._cl_asst("a1", "u1"),
+            self._cl_user("u2", None, "a different, later human turn"),
+            self._cl_asst("a2", "u2")])   # a2's chain a2→u2 (not u1)
+        self.assertFalse(relay.claude_response_attributed(p, "relay-id:abcd"))
+
+    def test_claude_cyclic_chain_terminates(self):
+        # a1→a2→a1 cycle, nonce not in it → returns False without hanging
+        p = self.w("cl.jsonl", [
+            self._cl_user("u1", None, "review relay-id:abcd"),
+            self._cl_asst("a1", "a2"), self._cl_asst("a2", "a1")])
+        self.assertFalse(relay.claude_response_attributed(p, "relay-id:abcd"))
+
+    def test_claude_nonce_absent(self):
+        p = self.w("cl.jsonl", [self._cl_asst("a1", None)])
+        self.assertFalse(relay.claude_response_attributed(p, "relay-id:zzz"))
+
+    def _compact(self, uuid, logical):
+        # Claude Code's context-compaction root: parentUuid is None (the chain is SEVERED), but
+        # logicalParentUuid points to the TRUE pre-compaction ancestor. Missing → fail-closed.
+        d = {"type": "system", "subtype": "compact_boundary", "uuid": uuid, "parentUuid": None,
+             "timestamp": "2026-08-21T00:10:00Z"}
+        if logical is not None:
+            d["logicalParentUuid"] = logical
+        return d
+
+    def test_claude_attribution_bridges_a_compaction_boundary(self):
+        # poke → compaction → response. parentUuid is severed at the boundary; logicalParentUuid
+        # points back into the pre-compaction thread, so the ancestry walk still reaches the
+        # nonce. Real 2026-08-23 loop-stall bug.
+        p = self.w("cl.jsonl", [
+            self._cl_user("u1", None, "next task relay-id:abcd"),      # nonce (pre-compaction)
+            self._cl_asst("pre", "u1"),                                # pre-compaction response
+            self._compact("BND", "pre"),                               # logicalParentUuid → pre → u1
+            self._cl_user("u2", "BND", "<summary continuation>"),
+            self._cl_asst("a1", "u2"), self._cl_asst("a2", "a1")])     # a2→a1→u2→BND→(logical)pre→u1
+        self.assertTrue(relay.claude_response_attributed(p, "relay-id:abcd"),
+                        "a response after compaction reaches a pre-boundary poke via logicalParentUuid")
+
+    def test_claude_bridge_follows_logicalParentUuid_not_line_position(self):
+        # The nonce is on an OLD SIBLING branch that PRECEDES the boundary but is NOT its logical
+        # ancestor. A position heuristic ("nonce before boundary → attributed") would wrongly say
+        # True; following logicalParentUuid (→ the 'main' branch) correctly says False. This is
+        # the mis-attribution Codex flagged in the first (line-position) implementation.
+        p = self.w("cl.jsonl", [
+            self._cl_user("sib", None, "an unrelated old branch relay-id:abcd"),  # sibling nonce
+            self._cl_asst("main", None),                               # the real logical ancestor
+            self._compact("BND", "main"),                              # logicalParentUuid → main (not sib)
+            self._cl_user("u2", "BND", "<summary continuation>"),
+            self._cl_asst("a1", "u2")])                                # a1→u2→BND→(logical)main→None
+        self.assertFalse(relay.claude_response_attributed(p, "relay-id:abcd"),
+                         "a sibling-branch nonce not on the logicalParentUuid chain is NOT attributed")
+
+    def test_claude_bridge_fail_closed_without_logicalParentUuid(self):
+        # A compact_boundary with NO logicalParentUuid severs the chain irrecoverably → the walk
+        # stops at the boundary (fail-closed) rather than guessing.
+        p = self.w("cl.jsonl", [
+            self._cl_user("u1", None, "poke relay-id:abcd"),
+            self._compact("BND", None),                                # no logicalParentUuid
+            self._cl_user("u2", "BND", "<summary continuation>"),
+            self._cl_asst("a1", "u2")])                                # a1→u2→BND→None (stops)
+        self.assertFalse(relay.claude_response_attributed(p, "relay-id:abcd"),
+                         "a boundary without logicalParentUuid fails closed, not open")
+
+    def test_claude_no_boundary_means_no_bridge(self):
+        # Without a compaction boundary, a severed chain (root parentUuid None, non-boundary)
+        # does NOT bridge — the old strict behaviour is preserved.
+        p = self.w("cl.jsonl", [
+            self._cl_user("u1", None, "poke relay-id:abcd"),
+            {"type": "system", "uuid": "S", "parentUuid": None, "timestamp": "2026-08-21T00:10:00Z"},  # NOT a compact_boundary
+            self._cl_user("u2", "S", "later"),
+            self._cl_asst("a1", "u2")])                                    # a1→u2→S (S is not a boundary)
+        self.assertFalse(relay.claude_response_attributed(p, "relay-id:abcd"))
+
+    # ---- find_poke_ts / turn_texts ---------------------------------------------
+    def test_find_poke_ts_per_agent_and_missing(self):
+        cl = self.w("cl.jsonl", [self._cl_user("u1", None, "hi relay-id:abcd", ts="2026-08-21T00:00:05Z")])
+        self.assertEqual(relay.find_poke_ts("claude", cl, "relay-id:abcd"), epoch("2026-08-21T00:00:05Z"))
+        cx = self.w("cx.jsonl", [self._cx_user("2026-08-21T00:00:07Z", "hi relay-id:abcd", "T1")])
+        self.assertEqual(relay.find_poke_ts("codex", cx, "relay-id:abcd"), epoch("2026-08-21T00:00:07Z"))
+        self.assertIsNone(relay.find_poke_ts("codex", cx, "relay-id:nope"))
+
+    def test_turn_texts_agent_and_time_window(self):
+        p = self.w("cx.jsonl", [
+            {"timestamp": "2026-08-21T00:00:01Z", "type": "response_item",
+             "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "too early"}]}},
+            {"timestamp": "2026-08-21T00:00:10Z", "type": "response_item",
+             "payload": {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "in window"}]}},
+            {"timestamp": "2026-08-21T00:00:30Z", "type": "response_item",
+             "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "not assistant"}]}}])
+        since = epoch("2026-08-21T00:00:05Z"); until = epoch("2026-08-21T00:00:12Z")
+        self.assertEqual(relay.turn_texts("codex", p, since, until), ["in window"])
+        # the +2s grace at the upper bound is included
+        self.assertIn("in window", relay.turn_texts("codex", p, since, epoch("2026-08-21T00:00:08Z")))
+
+
+class EndlessScenarios(unittest.TestCase):
+    """§11 Case1-6（メンテナーの決定 2026-08-24 / 設計メモ）を **scripted fake で単一
+    `StateMachine.run()` を実駆動**し、分類推移・sentinel 処理・配達先/文面・最終 exit を固定する。
+
+    `_drive` が sg.guard=False・応答完了・turn_texts・task-list 分類・poke を scenario 順に返し、
+    各ターン（Claude/Codex）を実際のループで処理させる。poke は (pane, 文面) の履歴で検証する。"""
+
+    def _cls(self, body):
+        return relay.state_machine.tasklist.classify(body)
+
+    def _drive(self, start_side, startup_cls, turns, autopilot=False, extra_patches=()):
+        """turns = [(agent, [texts], cls_or_None), ...] を順に処理。cls はその Codex ターンの分類呼び出しが
+        返す値（None は据え置き）。startup 分類は startup_cls。run() の code と poke の (pane, msg) 履歴を返す。"""
+        import types
+        sm = relay.state_machine
+        a = types.SimpleNamespace(start_side=start_side, settle=0, poll=0, max_rounds=20, endless=True,
+                                  task_list="tasks/todo.md", stop_side="codex", no_plan_review=True,
+                                  no_question_relay=True, plan_rounds=5, question_rounds=5, plan_ok="[P]",
+                                  gate=None, gate_timeout=600, gate_rounds=3, autopilot=autopilot)
+        rg = types.SimpleNamespace(response_done=lambda who, path, done: done, noshow=lambda who: False,
+                                   arm=lambda nonce: None, probe=None, probe_ts_cache=0.0)
+        sg = types.SimpleNamespace(guard=lambda: False)
+        box = {"cls": startup_cls}
+        turn_iter = iter(turns)
+
+        def _turn_texts(who, *aa, **kk):
+            agent, texts, cls = next(turn_iter)
+            self.assertEqual(agent, who, "turn script mismatch")
+            if cls is not None:
+                box["cls"] = cls
+            return list(texts)
+
+        machine = sm.StateMachine(
+            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x",
+            tracked={"claude": "c.jsonl", "codex": "x.jsonl"}, claude_seen=set(), codex_seen=set(),
+            baseline=0.0, sg=sg, rg=rg, bw=60, poke_codex="POKE_CODEX", poke_codex_next="POKE_CODEX_NEXT",
+            poke_claude="POKE_CLAUDE", poke_claude_pass="POKE_CLAUDE_PASS", poke_claude_next="POKE_CLAUDE_NEXT",
+            stop_phrases=["[AIPAIR_REVIEW_OK]"], next_ask_phrases=["[AIPAIR_NEXT]"],
+            all_done_phrases=["[AIPAIR_ALL_DONE]"], human_required_phrases=["[AIPAIR_HUMAN_REQUIRED]"])
+        with mock.patch.object(sm.tasklist, "load_or_exit", side_effect=lambda *a, **k: box["cls"]), \
+             mock.patch.object(sm, "set_pane_title"), \
+             mock.patch.object(sm, "claude_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "codex_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "claude_matches_pane", return_value=True), \
+             mock.patch.object(sm, "turn_texts", side_effect=_turn_texts), \
+             mock.patch.object(sm, "poke", return_value=object()) as poke_mock, \
+             mock.patch("time.sleep"):
+            for pt in extra_patches:
+                pt.start()
+            try:
+                code = machine.run()
+            finally:
+                for pt in extra_patches:
+                    pt.stop()
+        pokes = [(c.args[0], c.args[1]) for c in poke_mock.call_args_list]
+        return code, pokes
+
+    # 配達先/文面の定数（_drive の poke_* に対応）
+    TO_CODEX_NEXT = ("%2", "POKE_CODEX_NEXT")     # Claude→Codex（次タスク依頼）
+    TO_CLAUDE_NEXT = ("%1", "POKE_CLAUDE_NEXT")   # Codex→Claude（次タスク着手）
+
+    def test_case1_ready_selects_and_continues_then_all_done(self):
+        # [ ]+[x]（READY）: Claude [AIPAIR_NEXT] → Codex が `- [ ] A` を選択 → Claude へ POKE_CLAUDE_NEXT
+        # → 継続。次ラウンドで ALL_DONE → exit 0。
+        ready = self._cls("- [ ] A\n- [x] b\n")
+        alldone = self._cls("- [x] A\n- [x] b\n")
+        code, pokes = self._drive("claude", ready, [
+            ("claude", ["[AIPAIR_NEXT]"], None),
+            ("codex", ["- [ ] A"], ready),          # Codex が着手可 A を選択（no-progress round1・継続）
+            ("claude", ["[AIPAIR_NEXT]"], None),
+            ("codex", ["[AIPAIR_ALL_DONE]"], alldone),   # → exit 0
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(pokes, [self.TO_CODEX_NEXT, self.TO_CLAUDE_NEXT, self.TO_CODEX_NEXT])
+
+    def test_case2_all_done_through_loop_exits_0_no_poke(self):
+        ready = self._cls("- [ ] A\n")
+        code, pokes = self._drive("codex", ready, [("codex", ["[AIPAIR_ALL_DONE]"], self._cls("- [x] A\n"))])
+        self.assertEqual(code, 0)
+        self.assertEqual(pokes, [])                  # 終端の前に poke しない
+
+    def test_case3_human_required_through_loop_exits_8_no_poke(self):
+        ready = self._cls("- [ ] A\n")
+        blocked = self._cls("- [!] human\n  - blocker: repo admin\n")
+        code, pokes = self._drive("codex", ready, [("codex", ["[AIPAIR_HUMAN_REQUIRED]"], blocked)])
+        self.assertEqual(code, relay.state_machine.EXIT_BLOCKED)
+        self.assertEqual(pokes, [])
+        self.assertIn("再指示しない", relay.review_protocol.endless_poke_codex_next(
+            "t.md", "[AIPAIR_ALL_DONE]", "[AIPAIR_HUMAN_REQUIRED]"))
+
+    def test_case4_ready_then_human_required_same_run(self):
+        # 同一 run() 内で READY→BLOCKED 遷移: round1 は A を選択して継続、round2 は A 完了で BLOCKED →
+        # [AIPAIR_HUMAN_REQUIRED] を分類が支持 → exit 8。
+        ready = self._cls("- [ ] A\n- [!] human\n  - blocker: approval\n")
+        blocked = self._cls("- [x] A\n- [!] human\n  - blocker: approval\n")
+        code, pokes = self._drive("claude", ready, [
+            ("claude", ["[AIPAIR_NEXT]"], None),
+            ("codex", ["- [ ] A"], ready),            # READY: A を選択・継続
+            ("claude", ["[AIPAIR_NEXT]"], None),
+            ("codex", ["[AIPAIR_HUMAN_REQUIRED]"], blocked),   # BLOCKED: → exit 8
+        ])
+        self.assertEqual(code, relay.state_machine.EXIT_BLOCKED)
+        self.assertEqual(pokes, [self.TO_CODEX_NEXT, self.TO_CLAUDE_NEXT, self.TO_CODEX_NEXT])
+
+    def test_case5_no_progress_through_loop_exits_8(self):
+        # 毎ラウンド Claude [AIPAIR_NEXT]→Codex が同じ `- [ ] A` を割当（task-list 不変）を 3 ラウンド実駆動。
+        # 同一識別子＋snapshot hash 不変が 3 回連続で no-progress → exit 8。配達履歴（pane/文面の順序）を固定。
+        ready = self._cls("- [ ] A\n- [x] b\n")
+        code, pokes = self._drive("claude", ready, [
+            ("claude", ["[AIPAIR_NEXT]"], None), ("codex", ["- [ ] A"], ready),   # round1
+            ("claude", ["[AIPAIR_NEXT]"], None), ("codex", ["- [ ] A"], ready),   # round2
+            ("claude", ["[AIPAIR_NEXT]"], None), ("codex", ["- [ ] A"], ready),   # round3 → stop
+        ])
+        self.assertEqual(code, relay.state_machine.EXIT_BLOCKED)
+        # Codex 向け 3 回（POKE_CODEX_NEXT）・Claude 向け 2 回（POKE_CLAUDE_NEXT）＝3 回目以降 Claude へ配達しない
+        self.assertEqual(pokes, [self.TO_CODEX_NEXT, self.TO_CLAUDE_NEXT,
+                                 self.TO_CODEX_NEXT, self.TO_CLAUDE_NEXT,
+                                 self.TO_CODEX_NEXT])
+
+    def test_autopilot_no_progress_blocks_the_task_instead_of_stopping(self):
+        # --autopilot: 同じタスクの停滞は exit 8 にせず、1 回目は Claude に `[!]` 化を依頼、同じタスクで
+        # 2 回目は relay が task-list を直接保留化して Codex に次を選ばせる（ループしない）。
+        ready = self._cls("- [ ] A\n- [x] b\n")
+        marked = []
+        mb = mock.patch.object(relay.state_machine.tasklist, "mark_blocked",
+                               side_effect=lambda tl, cwd, line, why: marked.append(line) or True)
+        same = [("claude", ["[AIPAIR_NEXT]"], None), ("codex", ["- [ ] A"], ready)]
+        # 保留化の後は [!] しか残らない＝正当な終端（BLOCKED + HUMAN_REQUIRED）。no-progress の exit 8 ではない。
+        code, pokes = self._drive("claude", ready, same * 6 + [
+            ("codex", ["[AIPAIR_HUMAN_REQUIRED]"], self._cls("- [!] A\n  blocker: x\n- [x] b\n"))],
+            autopilot=True, extra_patches=[mb])
+        self.assertEqual(code, relay.state_machine.EXIT_BLOCKED)
+        self.assertEqual(marked, ["- [ ] A"], "the relay blocked the stuck task on the 2nd escalation")
+        esc = [m for p, m in pokes if p == "%1" and "停滞" in m]
+        self.assertEqual(len(esc), 1, "Claude was asked once to mark it [!]")
+        self.assertIn("- [ ] A", esc[0])
+        self.assertEqual(pokes[-1], self.TO_CODEX_NEXT, "after the relay blocked it, Codex picks the next")
+
+    def test_p0_1_case_b_review_ng_sends_normal_poke_not_pass(self):
+        # P0-1 Case B（Codex relay-id:806af357）: レビュー NG（[AIPAIR_REVIEW_OK] 無し）は通常の
+        # poke_claude を Claude へ送り、poke_claude_pass（= [x] 化を促す文面）は送らない。run() 実駆動で固定。
+        ready = self._cls("- [ ] A\n")
+        code, pokes = self._drive("codex", ready, [
+            ("codex", ["修正が必要です: X を直して"], None),      # NG レビュー（pending_kind=review）
+            ("claude", ["[AIPAIR_NEXT]"], None),
+            ("codex", ["[AIPAIR_ALL_DONE]"], self._cls("- [x] A\n")),
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(pokes, [("%1", "POKE_CLAUDE"), ("%2", "POKE_CODEX_NEXT")])
+        self.assertNotIn(("%1", "POKE_CLAUDE_PASS"), pokes)   # NG では pass（[x] 化）を送らない
+
+    def test_p0_1_case_c_review_ok_sends_pass(self):
+        # P0-1 Case C: レビュー合格（[AIPAIR_REVIEW_OK]）で初めて poke_claude_pass（[x] 化を促す）を送る。
+        ready = self._cls("- [ ] A\n")
+        code, pokes = self._drive("codex", ready, [
+            ("codex", ["[AIPAIR_REVIEW_OK]"], None),           # OK レビュー
+            ("claude", ["[AIPAIR_NEXT]"], None),
+            ("codex", ["[AIPAIR_ALL_DONE]"], self._cls("- [x] A\n")),
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual(pokes, [("%1", "POKE_CLAUDE_PASS"), ("%2", "POKE_CODEX_NEXT")])
+
+    def test_p0_1_case_d_unreviewed_task_stays_ready_on_restart(self):
+        # P0-1 Case D（メンテナーの決定 2026-08-24）: 実装後・レビュー前は task が [ ] のまま（next 文面は [x] 化を
+        # 指示しない）→ relay 再起動時の分類は READY で ALL_DONE にならない。
+        tl = relay.state_machine.tasklist
+        cls = self._cls("- [ ] task A（実装済み・未レビュー）\n- [x] task B（レビュー済み）\n")
+        self.assertEqual(cls["state"], tl.READY)
+        self.assertNotEqual(cls["state"], tl.ALL_DONE)
+
+    def test_case6_ready_rejects_human_required_then_reselects(self):
+        # [!] があっても着手可 [ ] があれば READY: Codex が [AIPAIR_HUMAN_REQUIRED] を出しても分類 READY が
+        # 支持せず reject。**Claude へは送らず Codex に選択を再要求**し、Codex が `- [ ] A` を選択して初めて
+        # Claude へ配達する。誤 sentinel で exit 8 にしない。
+        ready = self._cls("- [ ] A\n- [!] human\n  - blocker: x\n")
+        alldone = self._cls("- [x] A\n- [x] done\n")
+        code, pokes = self._drive("claude", ready, [
+            ("claude", ["[AIPAIR_NEXT]"], None),
+            ("codex", ["[AIPAIR_HUMAN_REQUIRED]"], ready),   # READY → reject → Codex へ再要求（Claude へ送らない）
+            ("codex", ["- [ ] A"], ready),                   # Codex が着手可 A を選択 → Claude へ配達
+            ("claude", ["[AIPAIR_NEXT]"], None),
+            ("codex", ["[AIPAIR_ALL_DONE]"], alldone),       # → exit 0
+        ])
+        self.assertEqual(code, 0)                    # 誤 HUMAN_REQUIRED では exit 8 にしない
+        # reject は Codex へ再要求（TO_CODEX_NEXT）、選択後に初めて Claude へ配達（TO_CLAUDE_NEXT）
+        self.assertEqual(pokes, [self.TO_CODEX_NEXT, self.TO_CODEX_NEXT, self.TO_CLAUDE_NEXT, self.TO_CODEX_NEXT])
+
+    # --- P1-2: codex_question を実駆動（Codex relay-id:8938cb00 が要求した scripted fake） ------- #
+    def _drive_question(self, turns, qs_blocks, sqa_ok=True):
+        """`codex_question` を実 `StateMachine.run()` で駆動する scripted fake。
+
+        最初の Claude 反復は「AskUserQuestion で停止」（claude_done_ts=None → 質問 elif へ）とし、
+        detect_question_dialog/scrape_questions を mock して Codex へ回答依頼 → `codex_question` へ遷移。
+        以降の Claude 完了は done=100。turns=[(agent,[texts],cls_or_None),...] は codex_question/codex/
+        claude の turn_texts を供給する（最初の質問停止は turn_texts を消費しない）。
+        戻り値 (code, pokes, send_question_answer mock, stdout)。"""
+        import types, io, contextlib
+        sm = relay.state_machine
+        a = types.SimpleNamespace(start_side="claude", settle=0, poll=0, max_rounds=20, endless=True,
+                                  task_list="tasks/todo.md", stop_side="codex", no_plan_review=True,
+                                  no_question_relay=False, plan_rounds=5, question_rounds=5, plan_ok="[P]",
+                                  gate=None, gate_timeout=600, gate_rounds=3)
+        rg = types.SimpleNamespace(response_done=lambda who, path, done: done, noshow=lambda who: False,
+                                   arm=lambda nonce: None, probe=None, probe_ts_cache=0.0, clear=lambda: None)
+        sg = types.SimpleNamespace(guard=lambda: False)
+        box = {"cls": self._cls("- [ ] A\n")}
+        turn_iter = iter(turns)
+
+        def _turn_texts(who, *aa, **kk):
+            agent, texts, cls = next(turn_iter)
+            self.assertEqual(agent, who, "turn script mismatch")
+            if cls is not None:
+                box["cls"] = cls
+            return list(texts)
+
+        calls = {"cd": 0}
+
+        def _claude_done(*aa, **kk):
+            calls["cd"] += 1
+            return None if calls["cd"] == 1 else 100.0   # 初回のみ質問停止（done=None）、以降は完了
+
+        machine = sm.StateMachine(
+            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x",
+            tracked={"claude": "c.jsonl", "codex": "x.jsonl"}, claude_seen=set(), codex_seen=set(),
+            baseline=0.0, sg=sg, rg=rg, bw=60, poke_codex="POKE_CODEX", poke_codex_next="POKE_CODEX_NEXT",
+            poke_claude="POKE_CLAUDE", poke_claude_pass="POKE_CLAUDE_PASS", poke_claude_next="POKE_CLAUDE_NEXT",
+            stop_phrases=["[AIPAIR_REVIEW_OK]"], next_ask_phrases=["[AIPAIR_NEXT]"],
+            all_done_phrases=["[AIPAIR_ALL_DONE]"], human_required_phrases=["[AIPAIR_HUMAN_REQUIRED]"])
+        buf = io.StringIO()
+        with mock.patch.object(sm.tasklist, "load_or_exit", side_effect=lambda *a, **k: box["cls"]), \
+             mock.patch.object(sm, "set_pane_title"), \
+             mock.patch.object(sm, "claude_done_ts", side_effect=_claude_done), \
+             mock.patch.object(sm, "codex_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "claude_matches_pane", return_value=True), \
+             mock.patch.object(sm, "turn_texts", side_effect=_turn_texts), \
+             mock.patch.object(sm, "detect_question_dialog", return_value={"chat": "1"}), \
+             mock.patch.object(sm, "scrape_questions", return_value=list(qs_blocks)), \
+             mock.patch.object(sm, "send_question_answer", return_value=sqa_ok) as sqa, \
+             mock.patch.object(sm, "poke", return_value=object()) as poke_mock, \
+             mock.patch("time.sleep"), contextlib.redirect_stdout(buf):
+            code = machine.run()
+        pokes = [(cc.args[0], cc.args[1]) for cc in poke_mock.call_args_list]
+        return code, pokes, sqa, buf.getvalue()
+
+    def test_question_human_required_stops_at_exit_8_without_answering(self):
+        # P1-2: Codex が回答に [AIPAIR_HUMAN_REQUIRED] を出す → Claude へ回答を送らず exit 8、
+        # banner に質問内容を表示。実駆動で送信非呼び出し・exit・banner を固定する。
+        code, pokes, sqa, out = self._drive_question(
+            [("codex", ["[AIPAIR_HUMAN_REQUIRED]"], None)], ["Pick a database"])
+        self.assertEqual(code, relay.state_machine.EXIT_BLOCKED)     # exit 8
+        sqa.assert_not_called()                                      # Claude へ回答を送らない
+        self.assertIn("Pick a database", out)                       # banner に質問内容
+        self.assertIn("HUMAN_REQUIRED", out)                        # 停止理由を表示
+        # Codex への回答依頼（question_poke_codex）は 1 回だけ、Claude への配達は無い
+        self.assertEqual([p[0] for p in pokes], ["%2"])
+        self.assertNotIn("%1", [p[0] for p in pokes])
+
+    def test_question_oversize_stops_at_exit_8_without_poking_codex(self):
+        # P1-3: 質問本文が自動中継上限を超えたら、truncate も Codex への回答依頼もせず exit 8 で停止。
+        # 不完全な質問で Codex に推測回答させない。banner に上限超過を表示。
+        code, pokes, sqa, out = self._drive_question([], ["Pick a very long option " * 200])
+        self.assertEqual(code, relay.state_machine.EXIT_BLOCKED)     # exit 8
+        self.assertEqual(pokes, [])                                  # Codex へ回答依頼を送らない
+        sqa.assert_not_called()                                      # Claude へも配達しない
+        self.assertIn("自動中継上限", out)                          # 上限超過を banner 表示
+
+    def test_question_deliver_answers_then_continues_to_all_done(self):
+        # 対照: 通常回答は send_question_answer で配達し、ループは継続（exit 8 にしない）。
+        # 配達後 Claude が [AIPAIR_NEXT] → Codex [AIPAIR_ALL_DONE] で exit 0。
+        code, pokes, sqa, out = self._drive_question([
+            ("codex", ["1問目: 選択肢1（Postgres）で"], None),        # codex_question: 通常回答 → 配達
+            ("claude", ["[AIPAIR_NEXT]"], None),                     # 配達後 Claude 完了 → 次依頼
+            ("codex", ["[AIPAIR_ALL_DONE]"], self._cls("- [x] A\n")),   # → exit 0
+        ], ["Pick a database"])
+        self.assertEqual(code, 0)
+        sqa.assert_called_once()
+        self.assertEqual(sqa.call_args.args[2], "1問目: 選択肢1（Postgres）で")   # 配達本文 = payload
+
+
+
+class ClaudePaneIdentityBySessionId(unittest.TestCase):
+    """Regression (2026-09-25, aipair pair): Claude Code showed a PARAPHRASE of the logged reply on screen,
+    so claude_matches_pane's text-fragment check failed for the correct log; the relay logged
+    '誤ピン疑い → 強制 re-lock' forever and never handed Claude's completion to Codex. The pane's claude
+    process --session-id (aipair launches it with one) now identifies its log without scraping."""
+    SID = "7d3f1a2e-4b5c-4d6e-8f90-a1b2c3d4e5f6"
+
+    def _cmdline(self, args):
+        d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(d, "4242"))
+        with open(os.path.join(d, "4242", "cmdline"), "wb") as fh:
+            fh.write(b"\0".join(a.encode() for a in args) + b"\0")
+        return d
+
+    def _sid(self, args, live=None):
+        ll = relay.log_lock
+        d = self._cmdline(args)
+        real_open = open
+
+        def fake_open(path, *a, **k):
+            if isinstance(path, str) and path.startswith("/proc/4242/"):
+                path = os.path.join(d, path[len("/proc/"):])
+            return real_open(path, *a, **k)
+        with mock.patch.object(ll.peerlog, "cli_process", return_value=(4242, 1, (1, 1))), \
+             mock.patch.object(ll.peerlog, "claude_live_session", return_value=live), \
+             mock.patch("builtins.open", side_effect=fake_open):
+            return ll.pane_session_id("%1")
+
+    def test_session_id_is_read_from_the_running_process(self):
+        self.assertEqual(self._sid(["claude", "--session-id", self.SID, "--dangerously-skip-permissions"]), self.SID)
+        self.assertEqual(self._sid(["claude", "--resume=" + self.SID]), self.SID)
+        self.assertEqual(self._sid(["claude", "-r", self.SID]), self.SID)
+        self.assertIsNone(self._sid(["claude"]), "no pin → None (screen fallback)")
+        self.assertIsNone(self._sid(["claude", "--session-id", "not-a-uuid"]))
+
+    LIVE = "11111111-2222-4333-8444-555555555555"
+
+    def _sessions(self, record):
+        d = tempfile.mkdtemp()
+        with open(os.path.join(d, "4242.json"), "w", encoding="utf-8") as fh:
+            json.dump(record, fh)
+        return d
+
+    def test_live_session_is_read_from_claude_sessions_and_checked_against_proc(self):
+        # Codex レビュー 2026-09-27 P1: --session-id X で起動して別の会話を再開するとログは再開側に書かれる
+        pl = relay.log_lock.peerlog
+        good = {"pid": 4242, "procStart": "777", "sessionId": self.LIVE}
+        cases = [(good, self.LIVE),
+                 (dict(good, pid=4243), None),              # 別 pid の記録
+                 (dict(good, procStart="778"), None),       # pid 使い回し（起動時刻が違う）
+                 ({"pid": 4242, "sessionId": self.LIVE}, None),   # procStart 無し → 信用しない
+                 (dict(good, sessionId="../x"), None)]
+        for record, want in cases:
+            with mock.patch.object(pl, "CLAUDE_SESSIONS", self._sessions(record)), \
+                 mock.patch.object(pl, "_proc_stat", return_value=("S", 777)):
+                self.assertEqual(pl.claude_live_session(4242), want, record)
+
+    def test_pane_session_id_prefers_the_resumed_session_over_the_launch_arg(self):
+        self.assertEqual(self._sid(["claude", "--session-id", self.SID], live=self.LIVE), self.LIVE)
+        self.assertEqual(self._sid(["claude", "--session-id", self.SID]), self.SID, "fallback: cmdline")
+
+    def test_peer_reads_the_resumed_session_even_with_a_stale_pin(self):
+        pl = relay.log_lock.peerlog
+        root = tempfile.mkdtemp()
+        os.makedirs(os.path.join(root, "proj"))
+        live_log = os.path.join(root, "proj", self.LIVE + ".jsonl")
+        open(live_log, "w").close()
+        with mock.patch.object(pl, "CLAUDE_PROJECTS", root), \
+             mock.patch.dict(os.environ, {"AIPAIR_CLAUDE_SESSION": self.SID}):
+            with mock.patch.object(pl, "claude_pane_session", return_value=self.LIVE):
+                self.assertEqual(pl.claude_file("/any"), live_log)
+            with mock.patch.object(pl, "claude_pane_session", return_value=None):
+                self.assertIsNone(pl.claude_file("/any"), "no live session → the pin rule as before")
+
+    def test_matching_session_id_wins_even_when_the_screen_shows_a_paraphrase(self):
+        ll = relay.log_lock
+        with mock.patch.object(ll, "pane_session_id", return_value=self.SID), \
+             mock.patch.object(ll, "tmux") as tm:
+            tm.return_value.stdout = "● 言い換えられた表示（ログの文面とは違う）\n"
+            self.assertTrue(ll.claude_matches_pane("/x/%s.jsonl" % self.SID, "%1"))
+            tm.assert_not_called()
+
+    def test_another_session_falls_back_to_the_screen_check(self):
+        ll = relay.log_lock
+        with mock.patch.object(ll, "pane_session_id", return_value=self.SID), \
+             mock.patch.object(ll, "tmux") as tm, \
+             mock.patch.object(ll.peerlog, "parse_claude", return_value=[(0, "assistant", "x" * 30)]):
+            tm.return_value.stdout = "nothing matching\n"
+            self.assertFalse(ll.claude_matches_pane("/x/other-session.jsonl", "%1"))
+            tm.assert_called()
+
+class AutopilotMode(unittest.TestCase):
+    """--autopilot（メンテナーの決定 2026-09-25）: 人間の判断待ちで止めず Codex が代理で答え、プラン／質問／停滞は
+    上限で止めずに《収束の段》で必ず前へ進める。質問は全問に答えたことを relay が照合する。
+    純関数の単体＋実 run() を tmux/ログを mock して駆動する。"""
+    HR = "[AIPAIR_HUMAN_REQUIRED]"
+    OK = "[AIPAIR_REVIEW_OK]"
+    PLAN = {"tell": "3", "yes": "1", "yes_label": "Yes, and use auto mode", "plan": "/tmp/p.md"}
+    QD = {"chat": "4"}
+
+    class _Stop(Exception):
+        pass
+
+    # --- pure helpers ------------------------------------------------------------------ #
+    def test_stage_ladder(self):
+        from aipairlib import autopilot_flow as ap
+        self.assertEqual([ap.stage(n, 2) for n in (1, 2, 3, 4, 9)],
+                         ["normal", "normal", "converge", "force", "force"])
+        self.assertEqual([ap.stall_action(k, 3) for k in (2, 3, 4, 5, 6, 9)],
+                         ["forward", "break", "forward", "final", "force", "force"])
+
+    def test_missing_answers(self):
+        from aipairlib import autopilot_flow as ap
+        self.assertEqual(ap.missing_answers("1問目: A\n3問目: C", 3), [2])
+        self.assertEqual(ap.missing_answers("１問目: A ２ 問目: B", 2), [], "full-width digits / spaces")
+        self.assertEqual(ap.missing_answers("11問目: x", 2), [1, 2], "'11問目' is not '1問目'")
+        self.assertEqual(ap.missing_answers("anything", 1), [], "a single question is never checked")
+
+    def test_force_plan_decision_approves_with_the_review_as_feedback(self):
+        from aipairlib import autopilot_flow as ap
+        from aipairlib.plan_flow import PlanDecision
+        d = ap.force_plan_decision(PlanDecision("changes", "直して"), self.PLAN)
+        self.assertEqual(d.action, "approve_feedback")
+        self.assertTrue(d.payload.startswith(ap.FORCE_PLAN_NOTE) and d.payload.endswith("直して"))
+        self.assertEqual(ap.force_plan_decision(PlanDecision("no_tell_option", None), self.PLAN).action, "approve")
+        for keep in ("no_dialog", "approve"):     # no_text は下の空返答テストで扱う
+            self.assertEqual(ap.force_plan_decision(PlanDecision(keep, None), self.PLAN).action, keep,
+                             "a vanished dialog is never operated, even at the force stage")
+
+    def test_force_plan_approves_an_empty_reply_while_the_dialog_is_up(self):
+        # Codex レビュー P1: 最終段で空の返答（no_text）が続くとプランレビューの再依頼が際限なく続いた
+        from aipairlib import autopilot_flow as ap
+        from aipairlib.plan_flow import PlanDecision
+        self.assertEqual(ap.force_plan_decision(PlanDecision("no_text", None), self.PLAN).action, "approve")
+        self.assertEqual(ap.force_plan_decision(PlanDecision("no_text", None), None).action, "no_text",
+                         "no dialog on screen → nothing is pressed")
+        no_yes = dict(self.PLAN, yes=None)
+        self.assertEqual(ap.force_plan_decision(PlanDecision("no_text", None), no_yes).action, "no_text")
+
+    def test_dir_fingerprint_tracks_edits_outside_git(self):
+        sm = relay.state_machine
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "a.txt"), "w") as fh:
+                fh.write("1")
+            os.makedirs(os.path.join(d, "node_modules"))
+            base = sm.dir_fingerprint(d)
+            self.assertEqual(sm.dir_fingerprint(d), base)
+            with open(os.path.join(d, "node_modules", "x.js"), "w") as fh:
+                fh.write("x")
+            self.assertEqual(sm.dir_fingerprint(d), base, "skipped dirs do not count")
+            with open(os.path.join(d, "a.txt"), "w") as fh:
+                fh.write("22")
+            self.assertNotEqual(sm.dir_fingerprint(d), base)
+            self.assertIsNone(sm.progress_fingerprint(d), "outside git, the normal mode keeps the guard off")
+            self.assertIsNotNone(sm.progress_fingerprint(d, autopilot=True))
+
+    def test_stall_ladder_works_outside_git(self):
+        # Codex レビュー P1: git 管理外（repo_fingerprint=None）でも autopilot は収束する
+        sm = relay.state_machine
+        with mock.patch.object(sm, "dir_fingerprint", return_value="D"):
+            code, rec = self._run(lambda who, r: ["修正なし"] if who == "claude" else ["未修正"], fps=[None] * 50)
+        self.assertEqual(code, 0, "forced pass")
+
+    def test_secrets_are_never_guessed(self):
+        # Codex レビュー P1: 代理回答が API キー等を推測・入力しない
+        from aipairlib import autopilot_flow as ap
+        rp = relay.review_protocol
+        for t in (ap.FORCE_QUESTION_ANSWER, ap.missing_note([1]), rp.AUTOPILOT_PROXY, rp.autopilot_poke_claude()):
+            self.assertIn("捏造", t)
+            self.assertIn("保留", t)
+
+    def test_dir_fingerprint_over_the_limit_is_not_partial(self):
+        # Codex レビュー P2: 上限で打ち切った部分指紋は使わない → 代替（猶予の長い段）へ
+        sm = relay.state_machine
+        with tempfile.TemporaryDirectory() as d:
+            for i in range(3):
+                with open(os.path.join(d, "f%d" % i), "w") as fh:
+                    fh.write("x")
+            self.assertIsNotNone(sm.dir_fingerprint(d, limit=3))
+            self.assertIsNone(sm.dir_fingerprint(d, limit=2))
+            with mock.patch.object(sm, "dir_fingerprint", return_value=None):
+                self.assertEqual(sm.progress_fingerprint(d, autopilot=True), sm.NO_FINGERPRINT)
+
+    def test_no_fingerprint_starts_the_ladder_later(self):
+        sm = relay.state_machine
+        with mock.patch.object(sm, "dir_fingerprint", return_value=None):
+            code, rec = self._run(lambda who, r: ["修正なし"] if who == "claude" else ["未修正"], fps=[None] * 80)
+        self.assertEqual(code, 0)
+        panes = [p for p, _ in rec["pokes"]]
+        # 9 回（stall_rounds 3 × 3）までは通常どおり Claude へ渡し、その後に打破 → … → 強制合格
+        self.assertEqual(panes[:20], ["%2", "%1"] * 9 + ["%2", "%2"])
+
+    def test_question_file_is_private_and_removed_after_the_answer(self):
+        sm = relay.state_machine
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"XDG_CACHE_HOME": d}):
+            old = os.umask(0)
+            try:
+                path = sm.write_question_file(["secret question"])
+            finally:
+                os.umask(old)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            self.assertEqual(os.stat(os.path.dirname(path)).st_mode & 0o777, 0o700)
+            self.assertIsNone(sm.discard_question_file(path))
+            self.assertFalse(os.path.exists(path))
+            code, rec = self._run(lambda who, r: ["1問目: A"], claude_done=None, qdlg=self.QD,
+                                  questions=["x" * 4000], stop_when=lambda r: bool(r["answers"]))
+            left = [f for _, _, fs in os.walk(d) for f in fs]
+            self.assertEqual(left, [], "the question file is deleted once the answer is delivered")
+
+    def test_force_question_answer_prefers_reversible_options(self):
+        # Codex レビュー 2026-09-25: Recommended/1 番を機械的に選ぶと不可逆な肢を選びうる
+        from aipairlib import autopilot_flow as ap
+        for t in (ap.FORCE_QUESTION_ANSWER, ap.missing_note([2])):
+            self.assertIn("元に戻せる安全な選択肢を優先", t)
+            self.assertIn("dry-run", t)
+
+    def test_prompts(self):
+        rp = relay.review_protocol
+        self.assertNotIn(self.HR, rp.autopilot_poke_codex(self.OK), "no human-wait exit is offered")
+        self.assertIn("すべて列挙して1つずつ代理で", rp.autopilot_poke_codex(self.OK))
+        self.assertNotIn(self.HR, rp.autopilot_poke_claude())
+        q = rp.question_poke_codex(["a", "b", "c"], None)
+        self.assertIn("全 3 問すべてに", q)
+        self.assertIn("/tmp/q.md", rp.question_poke_codex(["x" * 5000], None, qfile="/tmp/q.md"))
+        self.assertNotIn("x" * 5000, rp.question_poke_codex(["x" * 5000], None, qfile="/tmp/q.md"))
+        fill = rp.question_fill_poke([2], ["Q1", "Q2", "Q3"])
+        self.assertIn("2問目", fill); self.assertIn("Q2", fill); self.assertNotIn("Q1", fill)
+
+    def test_cli_max_rounds_default(self):
+        cli = relay.cli
+        with mock.patch.dict(os.environ, {"AIPAIR_MAX_ROUNDS": "", "AIPAIR_AUTOPILOT": ""}):
+            p = cli.build_parser()
+            self.assertEqual(cli.apply_autopilot_defaults(p.parse_args([])).max_rounds, 20)
+            self.assertIsNone(cli.apply_autopilot_defaults(p.parse_args(["--autopilot"])).max_rounds)
+            self.assertEqual(cli.apply_autopilot_defaults(p.parse_args(["--autopilot", "--max-rounds", "7"])).max_rounds, 7)
+            a = cli.apply_autopilot_defaults(p.parse_args(["--autopilot", "--no-autopilot"]))
+            self.assertEqual((a.autopilot, a.max_rounds), (False, 20))
+
+    def test_mark_blocked(self):
+        from aipairlib import tasklist
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "todo.md")
+            def write(text):
+                with open(path, "w", encoding="utf-8", newline="") as fh:
+                    fh.write(text)
+
+            def read():
+                with open(path, encoding="utf-8", newline="") as fh:
+                    return fh.read()
+            write("- [x] a\r\n  - [ ] b\r\n- [ ] c\r\n")
+            self.assertTrue(tasklist.mark_blocked("todo.md", d, "  - [ ] b", "stuck\nhere"))
+            self.assertEqual(read(),
+                             "- [x] a\r\n  - [!] b\r\n    blocker: stuck here\r\n- [ ] c\r\n")
+            self.assertEqual(tasklist.load("todo.md", d)["ready"], ["- [ ] c"])
+            self.assertFalse(tasklist.mark_blocked("todo.md", d, "- [ ] zzz", "r"), "absent line → untouched")
+            write("- [ ] d\n- [ ] d\n")
+            self.assertFalse(tasklist.mark_blocked("todo.md", d, "- [ ] d", "r"), "ambiguous → untouched")
+
+    # --- the real run() ---------------------------------------------------------------- #
+    def _run(self, texts_for, *, claude_done=100.0, plan=None, qdlg=None, questions=(), fps=None,
+             autopilot=True, stall_rounds=3, max_rounds=None, plan_rounds=5, question_rounds=5,
+             stop_when=None):
+        sm = relay.state_machine
+        a = types.SimpleNamespace(start_side="claude", settle=0, poll=0, max_rounds=max_rounds, endless=False,
+                                  stop_side="codex", no_plan_review=plan is None, no_question_relay=qdlg is None,
+                                  plan_rounds=plan_rounds, question_rounds=question_rounds,
+                                  plan_ok="[AIPAIR_PLAN_APPROVED]", gate=None, gate_timeout=600, gate_rounds=3,
+                                  stall_rounds=stall_rounds, autopilot=autopilot)
+        rg = types.SimpleNamespace(response_done=lambda who, path, done: done, noshow=lambda who: False,
+                                   arm=lambda nonce: None, clear=lambda: None, probe=None, probe_ts_cache=0.0)
+        rec = {"pokes": [], "plan": [], "answers": [], "stop": False}
+
+        def guard():
+            if rec["stop"]:
+                raise self._Stop()
+            return False
+
+        def poke(pane, text, **kw):
+            rec["pokes"].append((pane, text))
+            return "nonce"
+
+        def plan_fb(pane, dialog, text, approve, watch=None):
+            rec["plan"].append((approve, text))
+            if stop_when and stop_when(rec):
+                rec["stop"] = True
+            return True
+
+        def answer(pane, q, text, watch=None):
+            rec["answers"].append(text)
+            if stop_when and stop_when(rec):
+                rec["stop"] = True
+            return True
+
+        machine = sm.StateMachine(
+            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x",
+            tracked={"claude": "c.jsonl", "codex": "x.jsonl"}, claude_seen=set(), codex_seen=set(),
+            baseline=0.0, sg=types.SimpleNamespace(guard=guard), rg=rg,
+            vg=types.SimpleNamespace(dialog_ok=lambda: True), bw=60,
+            poke_codex="PC", poke_codex_next="PCN", poke_claude="PCL", poke_claude_pass="PCP",
+            poke_claude_next="PCX", stop_phrases=[self.OK], next_ask_phrases=["[AIPAIR_NEXT]"],
+            all_done_phrases=["[AIPAIR_ALL_DONE]"], human_required_phrases=[self.HR])
+        fp = iter(fps or [])
+        code = None
+        with mock.patch.object(sm, "set_pane_title"), \
+             mock.patch.object(sm, "claude_done_ts", return_value=claude_done), \
+             mock.patch.object(sm, "codex_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "claude_matches_pane", return_value=True), \
+             mock.patch.object(sm, "turn_texts", side_effect=lambda who, *r: texts_for(who, rec)), \
+             mock.patch.object(sm, "detect_plan_dialog", return_value=plan), \
+             mock.patch.object(sm, "detect_question_dialog", return_value=qdlg), \
+             mock.patch.object(sm, "scrape_questions", return_value=list(questions)), \
+             mock.patch.object(sm, "send_plan_feedback", side_effect=plan_fb), \
+             mock.patch.object(sm, "send_question_answer", side_effect=answer), \
+             mock.patch.object(sm, "press"), \
+             mock.patch.object(sm, "approval_took_effect", return_value=True), \
+             mock.patch.object(sm, "repo_fingerprint", side_effect=lambda cwd: next(fp, "SAME")), \
+             mock.patch.object(sm, "poke", side_effect=poke), \
+             mock.patch("time.sleep"), mock.patch("builtins.print"):
+            try:
+                code = machine.run()
+            except self._Stop:
+                pass
+        return code, rec
+
+    def test_human_required_never_stops_the_review_loop(self):
+        # Claude と Codex の両方が HUMAN_REQUIRED を出しても止まらず、Codex の代理判断で往復が続く
+        code, rec = self._run(lambda who, r: [self.HR + "\n判断待ち"], stall_rounds=0, max_rounds=3)
+        self.assertEqual(code, 3, "only the explicit --max-rounds cap ends it")
+        self.assertEqual([p for p, _ in rec["pokes"]], ["%2", "%1", "%2", "%1", "%2"])
+
+    def test_the_same_run_without_autopilot_stops_with_exit_8(self):
+        code, _ = self._run(lambda who, r: [self.HR + "\n判断待ち"], autopilot=False, max_rounds=20)
+        self.assertEqual(code, 8)
+
+    def test_stall_ladder_ends_in_a_forced_pass(self):
+        code, rec = self._run(lambda who, r: ["同じ2点、修正なし"] if who == "claude" else ["2点とも未修正"])
+        self.assertEqual(code, 0, "forced pass (exit 0), never exit 8")
+        panes = [p for p, _ in rec["pokes"]]
+        # reviews 1-3 forward; 4th: break → Codex; its reply forwards to Claude; next review: final → Codex;
+        # its reply: force pass
+        self.assertEqual(panes, ["%2", "%1"] * 3 + ["%2", "%2", "%1", "%2", "%2"])
+        self.assertIn("膠着打破", rec["pokes"][7][1])
+        self.assertIn("最終", rec["pokes"][10][1])
+
+    def test_stall_ladder_stops_as_soon_as_codex_passes(self):
+        def texts(who, r):
+            if who == "claude":
+                return ["修正なし"]
+            return [self.OK] if any("膠着打破" in t for _, t in r["pokes"]) else ["未修正"]
+        code, rec = self._run(texts)
+        self.assertEqual(code, 0)
+        self.assertEqual([p for p, _ in rec["pokes"]], ["%2", "%1"] * 3 + ["%2", "%2"])
+
+    def test_plan_review_converges_then_force_approves(self):
+        code, rec = self._run(lambda who, r: ["ここを直して"], claude_done=None, plan=self.PLAN, plan_rounds=1,
+                              stop_when=lambda r: any(ap for ap, _ in r["plan"]))
+        self.assertEqual([ap for ap, _ in rec["plan"]], [False, False, True],
+                         "normal → converge → force approve with feedback")
+        self.assertIn("ここを直して", rec["plan"][-1][1])
+        self.assertIn("収束", rec["pokes"][1][1])
+        self.assertIn("内容にかかわらず", rec["pokes"][2][1])
+
+    def test_plan_review_cap_still_stops_without_autopilot(self):
+        code, rec = self._run(lambda who, r: ["ここを直して"], claude_done=None, plan=self.PLAN, plan_rounds=1,
+                              autopilot=False, max_rounds=20)
+        self.assertEqual(code, 5)
+
+    def test_every_question_is_answered(self):
+        # 3 問中 2 問目を飛ばした回答 → その問だけ追加で聞き、両方をまとめて配達する（autopilot 無しでも）
+        for ap in (False, True):
+            answers = iter([["1問目: 選択肢1（A）\n3問目: 選択肢2（C）"], ["2問目: 選択肢1（B）"]])
+            code, rec = self._run(lambda who, r: next(answers), claude_done=None, qdlg=self.QD,
+                                  questions=["Q1", "Q2", "Q3"], autopilot=ap, max_rounds=20,
+                                  stop_when=lambda r: bool(r["answers"]))
+            self.assertEqual(len(rec["pokes"]), 2, "question request + one fill request")
+            self.assertIn("2問目", rec["pokes"][1][1]); self.assertIn("Q2", rec["pokes"][1][1])
+            sent = rec["answers"][0]
+            for n in (1, 2, 3):
+                self.assertIn(f"{n}問目", sent)
+            self.assertEqual("autopilot" in sent, ap)
+
+    def test_question_still_missing_after_the_fill_is_delivered_with_the_safe_rule(self):
+        code, rec = self._run(lambda who, r: ["1問目: A"], claude_done=None, qdlg=self.QD,
+                              questions=["Q1", "Q2"], stop_when=lambda r: bool(r["answers"]))
+        self.assertIn("2問目 への回答がありません", rec["answers"][0])
+        self.assertIn("元に戻せる安全な選択肢を優先", rec["answers"][0])
+
+    def test_question_ladder_ends_in_the_relays_own_safe_answer(self):
+        from aipairlib import autopilot_flow as apf
+        code, rec = self._run(lambda who, r: ["1問目: A\n2問目: B"], claude_done=None, qdlg=self.QD,
+                              questions=["Q1", "Q2"], question_rounds=1,
+                              stop_when=lambda r: len(r["answers"]) >= 3)
+        self.assertEqual(len(rec["pokes"]), 2, "normal + converge go to Codex; force does not")
+        self.assertIn("収束", rec["pokes"][1][1])
+        self.assertEqual(rec["answers"][2], apf.FORCE_QUESTION_ANSWER)
+
+    def test_codex_human_required_on_a_question_is_re_asked_not_stopped(self):
+        seq = iter([[self.HR], ["1問目: A\n2問目: B"]])
+        code, rec = self._run(lambda who, r: next(seq), claude_done=None, qdlg=self.QD,
+                              questions=["Q1", "Q2"], stop_when=lambda r: bool(r["answers"]))
+        self.assertIsNone(code, "never exit 8")
+        self.assertEqual(len(rec["pokes"]), 2, "asked again")
+        self.assertNotIn(self.HR, rec["pokes"][0][1], "the human-wait sentinel is not offered")
+        self.assertNotIn(self.HR, rec["answers"][0])
+
+    def test_oversize_question_goes_through_a_file(self):
+        sm = relay.state_machine
+        real_write = sm.write_question_file
+        seen = {}
+
+        def write(blocks):
+            path = real_write(blocks)
+            with open(path, encoding="utf-8") as fh:
+                seen["path"], seen["body"] = path, fh.read()
+            return path
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {"XDG_CACHE_HOME": d}), \
+             mock.patch.object(sm, "write_question_file", side_effect=write):
+            big = "x" * 4000
+            code, rec = self._run(lambda who, r: ["1問目: A"], claude_done=None, qdlg=self.QD,
+                                  questions=[big], stop_when=lambda r: bool(r["answers"]))
+            self.assertIsNone(code, "not exit 8 under autopilot")
+            self.assertIn(big, seen["body"])
+            self.assertIn(seen["path"], rec["pokes"][0][1])
+            self.assertNotIn(big, rec["pokes"][0][1])
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

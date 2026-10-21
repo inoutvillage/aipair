@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# aipair-codex — how `aipair` starts Codex in a pair's pane: `codex` plus --no-daemon when needed.
+#
+# codex 0.158+ runs every TUI through ONE shared background server by default. That server — not the
+# pane's TUI — then holds the session log and runs Codex's shell commands with the environment of
+# whichever pane first started it: the relay could not find the pair's Codex log (it never saw Codex
+# finish) and Codex's `peer` read another, long-gone pair's pins (2026-09-29). --no-daemon keeps the
+# TUI self-contained.
+#
+# This runs AFTER the pane's shell has expanded the user's AIPAIR_CODEX_FLAGS ($VAR, $(…), quotes,
+# comments), so "is --no-daemon already there?" is decided on the exact argv codex will get — codex
+# rejects a repeated --no-daemon, and no reading of the unexpanded text can be exact (Codex review
+# 2026-09-29). Added only when this codex offers it (older ones reject unknown flags); arguments after
+# a lone `--` are not options. Then this process BECOMES codex (exec), so the relay and `peer` find
+# the same process they always did.
+set -u
+want=0
+case "$(codex --help 2>/dev/null || true)" in
+  *--no-daemon*) want=1 ;;
+esac
+if [ "$want" = 1 ]; then
+  for a in "$@"; do
+    [ "$a" = -- ] && break
+    [ "$a" = --no-daemon ] && { want=0; break; }
+  done
+fi
+if [ "$want" = 1 ]; then
+  exec codex --no-daemon "$@"
+fi
+exec codex "$@"
