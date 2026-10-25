@@ -838,7 +838,9 @@ class CliBoundaries(unittest.TestCase):
 class CodexFirstStart(unittest.TestCase):
     """--start-side codex（Codex 先攻）は《最初に完了を待つ相手》だけを Codex にする。役割交換ではない:
     Codex の完了 → poke_claude で Claude へ → Claude の完了 → poke_codex で Codex へ、の通常の往復になる。
-    非 endless の実 `StateMachine.run()` を scripted fake で駆動し、poke の (pane, 文面) 履歴で固定する。"""
+    非 endless の実 `StateMachine.run()` を scripted fake で駆動し、poke の (pane, 文面) 履歴で固定する。
+    Codex の合格で終わる時は、最後に Claude へ合格と終了の知らせが 1 件届く（ReviewOkNotice）。"""
+    DONE = relay.review_protocol.REVIEW_OK_POKE_CLAUDE
 
     def _drive(self, start_side, turns):
         sm = relay.state_machine
@@ -885,7 +887,7 @@ class CodexFirstStart(unittest.TestCase):
         self.assertEqual(code, 0)
         # 最初の配達は Claude ペインへの poke_claude（Codex への poke はそれより前に出ない）。以後は通常の往復で、
         # 宛先と文面の組は Claude 先攻と同じ（Codex へは poke_codex）＝役割は入れ替わらない。
-        self.assertEqual(pokes, [("%1", "POKE_CLAUDE"), ("%2", "POKE_CODEX")])
+        self.assertEqual(pokes, [("%1", "POKE_CLAUDE"), ("%2", "POKE_CODEX"), ("%1", self.DONE)])
 
     def test_claude_first_default_is_unchanged(self):
         code, pokes = self._drive("claude", [
@@ -893,7 +895,7 @@ class CodexFirstStart(unittest.TestCase):
             ("codex", ["[AIPAIR_REVIEW_OK]"]),
         ])
         self.assertEqual(code, 0)
-        self.assertEqual(pokes, [("%2", "POKE_CODEX")])
+        self.assertEqual(pokes, [("%2", "POKE_CODEX"), ("%1", self.DONE)])
 
 
 class VersionGate(unittest.TestCase):
@@ -1362,6 +1364,121 @@ class ReviewLoopExits(unittest.TestCase):
         self.assertEqual(code, 3, "--stall-rounds 0 and an empty --human-required → old behaviour")
 
 
+class ReviewOkNotice(unittest.TestCase):
+    """2026-10-26 (maintainer request): when Codex's pass ([AIPAIR_REVIEW_OK]) ends the normal review loop, the relay
+    used to stop silently, so someone watching only the Claude pane could not tell "Codex is still reviewing" from
+    "the task is finished". Now the relay first tells Claude the review passed and the loop is over, and Claude
+    tells the user 「レビューOKを受け取ったのでタスクを完了します」. Drives the real StateMachine.run()."""
+    DONE = relay.review_protocol.REVIEW_OK_POKE_CLAUDE
+
+    def _run(self, turns, stop_side="codex", plan=None, question=None, poke_result=lambda pane, text: "nonce",
+             gate=None):
+        sm = relay.state_machine
+        a = types.SimpleNamespace(start_side="claude", settle=0, poll=0, max_rounds=20, endless=False,
+                                  stop_side=stop_side, no_plan_review=True, no_question_relay=True,
+                                  plan_rounds=5, question_rounds=5, plan_ok="[AIPAIR_PLAN_APPROVED]",
+                                  gate=None, gate_timeout=600, gate_rounds=3, stall_rounds=3)
+        rg = types.SimpleNamespace(response_done=lambda who, path, done: done, noshow=lambda who: False,
+                                   arm=lambda nonce: None, clear=lambda: None, probe=None, probe_ts_cache=0.0)
+        machine = sm.StateMachine(
+            a, panes={"claude": "%1", "codex": "%2"}, own="%0", cwd="/x",
+            tracked={"claude": "c.jsonl", "codex": "x.jsonl"}, claude_seen=set(), codex_seen=set(),
+            baseline=0.0, sg=types.SimpleNamespace(guard=lambda: False), rg=rg,
+            vg=types.SimpleNamespace(dialog_ok=lambda: True), bw=60,
+            poke_codex="PC", poke_codex_next="PCN", poke_claude="PCL", poke_claude_pass="PCP",
+            poke_claude_next="PCX", stop_phrases=["[AIPAIR_REVIEW_OK]"], next_ask_phrases=["[AIPAIR_NEXT]"],
+            all_done_phrases=["[AIPAIR_ALL_DONE]"], human_required_phrases=["[AIPAIR_HUMAN_REQUIRED]"])
+        turn_iter = iter(turns)
+
+        def _turn_texts(who, *r):
+            agent, texts = next(turn_iter)
+            self.assertEqual(agent, who, "turn script mismatch")
+            return list(texts)
+        patches = [mock.patch.object(sm, "gate_or_message", side_effect=gate)] if gate else []
+        with mock.patch.object(sm, "set_pane_title"), \
+             mock.patch.object(sm, "claude_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "codex_done_ts", return_value=100.0), \
+             mock.patch.object(sm, "claude_matches_pane", return_value=True), \
+             mock.patch.object(sm, "turn_texts", side_effect=_turn_texts), \
+             mock.patch.object(sm, "detect_plan_dialog", return_value=plan), \
+             mock.patch.object(sm, "detect_question_dialog", return_value=question), \
+             mock.patch.object(sm, "repo_fingerprint", return_value="SAME"), \
+             mock.patch.object(sm, "poke", side_effect=lambda pane, text, **k: poke_result(pane, text)) as poke_mock, \
+             mock.patch("time.sleep"), mock.patch("builtins.print") as printed:
+            for p in patches:
+                p.start()
+            try:
+                code = machine.run()
+            finally:
+                for p in patches:
+                    p.stop()
+        self.assertRaises(StopIteration, next, turn_iter)   # 台本を最後まで消費した（途中で止まっていない）
+        out = "\n".join(str(c.args[0]) for c in printed.call_args_list if c.args)
+        return code, [(c.args[0], c.args[1]) for c in poke_mock.call_args_list], out
+
+    def test_the_notice_asks_claude_to_tell_the_user_and_stop(self):
+        self.assertIn("「レビューOKを受け取ったのでタスクを完了します」", self.DONE)
+        self.assertIn("合格", self.DONE)
+        self.assertIn("新しい作業は始めず", self.DONE)
+        self.assertIn("再点火もしない", self.DONE, "the relay-here skill must not be fired again by the notice")
+        self.assertNotIn("[AIPAIR_REVIEW_OK]", self.DONE, "the stop sentinel is not handed to Claude to echo")
+
+    def test_codex_pass_tells_claude_before_the_loop_ends(self):
+        code, pokes, out = self._run([("claude", ["実装しました"]), ("codex", ["要修正: X"]),
+                                      ("claude", ["直しました"]), ("codex", ["[AIPAIR_REVIEW_OK]\n問題なし"])])
+        self.assertEqual(code, 0)
+        self.assertEqual(pokes, [("%2", "PC"), ("%1", "PCL"), ("%2", "PC"), ("%1", self.DONE)],
+                         "the review requests go on as before; only the pass adds the notice, last")
+        self.assertIn("Claude に合格とループ終了を知らせました", out)
+        self.assertLess(out.index("Claude に合格とループ終了を知らせました"), out.index("停止ワードを宣言"),
+                        "notified first, then the done banner")
+
+    def test_a_dialog_on_claudes_screen_is_never_typed_into(self):
+        for plan, question in (({"tell": "3", "yes": "1"}, None), (None, {"chat": "4"})):
+            code, pokes, out = self._run([("claude", ["実装しました"]), ("codex", ["[AIPAIR_REVIEW_OK]"])],
+                                         plan=plan, question=question)
+            self.assertEqual(code, 0, "the review passed")
+            self.assertEqual(pokes, [("%2", "PC")], "no poke into the dialog (its digits could pick an option)")
+            self.assertIn("ダイアログ表示中のため、合格の知らせは送らずに終了", out)
+
+    def test_an_undelivered_notice_is_shown_but_the_pass_still_exits_0(self):
+        code, pokes, out = self._run([("claude", ["実装しました"]), ("codex", ["[AIPAIR_REVIEW_OK]"])],
+                                     poke_result=lambda pane, text: None if text == self.DONE else "nonce")
+        self.assertEqual(code, 0)
+        self.assertEqual(pokes, [("%2", "PC"), ("%1", self.DONE)])
+        self.assertIn("合格の知らせを配達できず（poke失敗）", out)
+        self.assertNotIn("Claude に合格とループ終了を知らせました", out)
+
+    def test_a_tmux_error_while_notifying_does_not_crash_the_passed_relay(self):
+        # Codex review 2026-10-26 [P2]: the Claude pane was closed → tmux fails inside poke() → the relay died with
+        # exit 1 before the done banner, although the review had passed
+        def poke_result(pane, text):
+            if text == self.DONE:
+                raise subprocess.CalledProcessError(1, ["tmux", "send-keys", "-t", pane], stderr="can't find pane")
+            return "nonce"
+        code, pokes, out = self._run([("claude", ["実装しました"]), ("codex", ["[AIPAIR_REVIEW_OK]"])],
+                                     poke_result=poke_result)
+        self.assertEqual(code, 0)
+        self.assertEqual(pokes, [("%2", "PC"), ("%1", self.DONE)])
+        self.assertIn("合格の知らせを配達できず（tmux エラー:", out, "the reason is shown, not swallowed")
+        self.assertIn("停止ワードを宣言", out, "the done banner still follows")
+
+    def test_with_a_gate_the_notice_waits_for_the_gate_to_pass(self):
+        results = iter([(False, "GATE_FAILED"), (True, None)])
+        code, pokes, _ = self._run([("claude", ["実装しました"]), ("codex", ["[AIPAIR_REVIEW_OK]"]),
+                                    ("claude", ["テストを直しました"]), ("codex", ["[AIPAIR_REVIEW_OK]"])],
+                                   gate=lambda *r: next(results))
+        self.assertEqual(code, 0)
+        self.assertEqual(pokes, [("%2", "PC"), ("%1", "GATE_FAILED"), ("%2", "PC"), ("%1", self.DONE)],
+                         "a failed gate goes back to Claude as before; the notice comes only with the real end")
+
+    def test_claudes_own_stop_needs_no_notice(self):
+        # stop_side=claude: Claude declared the end itself, so it already knows the loop is over
+        code, pokes, _ = self._run([("claude", ["[AIPAIR_REVIEW_OK]"])], stop_side="claude")
+        self.assertEqual(code, 0)
+        self.assertEqual(pokes, [])
+
+
 class SubagentWaitInTheLoop(unittest.TestCase):
     """Regression (2026-10-12): Claude launched a background subagent and ended its turn to wait for it; the
     relay took that end_turn as 'implementation done' and poked Codex, which had nothing to review. These drive
@@ -1386,7 +1503,8 @@ class SubagentWaitInTheLoop(unittest.TestCase):
 
     def _run_scripted(self, answers, **a_extra):
         """run() against a scripted claude_done_ts: `answers(n, wait, on_subagents)` is the n-th check's
-        result. Returns (exit code, the kwargs of every check, the check count at each poke, stdout)."""
+        result. Returns (exit code, the kwargs of every check, the check count at each Codex poke, stdout).
+        Only Codex pokes are counted: the review-OK notice to Claude at the end is covered by ReviewOkNotice."""
         sm = relay.state_machine
         machine = self._machine(baseline=7.0, **a_extra)
         checks, pokes_at = [], []
@@ -1405,7 +1523,8 @@ class SubagentWaitInTheLoop(unittest.TestCase):
              mock.patch.object(sm, "detect_plan_dialog", return_value=None), \
              mock.patch.object(sm, "detect_question_dialog", return_value=None), \
              mock.patch.object(sm, "repo_fingerprint", return_value="SAME"), \
-             mock.patch.object(sm, "poke", side_effect=lambda *r, **k: pokes_at.append(len(checks)) or "nonce"), \
+             mock.patch.object(sm, "poke", side_effect=lambda pane, *r, **k:
+                               (pokes_at.append(len(checks)) if pane == "%2" else None) or "nonce"), \
              mock.patch("time.sleep"), mock.patch("builtins.print") as printed:
             code = machine.run()
         out = "\n".join(str(c.args[0]) for c in printed.call_args_list if c.args)
@@ -1513,8 +1632,8 @@ class SubagentWaitInTheLoop(unittest.TestCase):
              mock.patch.object(sm, "scrape_questions", return_value=["Pick a database"]), \
              mock.patch.object(sm, "send_question_answer", side_effect=deliver_answer) as answered, \
              mock.patch.object(sm, "repo_fingerprint", return_value="SAME"), \
-             mock.patch.object(sm, "poke", side_effect=lambda pane, text, **k: pokes.append((text[:6], stage[0]))
-                               or "nonce"), \
+             mock.patch.object(sm, "poke", side_effect=lambda pane, text, **k:
+                               (pokes.append((text[:6], stage[0])) if pane == "%2" else None) or "nonce"), \
              mock.patch("time.time", side_effect=lambda: clock[0]), \
              mock.patch("time.sleep", side_effect=sleep), mock.patch("builtins.print") as printed:
             code = machine.run()
@@ -4138,7 +4257,9 @@ class AutopilotMode(unittest.TestCase):
             return [self.OK] if any("膠着打破" in t for _, t in r["pokes"]) else ["未修正"]
         code, rec = self._run(texts)
         self.assertEqual(code, 0)
-        self.assertEqual([p for p, _ in rec["pokes"]], ["%2", "%1"] * 3 + ["%2", "%2"])
+        self.assertEqual([p for p, _ in rec["pokes"]], ["%2", "%1"] * 3 + ["%2", "%2", "%1"])
+        self.assertEqual(rec["pokes"][-1][1], relay.review_protocol.REVIEW_OK_POKE_CLAUDE,
+                         "the pass Codex gave ends the loop with the notice to Claude")
 
     def test_plan_review_converges_then_force_approves(self):
         code, rec = self._run(lambda who, r: ["ここを直して"], claude_done=None, plan=self.PLAN, plan_rounds=1,

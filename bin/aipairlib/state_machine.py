@@ -44,7 +44,7 @@ from .gate import gate_or_message
 from .corelib import hit_stop, oneline
 from .review_protocol import (plan_poke_codex, question_poke_codex, question_fill_poke, autopilot_plan_extra,
                               autopilot_question_extra, autopilot_stall_poke_codex,
-                              autopilot_no_progress_poke_claude)
+                              autopilot_no_progress_poke_claude, REVIEW_OK_POKE_CLAUDE)
 from . import autopilot_flow
 from .plan_flow import decide_plan_action
 from .question_flow import decide_question_action, handle_question_answer, decide_question_relay
@@ -594,6 +594,26 @@ class StateMachine:
                 return "repoked"
             return act
 
+        def notify_review_ok():
+            """通常モードで Codex の合格（停止ワード）により終わる直前に、Claude へ合格と終了を知らせる。
+            Claude の画面だけ見ていても、Codex がまだレビュー中か、もう終わったかが分かるようにする。
+            ダイアログ表示中は画面に触れない（poke の nonce の数字が選択肢として解釈されうる）。
+            知らせが届かなくても合格は確定しているので、終了コードは 0 のまま（理由は表示する）。
+            tmux の失敗（Claude ペインが閉じられた等）も同じ扱いで、合格済みの relay を異常終了させない。"""
+            if detect_plan_dialog(panes["claude"]) or detect_question_dialog(panes["claude"]):
+                log(c("warn", "◆ Claude がダイアログ表示中のため、合格の知らせは送らずに終了します"))
+                return
+            why = "poke失敗"
+            try:
+                sent = poke(panes["claude"], REVIEW_OK_POKE_CLAUDE, confirm=claude_poke_confirm(),
+                            badge=tracked["claude"] is None, busy_wait=bw)
+            except (subprocess.CalledProcessError, OSError) as e:
+                sent, why = None, f"tmux エラー: {e}"
+            if sent:
+                log("◆ " + c("ok", "Claude に合格とループ終了を知らせました"))
+            else:
+                log(c("warn", f"◆ Claude への合格の知らせを配達できず（{why}）。合格は確定しているので exit 0 で終了します"))
+
         # 終了理由を exit code で区別する（外部 orchestrator が成否を判別できるように）:
         #   0=停止ワード検知（正常完了） 3=最大往復キャップ 4=poke配達失敗
         #   5=プラン/質問リレー上限・選択肢欠落 6=停止ゲート失敗 7=ログschema不一致(fail-closed)
@@ -1009,10 +1029,11 @@ class StateMachine:
                         if text:
                             dim(c("codex", "codex") + ": " + oneline(text))
                         msg_claude, back_text = poke_claude, text
-                        # 既定モード: 停止ワードでループ終了（従来どおり）。--gate があればその成功が条件
+                        # 既定モード: 停止ワードでループ終了。--gate があればその成功が条件。終わる前に Claude へ知らせる
                         if (not a.endless) and a.stop_side in ("codex", "both") and hit_stop(texts, stop_phrases):
                             ok_gate, gate_msg = gate_or_message(a, gate_state, cwd)
                             if ok_gate:
+                                notify_review_ok()
                                 done_banner(rounds, "codex"); break
                             if gate_msg is None:
                                 code = 6; break

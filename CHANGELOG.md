@@ -72,6 +72,16 @@ task makes no progress across rounds) instead of guessing or spinning.
   (naming the blocking item or the question) so it is clear why the loop stopped and what to do.
 
 ### Changed
+- **Codex's review pass now tells Claude before the loop ends** — in the normal (non-endless) review loop,
+  when Codex's final answer starts with the stop sentinel (`[AIPAIR_REVIEW_OK]`) and any `--gate` passes, the
+  relay no longer stops silently. It first sends Claude a notice that the review passed and the loop is over,
+  and Claude replies 「レビューOKを受け取ったのでタスクを完了します」, so someone watching only the Claude pane
+  can tell "Codex is still reviewing" from "the task is finished". The relay exits once the notice is
+  delivered (confirmed the same way as every other message it sends to Claude); it does not wait for
+  Claude's reply. When Claude is showing a plan or question dialog, nothing is typed into it and the notice
+  is skipped; a notice that cannot be delivered is reported in the relay pane. In both cases the exit code
+  stays 0 because the review passed. Unchanged: endless mode (the stop sentinel still means "next task"),
+  Claude's own stop (`--stop-side claude`), the autopilot forced pass, and the other ways the loop ends.
 - **Default pane layout: bridge 17% high, Codex 28% wide** (was 30% / 50%) — `aipair` now splits the
   window so the Claude pane gets most of the space. **This changes how a newly started pair looks**
   for everyone who upgrades: the bottom bridge pane is shorter and the right-hand Codex pane is
