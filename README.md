@@ -695,12 +695,12 @@ bash tests/run-all.sh        # shebang で判別した全 bash/python3 スクリ
 | `tests/codex-follow.py` | Codex rollout の探索・追従・増分インデックス | 一時ディレクトリの fixture。`~/.codex` は読まない |
 | `tests/relay-parsers.py` | 停止ワード判定・env 解析・ペイン特定・プラン/質問ダイアログ検出・ターン完了検出・transcript パーサ | `tmux` / 画面キャプチャをモック |
 
-GitHub Actions（`.github/workflows/ci.yml`）が push / PR ごとに ubuntu-latest で同じ `tests/run-all.sh` を **3 lane の matrix**（`fail-fast: false`）で回す:
+GitHub Actions（`.github/workflows/ci.yml`）が push / PR ごとに同じ `tests/run-all.sh` を **3 lane の matrix**（`fail-fast: false`）で回す。ubuntu-latest（26.04）には setup-python の 3.8 が無いので、対応下限 Python の lane だけ ubuntu-24.04 で回し、ほかは ubuntu-latest:
 
 | lane | Python | tmux |
 |---|---|---|
-| 対応下限 Python | **3.8**（`aipair-install.sh` の要件） | distro（apt, 3.4 系） |
-| 現行 Python | 3.13 | distro |
+| 対応下限 Python | **3.8**（`aipair-install.sh` の要件） | distro（ubuntu-24.04 の apt, 3.4 系） |
+| 現行 Python | 3.13 | distro（ubuntu-latest の apt, 26.04 は 3.6 系） |
 | 対応下限 tmux | 3.13 | **3.1**（`split-window -l 30%` の下限）を **release tarball からソースビルド**（SHA-256 pin・展開前に検証、`tmux -V` が厳密に `tmux 3.1` かも assertion） |
 
 `run-all.sh` は shebang で判別するので、relay・`aipairlib` パッケージの各モジュール・peer-log・`.py` テスト、および shell テストが `python3` として起動する全経路がその lane の Python で走る。`session-name.sh` は実 tmux が < 3.2 なら `#{session_path}` 依存の採用/衝突ケースを skip（3.1 では安全な非採用に縮退。`[10]` の 3.1 シミュレーションが被覆）。shellcheck は全 lane で apt 導入。

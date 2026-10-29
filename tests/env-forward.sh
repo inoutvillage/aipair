@@ -35,6 +35,13 @@ mkdir -p "$W/home"; export HOME="$W/home"
 # These start real pairs under a pty (`script`), where aipair would ask how each agent starts; answer
 # up front (the launch aipair always made) so nothing waits for input.
 export AIPAIR_CLAUDE_RESUME=new AIPAIR_CODEX_RESUME=new AIPAIR_REMOTE_CONTROL=off
+# kill-server immediately followed by new-session on the same socket can hit
+# "server exited unexpectedly" (the new client connects to the still-dying server; every run on
+# tmux 3.6). reset_server waits for the socket to actually go away first.
+reset_server() {
+  "$REAL_TMUX" -L "$SOCKET" kill-server 2>/dev/null || true
+  for _ in $(seq 1 50); do "$REAL_TMUX" -L "$SOCKET" list-sessions >/dev/null 2>&1 || break; sleep 0.1; done
+}
 # Preflight: prove the tmux shim provably targets the PRIVATE socket before anything runs, so a
 # broken shim can never touch the user's default server (guardrail; same as the other tmux tests).
 "$REAL_TMUX" -L "$SOCKET" new-session -d -s probe 2>/dev/null
@@ -43,16 +50,9 @@ got="$(tmux display-message -p -t probe '#{socket_path}')"
 if [ "$got" != "$want" ] || [ "$(basename "$got")" != "$SOCKET" ]; then
   echo "tmux shim not effective (got '$got', want '$want') — refusing to touch the default server" >&2; exit 2
 fi
-"$REAL_TMUX" -L "$SOCKET" kill-server 2>/dev/null || true
+reset_server
 
 fail=0; n=0
-# kill-server immediately followed by new-session on the same socket can hit
-# "server exited unexpectedly" (the new client connects to the still-dying server).
-# reset_server waits for the socket to actually go away first.
-reset_server() {
-  "$REAL_TMUX" -L "$SOCKET" kill-server 2>/dev/null || true
-  for _ in $(seq 1 50); do "$REAL_TMUX" -L "$SOCKET" list-sessions >/dev/null 2>&1 || break; sleep 0.1; done
-}
 chk_has() { n=$((n+1)); if printf '%s' "$1" | grep -qF -- "$2"; then echo "ok   $3"; else echo "FAIL $3"; printf '     line: %s\n' "$1"; fail=1; fi; }
 wait_file() { for _ in $(seq 1 50); do [ -s "$1" ] && return 0; sleep 0.1; done; return 1; }
 

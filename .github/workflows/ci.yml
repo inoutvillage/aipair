@@ -4,7 +4,9 @@ on:
   pull_request:
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # ubuntu-latest (26.04) has no setup-python build of 3.8, so the python-floor lane stays on 24.04
+    # (whose distro tmux is 3.4); the other lanes follow ubuntu-latest (distro tmux 3.6).
+    runs-on: ${{ matrix.python == '3.8' && 'ubuntu-24.04' || 'ubuntu-latest' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false          # a red floor must not hide a red tip (python or tmux), or vice versa
@@ -12,15 +14,15 @@ jobs:
         # Cover the SUPPORTED floors and a current release without a full cross-product:
         #   - python 3.8 is the floor (aipair-install.sh requires python3 >= 3.8);
         #   - tmux 3.1 is the floor (README「必要環境」: `split-window -l 30%` is 3.1+), built from
-        #     source since the distro ships 3.4. session-name.sh auto-detects tmux < 3.2 and skips
+        #     source since the distro ships 3.4 / 3.6. session-name.sh auto-detects tmux < 3.2 and skips
         #     the `#{session_path}`-based legacy/collision cases (that path is a safe non-adopt,
         #     covered by its [10] simulation); everything else runs on the real 3.1 binary.
         # run-all.sh classifies by shebang, so the python files (the aipairlib package modules +
         # the thin entrypoints + the .py tests) and everything the shell tests invoke as `python3`
         # run on the matrix python.
         include:
-          - { python: '3.8',  tmux: distro }   # python floor, distro tmux (3.4)
-          - { python: '3.13', tmux: distro }   # current python, distro tmux
+          - { python: '3.8',  tmux: distro }   # python floor, distro tmux (24.04: 3.4)
+          - { python: '3.13', tmux: distro }   # current python, distro tmux (26.04: 3.6)
           - { python: '3.13', tmux: '3.1' }    # tmux floor, built from source
     name: test (py${{ matrix.python }}, tmux ${{ matrix.tmux }})
     steps:
