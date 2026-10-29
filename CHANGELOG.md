@@ -82,6 +82,14 @@ task makes no progress across rounds) instead of guessing or spinning.
   is skipped; a notice that cannot be delivered is reported in the relay pane. In both cases the exit code
   stays 0 because the review passed. Unchanged: endless mode (the stop sentinel still means "next task"),
   Claude's own stop (`--stop-side claude`), the autopilot forced pass, and the other ways the loop ends.
+- **Codex's "only human decisions remain" now tells Claude before the loop stops** — in the normal review
+  loop, when Codex's final answer starts with `[AIPAIR_HUMAN_REQUIRED]`, the relay no longer stops on the Codex
+  side without a word to Claude. It first tells Claude that the remaining points need a human decision and the
+  loop is over; Claude reads Codex's last message with `peer`, tells the user
+  「残りは人間の判断事項のため、リレーを終了します」 and writes out each decision (what to decide, the options,
+  its recommendation). Dialogs and undelivered notices are handled as for the review pass; the exit code stays
+  8. Unchanged: Claude's own `[AIPAIR_HUMAN_REQUIRED]` (Claude already knows), the no-progress stop, the
+  question relay's human-required stop, and endless mode.
 - **Default pane layout: bridge 17% high, Codex 28% wide** (was 30% / 50%) — `aipair` now splits the
   window so the Claude pane gets most of the space. **This changes how a newly started pair looks**
   for everyone who upgrades: the bottom bridge pane is shorter and the right-hand Codex pane is

@@ -1335,7 +1335,8 @@ class ReviewLoopExits(unittest.TestCase):
     def test_codex_human_required_stops_with_exit_8(self):
         code, pokes, _ = self._run(lambda who: ["修正あり"] if who == "claude" else [self.HR + "\nD1: 仕様の選択"])
         self.assertEqual(code, 8)
-        self.assertEqual(pokes, ["%2"], "Codex's HUMAN_REQUIRED is not relayed back to Claude")
+        self.assertEqual(pokes, ["%2", "%1"], "Codex's HUMAN_REQUIRED is not relayed back to Claude as a fix request; "
+                                              "the one poke to Claude is the end notice (ReviewHumanRequiredNotice)")
 
     def test_claude_human_required_stops_before_asking_codex(self):
         code, pokes, _ = self._run(lambda who: [self.HR + "\nユーザー判断待ち"] if who == "claude" else ["x"])
@@ -1477,6 +1478,64 @@ class ReviewOkNotice(unittest.TestCase):
         code, pokes, _ = self._run([("claude", ["[AIPAIR_REVIEW_OK]"])], stop_side="claude")
         self.assertEqual(code, 0)
         self.assertEqual(pokes, [])
+
+
+class ReviewHumanRequiredNotice(unittest.TestCase):
+    """2026-10-30 (maintainer request): when Codex declares that only human decisions remain
+    ([AIPAIR_HUMAN_REQUIRED]), the normal review loop stopped on the Codex side without a word to Claude, so the
+    Claude pane could not tell "Codex is still reviewing" from "the relay has stopped". Like the review pass, the
+    relay now tells Claude first, and Claude writes out what the human has to decide. Drives the real run()."""
+    HR = relay.review_protocol.REVIEW_HR_POKE_CLAUDE
+    _run = ReviewOkNotice._run
+    TURNS = [("claude", ["実装しました"]), ("codex", ["[AIPAIR_HUMAN_REQUIRED]\n- 公開範囲を A と B のどちらにするか"])]
+
+    def test_the_notice_asks_claude_to_write_out_the_decisions_and_stop(self):
+        self.assertIn("人間の判断事項", self.HR)
+        self.assertIn("「残りは人間の判断事項のため、リレーを終了します」", self.HR)
+        self.assertIn("`peer`", self.HR, "Claude reads what Codex left to the human")
+        self.assertIn("箇条書き", self.HR)
+        self.assertIn("新しい作業は始めず", self.HR)
+        self.assertIn("再点火もしない", self.HR)
+        for sentinel in ("[AIPAIR_HUMAN_REQUIRED]", "[AIPAIR_REVIEW_OK]"):
+            self.assertNotIn(sentinel, self.HR, "no control sentinel is handed to Claude to echo")
+
+    def test_codex_declaring_human_required_tells_claude_then_exits_8(self):
+        code, pokes, out = self._run(self.TURNS)
+        self.assertEqual(code, 8)
+        self.assertEqual(pokes, [("%2", "PC"), ("%1", self.HR)])
+        self.assertIn("Claude に人間の判断待ちとループ終了を知らせました", out)
+        self.assertLess(out.index("Claude に人間の判断待ちとループ終了を知らせました"),
+                        out.index("Codex が『残りは人間の判断事項』と宣言"), "notified first, then the exit-8 banner")
+
+    def test_a_dialog_on_claudes_screen_is_never_typed_into(self):
+        for plan, question in (({"tell": "3", "yes": "1"}, None), (None, {"chat": "4"})):
+            code, pokes, out = self._run(self.TURNS, plan=plan, question=question)
+            self.assertEqual(code, 8)
+            self.assertEqual(pokes, [("%2", "PC")])
+            self.assertIn("ダイアログ表示中のため、人間の判断待ちの知らせは送らずに終了", out)
+
+    def test_an_undelivered_notice_is_shown_and_the_exit_stays_8(self):
+        code, pokes, out = self._run(self.TURNS, poke_result=lambda pane, text: None if text == self.HR else "nonce")
+        self.assertEqual(code, 8)
+        self.assertEqual(pokes, [("%2", "PC"), ("%1", self.HR)])
+        self.assertIn("人間の判断待ちの知らせを配達できず（poke失敗）。人間の判断待ちとして exit 8 で終了します", out)
+
+    def test_a_tmux_error_while_notifying_still_ends_with_the_exit_8_banner(self):
+        def poke_result(pane, text):
+            if text == self.HR:
+                raise subprocess.CalledProcessError(1, ["tmux", "send-keys", "-t", pane], stderr="can't find pane")
+            return "nonce"
+        code, pokes, out = self._run(self.TURNS, poke_result=poke_result)
+        self.assertEqual(code, 8)
+        self.assertIn("人間の判断待ちの知らせを配達できず（tmux エラー:", out)
+        self.assertIn("Codex が『残りは人間の判断事項』と宣言", out)
+
+    def test_claudes_own_declaration_needs_no_notice(self):
+        # Claude wrote the sentinel itself, so it already knows the loop stops here
+        code, pokes, out = self._run([("claude", ["[AIPAIR_HUMAN_REQUIRED]\n- 公開範囲の判断が要る"])])
+        self.assertEqual(code, 8)
+        self.assertEqual(pokes, [])
+        self.assertIn("Claude が『残りは人間の判断事項』と宣言", out)
 
 
 class SubagentWaitInTheLoop(unittest.TestCase):
