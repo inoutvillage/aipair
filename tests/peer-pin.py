@@ -316,6 +316,24 @@ class ProcIdentity(Base):
             self.assertEqual(pl.codex_via_pane(self.CWD), main,
                              "the shallow (pair) codex wins over a deeper, newer nested one")
 
+    def test_the_pane_process_itself_can_be_the_codex(self):
+        # codex 0.166 / Node 22: codex.js replaces itself with the native binary (process.execve). A pane
+        # started with the command itself then has codex AS its pane_pid, with nothing above it in the pane.
+        ours = self.rollout("ours", self.CWD, "2026-08-21T00:00:00Z", 100)
+        with mock.patch.object(pl, "_tmux", return_value="2000"), \
+             mock.patch.object(pl, "_descendants", return_value=[]), \
+             mock.patch.object(pl, "_open_rollouts", side_effect=lambda pid: [ours] if pid == 2000 else []):
+            self.assertEqual(pl.codex_via_pane(self.CWD, "%7"), ours)
+
+    def test_the_pane_process_wins_over_a_nested_codex(self):
+        main = self.rollout("main", self.CWD, "2026-08-21T00:00:00Z", 100)
+        nested = self.rollout("nested", self.CWD, "2026-08-21T00:59:00Z", 9999)   # newer
+        opens = {2000: [main], 2001: [nested]}
+        with mock.patch.object(pl, "_tmux", return_value="2000"), \
+             mock.patch.object(pl, "_descendants", return_value=[2001]), \
+             mock.patch.object(pl, "_open_rollouts", side_effect=lambda pid: opens.get(pid, [])):
+            self.assertEqual(pl.codex_via_pane(self.CWD, "%7"), main)
+
     def test_valid_rollout_only_accepts_files_under_codex_sessions(self):
         good = self.rollout("good", self.CWD, "2026-08-21T00:00:00Z", 100)
         self.assertTrue(pl._valid_rollout(good))

@@ -396,9 +396,9 @@ def _ppid_from_stat(data):
 
 def _descendants(root):
     """Pids under `root`, breadth-first (shallowest first). Empty where /proc is absent (macOS).
-    Order matters: the pair's OWN codex sits directly under the pane shell, while a nested
-    codex-in-codex is strictly deeper — walking shallowest-first lets the caller take the pair's
-    own rollout and never a nested subprocess's (even when the nested one is newer)."""
+    `root` itself is not included. Order matters: the pair's OWN codex sits at most directly under the
+    pane shell, while a nested codex-in-codex is strictly deeper — walking shallowest-first lets the
+    caller take the pair's own rollout and never a nested subprocess's (even when the nested one is newer)."""
     children = {}
     try:
         names = os.listdir("/proc")
@@ -500,9 +500,11 @@ def codex_via_pane(cwd, pane=None):
     if ppid is None:
         return None
     want = _norm(cwd)
-    # BFS order → the shallowest process holding a cwd-matching rollout is the pair's OWN codex;
+    # The pane's own process first: codex.js can replace itself with the native binary (process.execve),
+    # so a pane started with the command itself (no shell above it) has codex AS its pane_pid.
+    # Then BFS order → the shallowest process holding a cwd-matching rollout is the pair's OWN codex;
     # a nested codex-in-codex sits deeper, so its (possibly newer) rollout never wins.
-    for pid in _descendants(ppid):
+    for pid in [ppid] + _descendants(ppid):
         for roll in _open_rollouts(pid):
             if same_dir(codex_cwd(roll), want):
                 return roll
@@ -560,9 +562,9 @@ def cli_process(pane, name):
     """(pid, starttime, exe_id) of the `name` CLI (claude / codex) running in tmux `pane` — the process
     whose TUI the relay scrapes. Checks the pane's own pid, then its descendants breadth-first, and takes
     the SHALLOWEST live process whose /proc comm is exactly `name`: the pane shell's child for claude, the
-    native binary under node's codex.js for codex (node's comm is 'node'). A nested CLI started by a tool
-    sits deeper and never wins; a truncated look-alike ('codex-code-mode') does not match; a zombie/dead
-    one (Z/X) is skipped. None when /proc is absent, the pane pid can't be queried, or no such process
+    native binary for codex (under node's codex.js, whose comm is 'node', or in its place once codex.js has
+    called process.execve). A nested CLI started by a tool sits deeper and never wins; a truncated
+    look-alike ('codex-code-mode') does not match; a zombie/dead one (Z/X) is skipped. None when /proc is absent, the pane pid can't be queried, or no such process
     exists. exe_id may be None (unreadable) — same_process() then never trusts the ident."""
     if not (pane and proc_available()):
         return None

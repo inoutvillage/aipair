@@ -138,6 +138,11 @@ task makes no progress across rounds) instead of guessing or spinning.
   approve edits" (no "bypass" wording), so the picker selects the first `Yes…` option.
 
 ### Fixed
+- **Finding Codex's log when Codex is the pane's own process** — `codex.js` can now replace itself with the
+  native binary (`process.execve`, seen with codex 0.166.0 on Node 22). A pane started with the command itself
+  then has Codex as its `pane_pid`, and the search for the rollout Codex holds open looked only at the pane's
+  descendants, so it found nothing. The pane's own process is now checked first. Pairs that `aipair` starts
+  were not affected: they type the command into a shell, which stays above Codex.
 - **The relay no longer stops (exit 7) on Claude Code 2.1.300+ logs** — from 2.1.300 Claude Code also writes
   `api-request-blob` rows: copies of the messages sent in each API request (`message{role, content}`
   deduplicated by `hash`, no `uuid` / `timestamp`). The conversation rows are unchanged and every runtime

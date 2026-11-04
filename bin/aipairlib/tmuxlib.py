@@ -31,7 +31,7 @@ def session_option(session, opt):
 def find_panes(session):
     """Identify the claude/codex panes. Prefer the pane ids aipair stamped
     (@aipair-claude-pane / @aipair-codex-pane) — deterministic, no title/command guessing
-    (Codex runs as `node`, titles get overwritten). Rules, per role:
+    (Codex runs as `node` or `codex`, titles get overwritten). Rules, per role:
       - a live, unique stamp that is not the relay's own pane → RESOLVED (locked);
       - a genuinely UNSET stamp → inferred from the remaining panes by the title/command/order
         heuristic below (keeps old codex-only pairs working across an upgrade, and pure-legacy
